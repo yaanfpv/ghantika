@@ -1,7 +1,5 @@
 import assert from "node:assert/strict";
-import { after, test } from "node:test";
-
-import { logActiveResourcesAtFileEnd } from "./helpers/activeResourcesDiagnostic.ts";
+import { test } from "node:test";
 
 // Real client, real in-process transport, real server - the end-to-end
 // jobStore-singleton-sharing regression coverage below drives an actual
@@ -1123,12 +1121,3 @@ test("end-to-end: a real `run` tools/call driven through a real Client/Server ro
   await client.close();
   await instance.shutdown("test cleanup");
 });
-
-// TEMPORARY DIAGNOSTIC - not for merge. On Windows this file's tests all
-// pass but the process that ran them never exits (deterministic, same
-// last test every run), which means something is still holding the event
-// loop open after every test here has already resolved. This prints
-// exactly what Node itself thinks is still active, run on the real
-// Windows CI leg, so the actual leaked resource can be read directly
-// instead of guessed at.
-after(() => logActiveResourcesAtFileEnd("jobStore.test.ts"));

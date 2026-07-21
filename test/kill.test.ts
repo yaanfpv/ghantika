@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { after, test } from "node:test";
+import { test } from "node:test";
 
 import type { CallToolResult } from "@modelcontextprotocol/server";
 
@@ -21,9 +21,6 @@ import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/sp
 // The shared marker-file poll and its pgid predicate - one implementation
 // for every suite that observes a job's real filesystem side effects.
 import { parsesAsPgid, waitForFile } from "./harness.ts";
-import { logActiveResourcesAtFileEnd } from "./helpers/activeResourcesDiagnostic.ts";
-
-after(() => logActiveResourcesAtFileEnd("kill.test.ts"));
 
 // ---------------------------------------------------------------------------
 // kill: unit-level handler tests (against the real dist/tools/kill.js, but
@@ -225,7 +222,7 @@ test(
     // work).
     skip:
       process.platform === "win32"
-        ? "real shell-forked process tree tracked via `pgrep -g`, POSIX-only"
+        ? "real shell-forked process tree tracked via `pgrep -g`, POSIX-only - see the Windows process-tree kill verification story"
         : false,
   },
   async () => {

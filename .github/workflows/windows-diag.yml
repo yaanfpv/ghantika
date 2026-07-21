@@ -1,0 +1,66 @@
+name: Windows diagnostic (temporary)
+
+# TEMPORARY, NOT PART OF THE PR GATE. Manually triggered only
+# (workflow_dispatch) - investigating why the "test" job's windows-latest
+# legs do not exit within their 15-minute ceiling (see ci.yml's "test" job).
+# Runs each file that spawns a real child process as its OWN step, with its
+# own short per-step timeout, so a single hanging file no longer hides
+# whether the other six exit cleanly on their own. Delete this file once
+# the investigation concludes either way.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolate:
+    name: isolate spawning files (windows-latest, node 22)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: e2e-server.test.ts
+        if: always()
+        timeout-minutes: 2
+        continue-on-error: true
+        run: node --test --test-reporter=spec --test-reporter-destination=stdout test/e2e-server.test.ts
+      - name: integration.test.ts
+        if: always()
+        timeout-minutes: 2
+        continue-on-error: true
+        run: node --test --test-reporter=spec --test-reporter-destination=stdout test/integration.test.ts
+      - name: jobStore.test.ts
+        if: always()
+        timeout-minutes: 2
+        continue-on-error: true
+        run: node --test --test-reporter=spec --test-reporter-destination=stdout test/jobStore.test.ts
+      - name: kill.test.ts
+        if: always()
+        timeout-minutes: 2
+        continue-on-error: true
+        run: node --test --test-reporter=spec --test-reporter-destination=stdout test/kill.test.ts
+      - name: shutdown.test.ts
+        if: always()
+        timeout-minutes: 2
+        continue-on-error: true
+        run: node --test --test-reporter=spec --test-reporter-destination=stdout test/shutdown.test.ts
+      - name: output-tail.test.ts
+        if: always()
+        timeout-minutes: 2
+        continue-on-error: true
+        run: node --test --test-reporter=spec --test-reporter-destination=stdout test/output-tail.test.ts
+      - name: process.test.ts
+        if: always()
+        timeout-minutes: 2
+        continue-on-error: true
+        run: node --test --test-reporter=spec --test-reporter-destination=stdout test/process.test.ts

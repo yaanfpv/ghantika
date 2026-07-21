@@ -11,7 +11,6 @@ import {
 } from "../dist/jobStore.js";
 import * as outputTool from "../dist/tools/output.js";
 import * as tailTool from "../dist/tools/tail.js";
-import { logActiveResourcesAtFileEnd } from "./helpers/activeResourcesDiagnostic.ts";
 
 // Explicit ".ts" extension - see test/e2e-server.test.ts's import comment
 // for why spawnServer.ts is imported this way.
@@ -659,8 +658,6 @@ after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   }
 });
-
-after(() => logActiveResourcesAtFileEnd("output-tail.test.ts"));
 
 interface ToolCallBody {
   readonly error?: { code: number; message: string };

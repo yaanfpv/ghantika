@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { after, test } from "node:test";
+import { test } from "node:test";
 
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
 // import comment for why.
@@ -28,9 +28,6 @@ import {
   signalProcessGroupPosix,
   waitForProcessDeath,
 } from "../dist/process.js";
-import { logActiveResourcesAtFileEnd } from "./helpers/activeResourcesDiagnostic.ts";
-
-after(() => logActiveResourcesAtFileEnd("process.test.ts"));
 
 // A handful of tests below exercise real POSIX process-GROUP primitives
 // this codebase's own code never asks Windows to perform (real `ps`/`pgrep`
@@ -44,7 +41,7 @@ after(() => logActiveResourcesAtFileEnd("process.test.ts"));
 // answered by skipping these.
 const POSIX_PROCESS_GROUP_SKIP =
   process.platform === "win32"
-    ? "exercises a real POSIX process-group primitive (ps/pgrep/negative-pid kill) with no win32 equivalent path here"
+    ? "exercises a real POSIX process-group primitive (ps/pgrep/negative-pid kill) with no win32 equivalent path here - see the Windows process-tree kill verification story"
     : false;
 
 // A structural guarantee: a real child's stdout must never

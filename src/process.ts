@@ -505,11 +505,6 @@ function readProcessElapsedSeconds(pid: number): number | undefined {
   } catch {
     return undefined; // ps exits non-zero when there is no such pid
   }
-  if (process.env.GHANTIKA_DIAG_PS === "1") {
-    process.stderr.write(
-      `[DIAG readProcessElapsedSeconds] pid=${pid} raw=${JSON.stringify(output)} parsed=${JSON.stringify(parseEtime(output))}\n`
-    );
-  }
   if (output.trim().length === 0) return undefined;
   return parseEtime(output);
 }

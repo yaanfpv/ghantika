@@ -14,7 +14,6 @@ import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/sp
 // observes a job's real filesystem side effects (see its own docs for why
 // it waits on content rather than on the file existing).
 import { parsesAsJsonObject, waitForFile } from "./harness.ts";
-import { logActiveResourcesAtFileEnd } from "./helpers/activeResourcesDiagnostic.ts";
 
 /**
  * The real end-to-end proof: a real spawned `dist/index.js` process, real
@@ -39,8 +38,6 @@ after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   }
 });
-
-after(() => logActiveResourcesAtFileEnd("e2e-server.test.ts"));
 
 test("initialize negotiates successfully and advertises tools capability", async () => {
   const server = tracked();
