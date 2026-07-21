@@ -16,14 +16,40 @@ name: Windows diagnostic (temporary)
 # Two controls are included deliberately, not just the seven real
 # spawning files: without them a green (or red) matrix is unreadable -
 # we would not know whether the mechanism itself can tell a healthy exit
-# from a hang. known-clean MUST pass fast; known-broken MUST time out. If
-# either control gives the wrong answer, nothing else in this run means
-# anything.
+# from a hang. known-clean MUST pass fast; known-broken MUST prove a hang
+# was genuinely detected. If either control gives the wrong answer,
+# nothing else in this run means anything.
+#
+# known-broken reports SUCCESS on a correctly-detected hang, not failure/
+# cancellation - this file attaches to every push on this PR (see the
+# trigger note below), so a control that can only prove itself by
+# cancelling would be a PERMANENTLY RED CHECK on a public pull request by
+# design, every single run, forever. That is a materially different and
+# worse problem than an ordinary red check: a stranger reading this repo
+# sees a red X and has no way to tell "this is an intentional control"
+# from "this repo's CI is broken." So known-broken's own step wraps the
+# inner `node --test` invocation in a small outer harness
+# (__known-broken-harness.mjs, generated alongside the fixtures below):
+# it races the inner process against its OWN bound (45s - comfortably
+# past the inner --test-timeout=30000, so whatever that flag does or
+# doesn't do on a given platform never decides the verdict) and checks
+# two things directly, proven locally against both a genuinely-hanging
+# fixture and a fixed/clean-exiting one before this was trusted: the
+# control's own assertion printed (it actually ran), AND the process is
+# STILL ALIVE when the bound fires (it did not exit on its own) - that
+# combination is the literal definition of "this hangs," independent of
+# any specific internal diagnostic wording. Only then does the harness
+# kill the child and exit 0. If the child exits early, or the assertion
+# never printed, the harness exits nonzero and the job genuinely fails -
+# at that point the control has stopped proving anything and a red check
+# is the correct, honest signal.
 #
 # Triggered on pull_request, same as ci.yml: a workflow_dispatch-only
 # workflow only becomes invocable once its YAML exists on the
 # repository's default branch, which this file deliberately never will.
-# Delete this file once the investigation concludes either way.
+# Delete this file (or move the surviving known-broken harness design
+# into a permanent green-on-detected-hang shape) once the investigation
+# concludes either way - it must not ship to main as-is.
 
 on:
   pull_request:
@@ -43,30 +69,39 @@ jobs:
           - label: "CONTROL known-clean (must pass fast)"
             file: __known-clean-control.test.js
             timeoutMinutes: 3
-          - label: "CONTROL known-broken (must time out)"
+            harness: false
+          - label: "CONTROL known-broken (must PROVE a detected hang, not just cancel)"
             file: __known-broken-control.test.js
             timeoutMinutes: 3
+            harness: true
           - label: e2e-server.test.ts
             file: test/e2e-server.test.ts
             timeoutMinutes: 5
+            harness: false
           - label: integration.test.ts
             file: test/integration.test.ts
             timeoutMinutes: 5
+            harness: false
           - label: jobStore.test.ts
             file: test/jobStore.test.ts
             timeoutMinutes: 5
+            harness: false
           - label: kill.test.ts
             file: test/kill.test.ts
             timeoutMinutes: 5
+            harness: false
           - label: shutdown.test.ts
             file: test/shutdown.test.ts
             timeoutMinutes: 5
+            harness: false
           - label: output-tail.test.ts
             file: test/output-tail.test.ts
             timeoutMinutes: 5
+            harness: false
           - label: process.test.ts
             file: test/process.test.ts
             timeoutMinutes: 5
+            harness: false
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -84,11 +119,12 @@ jobs:
       # image ships Git Bash, and a heredoc here is far simpler and more
       # reliable than the PowerShell equivalent.
       # ESM syntax, not require(): package.json declares "type": "module",
-      # so a generated .js file is an ES module under this package's scope
-      # regardless of platform - require() throws ReferenceError immediately,
-      # which is exactly what made both controls fail on the first run of
-      # this file (both died before either could test anything, and QA
-      # caught the same thing independently reading this exact commit).
+      # so a generated .js/.mjs file is an ES module under this package's
+      # scope regardless of platform - require() throws ReferenceError
+      # immediately, which is exactly what made both controls fail on the
+      # first run of this file (both died before either could test
+      # anything, and QA caught the same thing independently reading that
+      # exact commit).
       - name: write control fixtures
         shell: bash
         run: |
@@ -102,5 +138,68 @@ jobs:
             setInterval(() => {}, 1000);
           });
           EOF
+          cat > __known-broken-harness.mjs <<'EOF'
+          // Outer harness for known-broken - see this workflow's header
+          // comment for why known-broken must report success on a
+          // correctly-detected hang rather than relying on the job's own
+          // cancellation. Design proven locally against both a genuinely-
+          // hanging fixture (PASS) and a fixed/clean-exiting one (FAIL)
+          // before being trusted here.
+          import { spawn } from "node:child_process";
+
+          const BOUND_MS = 45000; // comfortably past the inner --test-timeout=30000
+
+          const child = spawn(
+            process.execPath,
+            [
+              "--test",
+              "--test-timeout=30000",
+              "--test-reporter=spec",
+              "--test-reporter-destination=stdout",
+              "__known-broken-control.test.js",
+            ],
+            { stdio: ["inherit", "pipe", "inherit"] }
+          );
+
+          let stdout = "";
+          let exited = false;
+          child.stdout.on("data", (chunk) => {
+            stdout += chunk;
+            process.stdout.write(chunk);
+          });
+          child.on("exit", () => {
+            exited = true;
+          });
+
+          setTimeout(() => {
+            const sawAssertionPass = /known-broken: passes its own assertion/.test(stdout);
+            if (exited) {
+              console.error(
+                `\nFAIL (outer harness): the control exited on its own before the ${BOUND_MS}ms ` +
+                  "bound - it is not actually hanging, so it cannot prove the matrix can detect one."
+              );
+              process.exit(1);
+            }
+            if (!sawAssertionPass) {
+              child.kill("SIGKILL");
+              console.error(
+                "\nFAIL (outer harness): the control's own assertion never printed - it isn't " +
+                  "running as designed."
+              );
+              process.exit(1);
+            }
+            console.log(
+              "\nPASS (outer harness): the control's assertion passed, and it genuinely never " +
+                `exited on its own within ${BOUND_MS}ms - killing it now. This proves the matrix ` +
+                "CAN detect a real hang."
+            );
+            child.kill("SIGKILL");
+            process.exit(0);
+          }, BOUND_MS);
+          EOF
       - name: run ${{ matrix.label }}
+        if: matrix.harness != true
         run: node --test --test-timeout=30000 --test-reporter=spec --test-reporter-destination=stdout ${{ matrix.file }}
+      - name: run ${{ matrix.label }} (via outer harness)
+        if: matrix.harness == true
+        run: node __known-broken-harness.mjs
