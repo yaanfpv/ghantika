@@ -29,6 +29,21 @@ import {
   waitForProcessDeath,
 } from "../dist/process.js";
 
+// A handful of tests below exercise real POSIX process-GROUP primitives
+// this codebase's own code never asks Windows to perform (real `ps`/`pgrep`
+// invocations, `process.kill(-pid, ...)`'s negative-pid group form, and
+// spawning bare `sleep`) - none of that has a win32 equivalent to run
+// against, so these skip there rather than hang or fail on a platform gap
+// this test is not measuring. This is a TEST-HARNESS gap, not a product
+// scope decision (OD-5: Windows is a supported platform) - the real
+// question of whether src/process.ts's own win32 kill path (taskkill-based
+// process-tree termination) actually works is separate, tracked work, not
+// answered by skipping these.
+const POSIX_PROCESS_GROUP_SKIP =
+  process.platform === "win32"
+    ? "exercises a real POSIX process-group primitive (ps/pgrep/negative-pid kill) with no win32 equivalent path here - see the Windows process-tree kill verification story"
+    : false;
+
 // A structural guarantee: a real child's stdout must never
 // be wired directly to the server's own stdout. "pipe" hands the server a
 // stream it must explicitly read from and forward somewhere (JobStore) -
@@ -605,22 +620,29 @@ test("spawnManaged: a command run with env replace mode sees ONLY the vars we ga
 // kill: process-tree containment and termination
 // ---------------------------------------------------------------------------
 
-test("spawnManaged (POSIX): a detached child is the LEADER of its own process group (pgid === its own pid) - the containment kill relies on, confirmed via a REAL external ps lookup", async () => {
-  const rec = recorder();
-  const env = buildChildEnv("merge", {});
-  const child = spawnManaged({ argv: ["sleep", "2"], cwd: process.cwd(), env }, callbacksFor(rec));
-  await waitFor(() => rec.spawned > 0);
-  const pid = child!.pid!;
-  const pgidOutput = execFileSync("ps", ["-p", String(pid), "-o", "pgid="], {
-    encoding: "utf8",
-  }).trim();
-  assert.equal(
-    Number(pgidOutput),
-    pid,
-    "the child's own pgid must equal its own pid - it must be its own group leader, assigned atomically at spawn time"
-  );
-  process.kill(-pid, "SIGKILL"); // cleanup
-});
+test(
+  "spawnManaged (POSIX): a detached child is the LEADER of its own process group (pgid === its own pid) - the containment kill relies on, confirmed via a REAL external ps lookup",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "2"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+    const pgidOutput = execFileSync("ps", ["-p", String(pid), "-o", "pgid="], {
+      encoding: "utf8",
+    }).trim();
+    assert.equal(
+      Number(pgidOutput),
+      pid,
+      "the child's own pgid must equal its own pid - it must be its own group leader, assigned atomically at spawn time"
+    );
+    process.kill(-pid, "SIGKILL"); // cleanup
+  }
+);
 
 // --- parseEtime (pure, no real process needed) ---
 
@@ -671,41 +693,55 @@ test("checkProcessIdentity: not-found for a pid that plainly doesn't exist", () 
   assert.equal(result.status, "not-found");
 });
 
-test("checkProcessIdentity: alive-confirmed for a real process whose ACTUAL recorded spawn time matches", async () => {
-  const rec = recorder();
-  const env = buildChildEnv("merge", {});
-  const spawnedAtMs = Date.now();
-  const child = spawnManaged({ argv: ["sleep", "3"], cwd: process.cwd(), env }, callbacksFor(rec));
-  await waitFor(() => rec.spawned > 0);
-  const result = checkProcessIdentity(child!.pid!, spawnedAtMs);
-  assert.equal(result.status, "alive-confirmed");
-  process.kill(-child!.pid!, "SIGKILL"); // cleanup
-});
-
-test("checkProcessIdentity REFUSES to confirm a real, currently-alive process when the expected spawn time is far in the past - a convincing simulation of PID reuse", async () => {
-  // Real pid recycling can't be forced deterministically from a test, so
-  // this simulates its ESSENCE instead: a REAL, currently-alive process
-  // (ps reports its REAL, near-0s elapsed time) checked against an
-  // `expectedSpawnedAtMs` far in the past - exactly what a stale, post-
-  // reuse bookkeeping record would look like from the outside (our record
-  // still points at this pid, but the REAL process now living there
-  // started at a very different time than the one we originally spawned).
-  // How convincing this is: fully real `ps` call and fully real elapsed-
-  // time comparison logic, on a genuinely live process - just not an
-  // actual OS-level pid recycling event, which this environment cannot
-  // force to order.
-  const rec = recorder();
-  const env = buildChildEnv("merge", {});
-  const child = spawnManaged({ argv: ["sleep", "3"], cwd: process.cwd(), env }, callbacksFor(rec));
-  await waitFor(() => rec.spawned > 0);
-  const fakeExpectedSpawnedAtMs = Date.now() - 10 * 60 * 1000; // 10 minutes "ago"
-  const result = checkProcessIdentity(child!.pid!, fakeExpectedSpawnedAtMs);
-  assert.equal(result.status, "identity-mismatch");
-  if (result.status === "identity-mismatch") {
-    assert.match(result.reason, /reused pid/);
+test(
+  "checkProcessIdentity: alive-confirmed for a real process whose ACTUAL recorded spawn time matches",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const spawnedAtMs = Date.now();
+    const child = spawnManaged(
+      { argv: ["sleep", "3"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const result = checkProcessIdentity(child!.pid!, spawnedAtMs);
+    assert.equal(result.status, "alive-confirmed");
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
   }
-  process.kill(-child!.pid!, "SIGKILL"); // cleanup
-});
+);
+
+test(
+  "checkProcessIdentity REFUSES to confirm a real, currently-alive process when the expected spawn time is far in the past - a convincing simulation of PID reuse",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    // Real pid recycling can't be forced deterministically from a test, so
+    // this simulates its ESSENCE instead: a REAL, currently-alive process
+    // (ps reports its REAL, near-0s elapsed time) checked against an
+    // `expectedSpawnedAtMs` far in the past - exactly what a stale, post-
+    // reuse bookkeeping record would look like from the outside (our record
+    // still points at this pid, but the REAL process now living there
+    // started at a very different time than the one we originally spawned).
+    // How convincing this is: fully real `ps` call and fully real elapsed-
+    // time comparison logic, on a genuinely live process - just not an
+    // actual OS-level pid recycling event, which this environment cannot
+    // force to order.
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "3"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const fakeExpectedSpawnedAtMs = Date.now() - 10 * 60 * 1000; // 10 minutes "ago"
+    const result = checkProcessIdentity(child!.pid!, fakeExpectedSpawnedAtMs);
+    assert.equal(result.status, "identity-mismatch");
+    if (result.status === "identity-mismatch") {
+      assert.match(result.reason, /reused pid/);
+    }
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
 
 // --- isProcessAlive ---
 
@@ -732,21 +768,32 @@ test("isProcessAlive: false for a pid that plainly doesn't exist", () => {
 
 // --- signalProcessGroupPosix ---
 
-test("signalProcessGroupPosix: signaling the group actually reaches it (green control, precursor to the real external-lineage e2e proof in test/kill.test.ts)", async () => {
-  const rec = recorder();
-  const env = buildChildEnv("merge", {});
-  const child = spawnManaged({ argv: ["sleep", "5"], cwd: process.cwd(), env }, callbacksFor(rec));
-  await waitFor(() => rec.spawned > 0);
-  const result = signalProcessGroupPosix(child!.pid!, "SIGKILL");
-  assert.equal(result.ok, true);
-  await waitFor(() => rec.exits.length > 0, 3000);
-  assert.equal(rec.exits[0]!.signal, "SIGKILL");
-});
+test(
+  "signalProcessGroupPosix: signaling the group actually reaches it (green control, precursor to the real external-lineage e2e proof in test/kill.test.ts)",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const result = signalProcessGroupPosix(child!.pid!, "SIGKILL");
+    assert.equal(result.ok, true);
+    await waitFor(() => rec.exits.length > 0, 3000);
+    assert.equal(rec.exits[0]!.signal, "SIGKILL");
+  }
+);
 
-test("signalProcessGroupPosix: signaling an already-gone group is treated as success (ESRCH), not a failure", () => {
-  const result = signalProcessGroupPosix(999_999, "SIGTERM");
-  assert.equal(result.ok, true);
-});
+test(
+  "signalProcessGroupPosix: signaling an already-gone group is treated as success (ESRCH), not a failure",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  () => {
+    const result = signalProcessGroupPosix(999_999, "SIGTERM");
+    assert.equal(result.ok, true);
+  }
+);
 
 // --- waitForProcessDeath ---
 
@@ -762,75 +809,93 @@ test("waitForProcessDeath resolves true quickly once a process actually dies wit
   assert.equal(died, true);
 });
 
-test("waitForProcessDeath resolves false once the timeout elapses for a still-alive process", async () => {
-  const rec = recorder();
-  const env = buildChildEnv("merge", {});
-  const child = spawnManaged({ argv: ["sleep", "5"], cwd: process.cwd(), env }, callbacksFor(rec));
-  await waitFor(() => rec.spawned > 0);
-  const start = Date.now();
-  const died = await waitForProcessDeath(child!.pid!, 150, 20);
-  const elapsed = Date.now() - start;
-  assert.equal(died, false);
-  assert.ok(
-    elapsed >= 150 && elapsed < 1000,
-    `expected to resolve close to the 150ms timeout, took ${elapsed}ms`
-  );
-  process.kill(-child!.pid!, "SIGKILL"); // cleanup
-});
+test(
+  "waitForProcessDeath resolves false once the timeout elapses for a still-alive process",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const start = Date.now();
+    const died = await waitForProcessDeath(child!.pid!, 150, 20);
+    const elapsed = Date.now() - start;
+    assert.equal(died, false);
+    assert.ok(
+      elapsed >= 150 && elapsed < 1000,
+      `expected to resolve close to the 150ms timeout, took ${elapsed}ms`
+    );
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
 
 // --- killProcessGroupPosix (the real phase split) ---
 
-test("killProcessGroupPosix: a normal (non-resistant) process dies from SIGTERM alone - no escalation needed", async () => {
-  const rec = recorder();
-  const env = buildChildEnv("merge", {});
-  const child = spawnManaged({ argv: ["sleep", "10"], cwd: process.cwd(), env }, callbacksFor(rec));
-  await waitFor(() => rec.spawned > 0);
-  const result = await killProcessGroupPosix(child!.pid!, 2000);
-  assert.equal(result.finalSignal, "SIGTERM");
-  assert.equal(result.escalated, false);
-  assert.equal(isProcessAlive(child!.pid!), false);
-});
+test(
+  "killProcessGroupPosix: a normal (non-resistant) process dies from SIGTERM alone - no escalation needed",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "10"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const result = await killProcessGroupPosix(child!.pid!, 2000);
+    assert.equal(result.finalSignal, "SIGTERM");
+    assert.equal(result.escalated, false);
+    assert.equal(isProcessAlive(child!.pid!), false);
+  }
+);
 
-test("a SIGTERM-resistant process is escalated to SIGKILL after the grace period and actually dies", async () => {
-  const rec = recorder();
-  const env = buildChildEnv("merge", {});
-  // Ignores SIGTERM entirely and stays alive on its own - proves
-  // escalation is REQUIRED (not merely possible) for this test to pass.
-  // Prints a "ready" marker AFTER registering the handler, and the test
-  // waits for it before sending any signal - without this synchronization,
-  // a SIGTERM landing in the tiny startup window BEFORE `process.on` runs
-  // would hit Node's default (terminating) disposition instead of the
-  // no-op handler, making the child die from plain SIGTERM and falsely
-  // "pass" without ever exercising real escalation - exactly what a first,
-  // unsynchronized version of this test did.
-  const child = spawnManaged(
-    {
-      argv: [
-        "node",
-        "-e",
-        "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000)",
-      ],
-      cwd: process.cwd(),
-      env,
-    },
-    callbacksFor(rec)
-  );
-  await waitFor(() => rec.spawned > 0);
-  await waitFor(() => Buffer.concat(rec.stdout).toString("utf8").includes("ready"));
-  // A real wait, short only to keep the suite fast - the SAME code path as
-  // the real 5000ms production default (POSIX_KILL_GRACE_PERIOD_MS),
-  // exercised here with an injected, still-genuine, non-instant grace
-  // period via killProcessGroupPosix's own `graceMs` parameter.
-  const shortGraceMs = 300;
-  const result = await killProcessGroupPosix(child!.pid!, shortGraceMs);
-  assert.equal(result.finalSignal, "SIGKILL");
-  assert.equal(result.escalated, true);
-  assert.equal(
-    isProcessAlive(child!.pid!),
-    false,
-    "the SIGTERM-resistant process must actually be dead after SIGKILL escalation"
-  );
-});
+test(
+  "a SIGTERM-resistant process is escalated to SIGKILL after the grace period and actually dies",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    // Ignores SIGTERM entirely and stays alive on its own - proves
+    // escalation is REQUIRED (not merely possible) for this test to pass.
+    // Prints a "ready" marker AFTER registering the handler, and the test
+    // waits for it before sending any signal - without this synchronization,
+    // a SIGTERM landing in the tiny startup window BEFORE `process.on` runs
+    // would hit Node's default (terminating) disposition instead of the
+    // no-op handler, making the child die from plain SIGTERM and falsely
+    // "pass" without ever exercising real escalation - exactly what a first,
+    // unsynchronized version of this test did.
+    const child = spawnManaged(
+      {
+        argv: [
+          "node",
+          "-e",
+          "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000)",
+        ],
+        cwd: process.cwd(),
+        env,
+      },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    await waitFor(() => Buffer.concat(rec.stdout).toString("utf8").includes("ready"));
+    // A real wait, short only to keep the suite fast - the SAME code path as
+    // the real 5000ms production default (POSIX_KILL_GRACE_PERIOD_MS),
+    // exercised here with an injected, still-genuine, non-instant grace
+    // period via killProcessGroupPosix's own `graceMs` parameter.
+    const shortGraceMs = 300;
+    const result = await killProcessGroupPosix(child!.pid!, shortGraceMs);
+    assert.equal(result.finalSignal, "SIGKILL");
+    assert.equal(result.escalated, true);
+    assert.equal(
+      isProcessAlive(child!.pid!),
+      false,
+      "the SIGTERM-resistant process must actually be dead after SIGKILL escalation"
+    );
+  }
+);
 
 test("POSIX_KILL_GRACE_PERIOD_MS is the real 5-second default ('a real grace period, not a token delay')", () => {
   assert.equal(POSIX_KILL_GRACE_PERIOD_MS, 5000);

@@ -266,40 +266,54 @@ test("isTerminalJobState is true for exited/killed/failed and false for starting
   assert.equal(isTerminalJobState("running"), false);
 });
 
-test("attachChild/getChildHandle: a real attached child's pid and an approximate spawnedAtMs are retrievable, never the raw ChildProcess itself", async () => {
-  const store = new JobStore();
-  const record = store.createJob({ argv: ["sleep", "1"], cwd: "/tmp", env: {}, isShell: false });
-  const beforeAttach = Date.now();
-  const child = spawnManaged(
-    {
-      argv: ["sleep", "1"],
-      cwd: process.cwd(),
-      env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
-    },
-    {
-      onSpawn: () => {},
-      onError: () => {},
-      onExit: () => {},
-      onStdoutChunk: () => {},
-      onStderrChunk: () => {},
-      onStdoutEnd: () => {},
-      onStderrEnd: () => {},
-    }
-  );
-  store.attachChild(record.job_id, child!);
-  const afterAttach = Date.now();
+test(
+  "attachChild/getChildHandle: a real attached child's pid and an approximate spawnedAtMs are retrievable, never the raw ChildProcess itself",
+  {
+    // Spawns the bare `sleep` binary and cleans up via a negative-pid
+    // process-group kill, neither of which has a Windows equivalent here -
+    // a test-harness gap tracked separately (OD-5: Windows is a supported
+    // platform; only this harness's real POSIX process-group primitives
+    // are not).
+    skip:
+      process.platform === "win32"
+        ? "spawns bare `sleep` and cleans up via a negative-pid process-group kill, both POSIX-only"
+        : false,
+  },
+  async () => {
+    const store = new JobStore();
+    const record = store.createJob({ argv: ["sleep", "1"], cwd: "/tmp", env: {}, isShell: false });
+    const beforeAttach = Date.now();
+    const child = spawnManaged(
+      {
+        argv: ["sleep", "1"],
+        cwd: process.cwd(),
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+      },
+      {
+        onSpawn: () => {},
+        onError: () => {},
+        onExit: () => {},
+        onStdoutChunk: () => {},
+        onStderrChunk: () => {},
+        onStdoutEnd: () => {},
+        onStderrEnd: () => {},
+      }
+    );
+    store.attachChild(record.job_id, child!);
+    const afterAttach = Date.now();
 
-  const handle = store.getChildHandle(record.job_id)!;
-  assert.equal(handle.pid, child!.pid);
-  assert.ok(handle.spawnedAtMs >= beforeAttach && handle.spawnedAtMs <= afterAttach);
-  assert.equal(
-    "child" in (handle as unknown as Record<string, unknown>),
-    false,
-    "getChildHandle must never expose the raw ChildProcess, only {pid, spawnedAtMs}"
-  );
+    const handle = store.getChildHandle(record.job_id)!;
+    assert.equal(handle.pid, child!.pid);
+    assert.ok(handle.spawnedAtMs >= beforeAttach && handle.spawnedAtMs <= afterAttach);
+    assert.equal(
+      "child" in (handle as unknown as Record<string, unknown>),
+      false,
+      "getChildHandle must never expose the raw ChildProcess, only {pid, spawnedAtMs}"
+    );
 
-  process.kill(-child!.pid!, "SIGKILL"); // cleanup
-});
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
 
 test("getChildHandle returns undefined for a job that never had a child attached (e.g. a job that started already-failed)", () => {
   const store = new JobStore();

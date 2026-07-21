@@ -32,6 +32,18 @@ import {
   waitForPgrepGroupMembers,
 } from "./harness.ts";
 
+// The three tests below build real, multi-descendant process trees via
+// startNoisyJobs and confirm them with a real external `pgrep -g <pgid>`
+// call, neither of which has a Windows equivalent path exercised anywhere
+// in this codebase - a test-harness gap, not a product scope decision
+// (OD-5: Windows is a supported platform; the real question of whether a
+// live job's whole process tree is actually reaped on Windows is
+// separate, tracked work).
+const PGREP_ORACLE_SKIP =
+  process.platform === "win32"
+    ? "builds/confirms a real process-group tree via startNoisyJobs + pgrep -g, POSIX-only - see the Windows process-tree kill verification story"
+    : false;
+
 const spawned: SpawnedServer[] = [];
 function tracked(): SpawnedServer {
   const server = spawnServer();
@@ -68,169 +80,173 @@ function nextId(): number {
 // noise.
 // =============================================================================
 
-test("THE CENTERPIECE: real stdio client drives JOBS=4 concurrent live jobs (DESCENDANTS-per-job=3, NOISE-bytes=64KiB each); while one stays live the SAME session reads its status/output AND starts a 5th job, non-blocking; framing stays clean under the noise", async () => {
-  const server = tracked();
-  await completeHandshake(server);
+test(
+  "THE CENTERPIECE: real stdio client drives JOBS=4 concurrent live jobs (DESCENDANTS-per-job=3, NOISE-bytes=64KiB each); while one stays live the SAME session reads its status/output AND starts a 5th job, non-blocking; framing stays clean under the noise",
+  { skip: PGREP_ORACLE_SKIP },
+  async () => {
+    const server = tracked();
+    await completeHandshake(server);
 
-  // Setup phase + both barriers (all inside startNoisyJobs, see its own docs):
-  // JOBS=4 noisy jobs started CONCURRENTLY (pipelined `run` calls - the
-  // session never serializes even the starts), each confirmed alive with
-  // its full DESCENDANTS_PER_JOB=3 real descendant tree via external
-  // pgrep, each confirmed to have genuinely materialized its NOISE_BYTES
-  // of real stdout via a real status().counts read.
-  const { jobIds, pgids } = await startNoisyJobs(server, JOBS, nextId);
-  assert.equal(jobIds.length, JOBS);
-  assert.equal(pgids.length, JOBS);
+    // Setup phase + both barriers (all inside startNoisyJobs, see its own docs):
+    // JOBS=4 noisy jobs started CONCURRENTLY (pipelined `run` calls - the
+    // session never serializes even the starts), each confirmed alive with
+    // its full DESCENDANTS_PER_JOB=3 real descendant tree via external
+    // pgrep, each confirmed to have genuinely materialized its NOISE_BYTES
+    // of real stdout via a real status().counts read.
+    const { jobIds, pgids } = await startNoisyJobs(server, JOBS, nextId);
+    assert.equal(jobIds.length, JOBS);
+    assert.equal(pgids.length, JOBS);
 
-  // ---------------------------------------------------------------------
-  // THE core proof: while job 0 stays LIVE (never killed yet - its
-  // process group is still confirmed alive below), the SAME MCP client
-  // session calls status()/output() on it AND starts a FIFTH job, all
-  // pipelined together as one concurrent batch - proving the server never
-  // blocks the whole session on one live child, jobs/streams stay
-  // correctly isolated from each other, and this ALL happens while the
-  // other three jobs' 64KiB-each noise sits in their buffers too.
-  // ---------------------------------------------------------------------
-  const liveJobIndex = 0;
-  const liveJobId = jobIds[liveJobIndex]!;
-  const livePgid = pgids[liveJobIndex]!;
+    // ---------------------------------------------------------------------
+    // THE core proof: while job 0 stays LIVE (never killed yet - its
+    // process group is still confirmed alive below), the SAME MCP client
+    // session calls status()/output() on it AND starts a FIFTH job, all
+    // pipelined together as one concurrent batch - proving the server never
+    // blocks the whole session on one live child, jobs/streams stay
+    // correctly isolated from each other, and this ALL happens while the
+    // other three jobs' 64KiB-each noise sits in their buffers too.
+    // ---------------------------------------------------------------------
+    const liveJobIndex = 0;
+    const liveJobId = jobIds[liveJobIndex]!;
+    const livePgid = pgids[liveJobIndex]!;
 
-  // Confirm job 0's tree really is still alive right before the proof
-  // (never trust "it should still be alive" - a real external check).
-  const stillAliveMembers = pgrepGroupMembers(livePgid);
-  assert.ok(
-    stillAliveMembers.length >= 1 + DESCENDANTS_PER_JOB,
-    `job ${liveJobIndex} must still be genuinely alive with its full tree right before the interleaved proof, pgrep saw: ${JSON.stringify(stillAliveMembers)}`
-  );
-
-  const statusCallId = nextId();
-  const outputCallId = nextId();
-  const fifthJobCallId = nextId();
-  const batchStart = Date.now();
-  const batchResponses = await callToolsConcurrently(server, [
-    { id: statusCallId, toolName: "status", args: { job_id: liveJobId } },
-    { id: outputCallId, toolName: "output", args: { job_id: liveJobId, stream: "stdout" } },
-    {
-      id: fifthJobCallId,
-      toolName: "run",
-      args: { command: ["true"], label: "fifth-job-mid-session" },
-    },
-  ]);
-  const batchElapsedMs = Date.now() - batchStart;
-
-  // Non-blocking: all three calls - two reads of a still-live noisy job AND
-  // starting a brand new job - resolve promptly. A server that serialized
-  // the session on the live child (awaited its completion, or awaited any
-  // of the other three still-noisy jobs) would take drastically longer
-  // than this, since job 0's own shell only exits when its `sleep 60`
-  // descendants do.
-  const MAX_BATCH_MS = 800;
-  assert.ok(
-    batchElapsedMs < MAX_BATCH_MS,
-    `status()/output() on a live noisy job plus starting a 5th job took ${batchElapsedMs}ms while 4 jobs (16KiB-64KiB+ noise each, live descendant trees) were still running - must never approach the child's own lifetime (non-blocking proof)`
-  );
-
-  const statusBody = batchResponses.get(statusCallId)!;
-  const statusStructured = requireStructuredContent(statusBody, "status(live job) mid-session");
-  assert.equal(statusStructured.job_id, liveJobId);
-  assert.equal(
-    statusStructured.state,
-    "running",
-    "job 0 must still genuinely be running - the interleaved proof is meaningless against an already-exited job"
-  );
-
-  const outputBody = batchResponses.get(outputCallId)!;
-  const outputStructured = requireStructuredContent(outputBody, "output(live job) mid-session");
-  const outputEvents = outputStructured.events as Array<{ text: string; stream: string }>;
-  assert.ok(
-    outputEvents.length > 0,
-    "output() on a job that has already produced 64KiB+ of stdout must return real events"
-  );
-
-  // Stream/job isolation: job 0's own output must contain
-  // ONLY job 0's own noise token, and NEVER any other job's - a real,
-  // concrete proof that jobs stay correctly isolated from each other, not
-  // merely "each job has its own record" at the type level.
-  const ownToken = noiseToken(liveJobIndex);
-  for (const event of outputEvents) {
+    // Confirm job 0's tree really is still alive right before the proof
+    // (never trust "it should still be alive" - a real external check).
+    const stillAliveMembers = pgrepGroupMembers(livePgid);
     assert.ok(
-      event.text.includes(ownToken) || event.text.length === 0,
-      `job ${liveJobIndex}'s own output must consist only of its own noise token "${ownToken}", got: ${JSON.stringify(event.text).slice(0, 120)}`
+      stillAliveMembers.length >= 1 + DESCENDANTS_PER_JOB,
+      `job ${liveJobIndex} must still be genuinely alive with its full tree right before the interleaved proof, pgrep saw: ${JSON.stringify(stillAliveMembers)}`
     );
-  }
-  for (let otherIndex = 0; otherIndex < JOBS; otherIndex += 1) {
-    if (otherIndex === liveJobIndex) continue;
-    const otherToken = noiseToken(otherIndex);
+
+    const statusCallId = nextId();
+    const outputCallId = nextId();
+    const fifthJobCallId = nextId();
+    const batchStart = Date.now();
+    const batchResponses = await callToolsConcurrently(server, [
+      { id: statusCallId, toolName: "status", args: { job_id: liveJobId } },
+      { id: outputCallId, toolName: "output", args: { job_id: liveJobId, stream: "stdout" } },
+      {
+        id: fifthJobCallId,
+        toolName: "run",
+        args: { command: ["true"], label: "fifth-job-mid-session" },
+      },
+    ]);
+    const batchElapsedMs = Date.now() - batchStart;
+
+    // Non-blocking: all three calls - two reads of a still-live noisy job AND
+    // starting a brand new job - resolve promptly. A server that serialized
+    // the session on the live child (awaited its completion, or awaited any
+    // of the other three still-noisy jobs) would take drastically longer
+    // than this, since job 0's own shell only exits when its `sleep 60`
+    // descendants do.
+    const MAX_BATCH_MS = 800;
+    assert.ok(
+      batchElapsedMs < MAX_BATCH_MS,
+      `status()/output() on a live noisy job plus starting a 5th job took ${batchElapsedMs}ms while 4 jobs (16KiB-64KiB+ noise each, live descendant trees) were still running - must never approach the child's own lifetime (non-blocking proof)`
+    );
+
+    const statusBody = batchResponses.get(statusCallId)!;
+    const statusStructured = requireStructuredContent(statusBody, "status(live job) mid-session");
+    assert.equal(statusStructured.job_id, liveJobId);
+    assert.equal(
+      statusStructured.state,
+      "running",
+      "job 0 must still genuinely be running - the interleaved proof is meaningless against an already-exited job"
+    );
+
+    const outputBody = batchResponses.get(outputCallId)!;
+    const outputStructured = requireStructuredContent(outputBody, "output(live job) mid-session");
+    const outputEvents = outputStructured.events as Array<{ text: string; stream: string }>;
+    assert.ok(
+      outputEvents.length > 0,
+      "output() on a job that has already produced 64KiB+ of stdout must return real events"
+    );
+
+    // Stream/job isolation: job 0's own output must contain
+    // ONLY job 0's own noise token, and NEVER any other job's - a real,
+    // concrete proof that jobs stay correctly isolated from each other, not
+    // merely "each job has its own record" at the type level.
+    const ownToken = noiseToken(liveJobIndex);
     for (const event of outputEvents) {
-      assert.equal(
-        event.text.includes(otherToken),
-        false,
-        `job ${liveJobIndex}'s output must NEVER contain job ${otherIndex}'s noise token "${otherToken}" - streams/jobs must stay isolated`
+      assert.ok(
+        event.text.includes(ownToken) || event.text.length === 0,
+        `job ${liveJobIndex}'s own output must consist only of its own noise token "${ownToken}", got: ${JSON.stringify(event.text).slice(0, 120)}`
       );
     }
-  }
+    for (let otherIndex = 0; otherIndex < JOBS; otherIndex += 1) {
+      if (otherIndex === liveJobIndex) continue;
+      const otherToken = noiseToken(otherIndex);
+      for (const event of outputEvents) {
+        assert.equal(
+          event.text.includes(otherToken),
+          false,
+          `job ${liveJobIndex}'s output must NEVER contain job ${otherIndex}'s noise token "${otherToken}" - streams/jobs must stay isolated`
+        );
+      }
+    }
 
-  const fifthJobBody = batchResponses.get(fifthJobCallId)!;
-  const fifthJobStructured = requireStructuredContent(
-    fifthJobBody,
-    "run() for the 5th job mid-session"
-  );
-  assert.equal(typeof fifthJobStructured.job_id, "string");
-  assert.notEqual(fifthJobStructured.job_id, liveJobId);
-  assert.ok(
-    !jobIds.includes(fifthJobStructured.job_id as string),
-    "the 5th job must be a genuinely NEW job, not one of the original 4"
-  );
-  assert.ok(["starting", "running", "exited"].includes(fifthJobStructured.state as string));
+    const fifthJobBody = batchResponses.get(fifthJobCallId)!;
+    const fifthJobStructured = requireStructuredContent(
+      fifthJobBody,
+      "run() for the 5th job mid-session"
+    );
+    assert.equal(typeof fifthJobStructured.job_id, "string");
+    assert.notEqual(fifthJobStructured.job_id, liveJobId);
+    assert.ok(
+      !jobIds.includes(fifthJobStructured.job_id as string),
+      "the 5th job must be a genuinely NEW job, not one of the original 4"
+    );
+    assert.ok(["starting", "running", "exited"].includes(fifthJobStructured.state as string));
 
-  // ---------------------------------------------------------------------
-  // Framing integrity under noise:
-  // across this WHOLE test - JOBS=4 jobs each producing NOISE_BYTES of
-  // real child stdout/stderr, plus every JSON-RPC request/response
-  // exchanged above - every single line this server ever wrote to its own
-  // real stdout must be clean, valid, parseable JSON-RPC. A single
-  // corrupted byte (e.g. child output leaking onto the server's own
-  // stdout channel) would show up here as a parseError.
-  // ---------------------------------------------------------------------
-  const allLines = server.allLines();
-  assert.ok(allLines.length > 0);
-  for (const line of allLines) {
-    assert.equal(
-      line.parseError,
-      undefined,
-      `every stdout line must be clean JSON-RPC even under ${JOBS}x${NOISE_BYTES}-byte real child noise - got a parse error on: ${JSON.stringify(line.raw).slice(0, 200)}`
-    );
-    const body = line.parsed as { jsonrpc?: string };
-    assert.equal(
-      body.jsonrpc,
-      "2.0",
-      `every stdout line must be a clean JSON-RPC 2.0 message even under real noise, got: ${JSON.stringify(line.raw).slice(0, 200)}`
-    );
-  }
+    // ---------------------------------------------------------------------
+    // Framing integrity under noise:
+    // across this WHOLE test - JOBS=4 jobs each producing NOISE_BYTES of
+    // real child stdout/stderr, plus every JSON-RPC request/response
+    // exchanged above - every single line this server ever wrote to its own
+    // real stdout must be clean, valid, parseable JSON-RPC. A single
+    // corrupted byte (e.g. child output leaking onto the server's own
+    // stdout channel) would show up here as a parseError.
+    // ---------------------------------------------------------------------
+    const allLines = server.allLines();
+    assert.ok(allLines.length > 0);
+    for (const line of allLines) {
+      assert.equal(
+        line.parseError,
+        undefined,
+        `every stdout line must be clean JSON-RPC even under ${JOBS}x${NOISE_BYTES}-byte real child noise - got a parse error on: ${JSON.stringify(line.raw).slice(0, 200)}`
+      );
+      const body = line.parsed as { jsonrpc?: string };
+      assert.equal(
+        body.jsonrpc,
+        "2.0",
+        `every stdout line must be a clean JSON-RPC 2.0 message even under real noise, got: ${JSON.stringify(line.raw).slice(0, 200)}`
+      );
+    }
 
-  // ---------------------------------------------------------------------
-  // Cleanup: kill all 4 original noisy jobs (concurrently) - this doubles
-  // as this test's own teardown AND is independent evidence toward
-  // the whole-tree-reap requirement (the OWNING test for that is
-  // the dedicated one further down this file, at the full 4x3 scale with
-  // its own explicit external-pgrep before/after transcript - this is
-  // just this test's own belt-and-braces cleanup, kept lightweight).
-  // ---------------------------------------------------------------------
-  const killCalls = jobIds.map((jobId) => ({
-    id: nextId(),
-    toolName: "kill",
-    args: { job_id: jobId },
-  }));
-  const killResponses = await callToolsConcurrently(server, killCalls, 10_000);
-  for (const call of killCalls) {
-    const structured = requireStructuredContent(
-      killResponses.get(call.id)!,
-      `kill(${call.args.job_id})`
-    );
-    assert.equal(structured.state, "killed");
+    // ---------------------------------------------------------------------
+    // Cleanup: kill all 4 original noisy jobs (concurrently) - this doubles
+    // as this test's own teardown AND is independent evidence toward
+    // the whole-tree-reap requirement (the OWNING test for that is
+    // the dedicated one further down this file, at the full 4x3 scale with
+    // its own explicit external-pgrep before/after transcript - this is
+    // just this test's own belt-and-braces cleanup, kept lightweight).
+    // ---------------------------------------------------------------------
+    const killCalls = jobIds.map((jobId) => ({
+      id: nextId(),
+      toolName: "kill",
+      args: { job_id: jobId },
+    }));
+    const killResponses = await callToolsConcurrently(server, killCalls, 10_000);
+    for (const call of killCalls) {
+      const structured = requireStructuredContent(
+        killResponses.get(call.id)!,
+        `kill(${call.args.job_id})`
+      );
+      assert.equal(structured.state, "killed");
+    }
+    server.child.kill("SIGKILL");
   }
-  server.child.kill("SIGKILL");
-});
+);
 
 // =============================================================================
 // cross-tool lifecycle assertions this file owns - what
@@ -332,88 +348,48 @@ test("output()/tail() buffers remain readable after a real kill() (not just afte
   server.child.kill("SIGKILL");
 });
 
-test("whole-tree reap under the FULL 4x3 concurrent load - a real external pgrep confirms ZERO survivors across ALL 4 jobs' full descendant trees after killing them", async () => {
-  const server = tracked();
-  await completeHandshake(server);
-
-  const { jobIds, pgids } = await startNoisyJobs(server, JOBS, nextId);
-
-  // BEFORE: every one of the 4 jobs' real process groups is confirmed
-  // alive with its full DESCENDANTS_PER_JOB tree (startNoisyJobs' own
-  // barrier already proved this at setup time - re-confirmed here,
-  // immediately before the kill, as the actual "before" half of this
-  // test's own before/after transcript).
-  const beforeMembersByJob = pgids.map((pgid) => pgrepGroupMembers(pgid));
-  beforeMembersByJob.forEach((members, i) => {
-    assert.ok(
-      members.length >= 1 + DESCENDANTS_PER_JOB,
-      `job ${i} (pgid ${pgids[i]}) must be alive with >= ${1 + DESCENDANTS_PER_JOB} real process-group members immediately before the whole-tree kill, pgrep saw: ${JSON.stringify(members)}`
-    );
-  });
-
-  // Kill all 4 jobs CONCURRENTLY (not the single-job
-  // centerpiece pattern, and not the simpler sequential-friendly
-  // cleanup above) - the FULL 4x3 load this test specifically targets.
-  const killCalls = jobIds.map((jobId) => ({
-    id: nextId(),
-    toolName: "kill",
-    args: { job_id: jobId },
-  }));
-  const killResponses = await callToolsConcurrently(server, killCalls, 10_000);
-  for (const call of killCalls) {
-    assert.equal(
-      requireStructuredContent(killResponses.get(call.id)!, `kill(${call.args.job_id})`).state,
-      "killed"
-    );
-  }
-
-  // AFTER: a real, independent `pgrep -g <pgid>` call per job - never this
-  // codebase's own bookkeeping - must show ZERO survivors across the
-  // WHOLE tree for EVERY one of the 4 jobs (12 real descendant processes
-  // plus their 4 leaders, 16 processes total), not merely one job's tree.
-  const afterMembersByJob = await Promise.all(
-    pgids.map((pgid) => waitForPgrepGroupMembers(pgid, (members) => members.length === 0, 5000))
-  );
-  afterMembersByJob.forEach((members, i) => {
-    assert.deepEqual(
-      members,
-      [],
-      `job ${i} (pgid ${pgids[i]}) must have ZERO surviving process-group members after the whole-tree kill, pgrep still saw: ${JSON.stringify(members)}`
-    );
-  });
-
-  server.child.kill("SIGKILL");
-});
-
-test("orphan-proof teardown on a catchable shutdown signal under the FULL 4x3 concurrent load (multiple live jobs at once, not the single-job case)", async () => {
-  async function assertShutdownReapsAllUnderLoad(
-    trigger: "stdin EOF" | "SIGTERM" | "SIGINT"
-  ): Promise<void> {
+test(
+  "whole-tree reap under the FULL 4x3 concurrent load - a real external pgrep confirms ZERO survivors across ALL 4 jobs' full descendant trees after killing them",
+  { skip: PGREP_ORACLE_SKIP },
+  async () => {
     const server = tracked();
     await completeHandshake(server);
-    const { pgids } = await startNoisyJobs(server, JOBS, nextId);
 
+    const { jobIds, pgids } = await startNoisyJobs(server, JOBS, nextId);
+
+    // BEFORE: every one of the 4 jobs' real process groups is confirmed
+    // alive with its full DESCENDANTS_PER_JOB tree (startNoisyJobs' own
+    // barrier already proved this at setup time - re-confirmed here,
+    // immediately before the kill, as the actual "before" half of this
+    // test's own before/after transcript).
     const beforeMembersByJob = pgids.map((pgid) => pgrepGroupMembers(pgid));
     beforeMembersByJob.forEach((members, i) => {
       assert.ok(
         members.length >= 1 + DESCENDANTS_PER_JOB,
-        `[${trigger}] job ${i} must be alive with its full tree before shutdown, pgrep saw: ${JSON.stringify(members)}`
+        `job ${i} (pgid ${pgids[i]}) must be alive with >= ${1 + DESCENDANTS_PER_JOB} real process-group members immediately before the whole-tree kill, pgrep saw: ${JSON.stringify(members)}`
       );
     });
 
-    if (trigger === "stdin EOF") {
-      server.child.stdin.end();
-    } else {
-      server.child.kill(trigger);
+    // Kill all 4 jobs CONCURRENTLY (not the single-job
+    // centerpiece pattern, and not the simpler sequential-friendly
+    // cleanup above) - the FULL 4x3 load this test specifically targets.
+    const killCalls = jobIds.map((jobId) => ({
+      id: nextId(),
+      toolName: "kill",
+      args: { job_id: jobId },
+    }));
+    const killResponses = await callToolsConcurrently(server, killCalls, 10_000);
+    for (const call of killCalls) {
+      assert.equal(
+        requireStructuredContent(killResponses.get(call.id)!, `kill(${call.args.job_id})`).state,
+        "killed"
+      );
     }
-    const { code, signal } = await server.waitForExit();
-    assert.equal(
-      code,
-      0,
-      `[${trigger}] the server's own shutdown handler must exit cleanly even while reaping ${JOBS} concurrent live job trees`
-    );
-    assert.equal(signal, null);
 
+    // AFTER: a real, independent `pgrep -g <pgid>` call per job - never this
+    // codebase's own bookkeeping - must show ZERO survivors across the
+    // WHOLE tree for EVERY one of the 4 jobs (12 real descendant processes
+    // plus their 4 leaders, 16 processes total), not merely one job's tree.
     const afterMembersByJob = await Promise.all(
       pgids.map((pgid) => waitForPgrepGroupMembers(pgid, (members) => members.length === 0, 5000))
     );
@@ -421,15 +397,63 @@ test("orphan-proof teardown on a catchable shutdown signal under the FULL 4x3 co
       assert.deepEqual(
         members,
         [],
-        `[${trigger}] job ${i} must have ZERO surviving process-group members after shutdown under full concurrent load, pgrep still saw: ${JSON.stringify(members)}`
+        `job ${i} (pgid ${pgids[i]}) must have ZERO surviving process-group members after the whole-tree kill, pgrep still saw: ${JSON.stringify(members)}`
       );
     });
-  }
 
-  await assertShutdownReapsAllUnderLoad("stdin EOF");
-  await assertShutdownReapsAllUnderLoad("SIGTERM");
-  await assertShutdownReapsAllUnderLoad("SIGINT");
-});
+    server.child.kill("SIGKILL");
+  }
+);
+
+test(
+  "orphan-proof teardown on a catchable shutdown signal under the FULL 4x3 concurrent load (multiple live jobs at once, not the single-job case)",
+  { skip: PGREP_ORACLE_SKIP },
+  async () => {
+    async function assertShutdownReapsAllUnderLoad(
+      trigger: "stdin EOF" | "SIGTERM" | "SIGINT"
+    ): Promise<void> {
+      const server = tracked();
+      await completeHandshake(server);
+      const { pgids } = await startNoisyJobs(server, JOBS, nextId);
+
+      const beforeMembersByJob = pgids.map((pgid) => pgrepGroupMembers(pgid));
+      beforeMembersByJob.forEach((members, i) => {
+        assert.ok(
+          members.length >= 1 + DESCENDANTS_PER_JOB,
+          `[${trigger}] job ${i} must be alive with its full tree before shutdown, pgrep saw: ${JSON.stringify(members)}`
+        );
+      });
+
+      if (trigger === "stdin EOF") {
+        server.child.stdin.end();
+      } else {
+        server.child.kill(trigger);
+      }
+      const { code, signal } = await server.waitForExit();
+      assert.equal(
+        code,
+        0,
+        `[${trigger}] the server's own shutdown handler must exit cleanly even while reaping ${JOBS} concurrent live job trees`
+      );
+      assert.equal(signal, null);
+
+      const afterMembersByJob = await Promise.all(
+        pgids.map((pgid) => waitForPgrepGroupMembers(pgid, (members) => members.length === 0, 5000))
+      );
+      afterMembersByJob.forEach((members, i) => {
+        assert.deepEqual(
+          members,
+          [],
+          `[${trigger}] job ${i} must have ZERO surviving process-group members after shutdown under full concurrent load, pgrep still saw: ${JSON.stringify(members)}`
+        );
+      });
+    }
+
+    await assertShutdownReapsAllUnderLoad("stdin EOF");
+    await assertShutdownReapsAllUnderLoad("SIGTERM");
+    await assertShutdownReapsAllUnderLoad("SIGINT");
+  }
+);
 
 // =============================================================================
 // The Windows terminal-mapping nuance.

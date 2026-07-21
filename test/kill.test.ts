@@ -210,88 +210,108 @@ interface RunResponseBody {
   readonly result?: { isError?: boolean; structuredContent?: Record<string, unknown> };
 }
 
-test("THE CENTERPIECE: kill() reaps a REAL process tree - a real job that itself forked real descendant processes - confirmed by a REAL external pgrep after the kill showing zero survivors across the WHOLE tree, not just the direct child", async () => {
-  const server = tracked();
-  await completeHandshake(server);
+test(
+  "THE CENTERPIECE: kill() reaps a REAL process tree - a real job that itself forked real descendant processes - confirmed by a REAL external pgrep after the kill showing zero survivors across the WHOLE tree, not just the direct child",
+  {
+    // A real shell-forked process tree, tracked via a real external
+    // `pgrep -g`, has no Windows equivalent path exercised anywhere in
+    // this codebase's own source or this harness - a test-harness gap,
+    // not a product scope decision (OD-5: Windows is a supported
+    // platform; the real question of whether src/tools/kill.ts's win32
+    // branch actually reaps a Windows process tree is separate, tracked
+    // work).
+    skip:
+      process.platform === "win32"
+        ? "real shell-forked process tree tracked via `pgrep -g`, POSIX-only - see the Windows process-tree kill verification story"
+        : false,
+  },
+  async () => {
+    const server = tracked();
+    await completeHandshake(server);
 
-  const dir = makeTempDir();
-  const marker = path.join(dir, "pgid.txt");
-  // A real shell child (the job's own tracked process, and the process-
-  // group LEADER) that itself forks two real `sleep` descendants, writes
-  // its own pid (== the group's pgid, since spawnManaged spawns it
-  // detached) to a marker file, then blocks on `wait` so the whole tree
-  // stays genuinely alive until we kill it.
-  const shellCommand = `echo $$ > '${marker}'; sleep 60 & sleep 60 & wait`;
+    const dir = makeTempDir();
+    const marker = path.join(dir, "pgid.txt");
+    // A real shell child (the job's own tracked process, and the process-
+    // group LEADER) that itself forks two real `sleep` descendants, writes
+    // its own pid (== the group's pgid, since spawnManaged spawns it
+    // detached) to a marker file, then blocks on `wait` so the whole tree
+    // stays genuinely alive until we kill it.
+    const shellCommand = `echo $$ > '${marker}'; sleep 60 & sleep 60 & wait`;
 
-  server.send({
-    jsonrpc: "2.0",
-    id: 500,
-    method: "tools/call",
-    params: { name: "run", arguments: { command: shellCommand, shell: true } },
-  });
-  const runLine = await server.nextLine();
-  const runBody = runLine.parsed as RunResponseBody;
-  assert.equal(runBody.error, undefined);
-  assert.notEqual(runBody.result?.isError, true, `run() must succeed: ${JSON.stringify(runBody)}`);
-  const jobId = runBody.result?.structuredContent?.job_id as string;
-  assert.equal(typeof jobId, "string");
+    server.send({
+      jsonrpc: "2.0",
+      id: 500,
+      method: "tools/call",
+      params: { name: "run", arguments: { command: shellCommand, shell: true } },
+    });
+    const runLine = await server.nextLine();
+    const runBody = runLine.parsed as RunResponseBody;
+    assert.equal(runBody.error, undefined);
+    assert.notEqual(
+      runBody.result?.isError,
+      true,
+      `run() must succeed: ${JSON.stringify(runBody)}`
+    );
+    const jobId = runBody.result?.structuredContent?.job_id as string;
+    assert.equal(typeof jobId, "string");
 
-  // Wait for a COMPLETE pgid, not merely for the marker to exist: the
-  // shell creates it on redirect, and the leading digits of a longer pid
-  // parse as a perfectly valid integer that names some other process.
-  const pgidText = await waitForFile(marker, { until: parsesAsPgid });
-  const pgid = Number(pgidText.trim());
-  assert.ok(
-    Number.isInteger(pgid) && pgid > 0,
-    `expected a real numeric pgid from the marker file, got: ${JSON.stringify(pgidText)}`
-  );
+    // Wait for a COMPLETE pgid, not merely for the marker to exist: the
+    // shell creates it on redirect, and the leading digits of a longer pid
+    // parse as a perfectly valid integer that names some other process.
+    const pgidText = await waitForFile(marker, { until: parsesAsPgid });
+    const pgid = Number(pgidText.trim());
+    assert.ok(
+      Number.isInteger(pgid) && pgid > 0,
+      `expected a real numeric pgid from the marker file, got: ${JSON.stringify(pgidText)}`
+    );
 
-  // Confirm the REAL tree is actually up (the shell + 2 sleeps = at least
-  // 3 group members) BEFORE we ever touch kill - a real external `pgrep`,
-  // never our own internal bookkeeping.
-  const beforeMembers = await waitForPgrepGroupMembers(
-    pgid,
-    (members) => members.length >= 3,
-    3000
-  );
-  assert.ok(
-    beforeMembers.length >= 3,
-    `expected >= 3 real process-group members (the shell + 2 sleeps) before kill, pgrep saw: ${JSON.stringify(beforeMembers)}`
-  );
+    // Confirm the REAL tree is actually up (the shell + 2 sleeps = at least
+    // 3 group members) BEFORE we ever touch kill - a real external `pgrep`,
+    // never our own internal bookkeeping.
+    const beforeMembers = await waitForPgrepGroupMembers(
+      pgid,
+      (members) => members.length >= 3,
+      3000
+    );
+    assert.ok(
+      beforeMembers.length >= 3,
+      `expected >= 3 real process-group members (the shell + 2 sleeps) before kill, pgrep saw: ${JSON.stringify(beforeMembers)}`
+    );
 
-  server.send({
-    jsonrpc: "2.0",
-    id: 501,
-    method: "tools/call",
-    params: { name: "kill", arguments: { job_id: jobId } },
-  });
-  const killLine = await server.nextLine(8000);
-  const killBody = killLine.parsed as RunResponseBody;
-  assert.equal(killBody.error, undefined);
-  assert.notEqual(
-    killBody.result?.isError,
-    true,
-    `kill() must succeed: ${JSON.stringify(killBody)}`
-  );
-  assert.equal(killBody.result?.structuredContent?.state, "killed");
+    server.send({
+      jsonrpc: "2.0",
+      id: 501,
+      method: "tools/call",
+      params: { name: "kill", arguments: { job_id: jobId } },
+    });
+    const killLine = await server.nextLine(8000);
+    const killBody = killLine.parsed as RunResponseBody;
+    assert.equal(killBody.error, undefined);
+    assert.notEqual(
+      killBody.result?.isError,
+      true,
+      `kill() must succeed: ${JSON.stringify(killBody)}`
+    );
+    assert.equal(killBody.result?.structuredContent?.state, "killed");
 
-  // THE proof: a REAL, independent `pgrep -g <pgid>` call AFTER the kill -
-  // never trusting our own bookkeeping - must show ZERO survivors across
-  // the WHOLE tree (the shell AND both sleep descendants), not merely the
-  // one direct child.
-  const afterMembers = await waitForPgrepGroupMembers(
-    pgid,
-    (members) => members.length === 0,
-    3000
-  );
-  assert.deepEqual(
-    afterMembers,
-    [],
-    `expected zero surviving process-group members after kill, pgrep still saw: ${JSON.stringify(afterMembers)}`
-  );
+    // THE proof: a REAL, independent `pgrep -g <pgid>` call AFTER the kill -
+    // never trusting our own bookkeeping - must show ZERO survivors across
+    // the WHOLE tree (the shell AND both sleep descendants), not merely the
+    // one direct child.
+    const afterMembers = await waitForPgrepGroupMembers(
+      pgid,
+      (members) => members.length === 0,
+      3000
+    );
+    assert.deepEqual(
+      afterMembers,
+      [],
+      `expected zero surviving process-group members after kill, pgrep still saw: ${JSON.stringify(afterMembers)}`
+    );
 
-  server.child.kill("SIGKILL");
-});
+    server.child.kill("SIGKILL");
+  }
+);
 
 test("kill() over the real wire: unknown job_id is a real tool-execution error, never a JSON-RPC protocol error", async () => {
   const server = tracked();

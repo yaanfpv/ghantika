@@ -27,6 +27,16 @@ import { parsesAsPgid, waitForFile } from "./harness.ts";
  * across all three triggers independently.
  */
 
+// The three whole-tree-reap tests below confirm their result via a real
+// external `pgrep -g <pgid>` call, which has no Windows equivalent path -
+// a test-harness gap, not a product scope decision (OD-5: Windows is a
+// supported platform; the real question of whether cleanup actually reaps
+// a live job's process tree on Windows is separate, tracked work).
+const PGREP_ORACLE_SKIP =
+  process.platform === "win32"
+    ? "confirms the result via a real external `pgrep -g`, POSIX-only - see the Windows process-tree kill verification story"
+    : false;
+
 // Each test waits for a REAL completed initialize handshake (not a fixed
 // sleep) before sending its signal/EOF - a blind `setTimeout` was flaky
 // under full-suite load (many test files spawn real child processes
@@ -211,69 +221,81 @@ async function spawnServerWithLiveTree(): Promise<{ server: SpawnedServer; pgid:
   return { server, pgid };
 }
 
-test("stdin EOF reaps a REAL live job's WHOLE process tree - zero survivors confirmed by a real external pgrep", async () => {
-  const { server, pgid } = await spawnServerWithLiveTree();
+test(
+  "stdin EOF reaps a REAL live job's WHOLE process tree - zero survivors confirmed by a real external pgrep",
+  { skip: PGREP_ORACLE_SKIP },
+  async () => {
+    const { server, pgid } = await spawnServerWithLiveTree();
 
-  server.child.stdin.end(); // closes stdin -> the server observes EOF and runs its real shutdown path
-  const { code, signal } = await server.waitForExit();
-  assert.equal(code, 0, "the server's own shutdown handler must exit cleanly");
-  assert.equal(signal, null);
+    server.child.stdin.end(); // closes stdin -> the server observes EOF and runs its real shutdown path
+    const { code, signal } = await server.waitForExit();
+    assert.equal(code, 0, "the server's own shutdown handler must exit cleanly");
+    assert.equal(signal, null);
 
-  // THE proof: a REAL, independent `pgrep -g <pgid>` call AFTER shutdown -
-  // never trusting this codebase's own bookkeeping - must show ZERO
-  // survivors across the WHOLE tree (the shell AND both sleep
-  // descendants), not merely the one direct tracked child.
-  const afterMembers = await waitForPgrepGroupMembers(
-    pgid,
-    (members) => members.length === 0,
-    3000
-  );
-  assert.deepEqual(
-    afterMembers,
-    [],
-    `expected zero surviving process-group members after stdin-EOF shutdown, pgrep still saw: ${JSON.stringify(afterMembers)}`
-  );
-});
+    // THE proof: a REAL, independent `pgrep -g <pgid>` call AFTER shutdown -
+    // never trusting this codebase's own bookkeeping - must show ZERO
+    // survivors across the WHOLE tree (the shell AND both sleep
+    // descendants), not merely the one direct tracked child.
+    const afterMembers = await waitForPgrepGroupMembers(
+      pgid,
+      (members) => members.length === 0,
+      3000
+    );
+    assert.deepEqual(
+      afterMembers,
+      [],
+      `expected zero surviving process-group members after stdin-EOF shutdown, pgrep still saw: ${JSON.stringify(afterMembers)}`
+    );
+  }
+);
 
-test("SIGTERM reaps a REAL live job's WHOLE process tree - zero survivors confirmed by a real external pgrep", async () => {
-  const { server, pgid } = await spawnServerWithLiveTree();
+test(
+  "SIGTERM reaps a REAL live job's WHOLE process tree - zero survivors confirmed by a real external pgrep",
+  { skip: PGREP_ORACLE_SKIP },
+  async () => {
+    const { server, pgid } = await spawnServerWithLiveTree();
 
-  server.child.kill("SIGTERM");
-  const { code, signal } = await server.waitForExit();
-  assert.equal(code, 0, "the server's own SIGTERM shutdown handler must exit cleanly");
-  assert.equal(signal, null);
+    server.child.kill("SIGTERM");
+    const { code, signal } = await server.waitForExit();
+    assert.equal(code, 0, "the server's own SIGTERM shutdown handler must exit cleanly");
+    assert.equal(signal, null);
 
-  const afterMembers = await waitForPgrepGroupMembers(
-    pgid,
-    (members) => members.length === 0,
-    3000
-  );
-  assert.deepEqual(
-    afterMembers,
-    [],
-    `expected zero surviving process-group members after SIGTERM shutdown, pgrep still saw: ${JSON.stringify(afterMembers)}`
-  );
-});
+    const afterMembers = await waitForPgrepGroupMembers(
+      pgid,
+      (members) => members.length === 0,
+      3000
+    );
+    assert.deepEqual(
+      afterMembers,
+      [],
+      `expected zero surviving process-group members after SIGTERM shutdown, pgrep still saw: ${JSON.stringify(afterMembers)}`
+    );
+  }
+);
 
-test("SIGINT reaps a REAL live job's WHOLE process tree - zero survivors confirmed by a real external pgrep", async () => {
-  const { server, pgid } = await spawnServerWithLiveTree();
+test(
+  "SIGINT reaps a REAL live job's WHOLE process tree - zero survivors confirmed by a real external pgrep",
+  { skip: PGREP_ORACLE_SKIP },
+  async () => {
+    const { server, pgid } = await spawnServerWithLiveTree();
 
-  server.child.kill("SIGINT");
-  const { code, signal } = await server.waitForExit();
-  assert.equal(code, 0, "the server's own SIGINT shutdown handler must exit cleanly");
-  assert.equal(signal, null);
+    server.child.kill("SIGINT");
+    const { code, signal } = await server.waitForExit();
+    assert.equal(code, 0, "the server's own SIGINT shutdown handler must exit cleanly");
+    assert.equal(signal, null);
 
-  const afterMembers = await waitForPgrepGroupMembers(
-    pgid,
-    (members) => members.length === 0,
-    3000
-  );
-  assert.deepEqual(
-    afterMembers,
-    [],
-    `expected zero surviving process-group members after SIGINT shutdown, pgrep still saw: ${JSON.stringify(afterMembers)}`
-  );
-});
+    const afterMembers = await waitForPgrepGroupMembers(
+      pgid,
+      (members) => members.length === 0,
+      3000
+    );
+    assert.deepEqual(
+      afterMembers,
+      [],
+      `expected zero surviving process-group members after SIGINT shutdown, pgrep still saw: ${JSON.stringify(afterMembers)}`
+    );
+  }
+);
 
 test("green control: a job that has already exited BEFORE shutdown is simply left alone - shutdown never errors or hangs on an already-terminal job", async () => {
   const server = spawnServer();
