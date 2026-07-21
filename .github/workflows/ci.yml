@@ -115,15 +115,17 @@ jobs:
   test:
     name: test (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
-    # scripts/run-tests.mjs is the tested wrapper (see its own header and
-    # test/run-tests.test.js): a per-test --test-timeout alone cannot catch
-    # a file whose tests all pass but whose own process never exits, which
-    # is exactly what wedges this job's concurrency slots and burns the
-    # 15-minute ceiling below in silence. This job must run the SAME
+    # scripts/run-tests.mjs (see its own header) is what this job's own
+    # test step below now runs: a per-test --test-timeout alone cannot
+    # catch a file whose tests all pass but whose own process never exits,
+    # which is exactly what wedges this job's concurrency slots and burns
+    # the 15-minute ceiling below in silence. This job must run the SAME
     # wrapper `npm test` runs locally, not a second, separately-spelled
     # node --test invocation that can silently drift from it (it already
     # had once - this comment used to claim a per-test timeout was in
     # effect here when the flag it referred to lived only in package.json).
+    # A dedicated test suite for run-tests.mjs itself is separate, in-
+    # progress work, not yet landed - nothing here claims it exists yet.
     timeout-minutes: 15
     strategy:
       fail-fast: false
