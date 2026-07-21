@@ -115,11 +115,15 @@ jobs:
   test:
     name: test (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
-    # A per-test timeout (node --test --test-timeout, in package.json's own
-    # "test" script) turns a hung test into a fast, named failure - this
-    # job-level ceiling is the backstop for anything outside that (a hang
-    # in a build/install step, not inside node --test itself), so a
-    # genuine hang fails in minutes, never GitHub's default 6-hour ceiling.
+    # A per-test timeout (--test-timeout, on this job's own node --test
+    # invocation below, not merely package.json's - a contributor's local
+    # npm test and this job are two separate invocations and each needs
+    # its own copy) turns a hung TEST into a fast, named failure - this
+    # job-level ceiling is the backstop for anything outside that: a hang
+    # while no test is even in progress, e.g. a wedged file process that
+    # never frees its node --test concurrency slot, so the files behind
+    # it never start and nothing prints. A genuine hang fails in minutes
+    # this way, never GitHub's default 6-hour ceiling.
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -149,9 +153,10 @@ jobs:
       # already is; `junit` on a file hands the next step something
       # structured to read.
       - run: >-
-          node --test
+          node --test --test-timeout=30000
           --test-reporter=spec --test-reporter-destination=stdout
           --test-reporter=junit --test-reporter-destination=test-results.xml
+          'test/**/*.test.ts' 'test/**/*.test.js'
       # A contributor whose change breaks a test on this leg should see
       # exactly which one, and why, right on the PR's Checks and Files
       # tabs - not have to go dig through a raw log. `annotate_only` writes
