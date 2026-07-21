@@ -83,15 +83,21 @@ jobs:
       # product tests. `shell: bash` is explicit: GitHub's windows-latest
       # image ships Git Bash, and a heredoc here is far simpler and more
       # reliable than the PowerShell equivalent.
+      # ESM syntax, not require(): package.json declares "type": "module",
+      # so a generated .js file is an ES module under this package's scope
+      # regardless of platform - require() throws ReferenceError immediately,
+      # which is exactly what made both controls fail on the first run of
+      # this file (both died before either could test anything, and QA
+      # caught the same thing independently reading this exact commit).
       - name: write control fixtures
         shell: bash
         run: |
           cat > __known-clean-control.test.js <<'EOF'
-          const { test } = require("node:test");
+          import { test } from "node:test";
           test("known-clean: spawns nothing, must pass fast", () => {});
           EOF
           cat > __known-broken-control.test.js <<'EOF'
-          const { test } = require("node:test");
+          import { test } from "node:test";
           test("known-broken: passes its own assertion but holds the event loop open forever", () => {
             setInterval(() => {}, 1000);
           });
