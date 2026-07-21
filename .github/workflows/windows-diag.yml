@@ -1,20 +1,29 @@
 name: Windows diagnostic (temporary)
 
-# TEMPORARY, NOT PART OF THE PR GATE - a separate workflow file, so its
-# job is a non-required status check on the PR (ci.yml's own "gate" job
-# only aggregates ci.yml's own jobs; nothing here is added to branch
-# protection). Investigating why the "test" job's windows-latest legs do
-# not exit within their 15-minute ceiling (see ci.yml's "test" job). Runs
-# each file that spawns a real child process as its OWN step, with its
-# own short per-step timeout, so a single hanging file no longer hides
-# whether the other six exit cleanly on their own. Delete this file once
-# the investigation concludes either way.
+# TEMPORARY, NOT PART OF THE PR GATE - a separate workflow file, so none of
+# its jobs are aggregated by ci.yml's own "gate" job or added to branch
+# protection. Investigating why the "test" job's windows-latest legs do
+# not exit within their 15-minute ceiling.
 #
-# Triggered on pull_request, same as ci.yml, rather than workflow_dispatch:
-# a workflow_dispatch-only workflow is only invocable once its YAML exists
-# on the repository's DEFAULT branch, which this one deliberately never
-# will (see the header above) - so pull_request is the only trigger that
-# actually runs it from a feature branch.
+# A genuine matrix - one job per entry, each its OWN fresh windows-latest
+# VM, fail-fast: false, a job-level timeout (never a step-level one, and
+# never continue-on-error) - an earlier version of this file ran the
+# spawning files as sequential STEPS in one shared job, which does not
+# give later steps a clean VM and, combined with continue-on-error, can
+# even mask a real timeout as a "successful" step in the run summary.
+# Fresh VM per entry is what makes "isolated" true here.
+#
+# Two controls are included deliberately, not just the seven real
+# spawning files: without them a green (or red) matrix is unreadable -
+# we would not know whether the mechanism itself can tell a healthy exit
+# from a hang. known-clean MUST pass fast; known-broken MUST time out. If
+# either control gives the wrong answer, nothing else in this run means
+# anything.
+#
+# Triggered on pull_request, same as ci.yml: a workflow_dispatch-only
+# workflow only becomes invocable once its YAML exists on the
+# repository's default branch, which this file deliberately never will.
+# Delete this file once the investigation concludes either way.
 
 on:
   pull_request:
@@ -23,10 +32,41 @@ permissions:
   contents: read
 
 jobs:
-  isolate:
-    name: isolate spawning files (windows-latest, node 22)
+  matrix:
+    name: ${{ matrix.label }} (windows-latest, node 22)
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: ${{ matrix.timeoutMinutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "CONTROL known-clean (must pass fast)"
+            file: __known-clean-control.test.js
+            timeoutMinutes: 3
+          - label: "CONTROL known-broken (must time out)"
+            file: __known-broken-control.test.js
+            timeoutMinutes: 3
+          - label: e2e-server.test.ts
+            file: test/e2e-server.test.ts
+            timeoutMinutes: 5
+          - label: integration.test.ts
+            file: test/integration.test.ts
+            timeoutMinutes: 5
+          - label: jobStore.test.ts
+            file: test/jobStore.test.ts
+            timeoutMinutes: 5
+          - label: kill.test.ts
+            file: test/kill.test.ts
+            timeoutMinutes: 5
+          - label: shutdown.test.ts
+            file: test/shutdown.test.ts
+            timeoutMinutes: 5
+          - label: output-tail.test.ts
+            file: test/output-tail.test.ts
+            timeoutMinutes: 5
+          - label: process.test.ts
+            file: test/process.test.ts
+            timeoutMinutes: 5
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -37,38 +77,24 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - name: e2e-server.test.ts
-        if: always()
-        timeout-minutes: 2
-        continue-on-error: true
-        run: node --test --test-reporter=spec --test-reporter-destination=stdout test/e2e-server.test.ts
-      - name: integration.test.ts
-        if: always()
-        timeout-minutes: 2
-        continue-on-error: true
-        run: node --test --test-reporter=spec --test-reporter-destination=stdout test/integration.test.ts
-      - name: jobStore.test.ts
-        if: always()
-        timeout-minutes: 2
-        continue-on-error: true
-        run: node --test --test-reporter=spec --test-reporter-destination=stdout test/jobStore.test.ts
-      - name: kill.test.ts
-        if: always()
-        timeout-minutes: 2
-        continue-on-error: true
-        run: node --test --test-reporter=spec --test-reporter-destination=stdout test/kill.test.ts
-      - name: shutdown.test.ts
-        if: always()
-        timeout-minutes: 2
-        continue-on-error: true
-        run: node --test --test-reporter=spec --test-reporter-destination=stdout test/shutdown.test.ts
-      - name: output-tail.test.ts
-        if: always()
-        timeout-minutes: 2
-        continue-on-error: true
-        run: node --test --test-reporter=spec --test-reporter-destination=stdout test/output-tail.test.ts
-      - name: process.test.ts
-        if: always()
-        timeout-minutes: 2
-        continue-on-error: true
-        run: node --test --test-reporter=spec --test-reporter-destination=stdout test/process.test.ts
+      # Written fresh on every job (cheap, harmless when unused) rather
+      # than committed to the tracked suite - these are throwaway
+      # negative/positive controls for this diagnostic alone, not real
+      # product tests. `shell: bash` is explicit: GitHub's windows-latest
+      # image ships Git Bash, and a heredoc here is far simpler and more
+      # reliable than the PowerShell equivalent.
+      - name: write control fixtures
+        shell: bash
+        run: |
+          cat > __known-clean-control.test.js <<'EOF'
+          const { test } = require("node:test");
+          test("known-clean: spawns nothing, must pass fast", () => {});
+          EOF
+          cat > __known-broken-control.test.js <<'EOF'
+          const { test } = require("node:test");
+          test("known-broken: passes its own assertion but holds the event loop open forever", () => {
+            setInterval(() => {}, 1000);
+          });
+          EOF
+      - name: run ${{ matrix.label }}
+        run: node --test --test-reporter=spec --test-reporter-destination=stdout ${{ matrix.file }}
