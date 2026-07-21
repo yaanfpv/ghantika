@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
 
+import { logActiveResourcesAtFileEnd } from "./helpers/activeResourcesDiagnostic.ts";
+
 // Real client, real in-process transport, real server - the end-to-end
 // jobStore-singleton-sharing regression coverage below drives an actual
 // `tools/call` through the SDK's own `Client`/`Server` classes rather than calling
@@ -1129,12 +1131,4 @@ test("end-to-end: a real `run` tools/call driven through a real Client/Server ro
 // exactly what Node itself thinks is still active, run on the real
 // Windows CI leg, so the actual leaked resource can be read directly
 // instead of guessed at.
-after(() => {
-  const active =
-    typeof process.getActiveResourcesInfo === "function"
-      ? process.getActiveResourcesInfo()
-      : ["process.getActiveResourcesInfo is not available on this Node version"];
-  process.stderr.write(
-    `[DIAGNOSTIC jobStore.test.ts after-all] active resources at file end: ${JSON.stringify(active)}\n`
-  );
-});
+after(() => logActiveResourcesAtFileEnd("jobStore.test.ts"));
