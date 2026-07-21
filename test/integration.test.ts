@@ -31,6 +31,7 @@ import {
   waitForFile,
   waitForPgrepGroupMembers,
 } from "./harness.ts";
+import { logActiveResourcesAtFileEnd } from "./helpers/activeResourcesDiagnostic.ts";
 
 // The three tests below build real, multi-descendant process trees via
 // startNoisyJobs and confirm them with a real external `pgrep -g <pgid>`
@@ -61,6 +62,8 @@ after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   }
 });
+
+after(() => logActiveResourcesAtFileEnd("integration.test.ts"));
 
 // A single monotonic JSON-RPC id source shared by every test in this file,
 // so two tests can never accidentally collide on the same id even though

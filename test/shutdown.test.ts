@@ -3,13 +3,16 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 
 // See test/e2e-server.test.ts's import comment for why this is ".ts", not ".js".
 import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/spawnServer.ts";
 // The shared marker-file poll and its pgid predicate - one implementation
 // for every suite that observes a job's real filesystem side effects.
 import { parsesAsPgid, waitForFile } from "./harness.ts";
+import { logActiveResourcesAtFileEnd } from "./helpers/activeResourcesDiagnostic.ts";
+
+after(() => logActiveResourcesAtFileEnd("shutdown.test.ts"));
 
 /**
  * A catchable shutdown signal (SIGTERM, SIGINT) or stdin EOF must reach a
