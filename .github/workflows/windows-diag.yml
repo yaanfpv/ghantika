@@ -103,4 +103,4 @@ jobs:
           });
           EOF
       - name: run ${{ matrix.label }}
-        run: node --test --test-reporter=spec --test-reporter-destination=stdout ${{ matrix.file }}
+        run: node --test --test-timeout=30000 --test-reporter=spec --test-reporter-destination=stdout ${{ matrix.file }}
