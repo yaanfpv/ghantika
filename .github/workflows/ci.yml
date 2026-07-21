@@ -115,15 +115,15 @@ jobs:
   test:
     name: test (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
-    # A per-test timeout (--test-timeout, on this job's own node --test
-    # invocation below, not merely package.json's - a contributor's local
-    # npm test and this job are two separate invocations and each needs
-    # its own copy) turns a hung TEST into a fast, named failure - this
-    # job-level ceiling is the backstop for anything outside that: a hang
-    # while no test is even in progress, e.g. a wedged file process that
-    # never frees its node --test concurrency slot, so the files behind
-    # it never start and nothing prints. A genuine hang fails in minutes
-    # this way, never GitHub's default 6-hour ceiling.
+    # scripts/run-tests.mjs is the tested wrapper (see its own header and
+    # test/run-tests.test.js): a per-test --test-timeout alone cannot catch
+    # a file whose tests all pass but whose own process never exits, which
+    # is exactly what wedges this job's concurrency slots and burns the
+    # 15-minute ceiling below in silence. This job must run the SAME
+    # wrapper `npm test` runs locally, not a second, separately-spelled
+    # node --test invocation that can silently drift from it (it already
+    # had once - this comment used to claim a per-test timeout was in
+    # effect here when the flag it referred to lived only in package.json).
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -150,13 +150,14 @@ jobs:
       # annotates always matches this leg's real result instead of a
       # second, possibly-different, re-run of the suite. `spec` on stdout
       # keeps this leg's console log exactly as readable as `npm test`
-      # already is; `junit` on a file hands the next step something
-      # structured to read.
-      - run: >-
-          node --test --test-timeout=30000
-          --test-reporter=spec --test-reporter-destination=stdout
-          --test-reporter=junit --test-reporter-destination=test-results.xml
-          'test/**/*.test.ts' 'test/**/*.test.js'
+      # already is; `junit` (via GHANTIKA_JUNIT) on a file hands the next
+      # step something structured to read. Calling scripts/run-tests.mjs
+      # directly rather than `npm test` avoids building twice - the build
+      # step above already did it, and `npm test` would run its own
+      # `npm run build` first.
+      - run: node scripts/run-tests.mjs --test-timeout=30000
+        env:
+          GHANTIKA_JUNIT: test-results.xml
       # A contributor whose change breaks a test on this leg should see
       # exactly which one, and why, right on the PR's Checks and Files
       # tabs - not have to go dig through a raw log. `annotate_only` writes
