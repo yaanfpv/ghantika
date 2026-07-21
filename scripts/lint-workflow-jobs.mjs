@@ -1,0 +1,174 @@
+#!/usr/bin/env node
+/**
+ * Structural lints over .github/workflows/ci.yml that go beyond the
+ * needs/if topology scripts/verify-workflow-topology.mjs checks:
+ *
+ *  - no job the "gate" aggregate depends on may set `continue-on-error:
+ *    true` anywhere, since that would let a step (and therefore the job)
+ *    report success on GitHub's dashboard while actually having failed -
+ *    exactly the kind of pass-that-isn't-a-pass the gate job exists to
+ *    rule out.
+ *  - the `test` job's matrix has to cover every combination of operating
+ *    system and Node version this project claims to support, so a leg
+ *    can't quietly go missing (e.g. nobody notices Windows + Node 24 was
+ *    dropped from the matrix).
+ *  - the workflow's job list must never contain a job pretending to be
+ *    secret scanning or Dependabot - those are GitHub repository settings
+ *    (and, for Dependabot, a separate .github/dependabot.yml config file),
+ *    not something a workflow job can meaningfully stand in for.
+ */
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { load as loadYaml } from "js-yaml";
+
+import { isMainModule } from "./lib/is-main.mjs";
+
+const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
+
+export const WORKFLOW_PATH = path.join(REPO_ROOT, ".github", "workflows", "ci.yml");
+export const AGGREGATE_JOB_ID = "gate";
+export const TEST_JOB_ID = "test";
+export const EXPECTED_OS = ["ubuntu-latest", "macos-latest", "windows-latest"];
+export const EXPECTED_NODE = ["22", "24"];
+export const FORBIDDEN_JOB_IDS = [
+  "secret-scan",
+  "secret_scan",
+  "secret-scanning",
+  "dependabot",
+  "dependabot-alerts",
+  "dependabot_alerts",
+];
+
+/**
+ * @param {string} [filePath]
+ * @returns {{ jobs: Record<string, any> }}
+ */
+export function loadWorkflow(filePath = WORKFLOW_PATH) {
+  return loadYaml(readFileSync(filePath, "utf8"));
+}
+
+/**
+ * Every job except the aggregate is a job the aggregate is meant to be
+ * gating on, so `continue-on-error: true` is forbidden anywhere in it -
+ * on the job itself or on any of its steps.
+ *
+ * @param {Record<string, any>} jobs
+ * @param {string} [aggregateId]
+ * @returns {string[]} ids of jobs with a forbidden continue-on-error
+ */
+export function findContinueOnError(jobs, aggregateId = AGGREGATE_JOB_ID) {
+  const offenders = [];
+  for (const [jobId, job] of Object.entries(jobs ?? {})) {
+    if (jobId === aggregateId) continue;
+    const onJob = job?.["continue-on-error"] === true;
+    const onAnyStep = (job?.steps ?? []).some((step) => step?.["continue-on-error"] === true);
+    if (onJob || onAnyStep) {
+      offenders.push(jobId);
+    }
+  }
+  return offenders;
+}
+
+/**
+ * Cross-products a matrix's `os` and `node` axes, honoring `exclude`
+ * entries, into a flat list of "<os>::<node>" leg keys.
+ *
+ * @param {{ os?: string[], node?: (string | number)[], exclude?: any[] }} [matrix]
+ * @returns {string[]}
+ */
+export function computeMatrixLegs(matrix) {
+  const osList = matrix?.os ?? [];
+  const nodeList = matrix?.node ?? [];
+  const excludes = matrix?.exclude ?? [];
+  const legs = [];
+  for (const os of osList) {
+    for (const node of nodeList) {
+      const excluded = excludes.some(
+        (entry) =>
+          (entry.os === undefined || entry.os === os) && String(entry.node) === String(node)
+      );
+      if (!excluded) {
+        legs.push(`${os}::${node}`);
+      }
+    }
+  }
+  return legs;
+}
+
+/**
+ * @param {any} job
+ * @param {string[]} [expectedOs]
+ * @param {string[]} [expectedNode]
+ * @returns {string[]} "<os>::<node>" keys that are missing from the matrix
+ */
+export function verifyMatrixCompleteness(
+  job,
+  expectedOs = EXPECTED_OS,
+  expectedNode = EXPECTED_NODE
+) {
+  const present = new Set(computeMatrixLegs(job?.strategy?.matrix));
+  const missing = [];
+  for (const os of expectedOs) {
+    for (const node of expectedNode) {
+      const key = `${os}::${node}`;
+      if (!present.has(key)) {
+        missing.push(key);
+      }
+    }
+  }
+  return missing;
+}
+
+/**
+ * @param {Record<string, any>} jobs
+ * @returns {string[]} forbidden job ids present in the workflow
+ */
+export function findForbiddenGovernanceJobs(jobs) {
+  return Object.keys(jobs ?? {}).filter((id) => FORBIDDEN_JOB_IDS.includes(id));
+}
+
+function main() {
+  const workflow = loadWorkflow();
+  const jobs = workflow.jobs ?? {};
+  const errors = [];
+
+  const continueOnErrorOffenders = findContinueOnError(jobs, AGGREGATE_JOB_ID);
+  for (const jobId of continueOnErrorOffenders) {
+    errors.push(
+      `job "${jobId}" sets continue-on-error: true, which would let it report success while actually failing`
+    );
+  }
+
+  const testJob = jobs[TEST_JOB_ID];
+  if (!testJob) {
+    errors.push(`no "${TEST_JOB_ID}" job found in the workflow`);
+  } else {
+    const missingLegs = verifyMatrixCompleteness(testJob);
+    for (const leg of missingLegs) {
+      errors.push(`"${TEST_JOB_ID}" matrix is missing the ${leg.replace("::", " / node ")} leg`);
+    }
+  }
+
+  const forbiddenJobs = findForbiddenGovernanceJobs(jobs);
+  for (const jobId of forbiddenJobs) {
+    errors.push(
+      `job "${jobId}" is a repository setting (or a dependabot.yml config), not a workflow job - remove it`
+    );
+  }
+
+  if (errors.length > 0) {
+    for (const error of errors) {
+      console.error(`workflow lint error: ${error}`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+  console.log(
+    `${path.relative(REPO_ROOT, WORKFLOW_PATH)} is clean: no continue-on-error, full test matrix, no fake governance jobs`
+  );
+}
+
+if (isMainModule(import.meta.url)) {
+  main();
+}

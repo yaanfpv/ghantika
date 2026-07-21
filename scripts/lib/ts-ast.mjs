@@ -1,0 +1,1032 @@
+/**
+ * Shared TypeScript-compiler-API helpers for this repo's guard scripts
+ * (scripts/check-module-boundaries.mjs, scripts/check-no-tasks-import.mjs,
+ * scripts/check-stdio-purity.mjs). These guards run on the real TypeScript
+ * AST rather than regex matching, so they catch every syntactic variant of
+ * a forbidden CLASS structurally instead of by spelling: comments are
+ * trivia, not AST nodes, so they can never hide a real construct from a
+ * parser the way they can from a regex; a computed `obj["prop"]` and a
+ * dotted `obj.prop` both produce a real, inspectable node shape regardless
+ * of the exact characters between them.
+ */
+import ts from "typescript";
+
+/**
+ * Parses `sourceText` (the contents of `fileName`) into a real TypeScript
+ * AST. `setParentNodes: true` is required for `.parent` to be populated on
+ * every node - several checks in this file's callers walk UP from a node
+ * to its parent (e.g. "is this `new Map()` immediately member-accessed,
+ * or bound to something that outlives this expression").
+ */
+export function parseSourceFile(fileName, sourceText) {
+  return ts.createSourceFile(
+    fileName,
+    sourceText,
+    ts.ScriptTarget.Latest,
+    /* setParentNodes */ true
+  );
+}
+
+/** Calls `visit(node)` for `node` itself, then recursively for every descendant, depth-first. */
+export function forEachDescendant(node, visit) {
+  visit(node);
+  ts.forEachChild(node, (child) => forEachDescendant(child, visit));
+}
+
+/**
+ * True for a `CallExpression` that IS a dynamic `import(...)` call - the
+ * TS AST represents this as a `CallExpression` whose `expression` is the
+ * bare `import` keyword token (`SyntaxKind.ImportKeyword`), distinct from
+ * calling some ordinary function that happens to be named `import`.
+ * `ts.isImportCall` is an internal-only helper in the installed TS
+ * version (not part of the public `typescript.d.ts` surface), so this
+ * reimplements the same check against public `ts.SyntaxKind`/
+ * `ts.isCallExpression` - verified empirically against the installed
+ * 5.9.3 package by parsing `import("./x.js")` and inspecting the
+ * resulting node shape.
+ */
+export function isDynamicImportCall(node) {
+  return ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword;
+}
+
+/**
+ * Unwraps any number of parenthesized-expression wrappers - `("x")` and
+ * `"x"` must resolve identically, since parentheses are never meaningful
+ * around a plain string/template literal (verified: `import(("x"))`
+ * parses its argument as a `ParenthesizedExpression` wrapping a
+ * `StringLiteral`, not a `StringLiteral` directly).
+ */
+function unwrapParens(node) {
+  let current = node;
+  while (ts.isParenthesizedExpression(current)) {
+    current = current.expression;
+  }
+  return current;
+}
+
+/**
+ * Extracts the literal text of a string-literal-like AST node - a plain
+ * `StringLiteral` (`"x"`/`'x'`) or a no-substitution template literal
+ * (`` `x` ``, no `${...}` interpolation). Returns `undefined` for anything
+ * else (an identifier, a member expression, string concatenation, or a
+ * template WITH an interpolation) - a genuinely dynamic/computed value
+ * that can't be resolved without actually running the code.
+ */
+export function stringLiteralText(node) {
+  if (node === undefined) return undefined;
+  const unwrapped = unwrapParens(node);
+  return ts.isStringLiteralLike(unwrapped) ? unwrapped.text : undefined;
+}
+
+/**
+ * True for a `CallExpression` whose callee is literally the bare
+ * identifier `require` (e.g. `require("./x.js")`, or `require(x)` after
+ * `x` was obtained from `createRequire`) - CommonJS's module-loading
+ * primitive. This matches on the identifier alone rather than trying to
+ * prove it resolves to Node's real `require` at runtime: a codebase whose
+ * architecture is ESM-only end to end has no legitimate reason for a
+ * `require` identifier to exist at all, so flagging every CallExpression
+ * literally named `require` - however that binding was obtained - is the
+ * correct, maximally-conservative check for that architecture.
+ */
+export function isRequireCall(node) {
+  return (
+    ts.isCallExpression(node) &&
+    ts.isIdentifier(node.expression) &&
+    node.expression.text === "require"
+  );
+}
+
+/**
+ * True for a `CallExpression` whose callee is literally the bare
+ * identifier `createRequire` (e.g. `createRequire(import.meta.url)`).
+ * Calling this at all is the violation callers care about, independent of
+ * what's done with the function it returns - an ESM-only codebase has no
+ * legitimate CommonJS-interop need anywhere.
+ */
+export function isCreateRequireCall(node) {
+  return (
+    ts.isCallExpression(node) &&
+    ts.isIdentifier(node.expression) &&
+    node.expression.text === "createRequire"
+  );
+}
+
+/**
+ * Every module-specifier-bearing construct in `sourceFile`, wherever it
+ * appears (a dynamic import or a `require(...)` call is a normal
+ * expression and can appear anywhere - inside a function, inside a
+ * comment-separated call, inside an argument list; a static import/export
+ * is always a top-level statement, but this walks the whole tree
+ * uniformly rather than special-casing statement position):
+ *
+ *   - a static `import ... from "x"` (`import type`, a bare side-effect
+ *     `import "x"`, and an ordinary `import { a } from "x"` are all the
+ *     same `ImportDeclaration` node kind)
+ *   - a re-export (`export { a } from "x"`, `export * from "x"`)
+ *   - a dynamic `import("x")` call
+ *   - a `require("x")` call - the mechanism used to load a module doesn't
+ *     change what target it resolves to, so a caller that cares about the
+ *     RESOLVED TARGET (a sibling file, a forbidden package subpath) needs
+ *     this alongside the ES forms above, not a separate parallel check.
+ *     `createRequire(...)` itself is intentionally NOT included here (it
+ *     carries no module specifier of its own - its argument is typically
+ *     `import.meta.url` - callers that care about its use at all should
+ *     check `isCreateRequireCall` directly).
+ *
+ * Each entry's `text` is the specifier's literal text when it's
+ * statically resolvable (comments between `import`/`export`/`from`/
+ * `require` and the specifier, or between `import(`/`require(` and its
+ * argument, can never hide it - comments aren't AST nodes). `text` is
+ * `undefined` when the specifier is a genuinely dynamic/computed
+ * expression that can't be resolved without running the code - callers
+ * decide for themselves whether an unresolvable specifier should fail
+ * open or fail closed for their own rule.
+ *
+ * A `require(...)` call is only ever collected when `require` resolves to
+ * the real, unshadowed global (via the same scope-aware check
+ * `findCreateRequireImports` uses) - a call through a locally shadowed
+ * `require` (a parameter, a local function/const, an import) is an
+ * ordinary function call, not a module-loading construct, regardless of
+ * what its argument happens to look like. Without this check, a
+ * sibling-looking or forbidden-looking STRING literal passed to a
+ * harmless local function named `require` would be misread as a real,
+ * resolved module specifier - an OVER-blocking failure, not an escape:
+ * verified empirically against `const require = (x) => x;
+ * require("./sibling.js")`, which must never be treated as an actual
+ * import of `"./sibling.js"`. `import`/`export`/dynamic-`import()` never
+ * need this check - none of those are identifiers a local declaration
+ * could shadow.
+ */
+export function collectModuleSpecifiers(sourceFile) {
+  const results = [];
+  const { sourceFile: checkedSourceFile, checker } = createScopeCheckedProgram(
+    sourceFile.fileName,
+    sourceFile.text
+  );
+  forEachDescendant(checkedSourceFile, (node) => {
+    if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier) {
+      results.push({ node, text: stringLiteralText(node.moduleSpecifier) });
+      return;
+    }
+    if (isDynamicImportCall(node)) {
+      const [firstArg] = node.arguments;
+      results.push({ node, text: firstArg ? stringLiteralText(firstArg) : undefined });
+      return;
+    }
+    if (isRequireCall(node) && isUnshadowedGlobalCallee(node, checker, checkedSourceFile)) {
+      const [firstArg] = node.arguments;
+      results.push({ node, text: firstArg ? stringLiteralText(firstArg) : undefined });
+    }
+  });
+  return results;
+}
+
+/**
+ * True when `callExpression`'s callee is a bare `Identifier` that resolves
+ * to the real, unshadowed global (or is genuinely unresolved, which fails
+ * CLOSED here the same way `findCreateRequireImports` does for the bare-
+ * identifier acquisition case - see `isUnshadowedGlobalSymbol`'s own doc
+ * comment). Shared by `collectModuleSpecifiers`'s `require(...)` handling
+ * so a call through a local shadow is recognized as an ordinary function
+ * call rather than a real module-loading construct.
+ */
+function isUnshadowedGlobalCallee(callExpression, checker, checkedSourceFile) {
+  const callee = callExpression.expression;
+  if (!ts.isIdentifier(callee)) return false;
+  const symbol = checker.getSymbolAtLocation(callee);
+  return symbol === undefined || isUnshadowedGlobalSymbol(symbol, checkedSourceFile);
+}
+
+/**
+ * The `node:module` builtin's specifier text, and the unprefixed `"module"`
+ * form Node/TS also accept for the same builtin - verified empirically:
+ * `import { createRequire } from "module"` resolves identically to the
+ * `"node:module"` form under this repo's `nodenext` module resolution, and
+ * Node itself resolves the bare specifier to the same builtin at runtime.
+ * Both forms must be checked; only checking `"node:module"` would leave the
+ * unprefixed spelling as an open escape.
+ */
+const MODULE_BUILTIN_SPECIFIERS = new Set(["node:module", "module"]);
+
+/**
+ * The four names this guard resolves via real lexical scope/symbol
+ * resolution rather than by spelling or invocation shape - see
+ * `findCreateRequireImports`'s own doc comment for the acquisition-site
+ * design this implements. `createRequire` is deliberately NOT here: unlike
+ * these four, it is never an ambient global - within this guard's own
+ * import-specifier analysis it is reachable only via an IMPORT of
+ * `"node:module"`, which the static-import branches of
+ * `findCreateRequireImports` (unchanged by this design) cover exhaustively.
+ * A route that reaches it WITHOUT going through that analysis at all is
+ * out of scope for a different reason - see that function's own
+ * "OUT OF SCOPE" section.
+ */
+const FORBIDDEN_GLOBAL_NAMES = new Set(["eval", "Function", "require", "module"]);
+
+/** Maps a forbidden global's name to the public `kind` string this file's callers switch on. */
+const GLOBAL_NAME_TO_KIND = {
+  eval: "eval-call",
+  Function: "function-constructor-call",
+  require: "commonjs-require",
+  module: "module-require",
+};
+
+const SYNTHETIC_GLOBALS_FILE_NAME = "__ghantika-forbidden-globals__.d.ts";
+
+/**
+ * A minimal, hand-written declaration file standing in for the real
+ * `lib.*.d.ts`/`@types/node` ambient globals - declares the four names
+ * this guard cares about, plus `globalThis` itself (needed so a
+ * `globalThis.eval`-shaped reference has something to resolve `globalThis`
+ * against in the first place), so building a `ts.Program` to resolve them
+ * stays fast (binding a few lines, not the real multi-thousand-line lib
+ * chain) and fully in-memory (no disk I/O for the file under test, which
+ * is often a bare fixture string with no real path on disk at all).
+ */
+const SYNTHETIC_GLOBALS_SOURCE = [
+  "declare function eval(x: string): any;",
+  "declare var Function: any;",
+  "declare var require: any;",
+  "declare var module: any;",
+  "declare var globalThis: any;",
+].join("\n");
+
+/**
+ * Builds a real `ts.Program` (and its `TypeChecker`) over exactly two
+ * files: the file under test, and the synthetic globals file above -
+ * entirely in-memory, via a `CompilerHost` that never touches the real
+ * filesystem (`fileExists`/`readFile`/`getSourceFile` all resolve from a
+ * `Map`). A checker is what makes REAL scope/symbol resolution possible at
+ * all: `ts.createSourceFile` alone (used everywhere else in this file)
+ * only parses syntax, it never binds an identifier reference back to its
+ * declaration, so there is no way to answer "is this `Function` reference
+ * the real global, or a local shadow" without one.
+ *
+ * `noLib: true` skips the real default lib entirely (the synthetic
+ * five-line file stands in for it instead), and no module resolution is
+ * configured - an import specifier that can't resolve (e.g. `"node:module"`,
+ * meaningless to a `noLib` program) still correctly BINDS its own local
+ * specifier name as a local declaration, which is all this file's
+ * scope-resolution check ever needs; it does not need the import's TARGET
+ * to resolve.
+ */
+function createScopeCheckedProgram(fileName, sourceText) {
+  const options = {
+    target: ts.ScriptTarget.Latest,
+    module: ts.ModuleKind.ESNext,
+    noLib: true,
+    types: [],
+  };
+  const virtualFiles = new Map([
+    [fileName, sourceText],
+    [SYNTHETIC_GLOBALS_FILE_NAME, SYNTHETIC_GLOBALS_SOURCE],
+  ]);
+  const host = {
+    getSourceFile(requestedFileName, languageVersion) {
+      const text = virtualFiles.get(requestedFileName);
+      return text === undefined
+        ? undefined
+        : ts.createSourceFile(requestedFileName, text, languageVersion, true);
+    },
+    getDefaultLibFileName: () => "",
+    writeFile: () => {},
+    getCurrentDirectory: () => "/",
+    getCanonicalFileName: (f) => f,
+    useCaseSensitiveFileNames: () => true,
+    getNewLine: () => "\n",
+    fileExists: (f) => virtualFiles.has(f),
+    readFile: (f) => virtualFiles.get(f),
+  };
+  const program = ts.createProgram([fileName, SYNTHETIC_GLOBALS_FILE_NAME], options, host);
+  return { sourceFile: program.getSourceFile(fileName), checker: program.getTypeChecker() };
+}
+
+/**
+ * True when `node` (an `Identifier` already known to be named one of the
+ * four forbidden globals) sits in a position that could actually READ ITS
+ * VALUE at runtime - excludes every position where the same text means
+ * something else entirely: the name being DECLARED (a `const`/`let`/
+ * parameter/import/class/function declaration - that identifier defines a
+ * NEW binding, it does not reference an existing one), a property/method
+ * KEY (the `.require` in `x.require`, or `require: ...` in an object/class
+ * literal - a label, never a lookup), a DESTRUCTURING SOURCE KEY (the
+ * `eval` in `const { eval: localEval } = safe` is a property key naming
+ * what to pull OFF `safe`, never a reference to the global - this applies
+ * uniformly regardless of what the destructuring source happens to be;
+ * see `findGlobalThisDestructureAcquisitions` for the SEPARATE, dedicated
+ * check that catches the one case where a destructuring key genuinely IS
+ * an acquisition: destructuring straight off the real `globalThis`), or a
+ * TYPE position (`: Function`, `typeof eval` used AS a type, a generic
+ * type argument - fully erased, carries no runtime capability, so a
+ * type-position reference stays green). Everything else - a callee, an
+ * operand, an argument, an initializer, a shorthand property VALUE, a
+ * computed property key's expression, the operand of the value-level
+ * `typeof` OPERATOR (`typeof eval === "function"` genuinely reads the
+ * binding at runtime, unlike its type-level namesake `typeof eval` in
+ * `type T = ...`) - is a real reference and stays a candidate.
+ */
+function isValueReferenceCandidate(node) {
+  const parent = node.parent;
+  if (parent === undefined) return true;
+  if (ts.isVariableDeclaration(parent) && parent.name === node) return false;
+  if (ts.isParameter(parent) && parent.name === node) return false;
+  if (ts.isBindingElement(parent) && (parent.name === node || parent.propertyName === node)) {
+    return false;
+  }
+  if (
+    (ts.isFunctionDeclaration(parent) ||
+      ts.isFunctionExpression(parent) ||
+      ts.isClassDeclaration(parent) ||
+      ts.isClassExpression(parent)) &&
+    parent.name === node
+  ) {
+    return false;
+  }
+  if (ts.isImportSpecifier(parent) && (parent.name === node || parent.propertyName === node))
+    return false;
+  if (ts.isImportClause(parent) && parent.name === node) return false;
+  if (ts.isNamespaceImport(parent) && parent.name === node) return false;
+  if (ts.isExportSpecifier(parent) && (parent.name === node || parent.propertyName === node))
+    return false;
+  if (ts.isImportEqualsDeclaration(parent) && parent.name === node) return false;
+  if (ts.isPropertyAccessExpression(parent) && parent.name === node) return false;
+  if (
+    (ts.isPropertyAssignment(parent) ||
+      ts.isPropertySignature(parent) ||
+      ts.isMethodDeclaration(parent) ||
+      ts.isMethodSignature(parent) ||
+      ts.isGetAccessorDeclaration(parent) ||
+      ts.isSetAccessorDeclaration(parent)) &&
+    parent.name === node
+  ) {
+    return false;
+  }
+  if (ts.isQualifiedName(parent)) {
+    // `typeof module.require` parses `module.require` as a QualifiedName
+    // (an EntityName), not a PropertyAccessExpression - a DIFFERENT node
+    // shape than the value-level `module.require` this guard otherwise
+    // flags. The whole chain (`a.b.c` as a type - QualifiedName nested
+    // inside QualifiedName) is erased together if its ROOT sits in a type
+    // position, regardless of whether THIS identifier is the qualifier
+    // (`.left`) or the member (`.right`) - a qualified name has no
+    // partial-erasure concept, so walking to the chain's root before
+    // checking is required, not optional.
+    let root = parent;
+    while (ts.isQualifiedName(root.parent)) root = root.parent;
+    if (ts.isTypeNode(root.parent)) return false;
+  }
+  if (ts.isTypeNode(parent)) return false;
+  return true;
+}
+
+/**
+ * True when `symbol` resolves to a declaration OUTSIDE `checkedSourceFile`
+ * - the real global, since the only two files this guard's `Program` ever
+ * contains are the file under test and the synthetic globals file, so "not
+ * declared in our own file" and "declared in the synthetic globals file"
+ * are the same fact. `false` for a symbol whose declarations sit in
+ * `checkedSourceFile` (a real local shadow: a `const`, a parameter, an
+ * import binding, a catch clause, a `for`/`for-of` declaration, a class
+ * name - any of them).
+ */
+function isUnshadowedGlobalSymbol(symbol, checkedSourceFile) {
+  if (symbol === undefined) return false;
+  const declarations = symbol.declarations ?? [];
+  return (
+    declarations.length > 0 && declarations.every((d) => d.getSourceFile() !== checkedSourceFile)
+  );
+}
+
+/**
+ * True for an (already paren-unwrapped) `Identifier` node reading
+ * `globalThis`, shadow-aware like every other reference this guard
+ * checks. `globalThis` needs a HYBRID approach unlike `eval`/`Function`/
+ * `require`/`module`: a PARAMETER, catch-binding, or `for`/`for-of`
+ * shadow resolves normally through `checker.getSymbolAtLocation` (proven
+ * empirically - those go through `isUnshadowedGlobalSymbol` below exactly
+ * like the other four names), but a MODULE-OR-BLOCK-SCOPE `const`/`let`
+ * shadow does not: `globalThis` has intrinsic compiler support, and a
+ * later reference to it resolves to a symbol with NO `.declarations` at
+ * all regardless of whether a `const globalThis = {...}` precedes it
+ * (verified empirically against the installed 5.9.3 package) - so
+ * "declared outside this file" is unanswerable from the symbol alone in
+ * that specific shape. When the symbol resolves with real declarations,
+ * trust them; when it resolves with none, fall back to a real lexical
+ * scope walk (`hasEnclosingLocalDeclaration`) to answer the same question
+ * the checker could not.
+ */
+function isUnshadowedGlobalThisReference(node, checker, checkedSourceFile) {
+  if (!ts.isIdentifier(node) || node.text !== "globalThis") return false;
+  const symbol = checker.getSymbolAtLocation(node);
+  if (symbol === undefined) return false;
+  const declarations = symbol.declarations ?? [];
+  if (declarations.length > 0) {
+    return declarations.every((d) => d.getSourceFile() !== checkedSourceFile);
+  }
+  return !hasEnclosingLocalDeclaration(node, "globalThis");
+}
+
+/**
+ * The AST node kinds that introduce their own lexical scope for a
+ * `const`/`let`/`var`/function/parameter/catch-binding/for-loop
+ * declaration - used only by `hasEnclosingLocalDeclaration`'s scope walk,
+ * the fallback path for the one name (`globalThis`) the checker's own
+ * symbol resolution cannot answer directly (see that function's own doc
+ * comment for why).
+ */
+function isScopeBoundary(node) {
+  return (
+    ts.isSourceFile(node) ||
+    ts.isBlock(node) ||
+    ts.isFunctionDeclaration(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isArrowFunction(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isConstructorDeclaration(node) ||
+    ts.isGetAccessorDeclaration(node) ||
+    ts.isSetAccessorDeclaration(node) ||
+    ts.isCatchClause(node) ||
+    ts.isForStatement(node) ||
+    ts.isForInStatement(node) ||
+    ts.isForOfStatement(node)
+  );
+}
+
+/** True when `bindingName` (a declaration's `name`, possibly a destructuring pattern) binds `name` anywhere within it. */
+function bindingDeclaresName(bindingName, name) {
+  if (ts.isIdentifier(bindingName)) return bindingName.text === name;
+  if (ts.isObjectBindingPattern(bindingName) || ts.isArrayBindingPattern(bindingName)) {
+    for (const element of bindingName.elements) {
+      if (ts.isBindingElement(element) && bindingDeclaresName(element.name, name)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * True when `name` is declared DIRECTLY within `scopeNode`'s own scope -
+ * its parameters (if function-like), its own catch/for-loop binding, or a
+ * `const`/`let`/`var`/function/class declaration among its immediate
+ * statements. Deliberately does NOT descend into a nested scope boundary
+ * (that is what makes this a per-scope check rather than a whole-subtree
+ * search) and does not model `var`/function hoisting through nested
+ * blocks precisely - a simplification acceptable here because this is a
+ * fallback for one specific, narrow shape (see
+ * `isUnshadowedGlobalThisReference`), not a general-purpose binder.
+ */
+function scopeDeclaresName(scopeNode, name) {
+  if (
+    ts.isFunctionDeclaration(scopeNode) ||
+    ts.isFunctionExpression(scopeNode) ||
+    ts.isArrowFunction(scopeNode) ||
+    ts.isMethodDeclaration(scopeNode) ||
+    ts.isConstructorDeclaration(scopeNode) ||
+    ts.isGetAccessorDeclaration(scopeNode) ||
+    ts.isSetAccessorDeclaration(scopeNode)
+  ) {
+    for (const param of scopeNode.parameters) {
+      if (bindingDeclaresName(param.name, name)) return true;
+    }
+  }
+  if (ts.isCatchClause(scopeNode) && scopeNode.variableDeclaration !== undefined) {
+    if (bindingDeclaresName(scopeNode.variableDeclaration.name, name)) return true;
+  }
+  if (
+    (ts.isForStatement(scopeNode) ||
+      ts.isForInStatement(scopeNode) ||
+      ts.isForOfStatement(scopeNode)) &&
+    scopeNode.initializer !== undefined &&
+    ts.isVariableDeclarationList(scopeNode.initializer)
+  ) {
+    for (const decl of scopeNode.initializer.declarations) {
+      if (bindingDeclaresName(decl.name, name)) return true;
+    }
+  }
+
+  const statements =
+    scopeNode.statements ??
+    (scopeNode.body !== undefined && ts.isBlock(scopeNode.body)
+      ? scopeNode.body.statements
+      : undefined);
+  if (statements === undefined) return false;
+  for (const statement of statements) {
+    if (ts.isVariableStatement(statement)) {
+      for (const decl of statement.declarationList.declarations) {
+        if (bindingDeclaresName(decl.name, name)) return true;
+      }
+    }
+    if (
+      (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) &&
+      statement.name !== undefined &&
+      statement.name.text === name
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Walks `node`'s enclosing scope chain looking for ANY declaration of `name` - see `isUnshadowedGlobalThisReference`'s doc comment for why this exists and what narrow case it covers. */
+function hasEnclosingLocalDeclaration(node, name) {
+  let current = node.parent;
+  while (current !== undefined) {
+    if (isScopeBoundary(current) && scopeDeclaresName(current, name)) return true;
+    current = current.parent;
+  }
+  return false;
+}
+
+/**
+ * Reads a property/element access's static key text - a dotted `.foo`, or
+ * a computed `["foo"]`/`["re" + "quire"]` key foldable to a literal string.
+ * `undefined` for a key that can't be statically resolved (a variable, an
+ * interpolated template).
+ */
+function accessKeyText(node) {
+  if (ts.isPropertyAccessExpression(node)) return node.name.text;
+  if (ts.isElementAccessExpression(node)) return foldConstantString(node.argumentExpression);
+  return undefined;
+}
+
+/**
+ * Folds a string-producing expression to its literal text, beyond
+ * `stringLiteralText`'s plain-literal case: a `+` concatenation chain of
+ * string literals (`"re" + "quire"`) is exactly as statically resolvable
+ * as the literal it produces character-for-character, and whitespace or a
+ * comment between the operands can never hide the result (neither is an
+ * AST node). Returns `undefined` for anything genuinely dynamic - a
+ * non-literal operand, any other operator, a template with interpolation.
+ */
+function foldConstantString(node) {
+  if (node === undefined) return undefined;
+  const unwrapped = unwrapParens(node);
+  const direct = stringLiteralText(unwrapped);
+  if (direct !== undefined) return direct;
+  if (
+    ts.isBinaryExpression(unwrapped) &&
+    unwrapped.operatorToken.kind === ts.SyntaxKind.PlusToken
+  ) {
+    const left = foldConstantString(unwrapped.left);
+    const right = foldConstantString(unwrapped.right);
+    if (left !== undefined && right !== undefined) return left + right;
+  }
+  return undefined;
+}
+
+/**
+ * Finds every NAMED LEXICAL ACQUISITION in `sourceFile` of `createRequire`
+ * (or the `node:module` namespace it lives on), of Node's per-module
+ * `module.require`, or of the global `eval`/`Function`/`require` - resolved
+ * by PROVENANCE (what a reference actually traces back to, via real
+ * TypeScript symbol/scope resolution for the four bare-global names, and
+ * via specifier analysis for the `node:module`-sourced import forms), never
+ * by matching one fixed spelling or invocation shape.
+ *
+ * SCOPE, STATED PRECISELY (see "OUT OF SCOPE" below before reading this as
+ * a completeness claim it is not): this function is built to close a
+ * route that acquires one of these primitives through a LEXICAL REFERENCE
+ * to its own name, or through an IMPORT of `"node:module"`/`"module"` by
+ * specifier - including through a local alias, a destructure, a
+ * `globalThis` qualification, or an indirect-invocation form standing
+ * between the acquisition and any eventual use, for every SPECIFIC shape
+ * enumerated and verified below. This is deliberately NOT stated as
+ * "every possible shape": JavaScript/TypeScript's scoping and
+ * destructuring grammar is large, and a claim of exhaustive coverage over
+ * all of it is a claim this AST walk cannot back - the honest claim is
+ * "these verified shapes close, and a shape outside this list may not."
+ * It does NOT and CANNOT close a route that reaches the same capability
+ * WITHOUT ever naming it or importing its module at all - see "OUT OF
+ * SCOPE" for the three concrete forms this guard is verified NOT to
+ * catch, on purpose, with the boundary enforced by dedicated tests rather
+ * than left as a sentence in this comment.
+ *
+ * THE ACQUISITION-SITE DESIGN. An earlier version of this function chased
+ * INVOCATION shape instead - matching one callee spelling at a time, then a
+ * hand-built alias map tracking local aliases, destructures, `.call`/
+ * `.apply`, `Reflect.apply`/`construct`, and comma-operator indirection.
+ * That approach cannot terminate: invocation shape is an infinite space
+ * (closing `.call` leaves `.bind` open, closing `.bind` leaves storage in
+ * an object open, and so on indefinitely), so it can only ever be
+ * incomplete by one more form. The fix is to reject the primitive at its
+ * ACQUISITION site instead: a runtime reference that resolves to the true
+ * global `eval`,
+ * `Function`, or `require`, or to Node's `module` global (from which
+ * `.require` is reachable), IS ITSELF the violation - whether it is
+ * called, stored, passed, returned, bound, or never used again. Once the
+ * BARE REFERENCE is flagged, every downstream invocation shape disappears
+ * from the problem: there is nothing left to enumerate, because the
+ * violation already happened before any wrapping syntax could matter.
+ *
+ * This is implemented with real TypeScript symbol resolution
+ * (`createScopeCheckedProgram` builds a `ts.Program` + `TypeChecker` over
+ * the file under test plus a five-line synthetic globals file), not name
+ * matching: an `Identifier` named `eval`/`Function`/`require`/`module`, in
+ * a genuine value-reference position (`isValueReferenceCandidate` excludes
+ * declaration names, property/method keys, and type positions), is a
+ * violation exactly when its resolved symbol's declarations sit OUTSIDE
+ * the file under test (`isUnshadowedGlobalSymbol`) - i.e. it resolves to
+ * the synthetic global, not to a real local `const`/`let`/parameter/
+ * import/class/catch-binding/for-loop declaration in THIS file. This is
+ * what makes a locally shadowed or imported harmless name of the same text
+ * stay green (`const Function = () => "safe"; Function()` never reads the
+ * real constructor) without needing to special-case a single invocation
+ * shape - `.bind(...)`, storage in an object, passing as an argument, and
+ * every other downstream use of an UNSHADOWED reference are simply
+ * ordinary value-reference positions this same check already covers.
+ *
+ * Every shape below was verified empirically - either by parsing and
+ * inspecting the resulting node shape (the import forms, against the
+ * installed 5.9.3 package), or by running the real symbol-resolution check
+ * against a battery of fixtures (the acquisition forms, including every
+ * green control: a locally shadowed name, a parameter binding, an
+ * import-aliased shadow, an unrelated object's own property, and a
+ * type-only reference):
+ *
+ *   - STATIC import - `import { createRequire } from "node:module"` (named,
+ *     aliased or not), `import * as mod from "node:module"` (namespace),
+ *     `import mod from "node:module"` (default - verified empirically to
+ *     ALSO expose `createRequire` as a property, same as namespace), or a
+ *     bare side-effect `import "node:module"` (carries no binding at all -
+ *     nothing to flag). A named specifier's real imported name is
+ *     `specifier.propertyName ?? specifier.name`, which is the true source
+ *     name regardless of a local alias.
+ *   - DYNAMIC import - `import("node:module")` - a `CallExpression` whose
+ *     `expression` is the bare `import` keyword. Flagged at the call
+ *     itself, uniformly covering every consumption shape verified
+ *     empirically to produce the identical call node: awaited and
+ *     destructured (`const { createRequire: x } = await import(...)`),
+ *     awaited into a bare namespace variable, and `.then(m => ...)` -
+ *     because all three share the same underlying `import("node:module")`
+ *     call node, flagging that one node closes all three without needing
+ *     to trace what the result is later assigned or destructured into.
+ *   - TS import-equals - `import moduleCrate = require("node:module")` - an
+ *     `ImportEqualsDeclaration` whose `moduleReference` is an
+ *     `ExternalModuleReference` wrapping the specifier. Binds the whole
+ *     `node:module` namespace to `moduleCrate`, exposing `createRequire`
+ *     exactly as a default/namespace import would.
+ *   - RE-EXPORT - `export { createRequire as exportedBridge } from
+ *     "node:module"` (named, resolved the same `propertyName ?? name` way
+ *     as an import), `export * from "node:module"` (wildcard - exposes
+ *     `createRequire` transitively the same as a namespace import, so
+ *     flagged the same way, outright), and `export * as ns from
+ *     "node:module"` (namespace re-export - same reasoning).
+ *   - GLOBAL `eval` / `Function` / `require` - flagged at ANY unshadowed
+ *     value-reference position, unconditionally on what is done with the
+ *     reference: called directly, called via `.call`/`.apply`/`.bind`,
+ *     called via `Reflect.apply`/`Reflect.construct`, reached through the
+ *     classic comma-operator indirection (`(0, eval)`), reached via
+ *     `globalThis.eval`/`globalThis["eval"]`, aliased through any number of
+ *     local `const`/`let` hops, stored in an object or array, passed as an
+ *     argument, or never invoked at all.
+ *   - GLOBAL `module` (and therefore `module.require`, its only relevant
+ *     property) - flagged the same unconditional way as the other three,
+ *     including through `globalThis.module`/`globalThis["module"]`. This
+ *     is broader than "flag only `.require` access off `module`" on
+ *     purpose: the codebase's frozen architecture has zero legitimate
+ *     reason to reference the CommonJS `module` global for ANY purpose
+ *     (verified: the real `src/` tree contains no reference to it at all),
+ *     and flagging the bare reference is what lets the alias/destructure
+ *     case (`const alias = module; alias.require(...)`) close via the same
+ *     acquisition-site principle as the other three, instead of needing a
+ *     dedicated two-step "traces to module, AND accesses .require" check.
+ *
+ * OUT OF SCOPE, DELIBERATELY, NOT BY OVERSIGHT: a statement-level
+ * `import type`/`export type` declaration or an individual specifier
+ * carrying the inline `type` modifier (fully erased by TypeScript, carries
+ * no runtime capability under any of the shapes above); a `typeof X` used
+ * AS A TYPE (`type T = typeof eval`, erased the same way - contrast with
+ * `typeof eval === "function"`, a genuine runtime reference this guard
+ * DOES flag); and three REFLECTIVE/STRUCTURAL acquisition forms that reach
+ * the same capability WITHOUT a lexical reference to its name or a
+ * `"node:module"` import specifier anywhere in source, each verified to
+ * execute on a real Node runtime:
+ *
+ *   - `(() => 1).constructor` - the `Function` constructor via any
+ *     ordinary function object's own `.constructor` property. No
+ *     identifier named `Function` appears anywhere.
+ *   - `Reflect.get(globalThis, "eval")` - the global `eval` via a runtime
+ *     STRING passed to `Reflect.get`, never an identifier reference.
+ *   - `process.getBuiltinModule("node:module").createRequire(...)` -
+ *     `createRequire` via a supported Node builtin-module API, with no
+ *     `import`/`require` syntax naming `"node:module"` anywhere.
+ *
+ * An AST walker COULD be taught to pattern-match these three specific
+ * spellings, but that would not close the class it looks like it closes:
+ * none of the three routes its capability through a LEXICAL REFERENCE to
+ * the primitive's own name or a `"node:module"` import specifier - the
+ * first routes through the STRUCTURE of an ordinary value (any function
+ * has a `.constructor`), the second through a runtime STRING handed to
+ * `Reflect.get` (not a lexical binding at all), the third through a
+ * different, unrelated Node API. Detecting these three named spellings
+ * would not prove the absence of the broader reflective/structural
+ * acquisition class they belong to - the next unenumerated form in that
+ * same class would still walk straight through, so matching exactly these
+ * three would re-manufacture the appearance of closure rather than
+ * deliver it. This guard's real job, evidenced by every escape route
+ * closed above, is stopping this codebase's OWN team from reintroducing
+ * CommonJS interop by ordinary habit or accident - a hygiene guard against
+ * carelessness, not a runtime security boundary against a deliberate
+ * adversary evading it. Each of the three routes above has a dedicated,
+ * PASSING control whose assertion is that this guard produces NO
+ * detection for it (see test/module-boundaries.test.ts and
+ * test/no-tasks-import.test.ts) - the boundary is an executable fact a
+ * future change can verify against, never a silent gap: if one of these
+ * routes is later closed, its control fails and says so, which only
+ * works because the control is green today, not permanently red.
+ *
+ * A MIXED import clause (a value specifier next to a type-only one in the
+ * same clause) still flags the value specifier - the type modifier is
+ * checked per-specifier, never treated as clearing the whole clause.
+ *
+ * @param {import("typescript").SourceFile} sourceFile
+ * @returns {{ node: import("typescript").Node, kind: "named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access" }[]}
+ */
+export function findCreateRequireImports(sourceFile) {
+  const hits = [];
+  const { sourceFile: checkedSourceFile, checker } = createScopeCheckedProgram(
+    sourceFile.fileName,
+    sourceFile.text
+  );
+  forEachDescendant(checkedSourceFile, (node) => {
+    // --- Static import ---
+    if (ts.isImportDeclaration(node)) {
+      const specifierText = stringLiteralText(node.moduleSpecifier);
+      if (specifierText === undefined || !MODULE_BUILTIN_SPECIFIERS.has(specifierText)) return;
+
+      const importClause = node.importClause;
+      if (importClause === undefined) return; // bare side-effect import - no binding at all
+
+      // A statement-level `import type ...` is fully erased by TypeScript -
+      // it emits nothing, produces no binding at runtime, and cannot yield
+      // a callable loader under any of the shapes below. The unit of
+      // analysis is a binding that CAN COME TO HOLD the runtime capability;
+      // this one provably cannot, so the whole declaration is out of scope,
+      // not just skipped-and-fallen-through (flagging it would be
+      // over-blocking, a failure in its own right - not just a false
+      // negative to avoid, a false positive to avoid).
+      if (importClause.isTypeOnly) return;
+
+      if (importClause.name !== undefined) {
+        hits.push({ node: importClause, kind: "default" });
+      }
+
+      const namedBindings = importClause.namedBindings;
+      if (namedBindings === undefined) return;
+
+      if (ts.isNamespaceImport(namedBindings)) {
+        hits.push({ node: namedBindings, kind: "namespace" });
+        return;
+      }
+
+      if (ts.isNamedImports(namedBindings)) {
+        for (const specifier of namedBindings.elements) {
+          // The INLINE per-specifier form - `import { type createRequire }
+          // from "..."` - erases that one binding the same way the
+          // statement-level form erases the whole declaration, even though
+          // the import statement itself may survive (a side-effect import
+          // of the builtin). A MIXED clause - `import { createRequire,
+          // type Something }` - must still flag the value specifier next
+          // to a type-only one: this check is per-specifier, never
+          // suppressed by another specifier's modifier in the same clause.
+          if (specifier.isTypeOnly) continue;
+          const importedName = (specifier.propertyName ?? specifier.name).text;
+          if (importedName === "createRequire") {
+            hits.push({ node: specifier, kind: "named" });
+          }
+        }
+      }
+      return;
+    }
+
+    // --- Re-export: named, wildcard, or namespace ---
+    if (ts.isExportDeclaration(node) && node.moduleSpecifier) {
+      const specifierText = stringLiteralText(node.moduleSpecifier);
+      if (specifierText === undefined || !MODULE_BUILTIN_SPECIFIERS.has(specifierText)) return;
+
+      // Same erasure reasoning as the import side: a statement-level
+      // `export type { ... } from "..."` (or `export type * from "..."`)
+      // is fully erased and hands off no runtime capability to whatever
+      // imports the re-exported name.
+      if (node.isTypeOnly) return;
+
+      const exportClause = node.exportClause;
+      if (exportClause === undefined) {
+        // `export * from "node:module"` - wildcard re-export, exposes
+        // createRequire transitively the same as a namespace import.
+        hits.push({ node, kind: "re-export-namespace" });
+        return;
+      }
+      if (ts.isNamespaceExport(exportClause)) {
+        // `export * as ns from "node:module"` - same reasoning.
+        hits.push({ node: exportClause, kind: "re-export-namespace" });
+        return;
+      }
+      if (ts.isNamedExports(exportClause)) {
+        for (const specifier of exportClause.elements) {
+          // Same per-specifier inline-type-modifier erasure as the import
+          // side, and the same mixed-clause rule: never suppressed by a
+          // sibling specifier's modifier.
+          if (specifier.isTypeOnly) continue;
+          const reExportedFromName = (specifier.propertyName ?? specifier.name).text;
+          if (reExportedFromName === "createRequire") {
+            hits.push({ node: specifier, kind: "re-export-named" });
+          }
+        }
+      }
+      return;
+    }
+
+    // --- Dynamic import: import("node:module"), any consumption shape ---
+    if (isDynamicImportCall(node)) {
+      const [firstArg] = node.arguments;
+      const specifierText = firstArg ? stringLiteralText(firstArg) : undefined;
+      if (specifierText !== undefined && MODULE_BUILTIN_SPECIFIERS.has(specifierText)) {
+        hits.push({ node, kind: "dynamic-import" });
+      }
+      return;
+    }
+
+    // --- TS import-equals: import X = require("node:module") ---
+    if (ts.isImportEqualsDeclaration(node)) {
+      const ref = node.moduleReference;
+      if (ref !== undefined && ts.isExternalModuleReference(ref)) {
+        const specifierText = stringLiteralText(ref.expression);
+        if (specifierText !== undefined && MODULE_BUILTIN_SPECIFIERS.has(specifierText)) {
+          hits.push({ node, kind: "import-equals" });
+        }
+      }
+      return;
+    }
+
+    // --- ACQUISITION SITE: the global `eval` / `Function` / `require` /
+    // `module` - flagged at any unshadowed VALUE-REFERENCE position,
+    // unconditionally on what happens to the reference afterward. This is
+    // the whole point of the acquisition-site design (see this function's
+    // own header comment): a `.call`/`.apply`/`.bind`/`Reflect.apply`/
+    // `Reflect.construct` invocation, a comma-operator indirection, an
+    // alias chain of any length, storage in an object/array, or passing as
+    // an argument are all just ordinary value-reference positions this one
+    // check already covers - none of them need their own special case. ---
+    if (ts.isIdentifier(node) && FORBIDDEN_GLOBAL_NAMES.has(node.text)) {
+      if (!isValueReferenceCandidate(node)) return;
+      const symbol = checker.getSymbolAtLocation(node);
+      // An unresolved symbol for one of these four specific names should
+      // not happen (all four are always declared in the synthetic globals
+      // file), but fails CLOSED rather than silently passing if it ever
+      // does - consistent with this guard's fail-closed posture elsewhere.
+      if (symbol === undefined || isUnshadowedGlobalSymbol(symbol, checkedSourceFile)) {
+        hits.push({ node, kind: GLOBAL_NAME_TO_KIND[node.text] });
+      }
+      return;
+    }
+
+    // --- globalThis.eval / globalThis["Function"] / globalThis.module /
+    // globalThis["require"] - `globalThis` bypasses lexical scoping by
+    // design (that is its entire purpose), so its property key ALONE -
+    // resolved dotted or computed/foldable, same as every other property
+    // access in this file - tells us definitively whether this reaches one
+    // of the four forbidden globals, with no need for a separate
+    // property-symbol lookup. A computed key that can't be resolved
+    // (`globalThis[someComputedExpr]`) FAILS CLOSED: this guard cannot
+    // prove it does NOT reach one of the four, so it is flagged rather
+    // than silently passed. ---
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const base = unwrapParens(node.expression);
+      if (!isUnshadowedGlobalThisReference(base, checker, checkedSourceFile)) return;
+      const key = accessKeyText(node);
+      if (key === undefined) {
+        hits.push({ node, kind: "unresolvable-globalthis-access" });
+        return;
+      }
+      if (FORBIDDEN_GLOBAL_NAMES.has(key)) {
+        hits.push({ node, kind: GLOBAL_NAME_TO_KIND[key] });
+      }
+      return;
+    }
+
+    // --- DESTRUCTURING straight off the real, unshadowed globalThis is an
+    // acquisition of whatever property it pulls out - `const { eval } =
+    // globalThis` genuinely reads the global eval the same way
+    // `globalThis.eval` does. This is a SEPARATE, dedicated check from the
+    // bare-identifier walk above: a destructuring KEY is never a value-
+    // reference candidate on its own (`isValueReferenceCandidate` excludes
+    // a BindingElement's `propertyName` uniformly, since MOST destructuring
+    // sources are ordinary objects where a same-named key means nothing -
+    // `const { eval: localEval } = safe` must stay green regardless of what
+    // `safe` is) - the acquisition only exists when the SOURCE being
+    // destructured is confirmed to be the real globalThis, resolved the
+    // same provenance-based way every other check in this function works.
+    // Scoped to TOP-LEVEL destructuring off a KNOWN initializer - a
+    // `VariableDeclaration`'s own `.initializer` (`const { eval } =
+    // globalThis`), OR a `Parameter`'s own DEFAULT value, which uses the
+    // exact same `.initializer` field for a different purpose
+    // (`function f({ eval } = globalThis)` - the default fires whenever
+    // the caller omits the argument, so it is exactly as real an
+    // acquisition as a variable declaration's initializer, not a
+    // hypothetical). A nested pattern (`const { a: { eval: x } } = obj`)
+    // is out of scope, not by oversight: `obj.a` is an arbitrary value,
+    // never provably globalThis itself. A catch clause's destructuring
+    // pattern (or a parameter with NO default) has no initializer at all
+    // to check against, so it falls through this check untouched -
+    // correctly green regardless of key spelling. ---
+    if (ts.isObjectBindingPattern(node)) {
+      const parent = node.parent;
+      const hasKnownInitializer =
+        (ts.isVariableDeclaration(parent) || ts.isParameter(parent)) &&
+        parent.initializer !== undefined;
+      if (hasKnownInitializer) {
+        const source = unwrapParens(parent.initializer);
+        if (isUnshadowedGlobalThisReference(source, checker, checkedSourceFile)) {
+          for (const element of node.elements) {
+            if (element.dotDotDotToken) continue; // a rest element carries no single source key
+            const key = bindingElementSourceKeyText(element);
+            if (key === undefined) {
+              hits.push({ node: element, kind: "unresolvable-globalthis-access" });
+              continue;
+            }
+            if (FORBIDDEN_GLOBAL_NAMES.has(key)) {
+              hits.push({ node: element, kind: GLOBAL_NAME_TO_KIND[key] });
+            }
+          }
+        }
+      }
+      return;
+    }
+
+    // --- The ASSIGNMENT-destructuring form of the same acquisition -
+    // `({ eval: execute } = globalThis)` - parses its LEFT side as an
+    // `ObjectLiteralExpression` rather than an `ObjectBindingPattern`
+    // (TypeScript's grammar reuses object-literal syntax for a
+    // destructuring ASSIGNMENT target, distinguished only by appearing on
+    // the left of a plain `=`), so it needs the same "source resolves to
+    // the real globalThis" check applied to a structurally different node
+    // shape. ---
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isObjectLiteralExpression(node.left)
+    ) {
+      const source = unwrapParens(node.right);
+      if (isUnshadowedGlobalThisReference(source, checker, checkedSourceFile)) {
+        for (const property of node.left.properties) {
+          const key = objectLiteralDestructurePropertyKeyText(property);
+          if (key === undefined) {
+            hits.push({ node: property, kind: "unresolvable-globalthis-access" });
+            continue;
+          }
+          if (FORBIDDEN_GLOBAL_NAMES.has(key)) {
+            hits.push({ node: property, kind: GLOBAL_NAME_TO_KIND[key] });
+          }
+        }
+      }
+    }
+  });
+  return hits;
+}
+
+/**
+ * Reads a static property/binding key's text - a plain `Identifier`, a
+ * string literal, or a computed key foldable to a literal string
+ * (`["eval"]`, `["ev" + "al"]`). `undefined` for anything else (a
+ * numeric-literal key, which can never match one of the four forbidden
+ * names anyway, or a genuinely dynamic computed key).
+ */
+function staticPropertyKeyText(key) {
+  if (key === undefined) return undefined;
+  if (ts.isIdentifier(key)) return key.text;
+  if (ts.isStringLiteralLike(key)) return key.text;
+  if (ts.isComputedPropertyName(key)) return foldConstantString(key.expression);
+  return undefined;
+}
+
+/**
+ * Reads a `BindingElement`'s source property key - the name it destructures
+ * OFF the right-hand object, which is `element.propertyName` when the
+ * binding renames (`{ eval: localEval }`) or `element.name` itself when it
+ * doesn't (`{ eval }`, shorthand - `undefined` here only if `.name` is
+ * itself a nested pattern, out of scope). `undefined` for a computed key
+ * that can't be statically resolved.
+ */
+function bindingElementSourceKeyText(element) {
+  if (element.propertyName !== undefined) return staticPropertyKeyText(element.propertyName);
+  return ts.isIdentifier(element.name) ? element.name.text : undefined;
+}
+
+/**
+ * Reads the source key an `ObjectLiteralExpression` property denotes when
+ * that object literal is being used as an ASSIGNMENT-destructuring
+ * target - a named `PropertyAssignment` (`{ eval: execute }`, key is
+ * `.name`) or a shorthand `ShorthandPropertyAssignment` (`{ eval }`, the
+ * identifier IS the key). `undefined` for a spread element (no single
+ * source key) or a shape that can't appear in a real destructuring target
+ * (a method/accessor - included only for exhaustiveness, since a genuine
+ * destructuring assignment's grammar never produces one).
+ */
+function objectLiteralDestructurePropertyKeyText(property) {
+  if (ts.isShorthandPropertyAssignment(property)) return property.name.text;
+  if (ts.isPropertyAssignment(property)) return staticPropertyKeyText(property.name);
+  return undefined;
+}
+
+export { ts };

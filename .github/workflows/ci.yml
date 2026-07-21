@@ -1,0 +1,358 @@
+name: CI
+
+# Every check here runs against a pull request, not a direct push to main.
+# The changelog-presence job specifically depends on that: it diffs the
+# branch against origin/main, and that diff is only meaningful while the
+# branch and main still differ. Once a change lands on main the two are
+# the same commit, so the same diff would always come up empty.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      # This script proves, statically, that the aggregate "gate" job below
+      # really depends on every other job and can't be satisfied by a job
+      # that only skipped or was cancelled. It has its own unit tests under
+      # test/, but running it here too means a bad edit to this workflow
+      # file shows up as a red check on the PR that made it, not just as a
+      # locally-run test someone has to remember to execute.
+      - run: npm run verify:workflow-topology
+      - run: npm run lint:workflow-jobs
+
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check
+
+  # Runs the suite once under c8, then two independent checks against the
+  # single resulting coverage/coverage-summary.json: an absolute floor per
+  # metric that blocks the job (scripts/check-coverage-floor.mjs), and a
+  # delta vs a checked-in baseline that is purely informational and can
+  # never affect this job's result (scripts/report-coverage-delta.mjs -
+  # see that script's header for why it is structurally incapable of
+  # failing the job, and config/coverage-baseline.json for how the
+  # baseline it compares against is maintained).
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run coverage
+      - name: enforce the absolute coverage floor (blocking)
+        run: npm run check:coverage-floor
+      - name: report coverage delta vs baseline (informational only)
+        if: ${{ !cancelled() }}
+        run: npm run report:coverage-delta
+
+  # The test job is the one that actually proves the package works, so it
+  # runs the full operating-system by Node-version matrix rather than a
+  # single representative leg the way build/typecheck/lint do.
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ["22", "24"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Full history, not just the tip commit: this repo's history
+          # carries no rewrite yet, but a planned no-rewrite guard over the
+          # published root (seeded from the real root SHA once the first
+          # push lands) needs the full ancestor chain to check against,
+          # which a shallow checkout would make impossible to see.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      # Both reporters read from the one test run, so what the next step
+      # annotates always matches this leg's real result instead of a
+      # second, possibly-different, re-run of the suite. `spec` on stdout
+      # keeps this leg's console log exactly as readable as `npm test`
+      # already is; `junit` on a file hands the next step something
+      # structured to read.
+      - run: >-
+          node --test
+          --test-reporter=spec --test-reporter-destination=stdout
+          --test-reporter=junit --test-reporter-destination=test-results.xml
+      # A contributor whose change breaks a test on this leg should see
+      # exactly which one, and why, right on the PR's Checks and Files
+      # tabs - not have to go dig through a raw log. `annotate_only` writes
+      # plain log annotations instead of opening a separate check run,
+      # which is the one approach that works the same way whether the PR
+      # came from this repository or from a fork: a forked PR's workflow
+      # token can't create check runs, but it can still write to its own
+      # job's log, and that's all a log annotation needs.
+      - name: annotate any failing tests from this leg on the PR
+        if: ${{ !cancelled() }}
+        uses: mikepenz/action-junit-report@d9f48fc87bc235f7e214acf696ca5abc0a986f16 # v6.4.2
+        with:
+          report_paths: test-results.xml
+          annotate_only: true
+
+  codeql:
+    name: codeql
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # needed by github/codeql-action/analyze to upload results as code scanning alerts
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@b7351df727350dca84cb9d725d57dcf5bc82ba26 # v3.37.1
+        with:
+          languages: javascript-typescript
+      - uses: github/codeql-action/analyze@b7351df727350dca84cb9d725d57dcf5bc82ba26 # v3.37.1
+
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      # Pinned to the exact version everything else in this project's
+      # toolchain is pinned to, so a local run and this job see the same
+      # rule engine and the same findings.
+      - run: pip install semgrep==1.170.0
+      - run: semgrep --config auto --error
+
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      # zizmor lints the workflow files themselves for security issues
+      # (excess permissions, unpinned actions, injectable expressions and
+      # the like), so it runs against this repo's own .github/workflows.
+      - run: pip install zizmor==1.27.0
+      - run: zizmor .
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - run: bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+      - run: ./actionlint -color
+
+  changelog-presence:
+    name: changelog-presence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: confirm the branch touches CHANGELOG.md
+        run: |
+          git fetch origin main --quiet
+          git diff --name-only "$(git merge-base origin/main HEAD)" HEAD | grep -qx CHANGELOG.md
+
+  # The repository's own source-level guards. Each has unit tests proving
+  # its logic, but a tested guard that nothing ever executes protects
+  # nothing, so they run here too and a violation fails this job.
+  guards:
+    name: guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+      # Needed before the guards run: three of them load the TypeScript
+      # compiler out of node_modules to parse src/.
+      - run: npm ci
+      - run: npm run guard:npm-ci
+      - run: npm run guard:sdk-pin
+      - run: npm run guard:module-boundaries
+      - run: npm run guard:no-tasks-import
+      - run: npm run guard:stdio-purity
+
+  # Confirms the checked-out commit really is the pull request's head rather
+  # than the synthetic merge commit a pull_request event checks out by
+  # default, and that nothing uncommitted is layered on top of it.
+  #
+  # Both SHAs handed to the guard come from the same context value, so its
+  # third comparison (stated SHA against PR head) compares a value with
+  # itself and cannot fail here. The two checks named above are the ones
+  # doing the work. scripts/check-sha-parity.mjs explains why no wiring of a
+  # pull_request event can keep all three inputs independent.
+  sha-parity:
+    name: sha-parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      # No install step on purpose. This guard imports only Node builtins
+      # and a local helper, and leaving the working tree untouched keeps it
+      # exactly as checked out, which is part of what the guard inspects.
+      #
+      # The two SHAs are set as shell variables on the command itself rather
+      # than through `env:`, since names beginning with GITHUB_ are reserved
+      # by Actions and setting one there is not dependable.
+      - name: confirm the checkout is the PR head and the tree is clean
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: GITHUB_SHA="$HEAD_SHA" GHANTIKA_PR_HEAD_SHA="$HEAD_SHA" npm run guard:sha-parity
+
+  # Two clean installs, compared tree against tree, plus a check that the
+  # comparison still reacts to a changed path set, a changed file, and a
+  # changed symlink target. It runs its own installs, so there is no install
+  # step here and no dependency cache warming one.
+  install-repro:
+    name: install-repro
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      - run: npm run verify:install-repro
+
+  # The single required check branch protection points at. It depends on
+  # every job above and only succeeds when every one of them reports the
+  # literal result "success".
+  #
+  # `if: always()` is what keeps this job from being marked "skipped" the
+  # moment one of the jobs above fails or is cancelled - GitHub treats a
+  # skipped required check as passing, which would silently defeat the
+  # whole point of having one. Running unconditionally and then failing
+  # this job on purpose, inside the step below, is what turns a real
+  # problem into a red "gate" check instead of a green-looking skip.
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - typecheck
+      - lint
+      - test
+      - format
+      - coverage
+      - codeql
+      - semgrep
+      - zizmor
+      - actionlint
+      - changelog-presence
+      - guards
+      - sha-parity
+      - install-repro
+    if: always()
+    steps:
+      - name: require every job above to have literally succeeded
+        env:
+          ALL_SUCCEEDED: >-
+            ${{
+              needs.build.result == 'success' &&
+              needs.typecheck.result == 'success' &&
+              needs.lint.result == 'success' &&
+              needs.test.result == 'success' &&
+              needs.format.result == 'success' &&
+              needs.coverage.result == 'success' &&
+              needs.codeql.result == 'success' &&
+              needs.semgrep.result == 'success' &&
+              needs.zizmor.result == 'success' &&
+              needs.actionlint.result == 'success' &&
+              needs.changelog-presence.result == 'success' &&
+              needs.guards.result == 'success' &&
+              needs.sha-parity.result == 'success' &&
+              needs.install-repro.result == 'success'
+            }}
+        run: |
+          if [ "$ALL_SUCCEEDED" != "true" ]; then
+            echo "one or more required jobs did not literally succeed (a skip or a cancel does not count as passing)"
+            exit 1
+          fi
+          echo "every required job succeeded"

@@ -1,0 +1,13 @@
+# Prettier reads .gitignore as well as this file, so anything ignored there
+# is already skipped and does not need repeating here.
+
+# Build output and dependencies
+dist/
+node_modules/
+coverage/
+
+# Generated / lockfile content prettier shouldn't reflow
+package-lock.json
+
+# Machine-readable test output
+test-results.xml

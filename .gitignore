@@ -1,0 +1,125 @@
+# This section is an allow-list. Everything at the top level of the
+# repository is ignored by default, and only the entries listed below are
+# tracked. That way scratch directories, editor and tool state, and working
+# notes left beside a checkout are never committed by accident.
+#
+# So if git tells you a new top-level file or directory is "ignored by one
+# of your .gitignore files", this is why, and the fix is to add a line here
+# that un-ignores it. Do that rather than taking git's suggestion of
+# `git add -f`, which tracks the file once but leaves the rule in place for
+# everyone else. Begin the line with !/ and give a directory a trailing
+# slash:
+#
+#     !/docs/       a new top-level directory
+#     !/Makefile    a new top-level file
+#
+# Only the top level works this way. Anything inside a directory that is
+# already listed below (src/, test/, scripts/, config/, .github/) is tracked
+# normally and needs nothing added here.
+/*
+!/.github/
+!/.gitignore
+!/.prettierignore
+!/.prettierrc.json
+!/CHANGELOG.md
+!/CODE_OF_CONDUCT.md
+!/CONTRIBUTING.md
+!/LICENSE
+!/README.md
+!/SECURITY.md
+!/config/
+!/eslint.config.js
+!/package-lock.json
+!/package.json
+!/scripts/
+!/src/
+!/test/
+!/tsconfig.json
+
+# OS / editor / IDE
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+.history/
+
+# Build output and dependencies
+node_modules/
+dist/
+build/
+out/
+.next/
+.turbo/
+.vite/
+.parcel-cache/
+.cache/
+coverage/
+.nyc_output/
+*.lcov
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.tsbuildinfo
+
+# Machine-readable test output (generated in CI by the per-leg test-
+# annotation step; reproduce locally with `node --test --test-reporter=junit
+# --test-reporter-destination=test-results.xml`)
+test-results.xml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg
+.tox/
+
+# Rust
+target/
+
+# Logs and temp
+*.log
+*.tmp
+*.temp
+tmp/
+.bun/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Secrets and credentials
+.env
+.env.local
+.env.*
+!.env.example
+!.env.template
+credentials.json
+secrets.json
+.secrets/
+.tokens/
+auth.json
+**/secrets/
+**/credentials/
+**/private/
+*.pem
+*.key
+*-key.json
+*_key.json
+*-token.json
+*_token.json
+.netrc
+
+# Packaged output
+*.tgz
+*.mcpb

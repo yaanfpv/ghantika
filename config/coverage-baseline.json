@@ -1,0 +1,7 @@
+{
+  "_note": "Checked-in reference point for the ADVISORY coverage delta printed by scripts/report-coverage-delta.mjs (see that file's header for why a checked-in file, not a fetched artifact, and what its limits are). Update these four numbers by hand, in the same PR, whenever coverage genuinely improves: re-run `npm run coverage` and copy the new \"total\" row's percentages from coverage/coverage-summary.json in below. This is informational only - scripts/check-coverage-floor.mjs and its COVERAGE_FLOORS constant are what actually gate the build. Last set 2026-07-20 from the coverage job's own first measured run.",
+  "statements": 87.23,
+  "branches": 81.6,
+  "functions": 85.18,
+  "lines": 87.23
+}
