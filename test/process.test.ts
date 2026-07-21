@@ -41,7 +41,7 @@ import {
 // answered by skipping these.
 const POSIX_PROCESS_GROUP_SKIP =
   process.platform === "win32"
-    ? "exercises a real POSIX process-group primitive (ps/pgrep/negative-pid kill) with no win32 equivalent path here - see the Windows process-tree kill verification story"
+    ? "exercises a real POSIX process-group primitive (ps/pgrep/negative-pid kill) with no win32 equivalent path here"
     : false;
 
 // A structural guarantee: a real child's stdout must never

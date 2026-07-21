@@ -34,7 +34,7 @@ import { parsesAsPgid, waitForFile } from "./harness.ts";
 // a live job's process tree on Windows is separate, tracked work).
 const PGREP_ORACLE_SKIP =
   process.platform === "win32"
-    ? "confirms the result via a real external `pgrep -g`, POSIX-only - see the Windows process-tree kill verification story"
+    ? "confirms the result via a real external `pgrep -g`, POSIX-only"
     : false;
 
 // Each test waits for a REAL completed initialize handshake (not a fixed

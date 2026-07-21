@@ -41,7 +41,7 @@ import {
 // separate, tracked work).
 const PGREP_ORACLE_SKIP =
   process.platform === "win32"
-    ? "builds/confirms a real process-group tree via startNoisyJobs + pgrep -g, POSIX-only - see the Windows process-tree kill verification story"
+    ? "builds/confirms a real process-group tree via startNoisyJobs + pgrep -g, POSIX-only"
     : false;
 
 const spawned: SpawnedServer[] = [];

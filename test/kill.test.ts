@@ -222,7 +222,7 @@ test(
     // work).
     skip:
       process.platform === "win32"
-        ? "real shell-forked process tree tracked via `pgrep -g`, POSIX-only - see the Windows process-tree kill verification story"
+        ? "real shell-forked process tree tracked via `pgrep -g`, POSIX-only"
         : false,
   },
   async () => {
