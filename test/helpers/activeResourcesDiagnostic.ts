@@ -17,6 +17,57 @@
  * "job X's child, pid Y, was never actually reaped".
  */
 
+import { execFileSync } from "node:child_process";
+
+/**
+ * Whether the OS itself still considers `pid` alive AND still the same
+ * command we spawned - independent of whether NODE's own ChildProcess
+ * object has observed an exit event. `killed:true, exitCode:null` is
+ * ambiguous on its own: it could mean a real live orphaned process, or it
+ * could mean the OS process is genuinely gone (and possibly this exact
+ * pid already recycled to something unrelated) with only Node's own
+ * exit-event delivery not having caught up. This is the external,
+ * ground-truth check that tells those apart - a bare "is this pid alive"
+ * is not enough on its own (pid reuse is exactly the class of bug this
+ * codebase's own checkProcessIdentity exists to guard against for the
+ * product's real kill path), so this also confirms the live process's
+ * command name still matches what we actually spawned.
+ *
+ * Deliberately NOT `ps`/`pgrep` on win32 - the predecessor project hit
+ * exactly this (MSYS `ps` on a Windows runner does not behave like real
+ * `ps`, and an ENOENT there can silently collapse into "nothing found").
+ * `tasklist` is Windows' own native tool for this.
+ */
+function isPidExternallyAlive(
+  pid: number,
+  expectedCommand: string
+): { alive: boolean | "unknown"; sameCommand: boolean | "unknown" } {
+  try {
+    if (process.platform === "win32") {
+      const output = execFileSync("tasklist", ["/fi", `PID eq ${pid}`, "/fo", "csv", "/nh"], {
+        encoding: "utf8",
+      });
+      const alive = output.includes(String(pid));
+      // tasklist's CSV image-name column is the first field, quoted.
+      const imageName = output.split(",")[0]?.replace(/"/g, "") ?? "";
+      return {
+        alive,
+        sameCommand: alive
+          ? imageName.toLowerCase().includes(expectedCommand.toLowerCase())
+          : false,
+      };
+    }
+    const comm = execFileSync("ps", ["-p", String(pid), "-o", "comm="], {
+      encoding: "utf8",
+    }).trim();
+    return { alive: true, sameCommand: comm.toLowerCase().includes(expectedCommand.toLowerCase()) };
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException & { status?: number | null };
+    if (typeof err.status === "number") return { alive: false, sameCommand: false }; // the tool ran and reported "not found"
+    return { alive: "unknown", sameCommand: "unknown" }; // the tool itself could not run (e.g. ENOENT) - don't guess
+  }
+}
+
 interface PossibleChildProcessHandle {
   readonly constructor: { readonly name: string };
   readonly pid?: unknown;
@@ -53,6 +104,13 @@ function describeHandle(handle: unknown): Record<string, unknown> {
   const internalHandle = h?._handle as { fd?: unknown } | undefined;
   if (internalHandle != null && typeof internalHandle === "object" && "fd" in internalHandle) {
     description.fd = internalHandle.fd;
+  }
+  if (constructorName === "ChildProcess" && typeof h?.pid === "number") {
+    const expectedCommand =
+      typeof h.spawnfile === "string" ? (h.spawnfile.split(/[/\\]/).pop() ?? h.spawnfile) : "";
+    const { alive, sameCommand } = isPidExternallyAlive(h.pid, expectedCommand);
+    description.externallyAlive = alive;
+    description.externallySameCommand = sameCommand;
   }
   return description;
 }
