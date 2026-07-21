@@ -8,23 +8,13 @@
  * module-scope `let`/`var`) - every read routes through the `jobStore`
  * singleton (`src/jobStore.ts`), read-only from this file's perspective.
  *
- * ## `seq` is now REAL data, not a per-call approximation
+ * ## `seq` is real data, not a per-call approximation
  *
- * `jobStore.getStreamSnapshot` used to return only `{lines:
- * StreamLineEntry[], truncated: boolean}`, with no seq/id field on a
- * `StreamLineEntry` and no running total anywhere - `output`/`tail` had no
- * choice but to APPROXIMATE `seq` as array position (exact only until the
- * first eviction) and disclose only a deliberately-narrow, honest
- * `{gap: [X, X]}` marker once truncation started, since the true dropped
- * count wasn't recoverable from the snapshot at all. That was a real
- * structural limit at the time: the running counter needed for a real seq
- * value had to live in `jobStore.ts`, and this file couldn't yet touch that
- * module, so the approximation was an explicit, flagged limitation until
- * that ownership boundary shifted.
- *
- * `jobStore.ts` now exposes that real running counter directly (see its
- * `StreamLineEntry.seq` and `StreamBufferSnapshot.totalEverMaterialized`
- * docs), so this file now consumes REAL data instead of approximating:
+ * `jobStore.getStreamSnapshot` returns each line's real, stable
+ * `StreamLineEntry.seq` (assigned once, at materialization time, never
+ * reused - see that field's own docs in `jobStore.ts`) plus the stream's
+ * real `totalEverMaterialized` count. This file consumes that real data
+ * directly:
  *
  * - **Single-stream reads (`stream: "stdout"`/`"stderr"`):** every event's
  *   `seq` is the line's own REAL, stable `StreamLineEntry.seq` - exact
@@ -35,17 +25,15 @@
  *   `[1, oldestSurvivingSeq - 1]` (see `computeExactGap`), narrowed to
  *   whatever portion of that range is still relevant to THIS caller's own
  *   `after_cursor` (a cursor already past everything ever dropped gets no
- *   gap marker at all - a real improvement over the old ALWAYS-disclose-
- *   something behavior, since there is genuinely nothing to disclose to
+ *   gap marker at all, since there is genuinely nothing to disclose to
  *   that caller).
- * - **`stream: "both"`:** UNCHANGED - see the next section. The real
- *   per-line `seq` this section describes is a per-STREAM value; "both"'s
- *   own merged numbering is a deliberately separate, arbitrary interleave
- *   axis (below), and mixing two streams' independent real seq spaces into
- *   one shared axis with no way to know their true interleave order would
- *   be exactly the kind of fabrication this whole rework is trying to
- *   avoid - so "both" keeps its existing synthetic parity numbering and
- *   existing best-effort (not exact) gap disclosure.
+ * - **`stream: "both"`:** see the next section. The real per-line `seq`
+ *   this section describes is a per-STREAM value; "both"'s own merged
+ *   numbering is a deliberately separate, arbitrary interleave axis
+ *   (below), and mixing two streams' independent real seq spaces into one
+ *   shared axis with no way to know their true interleave order would be
+ *   a fabrication - so "both" keeps its own synthetic parity numbering
+ *   and its own best-effort (not exact) gap disclosure.
  *
  * ## Cross-stream ("both") merge order - a disclosed policy, not a truth
  * claim
@@ -63,9 +51,9 @@
  * how much the OTHER stream grows), so merged numbering doesn't shift
  * around under the caller while both streams are un-truncated. Once either
  * stream has been truncated, "both" still discloses only a single leading
- * width-1 `{gap: [X, X]}` marker (the SAME best-effort shape single-stream
- * reads used before) - a real per-stream exact count exists for EACH
- * stream independently now, but there is no sound way to
+ * width-1 `{gap: [X, X]}` marker (the same best-effort shape single-stream
+ * reads use) - a real per-stream exact count exists for EACH stream, but
+ * there is no sound way to
  * express "N stdout lines and M stderr lines were dropped, in this unknown
  * relative order" as one exact range in the single shared merged-position
  * axis "both" uses, so this deliberately does not attempt to.
@@ -289,8 +277,7 @@ export function buildSingleStreamEvents(
   // the stream has ever been truncated, so there is no more untruncated-
   // vs-truncated code-path split for the EVENTS themselves. `head` is the
   // stream's true newest-ever-materialized seq (0 if nothing yet) -
-  // exact and eviction-independent, unlike the old `windowSize`-derived
-  // value.
+  // exact and eviction-independent.
   const events = snapshot.lines
     .filter((line) => line.seq > afterCursor)
     .map((line) => buildEvent(stream, line.seq, line.text, line.terminator));
@@ -323,9 +310,8 @@ export function buildSingleStreamEvents(
  *
  * The result is narrowed to what is still relevant to THIS caller's own
  * `afterCursor`: a cursor already at or past the last-ever-dropped seq
- * gets `undefined` (no gap to disclose - nothing beyond their cursor was
- * ever lost), rather than the old scheme's unconditional "always show
- * something" placeholder.
+ * gets `undefined` - no gap to disclose, since nothing beyond their
+ * cursor was ever lost.
  */
 function computeExactGap(
   afterCursor: number,

@@ -10,18 +10,16 @@
  * ## Why a module-level singleton rather than an instance threaded through
  * `src/server.ts` -> `src/registry.ts` -> each tool handler
  *
- * An earlier design anticipated `src/server.ts` constructing one
- * `JobStore` and passing it down. Implementing that literally would mean
- * changing `registry.ts`'s `ToolModule` handler signature (and therefore
- * EVERY one of the six tool modules, including the five `run` itself does
- * not touch) to accept a store parameter - a much wider blast radius than
- * this change's scope needs right now. Exporting a
- * single module-level instance from this file achieves the identical
- * property the original design cared about (exactly one instance, and
- * tool handlers are the only code that touches job state through it) with
- * a far smaller diff: a tool handler just imports `jobStore` from here.
- * `status`/`output`/`tail`/`kill` import the same singleton too, now that
- * all six tools have real implementations.
+ * Threading a `JobStore` instance through `src/server.ts` -> `registry.ts`
+ * -> each tool handler would mean giving `registry.ts`'s `ToolModule`
+ * handler signature (and therefore EVERY one of the six tool modules,
+ * including the five `run` itself does not touch) a store parameter - a
+ * much wider surface than a single shared store needs. Exporting a
+ * single module-level instance from this file gets the same property
+ * (exactly one instance, and tool handlers are the only code that
+ * touches job state through it) with a far smaller surface: a tool
+ * handler just imports `jobStore` from here.
+ * `status`/`output`/`tail`/`kill` import the same singleton too.
  *
  * ## Frozen shapes
  *
@@ -33,9 +31,8 @@
  *
  * `JobState` is a CLOSED five-value enum - `starting`, `running`,
  * `exited`, `killed`, `failed` - forever. `run` alone only ever produces
- * `starting`/`running`/`exited`/`failed` (there was no `kill` tool yet);
- * `markKilled` (below) is what actually produces `killed`,
- * without ever having needed to touch this already-closed union.
+ * `starting`/`running`/`exited`/`failed`; `markKilled` (below) is what
+ * produces `killed`, without needing to touch this already-closed union.
  */
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -299,8 +296,8 @@ const OVERSIZED_LINE_MARKER = "…[line exceeds 1 MiB, continues]";
  *   for the SAME logical line follow as later entries (themselves possibly
  *   also `oversized-split`), eventually ending in `newline` or, if the
  *   stream ends first, `stream-end`. Carries an explicit textual
- *   continuation marker ("never silently dropped or
- *   truncated without indication").
+ *   continuation marker, so a caller can tell a long line was split
+ *   rather than silently dropped or truncated.
  * - `stream-end`: the stream closed with a trailing, never-newline-
  *   terminated line still pending (a genuine "partial final line").
  *   The text is preserved verbatim, unmarked - the
@@ -312,19 +309,14 @@ export interface StreamLineEntry {
   readonly text: string;
   readonly terminator: StreamLineTerminator;
   /**
-   * A REAL monotonic per-line sequence number (the architectural addition
-   * resolving an earlier disclosed limitation): assigned once, at
+   * A REAL monotonic per-line sequence number: assigned once, at
    * materialization time, from `StreamBufferState.nextLineSeq`, and NEVER
    * reset or reused for the life of this job's stream - even across
-   * eviction. Working within the OLD constraint (no such field existed),
-   * `output.ts`/`tail.ts` had to approximate `seq` as the line's array
-   * INDEX (exact only until the first eviction) and could only ever
-   * disclose a deliberately-narrow, honest `{gap: [X, X]}` marker once
-   * truncation started, since there was no way to know the true size of
-   * what was dropped. With a real `seq` that survives eviction, both
-   * consumers can now use the STABLE, GLOBALLY-MEANINGFUL value here
-   * instead of the array-position approximation, and can compute an EXACT
-   * dropped-range gap (see `StreamBufferState.nextLineSeq`'s own docs).
+   * eviction. Because it survives eviction, `output.ts`/`tail.ts` can use
+   * this STABLE, GLOBALLY-MEANINGFUL value instead of the line's array
+   * position (which drifts once eviction starts), and can compute an
+   * EXACT dropped-range gap from it (see
+   * `StreamBufferState.nextLineSeq`'s own docs).
    */
   readonly seq: number;
 }
@@ -334,13 +326,11 @@ export interface StreamBufferSnapshot {
   readonly truncated: boolean;
   /**
    * The stream's REAL total-ever-materialized line count at snapshot time
-   * (`StreamBufferState.nextLineSeq - 1`) - the second half of the seq
-   * architectural addition (see `StreamLineEntry.seq`'s own docs for the
-   * first half). Lets a consumer (`output.ts`/`tail.ts`) compute an EXACT
-   * dropped-range gap once truncation starts (`[1, oldestSurvivingSeq -
-   * 1]`) and a stable `head` cursor, without the array-index approximation
-   * those files previously had no alternative to (an earlier disclosed
-   * limitation, resolved here).
+   * (`StreamBufferState.nextLineSeq - 1`). Lets a consumer
+   * (`output.ts`/`tail.ts`) compute an EXACT dropped-range gap once
+   * truncation starts (`[1, oldestSurvivingSeq - 1]`) and a stable `head`
+   * cursor, without depending on array position, which drifts once
+   * eviction starts.
    */
   readonly totalEverMaterialized: number;
 }

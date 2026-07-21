@@ -10,8 +10,8 @@
  * (kept decoupled/independently testable, matching the existing
  * `test/process.test.ts` pattern of importing this module alone).
  *
- * The one piece of this that was already load-bearing before this module's
- * spawn logic was filled in (stdio purity) is `MANAGED_CHILD_STDIO`, unchanged here.
+ * The one piece of this load-bearing on stdio purity is
+ * `MANAGED_CHILD_STDIO`, defined below.
  */
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
@@ -159,14 +159,14 @@ function effectiveWindowsServerPath(): string | undefined {
  * any host, regardless of which OS actually runs the assertion
  * (guarding against a "Windows env-key casing collision" regression) -
  * `effectivePathForLookup` below gates USE of this behind
- * `process.platform === "win32"`, so that internal branch itself only
- * ever runs as live code on this repo's own development machines
- * (macOS); it DOES run for real, unmocked, on this repo's CI (ci.yml's
- * `test` job matrix includes a `windows-latest` leg, where
- * `process.platform` genuinely is `"win32"`). The underlying
- * case-insensitive-key-resolution ALGORITHM this codebase implements is
- * not itself platform-specific, and is what this function isolates for
- * direct verification independent of `process.platform`.
+ * `process.platform === "win32"`, so that internal branch never runs as
+ * live code during local development on a non-Windows machine; it DOES
+ * run for real, unmocked, on this repo's own CI (ci.yml's `test` job
+ * matrix includes a `windows-latest` leg, where `process.platform`
+ * genuinely is `"win32"`). The underlying case-insensitive-key-resolution
+ * ALGORITHM this codebase implements is not itself platform-specific, and
+ * is what this function isolates for direct verification independent of
+ * `process.platform`.
  */
 export function resolveCaseInsensitivePathKey(
   env: Readonly<Record<string, string>>
@@ -339,9 +339,9 @@ export interface ManagedChildCallbacks {
  * `detached` set, "the child will be a group leader"). There is no window
  * in which the child exists but is NOT yet its own group leader, and no
  * later Node API to join/re-parent a process into a group after the fact -
- * so "assigned at spawn time, never late, never allowing breakaway" holds
- * by construction, not by a runtime check this file could get wrong
- * later. Once the child is its own
+ * so the property holds by construction (assigned at spawn time, never
+ * late, never allowing breakaway), not by a runtime check this file could
+ * get wrong later. Once the child is its own
  * group leader, its pid IS the group's pgid - every kill primitive below
  * relies on exactly that identity, so it never has to track a separate
  * pgid value alongside the pid.
@@ -581,8 +581,8 @@ export function signalProcessGroupPosix(pid: number, signal: string): SignalResu
 
 /**
  * Polls `isProcessAlive` until either `pid` is confirmed gone or
- * `timeoutMs` elapses - the real wait loop behind the grace
- * period ("a real grace period, not a token delay"). `pollIntervalMs`
+ * `timeoutMs` elapses - the real wait loop behind the grace period.
+ * `pollIntervalMs`
  * defaults small so death is detected promptly rather than only at the
  * next coarse tick, and is itself capped to never overshoot the deadline.
  */
@@ -635,12 +635,11 @@ export interface PosixKillCallbacks {
    * both are triggered by the identical signal, but the natural event can
    * only ever fire asynchronously (on a later turn of the event loop),
    * while a synchronous same-tick write can't be preempted by it. Without
-   * this hook (an earlier version of this function had none), the caller
-   * had no choice but to `await` the WHOLE phase-split-plus-wait sequence
-   * before writing anything, and during that real wait the job's own
-   * `exit` event reliably won the race instead - a job this codebase
-   * itself deliberately killed was ending up recorded as `exited`, not
-   * `killed`.
+   * this hook, the caller would have to `await` the whole
+   * phase-split-plus-wait sequence before writing anything, and during
+   * that wait the job's own `exit` event would reliably win the race
+   * instead - a job this codebase itself deliberately killed would end up
+   * recorded as `exited`, not `killed`.
    */
   readonly onSignaled?: (signal: "SIGTERM" | "SIGKILL") => void;
 }
@@ -711,10 +710,9 @@ export interface WindowsKillResult {
  * repo's `package.json`) is a lean command-runner with a single existing
  * dependency (the MCP SDK itself).
  *
- * Per this codebase's own explicit escape hatch ("implement POSIX properly
- * and add a Windows implementation that is HONEST about its actual
- * behavior... flag this tradeoff explicitly rather than overclaiming"),
- * this is that honest fallback: `taskkill /pid <pid> /t /f`, which walks
+ * This codebase implements POSIX properly and, on Windows, is honest
+ * about what its fallback actually does rather than overclaiming a
+ * guarantee it can't provide: `taskkill /pid <pid> /t /f`, which walks
  * the LIVE parent-pid tree Windows itself maintains at the MOMENT of the
  * kill and force-terminates every process it finds there. That is real,
  * and it does successfully reap a normal, non-adversarial process tree.

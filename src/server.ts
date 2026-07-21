@@ -32,9 +32,10 @@
  *   reporting it at all (confirmed against the installed
  *   @modelcontextprotocol/server package's own source), so
  *   `createStdioTransport` intercepts ahead of the transport to restore
- *   the reply - see its own doc comment for the full picture (why the SDK
- *   changed, why its own `ReadBuffer` can't be reused here, and how
- *   single-reader/single-writer safety is proven, not assumed).
+ *   the reply - see its own doc comment for the full picture (why this
+ *   codebase intercepts ahead of the transport, why its own `ReadBuffer`
+ *   can't be reused here, and how single-reader/single-writer safety is
+ *   proven, not assumed).
  * - A line that parses as JSON but isn't a valid JSON-RPC envelope still
  *   gets -32600 automatically via the transport's own `onerror` callback,
  *   unchanged; `attachParseErrorReporting` below closes THAT gap (the
@@ -466,11 +467,11 @@ function initializeResponseOutcome(
  * `if (error instanceof SyntaxError) continue;` - so `transport.onerror`
  * never fires for that case at all; only a `ZodError` (valid JSON that
  * isn't a valid JSON-RPC envelope, still handled by
- * `attachParseErrorReporting` below, unchanged) propagates out. Read the
- * MCP 2026-07-28 draft's stdio transport page end to end looking for a
- * ruling on this: it obligates the CLIENT not to send anything that isn't
- * a valid MCP message, but says nothing about what a server does when a
- * client violates that - genuinely silent, not permissive. So restoring
+ * `attachParseErrorReporting` below) propagates out. The MCP 2026-07-28
+ * draft's stdio transport page obligates the CLIENT not to send anything
+ * that isn't a valid MCP message, but says nothing about what a server
+ * does when a client violates that - genuinely silent, not permissive. So
+ * restoring
  * the conventional JSON-RPC reply is the safer default for an unknown
  * population of client authors, not a requirement the spec forces either
  * way.

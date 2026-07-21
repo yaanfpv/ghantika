@@ -326,7 +326,7 @@ test("e2e: tools/call for run with schema-invalid arguments is a normal successf
   server.child.kill("SIGKILL");
 });
 
-test("tools/call for run with valid argv arguments succeeds at the RPC level and returns a real starting/running job, never the old stub message", async () => {
+test("tools/call for run with valid argv arguments succeeds at the RPC level and returns a real starting/running job", async () => {
   const server = tracked();
   await completeHandshake(server);
   server.send({
@@ -562,10 +562,8 @@ test("tools/call succeeds normally once the full handshake (initialize + notific
     undefined,
     "after a completed handshake, tools/call must be processed normally"
   );
-  // list() is a real implementation: a completed handshake
-  // must reach a real success result, never isError (the old not-implemented
-  // stub always errored here - that was the prior test's marker for "not a
-  // rejection"; a real success result now proves the same thing).
+  // list() is a real implementation: a completed handshake must reach a
+  // real success result, never isError.
   assert.notEqual(body.result?.isError, true);
   server.child.kill("SIGKILL");
 });

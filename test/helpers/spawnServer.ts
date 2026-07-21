@@ -43,8 +43,8 @@ export const SERVER_ENTRY = path.join(REPO_ROOT, "dist", "index.js");
  * regularly runs many concurrent, unrelated processes) rather than a
  * reproducible property of instrumentation - consistent with the
  * general concurrent-load flakiness already observed elsewhere in this
- * suite tonight, but not confirmed, because it could not be reproduced
- * on demand to check.
+ * suite, but not confirmed, because it could not be reproduced on demand
+ * to check.
  *
  * Given that, this budget is set well above every reproducible
  * measurement specifically to tolerate an occasional contention spike

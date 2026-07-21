@@ -22,11 +22,8 @@
 !/.prettierignore
 !/.prettierrc.json
 !/CHANGELOG.md
-!/CODE_OF_CONDUCT.md
-!/CONTRIBUTING.md
 !/LICENSE
 !/README.md
-!/SECURITY.md
 !/config/
 !/eslint.config.js
 !/package-lock.json

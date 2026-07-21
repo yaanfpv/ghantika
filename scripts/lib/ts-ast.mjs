@@ -601,11 +601,11 @@ function foldConstantString(node) {
  * catch, on purpose, with the boundary enforced by dedicated tests rather
  * than left as a sentence in this comment.
  *
- * THE ACQUISITION-SITE DESIGN. An earlier version of this function chased
- * INVOCATION shape instead - matching one callee spelling at a time, then a
- * hand-built alias map tracking local aliases, destructures, `.call`/
- * `.apply`, `Reflect.apply`/`construct`, and comma-operator indirection.
- * That approach cannot terminate: invocation shape is an infinite space
+ * THE ACQUISITION-SITE DESIGN, AND WHY NOT INVOCATION SHAPE. Matching one
+ * callee spelling at a time, then a hand-built alias map tracking local
+ * aliases, destructures, `.call`/`.apply`, `Reflect.apply`/`construct`,
+ * and comma-operator indirection, cannot terminate: invocation shape is
+ * an infinite space
  * (closing `.call` leaves `.bind` open, closing `.bind` leaves storage in
  * an object open, and so on indefinitely), so it can only ever be
  * incomplete by one more form. The fix is to reject the primitive at its
@@ -724,8 +724,8 @@ function foldConstantString(node) {
  * same class would still walk straight through, so matching exactly these
  * three would re-manufacture the appearance of closure rather than
  * deliver it. This guard's real job, evidenced by every escape route
- * closed above, is stopping this codebase's OWN team from reintroducing
- * CommonJS interop by ordinary habit or accident - a hygiene guard against
+ * closed above, is stopping this codebase from reintroducing CommonJS
+ * interop by ordinary habit or accident - a hygiene guard against
  * carelessness, not a runtime security boundary against a deliberate
  * adversary evading it. Each of the three routes above has a dedicated,
  * PASSING control whose assertion is that this guard produces NO

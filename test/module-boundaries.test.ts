@@ -267,15 +267,14 @@ test("green control: a plain function that happens to be named require but is lo
 // ---------------------------------------------------------------------------
 // The guard's unit of analysis is the BINDING and its provenance, not the
 // ImportDeclaration node: any route that can deliver createRequire (or the
-// node:module namespace it lives on) is in scope, however it was obtained.
-// A prior version only inspected static ImportDeclaration nodes, so a
-// dynamic `await import("node:module")` destructured for createRequire ran
-// with zero violations and successfully loaded a sibling tools/*.ts file at
-// runtime - executable, not parser-only. Same entry routes as
+// node:module namespace it lives on) is in scope, however it was obtained -
+// including a dynamic `await import("node:module")` destructured for
+// createRequire, which is just as executable a route to a sibling
+// tools/*.ts file at runtime as a static import. Same entry routes as
 // no-tasks-import.test.ts, exercised here against the sibling-import guard.
 // ---------------------------------------------------------------------------
 
-test("a dynamic import of node:module, destructured for createRequire, is caught - the executable survivor that motivated this fix", () => {
+test("a dynamic import of node:module, destructured for createRequire, is caught", () => {
   const hits = siblingImportsFrom(
     'const { createRequire: weaveBridge } = await import("node:module");\n' +
       "const retrieveUnit = weaveBridge(import.meta.url);\n" +

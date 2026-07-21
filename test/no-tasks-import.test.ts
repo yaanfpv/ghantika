@@ -196,14 +196,13 @@ test("green control: a file with neither require nor createRequire at all stays 
 // ---------------------------------------------------------------------------
 // The guard's unit of analysis is the BINDING and its provenance, not the
 // ImportDeclaration node: any route that can deliver createRequire (or the
-// node:module namespace it lives on) is in scope, however it was obtained.
-// A prior version of this guard only inspected static ImportDeclaration
-// nodes, so a dynamic `await import("node:module")` destructured for
-// createRequire ran with zero violations and successfully loaded the
-// forbidden Tasks subpath at runtime - executable, not parser-only. Each
-// row below is a distinct entry route, each independently caught, plus
-// green controls proving legitimate dynamic imports and an unrelated
-// property named "require" stay clean.
+// node:module namespace it lives on) is in scope, however it was obtained -
+// including a dynamic `await import("node:module")` destructured for
+// createRequire, which is just as executable a route to the forbidden
+// Tasks subpath at runtime as a static import. Each row below is a
+// distinct entry route, each independently caught, plus green controls
+// proving legitimate dynamic imports and an unrelated property named
+// "require" stay clean.
 // ---------------------------------------------------------------------------
 
 test("a dynamic import of node:module, destructured for createRequire, is caught - the executable survivor that motivated this fix", () => {

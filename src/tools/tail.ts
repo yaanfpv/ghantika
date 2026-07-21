@@ -11,10 +11,8 @@
  * The event-numbering scheme (real per-line `seq`, the single-stream EXACT
  * gap disclosure, and the "both" cross-stream merge policy) is IDENTICAL to
  * `src/tools/output.ts`'s - see that file's header for the full reasoning,
- * including why `jobStore.ts` now exposes a real monotonic `seq`
- * (a later architectural addition that resolved an originally-disclosed
- * limitation from when this file couldn't yet touch `jobStore.ts` directly).
- * The module-boundary guard forbids a
+ * including why `jobStore.ts` exposes a real monotonic `seq`. The
+ * module-boundary guard forbids a
  * `tools/*.ts` file from importing a sibling `tools/*.ts` file, and the
  * frozen module list (also enforced by that guard) forbids adding a new
  * shared helper module - so the scheme is necessarily REIMPLEMENTED here

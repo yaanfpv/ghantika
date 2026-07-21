@@ -23,8 +23,8 @@
  * doesn't resolve to a real executable file, are validated BEFORE ever
  * calling `spawnManaged` - this handler explicitly forbids silently
  * defaulting a bad `cwd`, and requires that both failure classes produce a
- * job that "just starts already-terminal" rather than either throwing a
- * protocol error or racing an async OS-level failure. See
+ * job that starts already in a terminal state, rather than either
+ * throwing a protocol error or racing an async OS-level failure. See
  * `src/process.ts`'s `resolveCwd`/`resolveExecutable`.
  */
 import type { CallToolResult, Tool } from "@modelcontextprotocol/server";
@@ -168,7 +168,7 @@ type ValidationResult<T> =
  *   own job, per the server's error-class distinction: a schema-invalid
  *   call is a normal successful RPC whose result is a tool execution error,
  *   never a JSON-RPC protocol error - preserved here for run's own real
- *   validation, not just an earlier stub's placeholder checks).
+ *   validation).
  */
 export function handler(args: Record<string, unknown> | undefined): CallToolResult {
   const validated = validateRunInput(args);
