@@ -387,6 +387,7 @@ export function spawnManaged(
   let child: ChildProcess;
   try {
     if (options.shellCommand !== undefined) {
+      // nosemgrep: javascript.lang.security.audit.spawn-shell-true.spawn-shell-true -- running a caller-supplied shell command via a real shell is this tool's documented, intentional purpose (`run`'s `shell: true` opt-in), not an oversight.
       child = spawn(options.shellCommand, {
         cwd: options.cwd,
         env: options.env,
