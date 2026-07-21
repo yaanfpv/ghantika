@@ -1,15 +1,23 @@
 name: Windows diagnostic (temporary)
 
-# TEMPORARY, NOT PART OF THE PR GATE. Manually triggered only
-# (workflow_dispatch) - investigating why the "test" job's windows-latest
-# legs do not exit within their 15-minute ceiling (see ci.yml's "test" job).
-# Runs each file that spawns a real child process as its OWN step, with its
+# TEMPORARY, NOT PART OF THE PR GATE - a separate workflow file, so its
+# job is a non-required status check on the PR (ci.yml's own "gate" job
+# only aggregates ci.yml's own jobs; nothing here is added to branch
+# protection). Investigating why the "test" job's windows-latest legs do
+# not exit within their 15-minute ceiling (see ci.yml's "test" job). Runs
+# each file that spawns a real child process as its OWN step, with its
 # own short per-step timeout, so a single hanging file no longer hides
 # whether the other six exit cleanly on their own. Delete this file once
 # the investigation concludes either way.
+#
+# Triggered on pull_request, same as ci.yml, rather than workflow_dispatch:
+# a workflow_dispatch-only workflow is only invocable once its YAML exists
+# on the repository's DEFAULT branch, which this one deliberately never
+# will (see the header above) - so pull_request is the only trigger that
+# actually runs it from a feature branch.
 
 on:
-  workflow_dispatch:
+  pull_request:
 
 permissions:
   contents: read
