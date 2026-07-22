@@ -490,13 +490,13 @@ test("green control: a catch clause's destructuring pattern has no initializer t
 });
 
 // ---------------------------------------------------------------------------
-// Nothing is documented as out of scope in the reflective/structural class
-// anymore: process.getBuiltinModule, the bare Reflect global, and the
-// .constructor property are all now closed - see findCreateRequireImports's
+// process.getBuiltinModule, the bare Reflect global, and the .constructor
+// property are all closed as of this file - see findCreateRequireImports's
 // own doc comment (scripts/lib/ts-ast.mjs) for the full acquisition-site
 // design and why banning the whole Reflect/.constructor surface (rather
-// than pattern-matching Vera's one demonstrated combination of them) is
-// what actually closes the class.
+// than pattern-matching one demonstrated combination of them) is what
+// actually closes that specific class, plus why the broader reflective/
+// structural category is not claimed exhausted by doing so.
 // ---------------------------------------------------------------------------
 
 test("REGRESSION: obtaining the Function constructor via an ordinary function object's own .constructor property IS now detected", () => {
@@ -553,14 +553,14 @@ test("green control: an object literal's own 'constructor' property KEY (definin
 });
 
 // ---------------------------------------------------------------------------
-// process.getBuiltinModule - REGRESSION: Vera's exact executable fixture.
-// Reaches createRequire via a supported Node builtin-module API with no
-// import/require syntax naming "node:module" anywhere - previously
+// process.getBuiltinModule - REGRESSION: an executable fixture demonstrated
+// this route reaches createRequire via a supported Node builtin-module API
+// with no import/require syntax naming "node:module" anywhere - previously
 // undetected, now flagged at the property-access acquisition site the same
 // way the four bare globals are.
 // ---------------------------------------------------------------------------
 
-test('REGRESSION: process.getBuiltinModule("node:module").createRequire(...) IS now detected (Vera\'s fixture, prior out-of-scope ruling overturned)', () => {
+test('REGRESSION: process.getBuiltinModule("node:module").createRequire(...) IS now detected (prior out-of-scope ruling overturned by an executable fixture)', () => {
   const hits = siblingImportsFrom(
     'const r = process.getBuiltinModule("node:module").createRequire(import.meta.url);\n' +
       'r("./status.js");\n'

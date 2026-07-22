@@ -206,6 +206,11 @@ function isUnshadowedGlobalCallee(callExpression, checker, checkedSourceFile) {
  * Node itself resolves the bare specifier to the same builtin at runtime.
  * Both forms must be checked; only checking `"node:module"` would leave the
  * unprefixed spelling as an open escape.
+ *
+ * This is a literal-text membership check, not resolver-based comparison -
+ * see `findCreateRequireImports`'s "SPECIFIER COMPARISON IS ALSO NOT YET
+ * RESOLVER-BASED" note for what that leaves open (absolute, file-URL, and
+ * resolver-alias specifiers reaching the same builtin).
  */
 const MODULE_BUILTIN_SPECIFIERS = new Set(["node:module", "module"]);
 
@@ -638,9 +643,13 @@ function foldConstantString(node) {
  * "these verified shapes close, and a shape outside this list may not."
  * It does NOT and CANNOT close a route that reaches the same capability
  * WITHOUT ever naming it or importing its module at all - see "OUT OF
- * SCOPE" for the three concrete forms this guard is verified NOT to
- * catch, on purpose, with the boundary enforced by dedicated tests rather
- * than left as a sentence in this comment.
+ * SCOPE" below for the concrete forms this guard is currently verified
+ * NOT to catch, on purpose, with the boundary enforced by dedicated tests
+ * rather than left as a sentence in this comment. That list has already
+ * been revised once (two forms it originally named were closed by
+ * treating them as acquisition sites too, the same way as the four bare
+ * globals), so it is stated as the CURRENT known boundary, not a claim
+ * that no further form will ever be found.
  *
  * THE ACQUISITION-SITE DESIGN, AND WHY NOT INVOCATION SHAPE. Matching one
  * callee spelling at a time, then a hand-built alias map tracking local
@@ -782,10 +791,10 @@ function foldConstantString(node) {
  * its name or a `"node:module"` import specifier." That framing was
  * incomplete: closing `process.getBuiltinModule` alone left `.constructor`
  * and `Reflect` as UNCLOSED escape routes into the exact same reflective/
- * structural acquisition class it was trying to close - fixing one named
- * spelling (Vera's fixture) while leaving the class it belongs to open
- * would have re-manufactured the appearance of closure without delivering
- * it, the same failure mode this file's own prior version warned against.
+ * structural acquisition class it was trying to close - fixing one
+ * demonstrated route while leaving the class it belongs to open would have
+ * re-manufactured the appearance of closure without delivering it, the
+ * same failure mode this file's own prior version warned against.
  * The actual fix is not "pattern-match `(() => 1).constructor` and
  * `Reflect.get(globalThis, "eval")` as two more named spellings" - that
  * would ITSELF be vacuous, since the next unenumerated form in the same
@@ -811,10 +820,31 @@ function foldConstantString(node) {
  * no runtime capability under any of the shapes above); and a `typeof X`
  * used AS A TYPE (`type T = typeof eval`, erased the same way - contrast
  * with `typeof eval === "function"`, a genuine runtime reference this
- * guard DOES flag). No reflective/structural acquisition form remains
- * documented as out of scope: closing `Reflect` and `.constructor`
- * outright, rather than pattern-matching Vera's one demonstrated
- * combination of them, removed the class this section used to name.
+ * guard DOES flag). Closing `Reflect` and `.constructor` outright - rather
+ * than pattern-matching one demonstrated combination of them - removed
+ * the specific class those two belonged to, not the open-ended reflective/
+ * structural category itself: `Object.getOwnPropertyDescriptor` reaching
+ * the same primitives via a property-descriptor read is a further,
+ * independently-discovered form in that category, not yet closed here.
+ * This file does not claim the category is exhausted, and per the reasoning
+ * above (a fixed list of named spellings is never the boundary itself),
+ * it never will - a newly demonstrated route is a reason to extend this
+ * function's real coverage, not evidence that the prior extension failed.
+ *
+ * SPECIFIER COMPARISON IS ALSO NOT YET RESOLVER-BASED: every import/
+ * dynamic-import/re-export branch above decides whether a specifier reaches
+ * `"node:module"` by checking its literal text against
+ * `MODULE_BUILTIN_SPECIFIERS`, a two-entry string set - not by running the
+ * specifier through a real module resolver and comparing the resolved,
+ * canonical module identity the way `isUnshadowedGlobalSymbol` does for the
+ * four bare globals. That is string/path arithmetic, not resolver-based
+ * comparison, and it means an absolute specifier, a `file://` URL
+ * specifier, or a specifier reaching the same builtin through a resolver
+ * alias or path-mapping entry is not detected here even though it resolves
+ * to the identical module at runtime. Closing that gap needs the same kind
+ * of provenance-based resolution this function already uses for the four
+ * bare globals, applied to specifiers instead of identifiers - it is not
+ * done yet.
  *
  * A MIXED import clause (a value specifier next to a type-only one in the
  * same clause) still flags the value specifier - the type modifier is

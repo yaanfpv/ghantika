@@ -28,9 +28,16 @@
  *                                 referencing this ONE property of the global `process` is
  *                                 forbidden outright, the same acquisition-site principle as
  *                                 form 7, independent of what specifier it is later called
- *                                 with (see scripts/lib/ts-ast.mjs's own header for why this
- *                                 route is closeable by the same machinery while two other,
- *                                 genuinely different reflective/structural routes are not)
+ *                                 with. `Reflect` (any method) and `.constructor` property
+ *                                 access (any base) are closed the same way, outright, as
+ *                                 acquisition surfaces rather than named invocation shapes -
+ *                                 see scripts/lib/ts-ast.mjs's own header for that design and
+ *                                 for the routes it does NOT yet close: reflective acquisition
+ *                                 via `Object.getOwnPropertyDescriptor` reading the same
+ *                                 primitives off a descriptor, and a specifier reaching
+ *                                 `"node:module"` through anything other than the two literal
+ *                                 spellings this guard's specifier check compares against
+ *                                 (an absolute, file-URL, or resolver-alias specifier)
  *
  * WHAT THIS GUARD ACTUALLY COVERS, STATED PLAINLY: this project does not
  * depend on the monolithic `@modelcontextprotocol/sdk` package at all -

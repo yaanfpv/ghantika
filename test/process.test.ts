@@ -954,8 +954,8 @@ test(
   }
 );
 
-// REGRESSION: the exact defect Vera's fixture demonstrated. Waiting only
-// for the group LEADER's own pid let a SIGTERM-resistant descendant
+// REGRESSION: the exact defect an executable fixture demonstrated. Waiting
+// only for the group LEADER's own pid let a SIGTERM-resistant descendant
 // survive while killProcessGroupPosix reported escalated: false - as if
 // SIGTERM alone had been sufficient, when a real process in the group it
 // was asked to terminate was still running.
