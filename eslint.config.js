@@ -26,7 +26,11 @@ export default tseslint.config(
     },
   },
   {
-    files: ["test/**/*.js", "scripts/**/*.mjs", "eslint.config.js"],
+    // "test/**/*.mjs" covers real, standalone Node-script test fixtures
+    // (e.g. test/helpers/windowsChildTree.mjs, a real child process spawned
+    // directly by a test, never parsed/typechecked as TypeScript) the same
+    // way "test/**/*.js" already covers plain-JS test files.
+    files: ["test/**/*.js", "test/**/*.mjs", "scripts/**/*.mjs", "eslint.config.js"],
     languageOptions: {
       globals: globals.node,
       sourceType: "module",

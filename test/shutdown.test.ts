@@ -8,8 +8,15 @@ import { test } from "node:test";
 // See test/e2e-server.test.ts's import comment for why this is ".ts", not ".js".
 import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/spawnServer.ts";
 // The shared marker-file poll and its pgid predicate - one implementation
-// for every suite that observes a job's real filesystem side effects.
-import { parsesAsPgid, waitForFile } from "./harness.ts";
+// for every suite that observes a job's real filesystem side effects. The
+// rest are this file's own Windows-native counterparts to the POSIX-only
+// pgrep/shell-tree fixtures below - see test/harness.ts's own docs.
+import {
+  buildWindowsChildTreeArgv,
+  parsesAsPgid,
+  waitForFile,
+  waitForWindowsTaskState,
+} from "./harness.ts";
 
 /**
  * A catchable shutdown signal (SIGTERM, SIGINT) or stdin EOF must reach a
@@ -24,15 +31,30 @@ import { parsesAsPgid, waitForFile } from "./harness.ts";
  *
  * Further down this file: cleanup REAPS every live job's whole process tree
  * before the process exits, proven with a real external `pgrep` oracle
- * across all three triggers independently.
+ * across all three triggers independently on POSIX.
+ *
+ * SIGTERM/SIGINT specifically are a separate, KNOWN, currently-unfixed
+ * Windows product gap, not a test-harness portability gap: Windows has no
+ * catchable, externally-deliverable process signal at all (`child.kill()`/
+ * `process.kill()` unconditionally force-terminates the target regardless
+ * of signal name - verified against libuv's own win/process.c `uv_kill`),
+ * so `process.on('SIGTERM'/'SIGINT')` never runs there, and this codebase's
+ * shutdown-cleanup/reap path never gets a chance to either. That gap is
+ * tracked as its own story and is DELIBERATELY left alone here (both the
+ * two plain "reaches the real cleanup path" tests near the top of this
+ * file, their mutation control, and the SIGTERM-/SIGINT-triggered reap
+ * tests further down all still exercise the exact behavior this codebase
+ * currently does NOT have on Windows) - fixing test fixtures around it
+ * would silently mask a real gap rather than name it.
  */
 
-// The three whole-tree-reap tests below confirm their result via a real
-// external `pgrep -g <pgid>` call, which has no Windows equivalent path -
-// a test-harness gap, not a product scope decision. Windows is a
-// supported platform; whether cleanup actually reaps a live job's
-// process tree there is a separate question this test doesn't answer by
-// skipping.
+// The stdin-EOF-triggered reap test below (unlike its SIGTERM/SIGINT
+// siblings, which stay untouched pending the Windows signal-delivery gap
+// noted above) gets a REAL Windows-native counterpart, since stdin EOF
+// isn't a signal at all - it reaches this codebase's real shutdown/reap
+// path on every platform already. The SIGTERM/SIGINT reap tests still use
+// this same skip constant, for the pgrep-verification gap alone - see the
+// header note above for why they otherwise stay exactly as they are.
 const PGREP_ORACLE_SKIP =
   process.platform === "win32"
     ? "confirms the result via a real external `pgrep -g`, POSIX-only"
@@ -224,7 +246,21 @@ async function spawnServerWithLiveTree(): Promise<{ server: SpawnedServer; pgid:
 
 test(
   "stdin EOF reaps a REAL live job's WHOLE process tree - zero survivors confirmed by a real external pgrep",
-  { skip: PGREP_ORACLE_SKIP },
+  {
+    // Unlike its SIGTERM/SIGINT siblings further down, stdin EOF isn't a
+    // signal at all - it genuinely reaches this codebase's real shutdown/
+    // reap path on Windows too (see this file's header note). What's
+    // missing here is purely the POSIX verification primitive this test
+    // uses to PROVE the reap (a real shell-forked process GROUP plus
+    // `pgrep -g`, neither of which exists on Windows) - the WINDOWS
+    // COUNTERPART test directly below proves the identical underlying
+    // behavior using a real multi-process tree and a per-pid `tasklist`
+    // lookup instead.
+    skip:
+      process.platform === "win32"
+        ? "POSIX-only: needs a real process GROUP and `pgrep -g` as the verification oracle, neither of which exists on Windows - see the WINDOWS COUNTERPART test directly below for the win32-native proof of the same behavior"
+        : false,
+  },
   async () => {
     const { server, pgid } = await spawnServerWithLiveTree();
 
@@ -247,6 +283,102 @@ test(
       [],
       `expected zero surviving process-group members after stdin-EOF shutdown, pgrep still saw: ${JSON.stringify(afterMembers)}`
     );
+  }
+);
+
+/**
+ * The Windows-native counterpart to `spawnServerWithLiveTree` above: spawns
+ * a real server, hands it a real `run` job built from real `child_process`
+ * spawns (see `test/helpers/windowsChildTree.mjs`'s own docs) - a leader
+ * process plus `descendantCount` real leaf descendants, so the whole tree,
+ * not just the one direct child, must be reaped - confirms every pid is
+ * genuinely alive via a real external `tasklist` lookup BEFORE ever
+ * triggering shutdown, then hands back the server and every pid (leader
+ * first, then each descendant) for the caller to trigger its own shutdown
+ * path against and verify.
+ */
+async function spawnServerWithLiveWindowsTree(): Promise<{
+  server: SpawnedServer;
+  pids: number[];
+}> {
+  const server = spawnServer();
+  await completeHandshake(server);
+
+  const dir = makeTempDir();
+  const leaderMarker = path.join(dir, "leader-pid.txt");
+  const descendantCount = 2; // matches spawnServerWithLiveTree's own "shell + 2 sleeps" shape
+
+  server.send({
+    jsonrpc: "2.0",
+    id: 710,
+    method: "tools/call",
+    params: {
+      name: "run",
+      arguments: { command: buildWindowsChildTreeArgv(leaderMarker, descendantCount, dir) },
+    },
+  });
+  const runLine = await server.nextLine();
+  const runBody = runLine.parsed as RunResponseBody;
+  assert.equal(runBody.error, undefined);
+  assert.notEqual(runBody.result?.isError, true, `run() must succeed: ${JSON.stringify(runBody)}`);
+
+  const leaderPidText = await waitForFile(leaderMarker, { until: parsesAsPgid });
+  const leaderPid = Number(leaderPidText.trim());
+  assert.ok(
+    Number.isInteger(leaderPid) && leaderPid > 0,
+    `expected a real numeric pid from the leader marker file, got: ${JSON.stringify(leaderPidText)}`
+  );
+  const descendantPids = await Promise.all(
+    Array.from({ length: descendantCount }, async (_unused, i) => {
+      const text = await waitForFile(path.join(dir, `child-${i}-pid.txt`), { until: parsesAsPgid });
+      const pid = Number(text.trim());
+      assert.ok(
+        Number.isInteger(pid) && pid > 0,
+        `expected a real numeric pid from descendant ${i}'s marker file, got: ${JSON.stringify(text)}`
+      );
+      return pid;
+    })
+  );
+  const pids = [leaderPid, ...descendantPids];
+
+  for (const pid of pids) {
+    const alive = await waitForWindowsTaskState(pid, true, 3000);
+    assert.ok(
+      alive,
+      `expected pid ${pid} (leader or descendant) alive BEFORE shutdown, tasklist did not see it`
+    );
+  }
+
+  return { server, pids };
+}
+
+test(
+  "WINDOWS COUNTERPART: stdin EOF reaps a REAL live job's WHOLE process tree - zero survivors confirmed by a real external tasklist lookup per pid",
+  {
+    skip:
+      process.platform === "win32"
+        ? false
+        : "Windows-only - exercises taskkill /t (via shutdown's own reap path) against a real Windows process tree; the POSIX proof of the identical underlying behavior is the pgrep-based test above",
+  },
+  async () => {
+    const { server, pids } = await spawnServerWithLiveWindowsTree();
+
+    server.child.stdin.end(); // closes stdin -> the server observes EOF and runs its real shutdown path
+    const { code, signal } = await server.waitForExit();
+    assert.equal(code, 0, "the server's own shutdown handler must exit cleanly");
+    assert.equal(signal, null);
+
+    // THE proof: a REAL, independent `tasklist` lookup per pid AFTER
+    // shutdown - never trusting this codebase's own bookkeeping - must show
+    // every pid in the tree gone, not merely the one direct tracked child.
+    for (const pid of pids) {
+      const alive = await waitForWindowsTaskState(pid, false, 5000);
+      assert.equal(
+        alive,
+        false,
+        `expected pid ${pid} (leader or descendant) gone after stdin-EOF shutdown, tasklist still saw it`
+      );
+    }
   }
 );
 

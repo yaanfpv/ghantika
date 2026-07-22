@@ -19,8 +19,17 @@ import { spawnManaged } from "../dist/process.js";
 // identical comment on the same helper.
 import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/spawnServer.ts";
 // The shared marker-file poll and its pgid predicate - one implementation
-// for every suite that observes a job's real filesystem side effects.
-import { parsesAsPgid, waitForFile } from "./harness.ts";
+// for every suite that observes a job's real filesystem side effects. The
+// rest are this file's own Windows-native counterparts to the POSIX-only
+// pgrep/shell-tree fixtures below - see test/harness.ts's own docs for what
+// each does and why.
+import {
+  buildWindowsChildTreeArgv,
+  longRunningNodeArgv,
+  parsesAsPgid,
+  waitForFile,
+  waitForWindowsTaskState,
+} from "./harness.ts";
 
 // ---------------------------------------------------------------------------
 // kill: unit-level handler tests (against the real dist/tools/kill.js, but
@@ -82,15 +91,19 @@ test("green control: kill on an already-terminal job is an idempotent no-op, nev
 });
 
 test("kill: a real running job is actually terminated - state transitions to killed, signal recorded", async () => {
+  // Real, cross-platform long-lived argv - POSIX `sleep` isn't a real
+  // executable on Windows at all (see test/harness.ts's own docs on
+  // `longRunningNodeArgv`).
+  const argv = longRunningNodeArgv(10);
   const record = jobStore.createJob({
-    argv: ["sleep", "10"],
+    argv,
     cwd: process.cwd(),
     env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
     isShell: false,
   });
   const child = spawnManaged(
     {
-      argv: ["sleep", "10"],
+      argv,
       cwd: process.cwd(),
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
     },
@@ -111,19 +124,25 @@ test("kill: a real running job is actually terminated - state transitions to kil
   assert.notEqual(result.isError, true, `expected kill to succeed: ${JSON.stringify(result)}`);
   const structured = result.structuredContent as Record<string, unknown>;
   assert.equal(structured.state, "killed");
-  assert.equal(structured.signal, "SIGTERM"); // a plain `sleep` isn't SIGTERM-resistant - no escalation needed
+  // POSIX: a plain long-lived child isn't SIGTERM-resistant, so no
+  // escalation is needed and the recorded signal is the real SIGTERM sent.
+  // Windows: src/tools/kill.ts's own win32 branch has no graceful phase at
+  // all (see its docs) and always reports the honest "SIGKILL-equiv" label,
+  // regardless of what actually terminated the process.
+  assert.equal(structured.signal, process.platform === "win32" ? "SIGKILL-equiv" : "SIGTERM");
 });
 
 test('kill: an explicit non-default "signal" argument is sent once, with no automatic grace/escalation', async () => {
+  const argv = longRunningNodeArgv(10);
   const record = jobStore.createJob({
-    argv: ["sleep", "10"],
+    argv,
     cwd: process.cwd(),
     env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
     isShell: false,
   });
   const child = spawnManaged(
     {
-      argv: ["sleep", "10"],
+      argv,
       cwd: process.cwd(),
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
     },
@@ -146,7 +165,11 @@ test('kill: an explicit non-default "signal" argument is sent once, with no auto
   assert.notEqual(result.isError, true);
   const structured = result.structuredContent as Record<string, unknown>;
   assert.equal(structured.state, "killed");
-  assert.equal(structured.signal, "SIGKILL");
+  // POSIX: the caller's explicit SIGKILL is sent and recorded exactly.
+  // Windows: src/tools/kill.ts's win32 branch ignores any caller-supplied
+  // signal entirely (no graceful phase exists to skip) and always reports
+  // "SIGKILL-equiv" - see this file's other kill test for the same note.
+  assert.equal(structured.signal, process.platform === "win32" ? "SIGKILL-equiv" : "SIGKILL");
   assert.ok(
     elapsed < 1000,
     `an explicit signal must never wait through the default grace period, took ${elapsed}ms`
@@ -213,16 +236,24 @@ interface RunResponseBody {
 test(
   "THE CENTERPIECE: kill() reaps a REAL process tree - a real job that itself forked real descendant processes - confirmed by a REAL external pgrep after the kill showing zero survivors across the WHOLE tree, not just the direct child",
   {
-    // A real shell-forked process tree, tracked via a real external
-    // `pgrep -g`, has no Windows equivalent path exercised anywhere in
-    // this codebase's own source or this harness - a test-harness gap,
-    // not a product scope decision. Windows is a supported platform;
-    // whether src/tools/kill.ts's win32 branch actually reaps a Windows
-    // process tree is a separate question this test doesn't answer by
-    // skipping.
+    // Missing primitive, named explicitly: this test's whole tree (the
+    // shell process-group LEADER plus its forked descendants) exists only
+    // because of two real POSIX primitives Windows has neither of - a
+    // process GROUP (`spawnManaged`'s `detached: true` makes the job's
+    // leader its own group leader; there is no such concept on win32) and
+    // `pgrep -g`, the external oracle that counts a group's live members
+    // in one call. Windows has nothing to build either half from, so this
+    // test-harness gap (not a product scope decision - OD-5: Windows is a
+    // supported platform, and kill.ts's own win32 branch does reap a real
+    // process tree via taskkill, proven below) skips here. The Windows
+    // counterpart immediately below proves the SAME underlying behavior
+    // (kill reaps the WHOLE tree, not just the direct child) using what
+    // Windows actually has instead: a real multi-process tree built from
+    // plain child_process spawns, and a per-pid `tasklist` lookup as the
+    // external oracle in place of `pgrep -g`.
     skip:
       process.platform === "win32"
-        ? "real shell-forked process tree tracked via `pgrep -g`, POSIX-only"
+        ? "POSIX-only: needs a real process GROUP (spawnManaged's detached:true group-leader semantics) and `pgrep -g` as the verification oracle, neither of which exists on Windows - see the WINDOWS COUNTERPART test directly below for the win32-native proof of the same behavior"
         : false,
   },
   async () => {
@@ -308,6 +339,113 @@ test(
       [],
       `expected zero surviving process-group members after kill, pgrep still saw: ${JSON.stringify(afterMembers)}`
     );
+
+    server.child.kill("SIGKILL");
+  }
+);
+
+test(
+  "WINDOWS COUNTERPART: kill() reaps a REAL process tree via taskkill /t - a real job built from real child_process spawns (no shell process-group, no pgrep - see THE CENTERPIECE above) - confirmed by a REAL external tasklist lookup per pid after the kill showing zero survivors across the WHOLE tree, not just the direct child",
+  {
+    skip:
+      process.platform === "win32"
+        ? false
+        : "Windows-only - exercises taskkill /t against a real Windows process tree; THE CENTERPIECE test above is the POSIX proof of the identical underlying behavior (pgrep -g)",
+  },
+  async () => {
+    const server = tracked();
+    await completeHandshake(server);
+
+    const dir = makeTempDir();
+    const leaderMarker = path.join(dir, "leader-pid.txt");
+    const descendantCount = 2; // matches THE CENTERPIECE's own "shell + 2 sleeps" shape
+
+    server.send({
+      jsonrpc: "2.0",
+      id: 510,
+      method: "tools/call",
+      params: {
+        name: "run",
+        // Non-shell argv path (never `shell: true`): the tree here is a
+        // real multi-process tree built from Node's own child_process API
+        // (see windowsChildTree.mjs's docs), not a shell one-liner - there
+        // is no `&`/`wait` to shell out to on Windows in the first place.
+        arguments: { command: buildWindowsChildTreeArgv(leaderMarker, descendantCount, dir) },
+      },
+    });
+    const runLine = await server.nextLine();
+    const runBody = runLine.parsed as RunResponseBody;
+    assert.equal(runBody.error, undefined);
+    assert.notEqual(
+      runBody.result?.isError,
+      true,
+      `run() must succeed: ${JSON.stringify(runBody)}`
+    );
+    const jobId = runBody.result?.structuredContent?.job_id as string;
+    assert.equal(typeof jobId, "string");
+
+    // Wait for every REAL marker (the leader's own pid, plus each real
+    // descendant's own pid) - never for mere file existence, the same
+    // "wait for parseable content" discipline THE CENTERPIECE's own pgid
+    // wait uses (see waitForFile's docs).
+    const leaderPidText = await waitForFile(leaderMarker, { until: parsesAsPgid });
+    const leaderPid = Number(leaderPidText.trim());
+    assert.ok(
+      Number.isInteger(leaderPid) && leaderPid > 0,
+      `expected a real numeric pid from the leader marker file, got: ${JSON.stringify(leaderPidText)}`
+    );
+    const descendantPids = await Promise.all(
+      Array.from({ length: descendantCount }, async (_unused, i) => {
+        const text = await waitForFile(path.join(dir, `child-${i}-pid.txt`), {
+          until: parsesAsPgid,
+        });
+        const pid = Number(text.trim());
+        assert.ok(
+          Number.isInteger(pid) && pid > 0,
+          `expected a real numeric pid from descendant ${i}'s marker file, got: ${JSON.stringify(text)}`
+        );
+        return pid;
+      })
+    );
+    const allPids = [leaderPid, ...descendantPids];
+
+    // Confirm the REAL tree is actually up (the leader + 2 descendants)
+    // BEFORE we ever touch kill - a real external `tasklist` lookup per
+    // pid, never our own internal bookkeeping.
+    for (const pid of allPids) {
+      const alive = await waitForWindowsTaskState(pid, true, 3000);
+      assert.ok(alive, `expected pid ${pid} (leader or descendant) to be alive before kill`);
+    }
+
+    server.send({
+      jsonrpc: "2.0",
+      id: 511,
+      method: "tools/call",
+      params: { name: "kill", arguments: { job_id: jobId } },
+    });
+    const killLine = await server.nextLine(8000);
+    const killBody = killLine.parsed as RunResponseBody;
+    assert.equal(killBody.error, undefined);
+    assert.notEqual(
+      killBody.result?.isError,
+      true,
+      `kill() must succeed: ${JSON.stringify(killBody)}`
+    );
+    assert.equal(killBody.result?.structuredContent?.state, "killed");
+
+    // THE proof: a REAL, independent `tasklist` lookup per pid AFTER the
+    // kill - never trusting our own bookkeeping - must show every pid in
+    // the tree gone, not merely the one direct tracked child. This is what
+    // proves src/tools/kill.ts's win32 branch (`taskkill /pid <pid> /t /f`)
+    // actually reaps the WHOLE tree, not just the leader.
+    for (const pid of allPids) {
+      const alive = await waitForWindowsTaskState(pid, false, 5000);
+      assert.equal(
+        alive,
+        false,
+        `expected pid ${pid} (leader or descendant) to be gone after kill, tasklist still saw it`
+      );
+    }
 
     server.child.kill("SIGKILL");
   }

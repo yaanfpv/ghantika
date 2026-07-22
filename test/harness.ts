@@ -13,6 +13,20 @@
  * parameters for the concurrent-load proof: `JOBS=4`, `DESCENDANTS_PER_JOB=3`,
  * `NOISE_BYTES=64*1024`.
  *
+ * Also collects the Windows-native counterparts to the POSIX-only
+ * `pgrep -g`/shell-forked-tree pattern above: `windowsTaskExists`/
+ * `waitForWindowsTaskState` (a real external `tasklist` lookup per pid -
+ * Windows has no process-GROUP primitive to query in one shot the way
+ * `pgrep -g` does, so the oracle here is per-pid instead of per-group),
+ * `longRunningNodeArgv` (a cross-platform "just stay alive" child argv -
+ * POSIX `sleep` isn't a real executable on Windows at all), and
+ * `buildWindowsChildTreeArgv`/`WINDOWS_CHILD_TREE_FIXTURE` (a real
+ * multi-process tree built from Node's own `child_process` API, since
+ * there's no `&`/`wait`/`sleep` shell syntax to fork one with on Windows -
+ * see `test/helpers/windowsChildTree.mjs`'s own docs). Used by
+ * `test/kill.test.ts`'s and `test/shutdown.test.ts`'s own Windows-only
+ * counterpart tests.
+ *
  * Not a `*.test.ts` file itself (mirrors `spawnServer.ts`'s own "not
  * auto-discovered" property - `npm test`'s glob is
  * `'test/**\/*.test.ts' 'test/**\/*.test.js'`), used by
@@ -23,6 +37,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Explicit ".ts" extension - see test/e2e-server.test.ts's identical
 // comment on this same helper for why (no relative imports of its own, so
@@ -278,6 +293,92 @@ export async function waitForPgrepGroupMembers(
     if (Date.now() - start > timeoutMs) return members;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Windows-native counterpart to the pgrep-group observer above. Windows has
+// no process-GROUP primitive at all (no `-pid` negative-pid kill, nothing a
+// single `pgrep -g <pgid>` call could query), so there is nothing to build
+// a one-shot "every member of this group" oracle around. The nearest real,
+// external, OS-level equivalent - independent of this codebase's own
+// bookkeeping, same as pgrep is on POSIX - is a per-pid `tasklist` lookup,
+// checked once per pid this codebase itself recorded (via each process's
+// own self-written marker file - see `windowsChildTree.mjs`'s docs), rather
+// than trying to discover group membership from the OS the way pgrep does.
+// Used by test/kill.test.ts's and test/shutdown.test.ts's own Windows-only
+// counterpart tests (the win32 side of "kill/shutdown reaps the WHOLE
+// process tree, not just the direct child").
+// ---------------------------------------------------------------------------
+
+/** True if `pid` is still listed as a live process by a real, external `tasklist` call - Windows' nearest equivalent to `kill -0`/`pgrep` for "does this OS-level process still exist." Checked one pid at a time (never "the whole group") since Windows has nothing group-shaped to query. */
+export function windowsTaskExists(pid: number): boolean {
+  // `/nh` suppresses the column header so the only numeric-looking token in
+  // a genuine match is the pid itself; a non-match prints an informational
+  // "INFO: No tasks..." line instead (and tasklist still exits 0 either
+  // way) - so the pid's own literal decimal text actually appearing in the
+  // output is what distinguishes a real match, not the exit code.
+  const output = execFileSync("tasklist", ["/fi", `PID eq ${pid}`, "/nh"], { encoding: "utf8" });
+  return new RegExp(`(^|[^0-9])${pid}([^0-9]|$)`).test(output);
+}
+
+/** Polls `windowsTaskExists(pid)` until it matches `expectedExists` (or times out), mirroring `waitForPgrepGroupMembers`'s own polling shape - returns whatever the final observed state was, so a timeout is reported as "still saw X" rather than silently swallowed. */
+export async function waitForWindowsTaskState(
+  pid: number,
+  expectedExists: boolean,
+  timeoutMs: number
+): Promise<boolean> {
+  const start = Date.now();
+  for (;;) {
+    const exists = windowsTaskExists(pid);
+    if (exists === expectedExists) return exists;
+    if (Date.now() - start > timeoutMs) return exists;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+/**
+ * A real, cross-platform "just stay alive for `seconds`" child argv - never
+ * POSIX `sleep`, which is not a real executable on Windows at all (spawning
+ * it directly, without `shell: true`, ENOENTs there). Runs a real Node.js
+ * child process via this SAME server's own `process.execPath` (always
+ * genuinely resolvable, on every platform, by construction) whose entire
+ * body is one `setTimeout` - small enough to pass with `-e` rather than
+ * needing a separate fixture file, unlike `windowsChildTree.mjs` below
+ * (which needs a real file because it recursively re-spawns itself).
+ */
+export function longRunningNodeArgv(seconds: number): string[] {
+  return [process.execPath, "-e", `setTimeout(() => {}, ${seconds * 1000})`];
+}
+
+/** Absolute path to `test/helpers/windowsChildTree.mjs` - see that file's own docs for what it does and why it exists. */
+export const WINDOWS_CHILD_TREE_FIXTURE = fileURLToPath(
+  new URL("./helpers/windowsChildTree.mjs", import.meta.url)
+);
+
+/**
+ * Builds the real argv for one Windows-native multi-process tree - the
+ * win32 counterpart to `buildNoisyLiveJobShellCommand`'s POSIX shell one-
+ * liner below (`echo $$ > marker; sleep 60 & sleep 60 & wait`). Run via
+ * `run`'s default (non-shell) argv path: `process.execPath` is always a
+ * real, resolvable absolute path, so this never needs the shell escape
+ * hatch the POSIX fixture relies on for its own `&`/`wait` syntax.
+ * `childCount` real leaf descendants are written to `<childPidsDir>/
+ * child-<i>-pid.txt`; the LEADER's own pid goes to `selfPidMarkerPath` -
+ * see `windowsChildTree.mjs`'s own docs for the exact marker-writing
+ * shape (reusable via this file's own `parsesAsPgid`/`waitForFile`).
+ */
+export function buildWindowsChildTreeArgv(
+  selfPidMarkerPath: string,
+  childCount: number,
+  childPidsDir: string
+): string[] {
+  return [
+    process.execPath,
+    WINDOWS_CHILD_TREE_FIXTURE,
+    selfPidMarkerPath,
+    String(childCount),
+    childPidsDir,
+  ];
 }
 
 // ---------------------------------------------------------------------------
