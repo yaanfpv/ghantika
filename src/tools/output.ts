@@ -326,56 +326,97 @@ function computeExactGap(
 }
 
 /**
+ * The real per-stream seq at (and below) which everything is gone forever
+ * - `0` when nothing has ever been dropped. Same computation
+ * `computeExactGap` does internally for a single stream, extracted so
+ * `buildBothStreamsEvents`'s gap logic (below) can apply it to both
+ * streams independently.
+ */
+function droppedThroughRealSeq(snapshot: StreamBufferSnapshot): number {
+  const oldestSurvivingSeq = snapshot.lines.length > 0 ? snapshot.lines[0]!.seq : undefined;
+  return (oldestSurvivingSeq ?? snapshot.totalEverMaterialized + 1) - 1;
+}
+
+/**
+ * A best-effort merged-position gap for "both": each stream's own real
+ * dropped-through seq converts to a merged position via the SAME parity
+ * formula `buildBothStreamsEvents` uses for real events (stdout's real seq
+ * S -> merged 2S-1, stderr's real seq S -> merged 2S), and this discloses
+ * the HIGHER of the two converted boundaries - a genuine, honest upper
+ * bound on "something dropped could be at or before this merged position",
+ * not a claim about true interleave order (see this file's header for why
+ * an exact per-stream-interleaved range isn't sound to express here).
+ * Returns `undefined` when nothing relevant to THIS caller's own
+ * `afterCursor` was ever dropped on either stream.
+ */
+function computeBothStreamsGap(
+  afterCursor: number,
+  stdoutSnapshot: StreamBufferSnapshot,
+  stderrSnapshot: StreamBufferSnapshot
+): GapMarker | undefined {
+  const stdoutDroppedThrough = droppedThroughRealSeq(stdoutSnapshot);
+  const stderrDroppedThrough = droppedThroughRealSeq(stderrSnapshot);
+  const mergedDroppedThrough = Math.max(
+    stdoutDroppedThrough >= 1 ? 2 * stdoutDroppedThrough - 1 : 0,
+    stderrDroppedThrough >= 1 ? 2 * stderrDroppedThrough : 0
+  );
+  if (mergedDroppedThrough < 1) return undefined; // nothing has ever been dropped on either stream
+  const gapStart = Math.max(afterCursor + 1, 1);
+  if (gapStart > mergedDroppedThrough) return undefined; // this caller's cursor is already past everything ever dropped
+  return { gap: [gapStart, mergedDroppedThrough] };
+}
+
+/**
  * Merged "both" event view - see this file's header for the parity-split
  * merge policy and its prefix-stability property. Exported for direct
  * unit testing, same rationale as `buildSingleStreamEvents`.
+ *
+ * Merged position is derived from each line's own REAL, stable per-stream
+ * `seq` (see this file's header), never from its transient index into
+ * `snapshot.lines` - stdout's real seq S lands at merged position 2S-1,
+ * stderr's real seq S at merged position 2S. A line's real seq never
+ * changes once assigned, so its merged position never changes either -
+ * stable across eviction, unlike an index-based formula, whose result for
+ * a given line shifts every time an OLDER line gets evicted out from under
+ * it. That instability was a real defect, not a cosmetic one: once a
+ * stream had ever been truncated, the old index-based "both" branch
+ * recomputed the entire current window's numbering relative to the
+ * CALLER's OWN `after_cursor` on every call and returned it unfiltered -
+ * so a caller re-submitting the previous call's own `next_cursor` got the
+ * SAME lines back, renumbered, with a `next_cursor` that kept climbing,
+ * forever. Deriving merged position from real seq instead makes the exact
+ * same `seq > afterCursor` filter this file already uses for
+ * single-stream reads correct here too, in every case, truncated or not -
+ * so this function no longer needs a separate untruncated/truncated
+ * branch for the events themselves, only for whether a gap is disclosed.
  */
 export function buildBothStreamsEvents(
   stdoutSnapshot: StreamBufferSnapshot,
   stderrSnapshot: StreamBufferSnapshot,
   afterCursor: number
 ): { events: OutputEvent[]; gap?: GapMarker; head: number } {
-  const stdoutCount = stdoutSnapshot.lines.length;
-  const stderrCount = stderrSnapshot.lines.length;
-  const anyTruncated = stdoutSnapshot.truncated || stderrSnapshot.truncated;
+  const stdoutEvents = stdoutSnapshot.lines.map((line) =>
+    buildEvent("stdout", 2 * line.seq - 1, line.text, line.terminator)
+  );
+  const stderrEvents = stderrSnapshot.lines.map((line) =>
+    buildEvent("stderr", 2 * line.seq, line.text, line.terminator)
+  );
+  const merged = [...stdoutEvents, ...stderrEvents]
+    .filter((event) => event.seq > afterCursor)
+    .sort((a, b) => a.seq - b.seq);
 
-  if (!anyTruncated) {
-    // Fixed parity split: stdout's i-th line -> odd position 2i+1,
-    // stderr's i-th line -> even position 2i+2. Depends ONLY on each
-    // stream's own index, never on the other stream's length - so
-    // existing positions never shift as either stream grows
-    // (prefix-stable), and natural seq-filtering (`seq > afterCursor`)
-    // correctly produces an empty result for a cursor at or beyond head,
-    // with no separate "beyond head" special case needed.
-    const stdoutEvents = stdoutSnapshot.lines.map((line, i) =>
-      buildEvent("stdout", 2 * i + 1, line.text, line.terminator)
-    );
-    const stderrEvents = stderrSnapshot.lines.map((line, i) =>
-      buildEvent("stderr", 2 * i + 2, line.text, line.terminator)
-    );
-    const merged = [...stdoutEvents, ...stderrEvents].sort((a, b) => a.seq - b.seq);
-    const head = Math.max(
-      stdoutCount > 0 ? 2 * (stdoutCount - 1) + 1 : 0,
-      stderrCount > 0 ? 2 * (stderrCount - 1) + 2 : 0
-    );
-    return { events: merged.filter((event) => event.seq > afterCursor), head };
+  const stdoutHeadSeq = stdoutSnapshot.totalEverMaterialized;
+  const stderrHeadSeq = stderrSnapshot.totalEverMaterialized;
+  const head = Math.max(
+    stdoutHeadSeq > 0 ? 2 * stdoutHeadSeq - 1 : 0,
+    stderrHeadSeq > 0 ? 2 * stderrHeadSeq : 0
+  );
+
+  if (!stdoutSnapshot.truncated && !stderrSnapshot.truncated) {
+    return { events: merged, head };
   }
-
-  // BEST-EFFORT mode, same shape as the single-stream case: one width-1
-  // gap, then the full current window of BOTH streams, parity-merged and
-  // renumbered starting right after the gap.
-  const gapStart = afterCursor + 1;
-  const eventsStartSeq = afterCursor + 2;
-  const stdoutEvents = stdoutSnapshot.lines.map((line, i) =>
-    buildEvent("stdout", eventsStartSeq + 2 * i, line.text, line.terminator)
-  );
-  const stderrEvents = stderrSnapshot.lines.map((line, i) =>
-    buildEvent("stderr", eventsStartSeq + 2 * i + 1, line.text, line.terminator)
-  );
-  const merged = [...stdoutEvents, ...stderrEvents].sort((a, b) => a.seq - b.seq);
-  const lastEvent = merged[merged.length - 1];
-  const head = lastEvent !== undefined ? lastEvent.seq : afterCursor + 1;
-  return { events: merged, gap: { gap: [gapStart, gapStart] }, head };
+  const gap = computeBothStreamsGap(afterCursor, stdoutSnapshot, stderrSnapshot);
+  return { events: merged, gap, head };
 }
 
 // ---------------------------------------------------------------------------
