@@ -28,8 +28,8 @@ test("the real test job's matrix covers all 4 OS x Node legs", () => {
 // matrix and confirm the check names exactly the two legs (one per Node
 // version) that go missing with it - then confirm restoring it goes clean
 // again. Retargeted at macos-latest (was windows-latest, before Windows
-// was temporarily removed from the matrix - see CHANGELOG); restoring the
-// Windows leg later re-aims this back at windows-latest.
+// was temporarily removed from the matrix - see CHANGELOG); when the
+// Windows leg is restored, re-aim this back at windows-latest.
 test("mutation control: dropping macos-latest from the matrix is caught", () => {
   const workflow = loadWorkflow();
   const mutated = structuredClone(workflow);

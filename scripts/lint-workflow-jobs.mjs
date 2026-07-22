@@ -38,9 +38,8 @@ export const EXPECTED_NODE = ["22", "24"];
  * The independent, hard-coded closed set of "<os>::<node>" legs the real
  * `test` job matrix must contain - written directly here as a literal
  * array of string literals, never derived from `EXPECTED_OS`/
- * `EXPECTED_NODE` above. This is the PRODUCTION location the matrix
- * mutation matrix (story-0057-windows-matrix-removal.md, SELF/KEEP/WIN
- * sections) specifies: a constant declared only in a test file protects
+ * `EXPECTED_NODE` above. This is the PRODUCTION location the underlying
+ * design specifies: a constant declared only in a test file protects
  * just that test, while this file's own `main()` - which CI's `lint` job
  * actually runs - would keep shipping the weaker, derived check. A
  * coordinated edit that shrinks BOTH the real workflow matrix AND
