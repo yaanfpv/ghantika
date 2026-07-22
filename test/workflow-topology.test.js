@@ -201,23 +201,31 @@ test("mutation control: a decoy literal-success check in an unused env entry doe
 
 // --- hasLiteralSuccessCheck: the non-adjacent-disjunction CLASS ---
 //
-// Three successive fixes to this file each closed one named spelling of
-// "a `||` sits near the literal" (adjacent trailing, then adjacent
-// leading), and each was defeated by a spelling with one more operand of
-// distance between the literal and the disjunction that actually governs
-// it under real GitHub Actions operator precedence (`&&` binds tighter
-// than `||`, same as JS). Adjacency can never bound "how far away", so the
-// production check now parses the expression and asks a semantic
-// question instead: does forcing this job's result away from 'success'
-// make the WHOLE expression provably false, regardless of every other
-// unknown (see hasLiteralSuccessCheck / evaluateForcingJobFalse's own doc
-// comments)? The battery below exercises that CLASS directly against
-// hasLiteralSuccessCheck - not two more rows for two specific strings,
+// GitHub Actions binds `&&` tighter than `||` (same as JS), so a `||` can
+// govern a literal from any distance away, not merely from directly
+// beside it: `needs.build.result == 'success' && false || true` is
+// unconditionally true regardless of build's result, even with an extra
+// `&&` operand separating the literal from the disjunction that actually
+// controls it. No fixed adjacency distance can bound "how far away can
+// the disjunction be", so the production check parses the expression and
+// asks a semantic question instead: does forcing this job's result away
+// from 'success' make the WHOLE expression provably false, regardless of
+// every other unknown (see hasLiteralSuccessCheck / evaluateForcingJobFalse's
+// own doc comments)? The battery below exercises that CLASS directly
+// against hasLiteralSuccessCheck - not two rows for two specific strings,
 // but every combination of which side the disjunction is on and how many
 // extra operands sit between it and the literal.
+//
+// Every expression below is a real GitHub Actions boolean expression that
+// would let the `gate` job's required-success predicate pass regardless
+// of build's actual result - a bypass of the GATE PREDICATE itself. The
+// assertions confirm the opposite is true of the VERIFIER:
+// hasLiteralSuccessCheck correctly REJECTS every one of them (reports
+// build's check as not established), so none of these forms can slip
+// past the guard undetected.
 
-test("class battery: non-adjacent disjunctions on either side, at increasing operand distance, all bypass the check", () => {
-  const bypassed = [
+test("class battery: non-adjacent disjunctions on either side, at increasing operand distance, are all rejected by the verifier", () => {
+  const gatePredicateBypasses = [
     // trailing, zero operands of distance (the original adjacent case)
     "needs.build.result == 'success' || true",
     // trailing, one extra && operand between the literal and the ||
@@ -231,7 +239,7 @@ test("class battery: non-adjacent disjunctions on either side, at increasing ope
     // leading, two extra && operands
     "true || false && false && needs.build.result == 'success'",
   ];
-  for (const expression of bypassed) {
+  for (const expression of gatePredicateBypasses) {
     assert.equal(
       hasLiteralSuccessCheck(expression, "build"),
       false,
@@ -398,9 +406,10 @@ test("independent inventory: gate.needs and gate's literal success-checks cover 
       `gate.needs is missing the independently-required job "${jobId}"`
     );
     // hasLiteralSuccessCheck (imported from production, not reimplemented
-    // here) is ADJACENCY-aware: it requires the SAME jobId's own
-    // "needs.<id>.result" marker to be immediately followed by
-    // "== 'success'"/"== \"success\"", not merely that both substrings
+    // here) parses the controlling expression and evaluates it with the
+    // SAME jobId's success comparison forced false, reporting the job's
+    // check as established only when that forced evaluation is provably
+    // false - not merely that both "needs.<id>.result" and "'success'"
     // appear SOMEWHERE in the job text independently of each other. A
     // weaker two-independent-substrings check
     // (jobText.includes("needs.x.result") && jobText.includes("'success'"))
@@ -408,9 +417,9 @@ test("independent inventory: gate.needs and gate's literal success-checks cover 
     // checks - exactly the kind of paired-shrink escape this independent
     // inventory exists to close, so reusing the same non-vacuous mechanism
     // here (not a hand-rolled weaker one) matters as much as the
-    // independent job-id list does. It also rejects a trailing `||`
-    // disjunction after the match, so a vacuously-true clause doesn't
-    // count either.
+    // independent job-id list does. It also rejects a disjunction that
+    // governs the literal from any distance, not merely one sitting
+    // directly beside it, so a vacuously-true clause doesn't count either.
     assert.ok(
       hasLiteralSuccessCheck(controllingText, jobId),
       `gate does not appear to literally check needs.${jobId}.result == 'success'`

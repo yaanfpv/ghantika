@@ -19,14 +19,15 @@
  * only - the specific `env` value some step's `run` script actually reads
  * to decide pass/fail (see `collectControllingExpressionText`). Establishing
  * that a job's check is genuinely load-bearing is NOT a text-adjacency
- * question - three successive fixes here each closed one named spelling of
- * "a `||` sits near the literal" (a trailing `|| true`, a leading `(true ||
- * ...)`, then a THIRD spelling where one extra `&&`/`||` operand sits
- * between the literal and the disjunction that actually governs it under
- * real operator precedence, e.g. `needs.build.result == 'success' && false
- * || true`) and each was defeated by the next spelling, because adjacency
- * can never bound "how far away can the disjunction be" - there is always
- * one more operand of distance.
+ * question: GitHub Actions binds `&&` tighter than `||` (same as JS), so a
+ * disjunction can govern a literal from any distance away - `needs.build.
+ * result == 'success' && false || true` is unconditionally true regardless
+ * of build's result, even though the disjunction sits two operands away
+ * from the literal, not beside it. No fixed adjacency distance can bound
+ * "how far away can the disjunction be", since there is always one more
+ * operand of distance between the literal and whatever governs it - which
+ * is why this parses the expression and asks a semantic question instead
+ * of a shape question.
  *
  * WHAT THIS FILE NOW ESTABLISHES, so it does not need re-deriving by hand:
  * `hasLiteralSuccessCheck(expressionText, jobId)` parses `expressionText`
