@@ -30,7 +30,7 @@
     "test": "npm run build && node --test 'test/**/*.test.ts' 'test/**/*.test.js'",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "coverage": "c8 --reporter=text --reporter=json-summary node --test",
+    "coverage": "npm run build && c8 --reporter=text --reporter=json-summary node --test",
     "guard:npm-ci": "node scripts/check-npm-ci-usage.mjs",
     "guard:sdk-pin": "node scripts/check-sdk-exact-pin.mjs",
     "guard:module-boundaries": "node scripts/check-module-boundaries.mjs",
