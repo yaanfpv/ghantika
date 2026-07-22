@@ -30,16 +30,24 @@
  *                                 forbidden outright, the same acquisition-site principle as
  *                                 form 7, independent of what specifier it is later called
  *                                 with. `Reflect` (any method), `.constructor` property access
- *                                 (any base, including through a computed key or a
- *                                 destructuring pattern), and a descriptor read via
+ *                                 (any base, when the key is statically resolvable - dotted,
+ *                                 literal-bracketed, or a computed key foldable to the literal
+ *                                 through one local alias hop - or via a destructuring
+ *                                 pattern), and a descriptor read via
  *                                 `Object.getOwnPropertyDescriptor` naming any of these same
  *                                 identifiers are all closed the same way, outright, as
  *                                 acquisition surfaces rather than named invocation shapes -
- *                                 see scripts/lib/ts-ast.mjs's own header for that design and
- *                                 for the one route it does NOT yet close: a specifier reaching
- *                                 `"node:module"` through anything other than the two literal
- *                                 spellings this guard's specifier check compares against
- *                                 (an absolute, file-URL, or resolver-alias specifier)
+ *                                 see scripts/lib/ts-ast.mjs's own header, and
+ *                                 `CONSTRUCTOR_PROPERTY_NAME`'s own doc comment, for that
+ *                                 design and for the two routes it does NOT yet close: a
+ *                                 specifier reaching `"node:module"` through anything other
+ *                                 than the two literal spellings this guard's specifier check
+ *                                 compares against (an absolute, file-URL, or resolver-alias
+ *                                 specifier), and a `.constructor` access whose key is
+ *                                 GENUINELY non-resolvable (not foldable through one alias
+ *                                 hop) against a base that is neither `globalThis` nor
+ *                                 `process` - which fails OPEN, deliberately, rather than
+ *                                 over-block ordinary computed property access
  *
  * WHAT THIS GUARD ACTUALLY COVERS, STATED PLAINLY: this project does not
  * depend on the monolithic `@modelcontextprotocol/sdk` package at all -

@@ -436,22 +436,44 @@ const SYNTHETIC_GLOBALS_SOURCE = [
 const PROCESS_DANGEROUS_PROPERTIES = new Set(["getBuiltinModule", "dlopen", "binding"]);
 
 /**
- * The property name `.constructor` - flagged UNCONDITIONALLY, on ANY
- * base expression, unlike every other check in this file. Every value in
- * JavaScript carries a `.constructor` reachable off its own prototype
- * chain, so this is not an acquisition-site check keyed to one lexical
- * name or one known-dangerous base the way `process.getBuiltinModule` is
- * - there is no base expression to require being "the real global"
- * first, because the property exists on every object and function
- * regardless of where it came from (`(() => 1).constructor` reaches
- * `Function` with no identifier named `Function` anywhere in source, the
- * SAME class `Reflect.get(globalThis, "eval")` belongs to - reaching a
- * forbidden primitive through generic language structure rather than a
- * name or an import). This codebase has no legitimate reason to read
- * `.constructor` off anything (verified: the real `src/` tree contains no
- * reference to it), so the property access itself is banned outright, the
- * same "zero legitimate use, ban the whole surface" reasoning
+ * The property name `.constructor` - flagged on ANY base expression once
+ * the key is confirmed to be `"constructor"`, unlike every other check in
+ * this file, which additionally requires the base itself to resolve to
+ * one specific known-dangerous identifier (`globalThis`, `process`)
+ * before it even looks at a key. Every value in JavaScript carries a
+ * `.constructor` reachable off its own prototype chain, so there is no
+ * "is the base a real global" question to ask first: `(() => 1).constructor`
+ * reaches `Function` with no identifier named `Function` anywhere in
+ * source, the SAME class `Reflect.get(globalThis, "eval")` belongs to -
+ * reaching a forbidden primitive through generic language structure
+ * rather than a name or an import. This codebase has no legitimate reason
+ * to read `.constructor` off anything (verified: the real `src/` tree
+ * contains no reference to it), so once the key resolves to
+ * `"constructor"` - a dotted access, a literal-bracketed access, or a
+ * computed/bracketed access foldable to that literal through one local
+ * alias hop (`resolvedAccessKeyText`) - the access is a violation on ANY
+ * base, the same "zero legitimate use, ban the whole surface" reasoning
  * `FORBIDDEN_GLOBAL_NAMES` already applies to `module`.
+ *
+ * THE PRECISE BOUNDARY, NARROWER THAN "BANNED OUTRIGHT" SOUNDS: this is a
+ * prohibition on a STATICALLY RESOLVABLE key, not a proof that
+ * `.constructor` access is unreachable. `globalThis` and `process` each
+ * get their OWN dedicated fail-closed behaviour when THEIR key can't be
+ * resolved (`unresolvable-globalthis-access` / `unresolvable-process-
+ * access`, further down in `findCreateRequireImports`) precisely because
+ * those two bases are already suspicious enough to warrant failing closed
+ * on an unresolvable key. A GENUINELY non-resolvable computed key
+ * (`obj[someRuntimeExpression()]`) against a base that is NEITHER
+ * `globalThis` NOR `process` produces NO diagnostic at all - this file
+ * cannot tell that access apart from the ordinary, extremely common
+ * pattern of indexing an object by a runtime-computed string (a config
+ * lookup, a dispatch table, a plain record), and failing closed on every
+ * one of those to close this one further gap would be over-blocking, a
+ * failure this file's own design treats as seriously as a missed
+ * detection elsewhere. So: the ban is real and checkable for a resolvable
+ * key, on any base - it is not a claim that every possible SPELLING of a
+ * `.constructor` access is caught, and this file does not claim
+ * otherwise.
  */
 const CONSTRUCTOR_PROPERTY_NAME = "constructor";
 
@@ -1241,10 +1263,20 @@ function foldConstantString(node) {
  * no runtime capability under any of the shapes above); and a `typeof X`
  * used AS A TYPE (`type T = typeof eval`, erased the same way - contrast
  * with `typeof eval === "function"`, a genuine runtime reference this
- * guard DOES flag). Closing `Reflect` and `.constructor` outright - rather
- * than pattern-matching one demonstrated combination of them - removed
- * the specific class those two belonged to, not the open-ended reflective/
- * structural category itself: `Object.getOwnPropertyDescriptor` reaching
+ * guard DOES flag). ALSO OUT OF SCOPE, disclosed rather than silent: a
+ * `.constructor` access whose key is a GENUINELY non-resolvable computed
+ * expression (not foldable through one local alias hop) against a base
+ * that is neither `globalThis` nor `process` fails OPEN - see
+ * `CONSTRUCTOR_PROPERTY_NAME`'s own doc comment for why closing that
+ * specific gap would mean failing closed on ordinary, ubiquitous computed
+ * property access (a config lookup, a dispatch table) rather than on
+ * anything actually suspicious.
+ *
+ * Closing `Reflect` outright, and `.constructor` outright whenever its key
+ * is statically resolvable - rather than pattern-matching one demonstrated
+ * combination of them - removed the specific class those two belonged to,
+ * not the open-ended reflective/structural category itself:
+ * `Object.getOwnPropertyDescriptor` reaching
  * the same primitives via a property-descriptor read was a further,
  * independently-discovered form in that category, and IS now closed here
  * too (the `property-descriptor-access` acquisition check above) - the
