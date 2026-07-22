@@ -478,7 +478,18 @@ test("kill() over the real wire: a killed job's output buffer remains readable a
     method: "tools/call",
     params: {
       name: "run",
-      arguments: { command: `echo wrote-this > '${marker}'; sleep 30`, shell: true },
+      // A real, cross-platform child that writes the marker file then stays
+      // alive - never a shell one-liner (POSIX `echo ... > file; sleep 30`
+      // has no Windows equivalent: `sleep` is not a real Windows executable,
+      // and cmd.exe's own redirection/chaining syntax differs). Node's own
+      // fs API is portable, so one `-e` snippet does both jobs everywhere.
+      arguments: {
+        command: [
+          process.execPath,
+          "-e",
+          `require("fs").writeFileSync(${JSON.stringify(marker)}, "wrote-this"); setTimeout(() => {}, 30000)`,
+        ],
+      },
     },
   });
   const runLine = await server.nextLine();
