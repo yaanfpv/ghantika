@@ -669,6 +669,83 @@ test("documented boundary: a TWO-HOP alias chain is not chased (const g = global
 });
 
 // ---------------------------------------------------------------------------
+// Object.getOwnPropertyDescriptor - a DESCRIPTOR READ reaches the same value
+// a direct property access would, without ever writing the target's key as
+// a real property-access AST node - an independent adversarial pass proved
+// both rows below guard-green and runtime-executing before this guard
+// recognized Object.getOwnPropertyDescriptor as an acquisition site at all.
+// ---------------------------------------------------------------------------
+
+test('Object.getOwnPropertyDescriptor(globalThis, "eval")?.value reaches the real eval through a descriptor read, not a direct property access, and is caught', () => {
+  const hits = findTasksImports(
+    "const e = Object.getOwnPropertyDescriptor(globalThis, 'eval')?.value;\ne('1');\n"
+  );
+  assert.ok(
+    hits.some((h) => h.includes("getOwnPropertyDescriptor")),
+    `expected a property-descriptor-access violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("Object.getOwnPropertyDescriptor(Object.getPrototypeOf(fn), \"constructor\")?.value reaches .constructor through a descriptor read off an ARBITRARY target - caught unconditionally on the key, the same as a direct .constructor access", () => {
+  const hits = findTasksImports(
+    "const fn = () => {};\n" +
+      "const F = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(fn), 'constructor')?.value;\n" +
+      "F('return 1');\n"
+  );
+  assert.ok(
+    hits.some((h) => h.includes("getOwnPropertyDescriptor")),
+    `expected a property-descriptor-access violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a descriptor read via computed/bracket Object[\"getOwnPropertyDescriptor\"] is caught too, not just the dotted spelling", () => {
+  const hits = findTasksImports("const d = Object['getOwnPropertyDescriptor'](globalThis, 'eval');\n");
+  assert.ok(hits.some((h) => h.includes("getOwnPropertyDescriptor")));
+});
+
+test("a descriptor read targeting process's own dangerous property is caught the same way", () => {
+  const hits = findTasksImports(
+    "const d = Object.getOwnPropertyDescriptor(process, 'getBuiltinModule');\n"
+  );
+  assert.ok(hits.some((h) => h.includes("getOwnPropertyDescriptor")));
+});
+
+test("a descriptor key resolved through one local alias hop (const k = 'eval'; Object.getOwnPropertyDescriptor(globalThis, k)) is caught, not just a literal key", () => {
+  const hits = findTasksImports(
+    "const k = 'eval';\nconst d = Object.getOwnPropertyDescriptor(globalThis, k);\n"
+  );
+  assert.ok(hits.some((h) => h.includes("getOwnPropertyDescriptor")));
+});
+
+test("fail-closed: a descriptor read off globalThis with a genuinely unresolvable key is flagged, cannot prove it avoids a forbidden name", () => {
+  const hits = findTasksImports(
+    "const key = getKey();\nconst d = Object.getOwnPropertyDescriptor(globalThis, key);\n"
+  );
+  assert.ok(
+    hits.some((h) => h.includes("getOwnPropertyDescriptor")),
+    `expected the unresolvable-key descriptor read to fail closed, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a LOCALLY SHADOWED Object is never flagged, even for a descriptor read against globalThis", () => {
+  const hits = findTasksImports(
+    "const Object = { getOwnPropertyDescriptor: () => undefined };\n" +
+      "const d = Object.getOwnPropertyDescriptor(globalThis, 'eval');\n"
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("green control: a descriptor read off an unrelated, harmless object with an unrelated key is never flagged", () => {
+  const hits = findTasksImports("const safe = {};\nconst d = Object.getOwnPropertyDescriptor(safe, 'eval');\n");
+  assert.deepEqual(hits, []);
+});
+
+test("green control: a descriptor read for a harmless property on the real process global is never flagged - only the dangerous three properties are", () => {
+  const hits = findTasksImports("const d = Object.getOwnPropertyDescriptor(process, 'env');\n");
+  assert.deepEqual(hits, []);
+});
+
+// ---------------------------------------------------------------------------
 // process.getBuiltinModule - REGRESSION: an executable fixture demonstrated
 // this route reaches createRequire via a supported Node builtin-module API
 // with no import/require syntax naming "node:module" anywhere - previously

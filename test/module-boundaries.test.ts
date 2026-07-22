@@ -614,6 +614,54 @@ test("documented boundary: a TWO-HOP alias chain is not chased (const g = global
 });
 
 // ---------------------------------------------------------------------------
+// Object.getOwnPropertyDescriptor - see the matching section in
+// test/no-tasks-import.test.ts for the full rationale. Mirrored here since
+// this guard shares the exact same acquisition-site detection function.
+// ---------------------------------------------------------------------------
+
+test('Object.getOwnPropertyDescriptor(globalThis, "eval")?.value reaches the real eval through a descriptor read, not a direct property access, and is caught', () => {
+  const hits = siblingImportsFrom(
+    "const e = Object.getOwnPropertyDescriptor(globalThis, 'eval')?.value;\ne('1');\n"
+  );
+  assert.ok(
+    hits.some((h) => h.includes("getOwnPropertyDescriptor")),
+    `expected a property-descriptor-access violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("Object.getOwnPropertyDescriptor(Object.getPrototypeOf(fn), \"constructor\")?.value reaches .constructor through a descriptor read off an ARBITRARY target - caught unconditionally on the key, the same as a direct .constructor access", () => {
+  const hits = siblingImportsFrom(
+    "const fn = () => {};\n" +
+      "const F = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(fn), 'constructor')?.value;\n" +
+      "F('return 1');\n"
+  );
+  assert.ok(
+    hits.some((h) => h.includes("getOwnPropertyDescriptor")),
+    `expected a property-descriptor-access violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a descriptor key resolved through one local alias hop (const k = 'eval'; Object.getOwnPropertyDescriptor(globalThis, k)) is caught, not just a literal key", () => {
+  const hits = siblingImportsFrom(
+    "const k = 'eval';\nconst d = Object.getOwnPropertyDescriptor(globalThis, k);\n"
+  );
+  assert.ok(hits.some((h) => h.includes("getOwnPropertyDescriptor")));
+});
+
+test("green control: a LOCALLY SHADOWED Object is never flagged, even for a descriptor read against globalThis", () => {
+  const hits = siblingImportsFrom(
+    "const Object = { getOwnPropertyDescriptor: () => undefined };\n" +
+      "const d = Object.getOwnPropertyDescriptor(globalThis, 'eval');\n"
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("green control: a descriptor read for a harmless property on the real process global is never flagged - only the dangerous three properties are", () => {
+  const hits = siblingImportsFrom("const d = Object.getOwnPropertyDescriptor(process, 'env');\n");
+  assert.deepEqual(hits, []);
+});
+
+// ---------------------------------------------------------------------------
 // process.getBuiltinModule - REGRESSION: an executable fixture demonstrated
 // this route reaches createRequire via a supported Node builtin-module API
 // with no import/require syntax naming "node:module" anywhere - previously

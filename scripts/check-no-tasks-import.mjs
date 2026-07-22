@@ -24,17 +24,19 @@
  *                                 of what its returned function later loads, resolved by
  *                                 where the `createRequire` binding itself came from (see
  *                                 `createRequireImportBindingLabel`'s own doc comment)
- *   8. process.getBuiltinModule  process.getBuiltinModule("node:module").createRequire(...) -
- *                                 referencing this ONE property of the global `process` is
+ *   8. process's dangerous props  process.getBuiltinModule("node:module").createRequire(...) -
+ *                                 referencing any of `process.getBuiltinModule`/`.dlopen`/
+ *                                 `.binding`, directly or through one local alias hop, is
  *                                 forbidden outright, the same acquisition-site principle as
  *                                 form 7, independent of what specifier it is later called
- *                                 with. `Reflect` (any method) and `.constructor` property
- *                                 access (any base) are closed the same way, outright, as
+ *                                 with. `Reflect` (any method), `.constructor` property access
+ *                                 (any base, including through a computed key or a
+ *                                 destructuring pattern), and a descriptor read via
+ *                                 `Object.getOwnPropertyDescriptor` naming any of these same
+ *                                 identifiers are all closed the same way, outright, as
  *                                 acquisition surfaces rather than named invocation shapes -
  *                                 see scripts/lib/ts-ast.mjs's own header for that design and
- *                                 for the routes it does NOT yet close: reflective acquisition
- *                                 via `Object.getOwnPropertyDescriptor` reading the same
- *                                 primitives off a descriptor, and a specifier reaching
+ *                                 for the one route it does NOT yet close: a specifier reaching
  *                                 `"node:module"` through anything other than the two literal
  *                                 spellings this guard's specifier check compares against
  *                                 (an absolute, file-URL, or resolver-alias specifier)
@@ -114,11 +116,13 @@ const UNRESOLVABLE_DYNAMIC_IMPORT_LABEL =
  * or one imported from a package other than `"node:module"` - provenance
  * is the only thing this guard trusts.
  *
- * @param {"named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access" | "process-dangerous-property-access" | "unresolvable-process-access" | "reflect-reference" | "constructor-property-access"} kind
+ * @param {"named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access" | "process-dangerous-property-access" | "unresolvable-process-access" | "reflect-reference" | "constructor-property-access" | "property-descriptor-access"} kind
  * @returns {string}
  */
 function createRequireImportBindingLabel(kind) {
   switch (kind) {
+    case "property-descriptor-access":
+      return "<reads Object.getOwnPropertyDescriptor(target, key) where key resolves to a banned identifier - constructor, one of the four bare globals off globalThis, or a dangerous process property - a descriptor read reaches the same value a direct property access would without ever writing the identifier as a property-access key, so it's forbidden at the point of the descriptor call itself, unconditional on whether .value/.get is later extracted>";
     case "process-dangerous-property-access":
       return "<references one of process's dangerous properties (getBuiltinModule, dlopen, or binding) - directly, or through one local alias hop - each a route to native/builtin-loading capability with no import/require syntax naming its target anywhere, forbidden outright at the point of reference the same as the four bare globals, regardless of what specifier it is later called with or how the reference is stored/aliased>";
     case "unresolvable-process-access":

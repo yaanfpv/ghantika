@@ -990,20 +990,28 @@ function foldConstantString(node) {
  *     case (`const alias = module; alias.require(...)`) close via the same
  *     acquisition-site principle as the other three, instead of needing a
  *     dedicated two-step "traces to module, AND accesses .require" check.
- *   - `process.getBuiltinModule` - a FIFTH acquisition site, narrower in
- *     shape than the four bare globals above: unlike them, bare `process`
- *     is NOT flagged (it is used extensively and legitimately throughout
- *     this codebase), only the specific property
- *     `.getBuiltinModule` is - resolved the same PropertyAccessExpression/
- *     ElementAccessExpression + static-key-text machinery this file
- *     already uses for `globalThis.eval`-shaped access, just applied to a
- *     different unshadowed base identifier and a different single
- *     dangerous key (`PROCESS_DANGEROUS_PROPERTY`, not the four-name set).
+ *   - `process`'s dangerous properties - a FIFTH acquisition site, narrower
+ *     in shape than the four bare globals above: unlike them, bare
+ *     `process` is NOT flagged (it is used extensively and legitimately
+ *     throughout this codebase), only three specific properties are -
+ *     `getBuiltinModule`, `dlopen`, and `binding` (`PROCESS_DANGEROUS_
+ *     PROPERTIES`, a three-name set - `dlopen`/`binding` were added
+ *     alongside the one-hop alias support below, closing the sibling
+ *     acquisition routes that banning `getBuiltinModule` alone left open)
+ *     - resolved the same PropertyAccessExpression/ElementAccessExpression
+ *     + static-key-text machinery this file already uses for
+ *     `globalThis.eval`-shaped access, just applied to a different
+ *     unshadowed base identifier and a three-name dangerous-key set.
  *     `process.getBuiltinModule("node:module").createRequire(...)` is
  *     flagged at the `process.getBuiltinModule` property-access itself -
  *     the same acquisition-site principle as the other four, so storage,
  *     aliasing, or any invocation shape downstream of that reference is
- *     already covered without a separate check. A COMPUTED, non-
+ *     already covered without a separate check. `process`'s base is now
+ *     resolved through exactly one local alias hop too, the same as
+ *     `globalThis` (`const p = process; p.getBuiltinModule(...)`, and
+ *     `let p; p = process; p.getBuiltinModule(...)` - a bare reassignment
+ *     with no initializer of its own is exactly as real an alias as one
+ *     with an initializer, and is followed the same way). A COMPUTED, non-
  *     statically-foldable key on an unshadowed `process` base
  *     (`process[someComputedExpr]`) FAILS CLOSED the same way an
  *     unresolvable `globalThis[...]` access does, verified against the
@@ -1032,7 +1040,44 @@ function foldConstantString(node) {
  *     legitimate use, ban the whole surface" reasoning as `module` and
  *     `Reflect`, just applied to a property key instead of a global
  *     identifier - verified: the real `src/` tree contains no
- *     `.constructor` access of any kind).
+ *     `.constructor` access of any kind). Two further spellings of this
+ *     same unconditional-on-base access are closed the same way, each
+ *     independently, since the ban is on the KEY, not the syntax that
+ *     names it: a COMPUTED key foldable to the literal string
+ *     `"constructor"` through one local alias hop (`const k =
+ *     "constructor"; obj[k]` - `accessKeyText` alone folds only a literal
+ *     or `+`-concatenated key, never a variable reference, even though `k`
+ *     can only ever hold that one string; `resolvedAccessKeyText` extends
+ *     it through that one hop, mirroring `isUnshadowedGlobalOrOneHopAlias`'s
+ *     own one-hop discipline), and DESTRUCTURING the property directly off
+ *     any source (`const { constructor: F } = anything`, `({ constructor:
+ *     F } = anything)`) - both checked unconditionally on their own source
+ *     expression, before any globalThis/process-specific destructuring
+ *     check runs, for the identical reason the direct property-access
+ *     form is unconditional on its base.
+ *   - A CAST OR NON-NULL ASSERTION sitting directly on an acquisition base
+ *     no longer defeats symbol resolution: `globalThis!.eval(x)` and
+ *     `(globalThis as typeof globalThis).eval(x)` both walked straight
+ *     through an earlier version of this file, because unwrapping only
+ *     stripped parentheses (`unwrapParens`) - a `NonNullExpression` or an
+ *     `AsExpression`/`SatisfiesExpression` changed the base node's shape
+ *     from a bare `Identifier` to a wrapper node every base-expression
+ *     check here requires seeing PAST before it will even attempt symbol
+ *     resolution. `unwrapParens` is now `unwrapTransparentWrapper`, a
+ *     general unwrapper for all four syntax layers that are erased at
+ *     TypeScript emit and change nothing about which value an expression
+ *     reads at runtime - parentheses, a non-null assertion, an `as` cast,
+ *     and a `satisfies` clause, in any combination and order.
+ *   - AN AMBIENT `declare` SHADOW does not actually shadow at runtime:
+ *     `declare const Reflect: {...}; Reflect.get(globalThis, "eval")`
+ *     type-checks as though `Reflect` were declared locally, but `declare`
+ *     is TypeScript-only and emits no runtime binding whatsoever - the
+ *     compiled reference is the real global. `isUnshadowedGlobalSymbol`
+ *     now treats an in-file declaration as a real shadow only when it
+ *     actually EMITS (`isAmbientDeclaration` checks for the `Ambient`
+ *     modifier flag), so a genuine local `const`/`let`/parameter/import
+ *     still shadows exactly as before, and only the ambient, erased case
+ *     falls through to the true global.
  *
  * WHY THESE TWO ARE HERE NOW, NOT DOCUMENTED AS OUT OF SCOPE: an earlier
  * version of this guard treated `process.getBuiltinModule`, `.constructor`,
@@ -1074,12 +1119,15 @@ function foldConstantString(node) {
  * than pattern-matching one demonstrated combination of them - removed
  * the specific class those two belonged to, not the open-ended reflective/
  * structural category itself: `Object.getOwnPropertyDescriptor` reaching
- * the same primitives via a property-descriptor read is a further,
- * independently-discovered form in that category, not yet closed here.
- * This file does not claim the category is exhausted, and per the reasoning
- * above (a fixed list of named spellings is never the boundary itself),
- * it never will - a newly demonstrated route is a reason to extend this
- * function's real coverage, not evidence that the prior extension failed.
+ * the same primitives via a property-descriptor read was a further,
+ * independently-discovered form in that category, and IS now closed here
+ * too (the `property-descriptor-access` acquisition check above) - the
+ * category is not claimed exhausted by closing this one further form
+ * either. This file does not claim the reflective/structural category is
+ * exhausted, and per the reasoning above (a fixed list of named spellings
+ * is never the boundary itself), it never will - a newly demonstrated
+ * route is a reason to extend this function's real coverage, not evidence
+ * that the prior extension failed.
  *
  * SPECIFIER COMPARISON IS ALSO NOT YET RESOLVER-BASED: every import/
  * dynamic-import/re-export branch above decides whether a specifier reaches
@@ -1101,7 +1149,7 @@ function foldConstantString(node) {
  * checked per-specifier, never treated as clearing the whole clause.
  *
  * @param {import("typescript").SourceFile} sourceFile
- * @returns {{ node: import("typescript").Node, kind: "named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access" | "process-dangerous-property-access" | "unresolvable-process-access" | "reflect-reference" | "constructor-property-access" }[]}
+ * @returns {{ node: import("typescript").Node, kind: "named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access" | "process-dangerous-property-access" | "unresolvable-process-access" | "reflect-reference" | "constructor-property-access" | "property-descriptor-access" }[]}
  */
 export function findCreateRequireImports(sourceFile) {
   const hits = [];
@@ -1218,6 +1266,80 @@ export function findCreateRequireImports(sourceFile) {
         }
       }
       return;
+    }
+
+    // --- Object.getOwnPropertyDescriptor(target, key) - a DESCRIPTOR READ
+    // reaches the same value a direct property access would (an accessor
+    // descriptor's `.get`, or a data descriptor's `.value`), without ever
+    // writing the target's key as a real PropertyAccessExpression/
+    // ElementAccessExpression AST node at all - every check above this one
+    // resolves a dangerous key off an ACCESS node's own base/key fields,
+    // and a descriptor call has neither: `target` and `key` are ordinary
+    // call arguments, so this needs its own recognition rather than
+    // falling out of the access-based checks for free. `Object` is
+    // resolved the same unshadowed-global-or-one-hop-alias way as
+    // `globalThis`/`process` (`isUnshadowedObjectReference`) so a locally
+    // shadowed `Object` stays green; the call's own callee key
+    // (`getOwnPropertyDescriptor`, dotted or computed) is resolved via
+    // `resolvedAccessKeyText`, the same machinery every other property
+    // access in this file already uses. Once confirmed to be a real
+    // `Object.getOwnPropertyDescriptor` call, the SAME dangerous-key
+    // reasoning already applied to a direct access is applied to the
+    // call's OWN two arguments instead of an access node's base/key: the
+    // key argument is resolved through one alias hop
+    // (`resolveOneHopStringExpression`, the same as a computed access
+    // key), and is UNCONDITIONALLY a violation when it folds to
+    // `"constructor"` (matching the direct `.constructor` check's own
+    // unconditional-on-base reasoning - a descriptor read cannot make a
+    // universally-dangerous property any safer than a direct read would
+    // have been), or a violation when the TARGET argument resolves to the
+    // real unshadowed `globalThis`/`process` and the key names one of
+    // their own respective dangerous keys (or is unresolvable, failing
+    // closed the same way an unresolvable direct access does). This is
+    // flagged at the CALL itself, unconditional on whether the returned
+    // descriptor's `.value`/`.get` is ever actually extracted - the same
+    // acquisition-site principle as every other check in this function. ---
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression;
+      if (
+        (ts.isPropertyAccessExpression(callee) || ts.isElementAccessExpression(callee)) &&
+        resolvedAccessKeyText(callee, checker, checkedSourceFile) === "getOwnPropertyDescriptor" &&
+        isUnshadowedObjectReference(
+          unwrapTransparentWrapper(callee.expression),
+          checker,
+          checkedSourceFile
+        )
+      ) {
+        const [targetArg, keyArg] = node.arguments;
+        const key =
+          keyArg !== undefined
+            ? resolveOneHopStringExpression(keyArg, checker, checkedSourceFile)
+            : undefined;
+
+        if (key === CONSTRUCTOR_PROPERTY_NAME) {
+          hits.push({ node, kind: "property-descriptor-access" });
+          return;
+        }
+
+        const targetBase =
+          targetArg !== undefined ? unwrapTransparentWrapper(targetArg) : undefined;
+        if (
+          targetBase !== undefined &&
+          isUnshadowedGlobalThisReference(targetBase, checker, checkedSourceFile) &&
+          (key === undefined || FORBIDDEN_GLOBAL_NAMES.has(key))
+        ) {
+          hits.push({ node, kind: "property-descriptor-access" });
+          return;
+        }
+        if (
+          targetBase !== undefined &&
+          isUnshadowedProcessReference(targetBase, checker, checkedSourceFile) &&
+          (key === undefined || PROCESS_DANGEROUS_PROPERTIES.has(key))
+        ) {
+          hits.push({ node, kind: "property-descriptor-access" });
+          return;
+        }
+      }
     }
 
     // --- ACQUISITION SITE: the global `eval` / `Function` / `require` /
