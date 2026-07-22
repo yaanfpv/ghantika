@@ -110,8 +110,8 @@ jobs:
         run: npm run report:coverage-delta
 
   # The test job is the one that actually proves the package works, so it
-  # runs the full operating-system by Node-version matrix rather than a
-  # single representative leg the way build/typecheck/lint do.
+  # runs an operating-system by Node-version matrix rather than a single
+  # representative leg the way build/typecheck/lint do.
   test:
     name: test (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}

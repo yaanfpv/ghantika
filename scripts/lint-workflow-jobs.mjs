@@ -3,15 +3,18 @@
  * Structural lints over .github/workflows/ci.yml that go beyond the
  * needs/if topology scripts/verify-workflow-topology.mjs checks:
  *
- *  - no job the "gate" aggregate depends on may set `continue-on-error:
- *    true` anywhere, since that would let a step (and therefore the job)
- *    report success on GitHub's dashboard while actually having failed -
- *    exactly the kind of pass-that-isn't-a-pass the gate job exists to
- *    rule out.
+ *  - no job the "gate" aggregate depends on may set `continue-on-error`
+ *    to anything other than absent or the literal `false` - not just the
+ *    literal boolean `true`, but also a quoted string or a GitHub Actions
+ *    expression, either of which GitHub treats identically to the
+ *    boolean at runtime. Any of those would let a step (and therefore
+ *    the job) report success on GitHub's dashboard while actually having
+ *    failed - exactly the kind of pass-that-isn't-a-pass the gate job
+ *    exists to rule out.
  *  - the `test` job's matrix has to cover every combination of operating
  *    system and Node version this project claims to support, so a leg
- *    can't quietly go missing (e.g. nobody notices Windows + Node 24 was
- *    dropped from the matrix).
+ *    can't quietly go missing (e.g. nobody notices a leg silently drops
+ *    from the matrix).
  *  - the workflow's job list must never contain a job pretending to be
  *    secret scanning or Dependabot - those are GitHub repository settings
  *    (and, for Dependabot, a separate .github/dependabot.yml config file),
