@@ -165,6 +165,17 @@ export function findGateOwnContinueOnError(jobs, aggregateId = AGGREGATE_JOB_ID)
  * Cross-products a matrix's `os` and `node` axes, honoring `exclude`
  * entries, into a flat list of "<os>::<node>" leg keys.
  *
+ * An `exclude` entry may omit either axis key entirely, and GitHub Actions
+ * treats an omitted key as "matches anything on that axis" - not "matches
+ * nothing". So `{ os: "macos-latest" }` (no `node` key) excludes every
+ * Node version for macos-latest, and `{ node: "24" }` (no `os` key)
+ * excludes node 24 across every OS. Both axes are checked the same way for
+ * this reason: `entry.os === undefined` already meant "any os" here, and
+ * `entry.node === undefined` gets the identical treatment for the node
+ * axis, rather than falling through to `String(undefined) === String(node)`
+ * (always false), which would silently keep a leg that a real
+ * single-axis exclude was supposed to drop.
+ *
  * @param {{ os?: string[], node?: (string | number)[], exclude?: any[] }} [matrix]
  * @returns {string[]}
  */
@@ -177,7 +188,8 @@ export function computeMatrixLegs(matrix) {
     for (const node of nodeList) {
       const excluded = excludes.some(
         (entry) =>
-          (entry.os === undefined || entry.os === os) && String(entry.node) === String(node)
+          (entry.os === undefined || entry.os === os) &&
+          (entry.node === undefined || String(entry.node) === String(node))
       );
       if (!excluded) {
         legs.push(`${os}::${node}`);
@@ -209,6 +221,62 @@ export function verifyMatrixCompleteness(
     }
   }
   return missing;
+}
+
+/**
+ * The actual invariant `EXPECTED_OS`/`EXPECTED_NODE` must hold is "a
+ * non-empty array of non-empty strings" - not merely "non-empty", which a
+ * bare string would also satisfy (a string has `.length > 0` too, and
+ * iterates as individual characters if ever spread or mapped over,
+ * silently producing garbage leg keys rather than an error). An array
+ * containing `null` or an empty string is equally unsafe: either composes
+ * into a leg key that names no real OS/Node value at all.
+ *
+ * @param {unknown} value
+ * @param {string} name
+ * @returns {string | null} a human-readable problem, or null if clean
+ */
+function describeExpectedAxisViolation(value, name) {
+  if (!Array.isArray(value)) {
+    const gotType =
+      typeof value === "string" ? `the string ${JSON.stringify(value)}` : typeof value;
+    return `${name} is not an array (got ${gotType}) - the matrix-completeness check requires an actual array, not merely something with a truthy .length`;
+  }
+  if (value.length === 0) {
+    return `${name} is empty - the matrix-completeness check would vacuously pass with no ${name === "EXPECTED_OS" ? "operating systems" : "Node versions"} required at all`;
+  }
+  const badIndex = value.findIndex((entry) => typeof entry !== "string" || entry.length === 0);
+  if (badIndex !== -1) {
+    return `${name} contains a non-string or empty-string element at index ${badIndex} (${JSON.stringify(value[badIndex])}) - every element must be a real, non-empty string`;
+  }
+  return null;
+}
+
+/**
+ * `verifyMatrixCompleteness` above only ever reports legs that are present
+ * in `expectedOs x expectedNode` but absent from the real matrix - it has
+ * no opinion at all about whether `expectedOs`/`expectedNode` themselves
+ * are genuinely a non-empty array of non-empty strings. A degenerate value
+ * for either (empty, not an array, or containing a null/empty-string
+ * element) makes the cross-product either empty or garbage, so the
+ * completeness loop above either iterates zero times (vacuously
+ * "complete" no matter what the real matrix contains) or compares against
+ * leg keys nothing real could ever match. Nothing else in this file's
+ * production `main()` path would catch that: it is a direct guard against
+ * the two module-level constants themselves being degenerate, not against
+ * a leg going missing from the matrix.
+ *
+ * @param {unknown} [expectedOs]
+ * @param {unknown} [expectedNode]
+ * @returns {string[]} human-readable problems; empty means clean
+ */
+export function verifyExpectedAxesNonEmpty(expectedOs = EXPECTED_OS, expectedNode = EXPECTED_NODE) {
+  const errors = [];
+  const osViolation = describeExpectedAxisViolation(expectedOs, "EXPECTED_OS");
+  if (osViolation) errors.push(osViolation);
+  const nodeViolation = describeExpectedAxisViolation(expectedNode, "EXPECTED_NODE");
+  if (nodeViolation) errors.push(nodeViolation);
+  return errors;
 }
 
 /**
@@ -323,6 +391,11 @@ function main() {
     );
   }
 
+  const expectedAxesErrors = verifyExpectedAxesNonEmpty();
+  for (const message of expectedAxesErrors) {
+    errors.push(message);
+  }
+
   const testJob = jobs[TEST_JOB_ID];
   if (!testJob) {
     errors.push(`no "${TEST_JOB_ID}" job found in the workflow`);
@@ -363,7 +436,7 @@ function main() {
     return;
   }
   console.log(
-    `${path.relative(REPO_ROOT, WORKFLOW_PATH)} is clean: no continue-on-error (including on gate itself), full test matrix against both the derived and independent oracles, no fake governance jobs`
+    `${path.relative(REPO_ROOT, WORKFLOW_PATH)} is clean: no forbidden continue-on-error (including on gate itself), complete test matrix against both the derived and independent oracles, no fake governance jobs`
   );
 }
 

@@ -7,6 +7,7 @@ import {
   TEST_JOB_ID,
   computeMatrixLegs,
   loadWorkflow,
+  verifyExpectedAxesNonEmpty,
   verifyMatrixCompleteness,
 } from "../scripts/lint-workflow-jobs.mjs";
 
@@ -59,6 +60,50 @@ test("mutation control: an exclude entry silently dropping one leg is caught", (
 
   const missing = verifyMatrixCompleteness(mutated.jobs[TEST_JOB_ID]);
   assert.deepEqual(missing, ["macos-latest::24"]);
+});
+
+// Mutation control: a real GitHub Actions `exclude` entry may omit the
+// `node` key entirely - meaning "drop every node version for this os", not
+// "drop nothing". Before the fix, computeMatrixLegs always required
+// String(entry.node) === String(node), and String(undefined) is the
+// literal string "undefined", which never matches a real node value - so
+// an os-only exclude was silently ignored and both legs it should have
+// dropped stayed in the matrix.
+test("mutation control: an os-only exclude entry (no node key) drops every node version for that os", () => {
+  const workflow = loadWorkflow();
+  const mutated = structuredClone(workflow);
+  mutated.jobs[TEST_JOB_ID].strategy.matrix.exclude = [{ os: "macos-latest" }];
+
+  const legs = computeMatrixLegs(mutated.jobs[TEST_JOB_ID].strategy.matrix);
+  assert.ok(
+    !legs.includes("macos-latest::22") && !legs.includes("macos-latest::24"),
+    `expected both macos-latest legs to be excluded, got: ${JSON.stringify(legs)}`
+  );
+
+  const missing = verifyMatrixCompleteness(mutated.jobs[TEST_JOB_ID]);
+  assert.deepEqual(missing.sort(), ["macos-latest::22", "macos-latest::24"].sort());
+});
+
+// Sibling shape, for coverage rather than a second bug proof: an exclude
+// entry may instead omit the `os` key entirely - meaning "drop this node
+// version across every os". This direction was NEVER broken, before or
+// after the fix - entry.os === undefined already meant "any os" in the
+// old code too, so a node-only exclude already worked correctly. This
+// test is asserting that the fix didn't regress the direction that was
+// already fine, not proving a second bug was killed.
+test("mutation control: a node-only exclude entry (no os key) drops that node version across every os", () => {
+  const workflow = loadWorkflow();
+  const mutated = structuredClone(workflow);
+  mutated.jobs[TEST_JOB_ID].strategy.matrix.exclude = [{ node: "24" }];
+
+  const legs = computeMatrixLegs(mutated.jobs[TEST_JOB_ID].strategy.matrix);
+  assert.ok(
+    !legs.includes("ubuntu-latest::24") && !legs.includes("macos-latest::24"),
+    `expected both node-24 legs to be excluded, got: ${JSON.stringify(legs)}`
+  );
+
+  const missing = verifyMatrixCompleteness(mutated.jobs[TEST_JOB_ID]);
+  assert.deepEqual(missing.sort(), ["ubuntu-latest::24", "macos-latest::24"].sort());
 });
 
 test("restoring the full matrix after a mutation goes clean again", () => {
@@ -146,3 +191,61 @@ for (const [axis, droppedValue] of [
     );
   });
 }
+
+// --- Mandatory protection: EXPECTED_OS/EXPECTED_NODE can't be emptied ---
+//
+// verifyMatrixCompleteness derives "what's expected" by cross-producting
+// expectedOs x expectedNode. If either axis is emptied, the cross-product
+// is empty, so the completeness loop iterates zero times and reports zero
+// missing legs - vacuously "complete" regardless of what the real matrix
+// contains. verifyExpectedAxesNonEmpty is the direct guard against that:
+// it has no opinion about the real matrix at all, only about whether the
+// two module-level constants themselves are non-empty.
+test("the real EXPECTED_OS/EXPECTED_NODE constants pass the non-empty guard clean", () => {
+  assert.deepEqual(verifyExpectedAxesNonEmpty(), []);
+});
+
+test("mutation control: an emptied EXPECTED_OS is named by the non-empty guard", () => {
+  const errors = verifyExpectedAxesNonEmpty([], EXPECTED_NODE);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /EXPECTED_OS is empty/);
+});
+
+test("mutation control: an emptied EXPECTED_NODE is named by the non-empty guard", () => {
+  const errors = verifyExpectedAxesNonEmpty(EXPECTED_OS, []);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /EXPECTED_NODE is empty/);
+});
+
+test("mutation control: both axes emptied at once are both named by the non-empty guard", () => {
+  const errors = verifyExpectedAxesNonEmpty([], []);
+  assert.equal(errors.length, 2);
+  assert.ok(errors.some((error) => /EXPECTED_OS is empty/.test(error)));
+  assert.ok(errors.some((error) => /EXPECTED_NODE is empty/.test(error)));
+});
+
+// "Non-empty" alone is not the whole escape class: a non-empty ARRAY of
+// non-empty STRINGS is the real invariant. Each of the three sibling forms
+// below is a distinct way to satisfy a naive non-empty check while still
+// producing a degenerate or garbage expectation.
+
+test("mutation control: EXPECTED_OS containing an empty-string element is named by the guard", () => {
+  const errors = verifyExpectedAxesNonEmpty(["ubuntu-latest", ""], EXPECTED_NODE);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /EXPECTED_OS contains a non-string or empty-string element at index 1/);
+});
+
+test("mutation control: EXPECTED_NODE containing a null element is named by the guard", () => {
+  const errors = verifyExpectedAxesNonEmpty(EXPECTED_OS, ["22", null]);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /EXPECTED_NODE contains a non-string or empty-string element at index 1/);
+});
+
+test("mutation control: EXPECTED_OS being a bare string (not an array) is named by the guard, not silently accepted by a naive .length check", () => {
+  // "ubuntu-latest" has .length > 0 and would pass a naive non-empty
+  // check, while actually iterating as individual characters if ever
+  // spread or mapped over - exactly the escape this case exists to catch.
+  const errors = verifyExpectedAxesNonEmpty("ubuntu-latest", EXPECTED_NODE);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /EXPECTED_OS is not an array \(got the string "ubuntu-latest"\)/);
+});
