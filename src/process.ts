@@ -558,6 +558,32 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
+/**
+ * True if process GROUP `-pid` still has ANY member alive - the same
+ * real, zero-side-effect `kill(target, 0)` probe `isProcessAlive` uses,
+ * but targeting the whole group via a NEGATIVE pid (see
+ * `signalProcessGroupPosix`'s own docs for the identical POSIX negative-
+ * pid semantics: `kill(2)` with a negative target signals every process
+ * in that group, and returns ESRCH only once none remain).
+ *
+ * `isProcessAlive(pid)` alone is NOT sufficient to confirm a process
+ * GROUP is dead: it checks only the one pid named. A group's LEADER can
+ * exit (from a plain, untrapped SIGTERM, for example) while a descendant
+ * - a different pid, in the same group, that ignores or is slower to
+ * respond to the same signal - is still running. `isProcessAlive` on the
+ * leader's own pid alone reads that as "dead" even though the group
+ * patently is not.
+ */
+export function isProcessGroupAlive(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    return err.code !== "ESRCH";
+  }
+}
+
 export type SignalResult = { readonly ok: true } | { readonly ok: false; readonly message: string };
 
 /**
@@ -581,21 +607,26 @@ export function signalProcessGroupPosix(pid: number, signal: string): SignalResu
 }
 
 /**
- * Polls `isProcessAlive` until either `pid` is confirmed gone or
+ * Polls `isAlive(pid)` until it reports false (confirmed gone) or
  * `timeoutMs` elapses - the real wait loop behind the grace period.
- * `pollIntervalMs`
- * defaults small so death is detected promptly rather than only at the
- * next coarse tick, and is itself capped to never overshoot the deadline.
+ * `pollIntervalMs` defaults small so death is detected promptly rather
+ * than only at the next coarse tick, and is itself capped to never
+ * overshoot the deadline. Defaults `isAlive` to `isProcessAlive` (a
+ * single pid); pass `isProcessGroupAlive` to wait for a whole process
+ * GROUP to be gone instead - `killProcessGroupPosix` does exactly this,
+ * since a group-level kill must confirm the group is genuinely gone, not
+ * merely that its leader exited (see `isProcessGroupAlive`'s own docs).
  */
 export function waitForProcessDeath(
   pid: number,
   timeoutMs: number,
-  pollIntervalMs = 50
+  pollIntervalMs = 50,
+  isAlive: (pid: number) => boolean = isProcessAlive
 ): Promise<boolean> {
   return new Promise((resolve) => {
     const deadline = Date.now() + timeoutMs;
     const tick = (): void => {
-      if (!isProcessAlive(pid)) {
+      if (!isAlive(pid)) {
         resolve(true);
         return;
       }
@@ -667,6 +698,14 @@ const SIGKILL_CONFIRMATION_TIMEOUT_MS = 1000;
  * means "done," not merely "the final signal was sent." `callbacks.onSignaled`
  * fires synchronously after each real signal send - see its own docs for
  * why that matters (the kill/exit race).
+ *
+ * Both waits check the WHOLE GROUP (`isProcessGroupAlive`), never just
+ * the leader's own single pid. A group's leader can exit from a plain,
+ * untrapped SIGTERM while a descendant - a different pid, in the same
+ * group, that ignores or is slower to respond to the same signal - keeps
+ * running; checking only the leader's pid would read that as "the group
+ * died from SIGTERM alone" and return `escalated: false` while a real
+ * process in the group it was asked to terminate stayed alive.
  */
 export async function killProcessGroupPosix(
   pid: number,
@@ -678,14 +717,14 @@ export async function killProcessGroupPosix(
     throw new Error(`kill: failed to send SIGTERM to process group ${pid}: ${termResult.message}`);
   callbacks?.onSignaled?.("SIGTERM");
 
-  const diedFromTerm = await waitForProcessDeath(pid, graceMs);
+  const diedFromTerm = await waitForProcessDeath(pid, graceMs, 50, isProcessGroupAlive);
   if (diedFromTerm) return { finalSignal: "SIGTERM", escalated: false };
 
   const killResult = signalProcessGroupPosix(pid, "SIGKILL");
   if (!killResult.ok)
     throw new Error(`kill: failed to send SIGKILL to process group ${pid}: ${killResult.message}`);
   callbacks?.onSignaled?.("SIGKILL");
-  await waitForProcessDeath(pid, SIGKILL_CONFIRMATION_TIMEOUT_MS);
+  await waitForProcessDeath(pid, SIGKILL_CONFIRMATION_TIMEOUT_MS, 50, isProcessGroupAlive);
   return { finalSignal: "SIGKILL", escalated: true };
 }
 

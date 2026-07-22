@@ -22,6 +22,7 @@ import {
   checkProcessIdentity,
   identityElapsedTimesMatch,
   isProcessAlive,
+  isProcessGroupAlive,
   killProcessGroupPosix,
   killProcessTreeWindows,
   parseEtime,
@@ -892,6 +893,131 @@ test(
       isProcessAlive(child!.pid!),
       false,
       "the SIGTERM-resistant process must actually be dead after SIGKILL escalation"
+    );
+  }
+);
+
+// --- isProcessGroupAlive: the exact distinction isProcessAlive alone misses ---
+
+test(
+  "isProcessGroupAlive: true while ANY group member is alive, even after the LEADER itself is confirmed dead - isProcessAlive(leaderPid) alone cannot see this",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    // The leader forks a detached-looking grandchild that ignores SIGTERM
+    // and stays in the SAME process group (backgrounding in a
+    // non-interactive shell does not create a new one) - then the leader
+    // itself is killed by its OWN single pid, leaving the grandchild
+    // untouched and still running elsewhere in the group.
+    const child = spawnManaged(
+      {
+        argv: [
+          "bash",
+          "-c",
+          '(trap "" TERM; echo GRANDCHILD_READY; sleep 60) & echo "GRANDCHILD_PID:$!"; wait',
+        ],
+        cwd: process.cwd(),
+        env,
+      },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    await waitFor(() => {
+      const out = Buffer.concat(rec.stdout).toString("utf8");
+      return out.includes("GRANDCHILD_READY") && out.includes("GRANDCHILD_PID:");
+    });
+    const leaderPid = child!.pid!;
+    const grandchildPid = Number(
+      Buffer.concat(rec.stdout)
+        .toString("utf8")
+        .match(/GRANDCHILD_PID:(\d+)/)![1]
+    );
+    assert.ok(Number.isInteger(grandchildPid) && grandchildPid > 0);
+
+    process.kill(leaderPid, "SIGKILL"); // the leader's own single pid, NOT the group
+    await waitFor(() => isProcessAlive(leaderPid) === false);
+
+    assert.equal(isProcessAlive(leaderPid), false, "the leader itself must actually be dead");
+    assert.equal(
+      isProcessGroupAlive(leaderPid),
+      true,
+      "the GROUP must still read as alive: the grandchild, a different pid in the same pgid, is still running - exactly what isProcessAlive(leaderPid) alone cannot see"
+    );
+    assert.equal(
+      isProcessAlive(grandchildPid),
+      true,
+      "sanity check: the grandchild really is still alive, independent of the group-level check"
+    );
+
+    process.kill(-leaderPid, "SIGKILL"); // cleanup: reap the grandchild too
+  }
+);
+
+// REGRESSION: the exact defect Vera's fixture demonstrated. Waiting only
+// for the group LEADER's own pid let a SIGTERM-resistant descendant
+// survive while killProcessGroupPosix reported escalated: false - as if
+// SIGTERM alone had been sufficient, when a real process in the group it
+// was asked to terminate was still running.
+test(
+  "REGRESSION: killProcessGroupPosix escalates to SIGKILL when the LEADER dies from SIGTERM but a descendant survives, and the descendant actually ends up dead",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    // The LEADER has no SIGTERM trap of its own, so it dies immediately
+    // and normally from the plain SIGTERM sent to the group - exactly the
+    // shape that let the old, leader-pid-only wait wrongly conclude the
+    // whole group was gone. The GRANDCHILD it forks, staying in the same
+    // process group, traps and ignores SIGTERM, so it keeps running after
+    // the leader is already dead.
+    const child = spawnManaged(
+      {
+        argv: [
+          "bash",
+          "-c",
+          '(trap "" TERM; echo GRANDCHILD_READY; sleep 60) & echo "GRANDCHILD_PID:$!"; wait',
+        ],
+        cwd: process.cwd(),
+        env,
+      },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    await waitFor(() => {
+      const out = Buffer.concat(rec.stdout).toString("utf8");
+      return out.includes("GRANDCHILD_READY") && out.includes("GRANDCHILD_PID:");
+    });
+    const grandchildPid = Number(
+      Buffer.concat(rec.stdout)
+        .toString("utf8")
+        .match(/GRANDCHILD_PID:(\d+)/)![1]
+    );
+    assert.ok(Number.isInteger(grandchildPid) && grandchildPid > 0);
+
+    const shortGraceMs = 300;
+    const result = await killProcessGroupPosix(child!.pid!, shortGraceMs);
+
+    // The real, load-bearing assertion: escalation must have happened,
+    // because the group was NOT actually dead after the grace period. The
+    // buggy version of this function checked only the leader's own pid,
+    // saw it gone (it dies immediately, with no trap), and wrongly
+    // reported escalated: false while the grandchild kept running.
+    assert.equal(
+      result.escalated,
+      true,
+      "the group was not actually dead after SIGTERM alone (a descendant survived) - escalation to SIGKILL must have been triggered"
+    );
+    assert.equal(result.finalSignal, "SIGKILL");
+
+    // Independent verification, external to killProcessGroupPosix's own
+    // bookkeeping: the grandchild's OWN pid, checked directly, must
+    // actually be dead - not merely presumed dead because the leader
+    // exited.
+    assert.equal(
+      isProcessAlive(grandchildPid),
+      false,
+      "the SIGTERM-resistant grandchild must actually be dead after escalation, not merely presumed dead because the leader exited"
     );
   }
 );
