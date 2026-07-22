@@ -222,7 +222,7 @@ const MODULE_BUILTIN_SPECIFIERS = new Set(["node:module", "module"]);
  * out of scope for a different reason - see that function's own
  * "OUT OF SCOPE" section.
  */
-const FORBIDDEN_GLOBAL_NAMES = new Set(["eval", "Function", "require", "module"]);
+const FORBIDDEN_GLOBAL_NAMES = new Set(["eval", "Function", "require", "module", "Reflect"]);
 
 /** Maps a forbidden global's name to the public `kind` string this file's callers switch on. */
 const GLOBAL_NAME_TO_KIND = {
@@ -230,6 +230,7 @@ const GLOBAL_NAME_TO_KIND = {
   Function: "function-constructor-call",
   require: "commonjs-require",
   module: "module-require",
+  Reflect: "reflect-reference",
 };
 
 const SYNTHETIC_GLOBALS_FILE_NAME = "__ghantika-forbidden-globals__.d.ts";
@@ -251,6 +252,7 @@ const SYNTHETIC_GLOBALS_SOURCE = [
   "declare var module: any;",
   "declare var globalThis: any;",
   "declare var process: any;",
+  "declare var Reflect: any;",
 ].join("\n");
 
 /**
@@ -270,6 +272,26 @@ const SYNTHETIC_GLOBALS_SOURCE = [
  * `src/` tree contains no reference to it).
  */
 const PROCESS_DANGEROUS_PROPERTY = "getBuiltinModule";
+
+/**
+ * The property name `.constructor` - flagged UNCONDITIONALLY, on ANY
+ * base expression, unlike every other check in this file. Every value in
+ * JavaScript carries a `.constructor` reachable off its own prototype
+ * chain, so this is not an acquisition-site check keyed to one lexical
+ * name or one known-dangerous base the way `process.getBuiltinModule` is
+ * - there is no base expression to require being "the real global"
+ * first, because the property exists on every object and function
+ * regardless of where it came from (`(() => 1).constructor` reaches
+ * `Function` with no identifier named `Function` anywhere in source, the
+ * SAME class `Reflect.get(globalThis, "eval")` belongs to - reaching a
+ * forbidden primitive through generic language structure rather than a
+ * name or an import). This codebase has no legitimate reason to read
+ * `.constructor` off anything (verified: the real `src/` tree contains no
+ * reference to it), so the property access itself is banned outright, the
+ * same "zero legitimate use, ban the whole surface" reasoning
+ * `FORBIDDEN_GLOBAL_NAMES` already applies to `module`.
+ */
+const CONSTRUCTOR_PROPERTY_NAME = "constructor";
 
 /**
  * Builds a real `ts.Program` (and its `TypeChecker`) over exactly two
@@ -729,75 +751,77 @@ function foldConstantString(node) {
  *     real `src/` tree, which contains zero computed access on `process`
  *     of any kind today.
  *
- * WHY `process.getBuiltinModule` MOVED HERE, NOT LEFT DOCUMENTED-BUT-
- * UNCAUGHT: an earlier version of this guard treated it as out of scope
- * alongside the two forms below, reasoning that all three "reach the same
- * capability WITHOUT a lexical reference to its name or a `"node:module"`
- * import specifier." That framing was wrong for THIS one specifically:
- * `process.getBuiltinModule` still routes through a real, unshadowed
- * lexical reference (`process`) followed by a real, statically-readable
- * property key (`"getBuiltinModule"`) - exactly the acquisition-site shape
- * this file already resolves for `globalThis.eval` and the four bare
- * globals, just with a narrower base (one property of `process`, not the
- * whole identifier). It was closeable with the SAME machinery already
- * proven here, not a new mechanism. The two forms below are genuinely
- * different in kind, not merely unenumerated: neither routes through a
- * lexical reference to a forbidden name OR an import specifier AT ALL.
+ *   - GLOBAL `Reflect` - flagged the same unconditional way as `module`:
+ *     the codebase's frozen architecture has zero legitimate reason to
+ *     reference `Reflect` for ANY purpose (verified: the real `src/` tree
+ *     contains no reference to it at all), so the bare reference is
+ *     banned outright rather than trying to enumerate which of its many
+ *     methods (`.get`, `.apply`, `.construct`, `.defineProperty`, and
+ *     more) could reach a forbidden primitive - `Reflect.get(globalThis,
+ *     "eval")` is caught here, at the `Reflect` reference itself, not by
+ *     recognizing that specific call shape.
+ *   - `.constructor` PROPERTY ACCESS - flagged UNCONDITIONALLY, on ANY
+ *     base expression, not just an unshadowed global's. Unlike every
+ *     other check in this function, there is no "is the base a real
+ *     global" question to ask first: every value in JavaScript carries a
+ *     `.constructor` reachable off its own prototype chain regardless of
+ *     where it came from, so `(() => 1).constructor` reaches `Function`
+ *     with no identifier named `Function`, no import, and no globalThis
+ *     qualification anywhere in source - a genuinely different
+ *     acquisition SHAPE than every check above it, closed by treating the
+ *     PROPERTY ITSELF, universally, as the violation (the same "zero
+ *     legitimate use, ban the whole surface" reasoning as `module` and
+ *     `Reflect`, just applied to a property key instead of a global
+ *     identifier - verified: the real `src/` tree contains no
+ *     `.constructor` access of any kind).
+ *
+ * WHY THESE TWO ARE HERE NOW, NOT DOCUMENTED AS OUT OF SCOPE: an earlier
+ * version of this guard treated `process.getBuiltinModule`, `.constructor`,
+ * and `Reflect.get(globalThis, "eval")` as equally out of scope, reasoning
+ * that all three "reach the same capability WITHOUT a lexical reference to
+ * its name or a `"node:module"` import specifier." That framing was
+ * incomplete: closing `process.getBuiltinModule` alone left `.constructor`
+ * and `Reflect` as UNCLOSED escape routes into the exact same reflective/
+ * structural acquisition class it was trying to close - fixing one named
+ * spelling (Vera's fixture) while leaving the class it belongs to open
+ * would have re-manufactured the appearance of closure without delivering
+ * it, the same failure mode this file's own prior version warned against.
+ * The actual fix is not "pattern-match `(() => 1).constructor` and
+ * `Reflect.get(globalThis, "eval")` as two more named spellings" - that
+ * would ITSELF be vacuous, since the next unenumerated form in the same
+ * class (`Reflect.apply`, `Reflect.construct`, `[].constructor`,
+ * `obj.constructor.constructor`) would still walk straight through. The
+ * fix that actually closes the class is banning the ACQUISITION SURFACE
+ * outright: the whole `Reflect` global (any method, any invocation shape,
+ * matching how `module` is banned outright rather than just
+ * `module.require`), and the `.constructor` property universally (any
+ * base, matching the same "the codebase has zero legitimate use" evidence
+ * standard already established for `module` and now `Reflect`). Both are
+ * NOW covered by the acquisition-site design's core claim - "once the BARE
+ * REFERENCE is flagged, every downstream invocation shape disappears from
+ * the problem" - the same guarantee `eval`/`Function`/`require`/`module`
+ * already had, extended to two more surfaces this file can resolve by
+ * provenance (a real lexical reference for `Reflect`, a real static
+ * property key for `.constructor`) rather than by name-matching an
+ * invocation shape.
  *
  * OUT OF SCOPE, DELIBERATELY, NOT BY OVERSIGHT: a statement-level
  * `import type`/`export type` declaration or an individual specifier
  * carrying the inline `type` modifier (fully erased by TypeScript, carries
- * no runtime capability under any of the shapes above); a `typeof X` used
- * AS A TYPE (`type T = typeof eval`, erased the same way - contrast with
- * `typeof eval === "function"`, a genuine runtime reference this guard
- * DOES flag); and two REFLECTIVE/STRUCTURAL acquisition forms that reach a
- * forbidden primitive WITHOUT a lexical reference to its name and WITHOUT
- * an import specifier, each verified to execute on a real Node runtime:
- *
- *   - `(() => 1).constructor` - the `Function` constructor via any
- *     ordinary function object's own `.constructor` property. No
- *     identifier named `Function` appears anywhere - `.constructor` is a
- *     property every function object carries by virtue of being a
- *     function, not a named acquisition site this file can resolve by
- *     provenance.
- *   - `Reflect.get(globalThis, "eval")` - the global `eval` via a runtime
- *     STRING passed to `Reflect.get`, never an identifier reference or a
- *     property-access node this file's static-key-text machinery can read
- *     - `Reflect.get`'s second argument is an arbitrary VALUE expression,
- *     not a syntactic key.
- *
- * An AST walker COULD be taught to pattern-match these two specific
- * spellings, but that would not close the class it looks like it closes:
- * neither routes its capability through a LEXICAL REFERENCE to the
- * primitive's own name, an import specifier, OR a statically-readable
- * property key on a resolvable base - the first routes through the
- * STRUCTURE of an ordinary value (any function has a `.constructor`), the
- * second through a runtime VALUE handed to a generic reflection function
- * (not a syntactic key at all). Detecting these two named spellings would
- * not prove the absence of the broader reflective/structural acquisition
- * class they belong to - the next unenumerated form in that same class
- * (a different generic-object property every value shares, a different
- * generic reflection API) would still walk straight through, so matching
- * exactly these two would re-manufacture the appearance of closure rather
- * than deliver it. This guard's real job, evidenced by every escape route
- * closed above, is stopping this codebase from reintroducing CommonJS
- * interop or arbitrary builtin-module access by ordinary habit or
- * accident, through any route this file can resolve by provenance - a
- * hygiene guard against carelessness, not a runtime security boundary
- * against a deliberate adversary evading it. Each of the two routes above
- * has a dedicated, PASSING control whose assertion is that this guard
- * produces NO detection for it (see test/module-boundaries.test.ts and
- * test/no-tasks-import.test.ts) - the boundary is an executable fact a
- * future change can verify against, never a silent gap: if one of these
- * routes is later closed, its control fails and says so, which only
- * works because the control is green today, not permanently red.
+ * no runtime capability under any of the shapes above); and a `typeof X`
+ * used AS A TYPE (`type T = typeof eval`, erased the same way - contrast
+ * with `typeof eval === "function"`, a genuine runtime reference this
+ * guard DOES flag). No reflective/structural acquisition form remains
+ * documented as out of scope: closing `Reflect` and `.constructor`
+ * outright, rather than pattern-matching Vera's one demonstrated
+ * combination of them, removed the class this section used to name.
  *
  * A MIXED import clause (a value specifier next to a type-only one in the
  * same clause) still flags the value specifier - the type modifier is
  * checked per-specifier, never treated as clearing the whole clause.
  *
  * @param {import("typescript").SourceFile} sourceFile
- * @returns {{ node: import("typescript").Node, kind: "named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access" | "process-getbuiltinmodule-access" | "unresolvable-process-access" }[]}
+ * @returns {{ node: import("typescript").Node, kind: "named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access" | "process-getbuiltinmodule-access" | "unresolvable-process-access" | "reflect-reference" | "constructor-property-access" }[]}
  */
 export function findCreateRequireImports(sourceFile) {
   const hits = [];
@@ -950,6 +974,17 @@ export function findCreateRequireImports(sourceFile) {
     // than silently passed. ---
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const base = unwrapParens(node.expression);
+
+      // --- .constructor - see CONSTRUCTOR_PROPERTY_NAME's own doc
+      // comment. Checked FIRST and unconditionally on the base
+      // expression, before the globalThis/process-specific checks below:
+      // every value carries this property regardless of where it came
+      // from, so there is no "is the base the real global" question to
+      // ask first the way the other two checks below need to. ---
+      if (accessKeyText(node) === CONSTRUCTOR_PROPERTY_NAME) {
+        hits.push({ node, kind: "constructor-property-access" });
+        return;
+      }
 
       if (isUnshadowedGlobalThisReference(base, checker, checkedSourceFile)) {
         const key = accessKeyText(node);

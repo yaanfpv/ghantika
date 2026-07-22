@@ -490,30 +490,65 @@ test("green control: a catch clause's destructuring pattern has no initializer t
 });
 
 // ---------------------------------------------------------------------------
-// The guard resolves named lexical references and statically-readable
-// property keys; a value obtained through a function object's own
-// constructor property, or a reflective string-key lookup on globalThis, is
-// neither and is not detected - see this function's own doc comment for the
-// full boundary. These two controls make that limit an executable fact:
-// each one is a real acquisition route, verified to execute on a real Node
-// runtime, and each is asserted here to produce NO detection so the
-// boundary is visible rather than silently assumed.
-//
-// process.getBuiltinModule is NOT in this list - a prior version of this
-// guard treated it as out of scope for the same reason as the two below,
-// which was wrong: it routes through a real, unshadowed lexical reference
-// (process) and a real, statically-readable property key
-// ("getBuiltinModule"), the same acquisition-site shape this guard already
-// resolves for the four bare globals - see the dedicated section below.
+// Nothing is documented as out of scope in the reflective/structural class
+// anymore: process.getBuiltinModule, the bare Reflect global, and the
+// .constructor property are all now closed - see findCreateRequireImports's
+// own doc comment (scripts/lib/ts-ast.mjs) for the full acquisition-site
+// design and why banning the whole Reflect/.constructor surface (rather
+// than pattern-matching Vera's one demonstrated combination of them) is
+// what actually closes the class.
 // ---------------------------------------------------------------------------
 
-test("documented out of scope: obtaining the Function constructor via an ordinary function object's own .constructor property is not detected", () => {
+test("REGRESSION: obtaining the Function constructor via an ordinary function object's own .constructor property IS now detected", () => {
   const hits = siblingImportsFrom('const F = (() => 1).constructor;\nF("return 1");\n');
+  assert.ok(
+    hits.some((hit) => hit.includes(".constructor")),
+    `expected a constructor-property-access violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test('REGRESSION: obtaining the global eval via Reflect.get(globalThis, "eval") IS now detected - at the bare Reflect reference itself', () => {
+  const hits = siblingImportsFrom('const e = Reflect.get(globalThis, "eval");\ne("1");\n');
+  assert.ok(
+    hits.some((hit) => hit.includes("references the global Reflect")),
+    `expected a reflect-reference violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("Reflect is flagged at the ACQUISITION site regardless of which method is used or how the reference is stored", () => {
+  const hits = siblingImportsFrom("const R = Reflect;\nR.construct(Object, []);\n");
+  assert.ok(
+    hits.some((hit) => hit.includes("references the global Reflect")),
+    `expected the aliased Reflect reference to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a LOCALLY SHADOWED Reflect (never the real global) is never flagged", () => {
+  const hits = siblingImportsFrom(
+    "function f(Reflect: { get: (t: unknown, k: string) => unknown }) {\n" +
+      '  return Reflect.get(globalThis, "eval");\n' +
+      "}\n"
+  );
   assert.deepEqual(hits, []);
 });
 
-test('documented out of scope: obtaining the global eval via Reflect.get(globalThis, "eval") (a runtime string key, not an identifier reference) is not detected', () => {
-  const hits = siblingImportsFrom('const e = Reflect.get(globalThis, "eval");\ne("1");\n');
+test(".constructor is flagged on ANY base, not just a known-dangerous one - a plain object literal's .constructor is just as flagged as a function's", () => {
+  const hits = siblingImportsFrom("const c = ({}).constructor;\n");
+  assert.ok(
+    hits.some((hit) => hit.includes(".constructor")),
+    `expected the plain-object .constructor access to be flagged too, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a class's OWN constructor method declaration is never confused with a .constructor property READ - defining a constructor is not an acquisition", () => {
+  const hits = siblingImportsFrom(
+    "class Foo {\n  constructor() {\n    this.ready = true;\n  }\n}\nnew Foo();\n"
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("green control: an object literal's own 'constructor' property KEY (defining, not reading) is never flagged", () => {
+  const hits = siblingImportsFrom('const obj = { constructor: () => "not a real class" };\n');
   assert.deepEqual(hits, []);
 });
 
