@@ -249,3 +249,74 @@ test("mutation control: EXPECTED_OS being a bare string (not an array) is named 
   assert.equal(errors.length, 1);
   assert.match(errors[0], /EXPECTED_OS is not an array \(got the string "ubuntu-latest"\)/);
 });
+
+// --- Mandatory protection: a whole-axis null must not be a MISOWNED red ---
+//
+// verifyExpectedAxesNonEmpty above is a pure function tested in isolation
+// with explicit arguments - it builds the correct diagnostic whether or
+// not its result ever reaches a real reporting path. That is NOT the same
+// question as whether the shipped CLI (`npm run lint:workflow-jobs`, which
+// runs this file's own main()) actually DELIVERS that diagnostic when
+// EXPECTED_OS/EXPECTED_NODE - the real module-level constants main() reads
+// via default parameters, not an explicit argument a test controls - are
+// themselves null. main() used to call verifyMatrixCompleteness(testJob)
+// unconditionally, which resolves its own expectedOs/expectedNode
+// parameters to the SAME EXPECTED_OS/EXPECTED_NODE, and `for (const os of
+// expectedOs)` on a null value throws an uncaught TypeError BEFORE main()
+// ever reaches its own error-reporting block - so the correct, already-
+// built diagnostic from verifyExpectedAxesNonEmpty never printed. The exit
+// code was still 1 either way, which is exactly why this class survived
+// undetected: "exits 1" is not proof the NAMED check is what produced it.
+//
+// These two tests exercise the real command as a subprocess, against a
+// temporarily mutated copy of the actual script (restored/deleted
+// unconditionally in `finally`), and assert on the ACTUAL text on stderr -
+// the named diagnostic must be present, and the crash's own TypeError
+// text must be absent - not merely that the process exited non-zero.
+import { execFileSync } from "node:child_process";
+import { readFileSync as readFileSyncForMutant, writeFileSync, rmSync } from "node:fs";
+import { fileURLToPath as toPathForMutant } from "node:url";
+
+const REAL_SCRIPT_PATH = toPathForMutant(
+  new URL("../scripts/lint-workflow-jobs.mjs", import.meta.url)
+);
+const MUTANT_SCRIPT_PATH = toPathForMutant(
+  new URL("../scripts/.tmp-null-axis-mutant.mjs", import.meta.url)
+);
+
+function runMutatedAxis(constantName) {
+  const original = readFileSyncForMutant(REAL_SCRIPT_PATH, "utf8");
+  const pattern = new RegExp(`^export const ${constantName} = .*;$`, "m");
+  assert.match(
+    original,
+    pattern,
+    `test assumption: ${constantName}'s declaration line is findable`
+  );
+  const mutated = original.replace(pattern, `export const ${constantName} = null;`);
+  assert.notEqual(mutated, original, `the ${constantName} mutation should have changed the source`);
+  writeFileSync(MUTANT_SCRIPT_PATH, mutated);
+  try {
+    execFileSync(process.execPath, [MUTANT_SCRIPT_PATH], { stdio: "pipe" });
+    assert.fail(`expected the mutant to exit non-zero (${constantName} = null)`);
+  } catch (error) {
+    return { status: error.status, stderr: String(error.stderr) };
+  } finally {
+    rmSync(MUTANT_SCRIPT_PATH, { force: true });
+  }
+}
+
+test("mutation control: a whole-axis EXPECTED_OS = null delivers the named diagnostic on the real CLI, not a crash", () => {
+  const { status, stderr } = runMutatedAxis("EXPECTED_OS");
+  assert.equal(status, 1);
+  assert.match(stderr, /EXPECTED_OS is not an array \(got object\)/);
+  assert.doesNotMatch(stderr, /TypeError/);
+  assert.doesNotMatch(stderr, /is not iterable/);
+});
+
+test("mutation control: a whole-axis EXPECTED_NODE = null delivers the named diagnostic on the real CLI, not a crash", () => {
+  const { status, stderr } = runMutatedAxis("EXPECTED_NODE");
+  assert.equal(status, 1);
+  assert.match(stderr, /EXPECTED_NODE is not an array \(got object\)/);
+  assert.doesNotMatch(stderr, /TypeError/);
+  assert.doesNotMatch(stderr, /is not iterable/);
+});

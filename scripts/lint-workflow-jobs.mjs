@@ -400,9 +400,25 @@ function main() {
   if (!testJob) {
     errors.push(`no "${TEST_JOB_ID}" job found in the workflow`);
   } else {
-    const missingLegs = verifyMatrixCompleteness(testJob);
-    for (const leg of missingLegs) {
-      errors.push(`"${TEST_JOB_ID}" matrix is missing the ${leg.replace("::", " / node ")} leg`);
+    // verifyMatrixCompleteness resolves its expectedOs/expectedNode
+    // parameters, via their own default values, to the SAME EXPECTED_OS/
+    // EXPECTED_NODE this file just validated above - so it must never run
+    // when expectedAxesErrors is non-empty. A degenerate axis (null, not
+    // an array, empty) is not merely "incomplete data" to that function:
+    // `for (const os of expectedOs)` throws an uncaught TypeError when
+    // expectedOs isn't iterable, which would crash main() before the
+    // diagnostic verifyExpectedAxesNonEmpty already built above ever
+    // reaches the console.error/exitCode reporting below - a misowned red
+    // (the crash, not the intended message, is what a caller would see),
+    // not a real kill of the named check. verifyIndependentMatrixLegs
+    // below is unaffected by this and always runs regardless: it reads
+    // INDEPENDENT_EXPECTED_LEGS, a separate literal never derived from
+    // EXPECTED_OS/EXPECTED_NODE.
+    if (expectedAxesErrors.length === 0) {
+      const missingLegs = verifyMatrixCompleteness(testJob);
+      for (const leg of missingLegs) {
+        errors.push(`"${TEST_JOB_ID}" matrix is missing the ${leg.replace("::", " / node ")} leg`);
+      }
     }
 
     const independentResult = verifyIndependentMatrixLegs(testJob);
