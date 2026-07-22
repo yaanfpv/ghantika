@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import {
   FROZEN_MODULES,
@@ -750,6 +751,333 @@ test("a MIXED import clause still reds on its value specifier - a sibling type-o
     hits.some((h) => h.includes("imports createRequire")),
     `expected the value specifier to still be flagged despite the type-only sibling, got: ${JSON.stringify(hits)}`
   );
+});
+
+// ---------------------------------------------------------------------------
+// THE REAL RESOLVER - canonical resolution + realpath compare, catching an
+// absolute path, a file:// URL, a package/subpath-import alias, an
+// extensionless or directory-index specifier, and a symlink whose real
+// target sits inside tools/ even when the symlink's own path does not.
+// Each fixture here writes REAL files to a real scratch directory (unlike
+// most of this file's other tests, which exercise pure text against the
+// original fast-path arithmetic) - the real resolver only fires when a
+// specifier resolves to a real file on disk, so proving it catches
+// anything requires a real file to resolve to.
+// ---------------------------------------------------------------------------
+
+/** Builds a scratch src/-shaped tree: `tools/sibling.ts` and `tools/index.ts` always present, plus whatever `extraFiles`/`symlinks` the caller asks for. Returns the tree's root dir and its `tools/` subdirectory. */
+function buildResolverFixture(
+  extraFiles: Record<string, string> = {},
+  symlinks: Record<string, string> = {}
+): { dir: string; toolsDir: string } {
+  const dir = mkdtempSync(path.join(tmpdir(), "ghantika-resolver-"));
+  const toolsDir = path.join(dir, "tools");
+  mkdirSync(toolsDir, { recursive: true });
+  writeFileSync(path.join(toolsDir, "sibling.ts"), "export const marker = 1;\n");
+  writeFileSync(path.join(toolsDir, "index.ts"), "export const marker = 2;\n");
+  for (const [relPath, content] of Object.entries(extraFiles)) {
+    const abs = path.join(dir, relPath);
+    mkdirSync(path.dirname(abs), { recursive: true });
+    writeFileSync(abs, content);
+  }
+  for (const [relLinkPath, relTargetPath] of Object.entries(symlinks)) {
+    const linkAbs = path.join(dir, relLinkPath);
+    mkdirSync(path.dirname(linkAbs), { recursive: true });
+    symlinkSync(path.join(dir, relTargetPath), linkAbs);
+  }
+  return { dir, toolsDir };
+}
+
+test("SPEC-6 (re-verified against the real resolver): a relative sibling specifier resolves and compares correctly through the real resolver, not just the fast path", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports('import { x } from "./sibling.js";\n', importing, toolsDir);
+    assert.ok(hits.includes("./sibling.js"), `expected the sibling hit, got: ${JSON.stringify(hits)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// SPEC-2..5: an ordinary static `import` cannot syntactically take a
+// template/interpolated/concatenated/computed specifier at all (a parse
+// error, never a kill) - each fixture here uses a PERMITTED loader form
+// instead (a dynamic `import()`, whose argument is an ordinary expression
+// position) so the module-boundary specifier check is the only thing that
+// can produce the red, never an acquisition diagnostic from a banned
+// loader.
+// ---------------------------------------------------------------------------
+
+test("SPEC-2: a no-substitution TEMPLATE LITERAL specifier, via a permitted dynamic import(), is read as a literal and caught the same as a plain string", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports("import(`./sibling.js`);\n", importing, toolsDir);
+    assert.ok(hits.includes("./sibling.js"), `expected the template-literal sibling hit, got: ${JSON.stringify(hits)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SPEC-3: an INTERPOLATED template specifier, via a permitted dynamic import(), fails CLOSED - a skip would be a fail", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports(
+      'const dir = "tools";\nimport(`../${dir}/sibling.js`);\n',
+      importing,
+      toolsDir
+    );
+    assert.ok(
+      hits.some((h) => h.includes("computed/non-literal")),
+      `expected the interpolated-template specifier to fail closed, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SPEC-4: a string-CONCATENATION specifier, via a permitted dynamic import(), fails CLOSED", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports(
+      'import("../tools/" + "sibling.js");\n',
+      importing,
+      toolsDir
+    );
+    assert.ok(
+      hits.some((h) => h.includes("computed/non-literal")),
+      `expected the concatenated specifier to fail closed, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SPEC-5: a COMPUTED/VARIABLE specifier, via a permitted dynamic import(), fails CLOSED", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports(
+      "const specifier = getSiblingPath();\nimport(specifier);\n",
+      importing,
+      toolsDir
+    );
+    assert.ok(
+      hits.some((h) => h.includes("computed/non-literal")),
+      `expected the computed specifier to fail closed, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("green control (SPEC-2..5 harness): a dynamic import() of a legitimate, unrelated, statically-resolvable specifier is never flagged", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports('import("node:path");\n', importing, toolsDir);
+    assert.deepEqual(hits, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SPEC-7: an ABSOLUTE PATH specifier pointing at a real sibling file is caught - the fast path skips non-dot specifiers entirely, only the real resolver sees this", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const absSpecifier = path.join(toolsDir, "sibling.js");
+    const hits = findSiblingToolImports(`import { x } from "${absSpecifier}";\n`, importing, toolsDir);
+    assert.ok(
+      hits.includes(absSpecifier),
+      `expected the absolute-path sibling hit, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SPEC-8a: an EXTENSIONLESS relative specifier resolving to a real sibling .ts file is caught", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports(
+      'import { x } from "../tools/sibling";\n',
+      importing,
+      toolsDir
+    );
+    assert.ok(
+      hits.includes("../tools/sibling"),
+      `expected the extensionless sibling hit, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SPEC-8b: a DIRECTORY-INDEX specifier (trailing slash, resolving to the real index.ts) is caught", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports('import { x } from "../tools/";\n', importing, toolsDir);
+    assert.ok(
+      hits.includes("../tools/"),
+      `expected the directory-index sibling hit, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SPEC-9: a file:// URL specifier pointing at a real sibling file is caught - a prefix/suffix text test on the raw specifier would never see through the URL encoding", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const fileUrl = pathToFileURL(path.join(toolsDir, "sibling.js")).href;
+    const hits = findSiblingToolImports(`import { x } from "${fileUrl}";\n`, importing, toolsDir);
+    assert.ok(hits.includes(fileUrl), `expected the file:// URL sibling hit, got: ${JSON.stringify(hits)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SPEC-10a: a SYMLINK located OUTSIDE tools/ whose real target sits INSIDE tools/ is caught - the fast path's pure path arithmetic on the symlink's own (outside-tools) path would miss this entirely, only realpath-following the resolved target catches it", () => {
+  const { dir, toolsDir } = buildResolverFixture(
+    {},
+    { "lib/sibling-alias.ts": "tools/sibling.ts" }
+  );
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports(
+      'import { x } from "../lib/sibling-alias.js";\n',
+      importing,
+      toolsDir
+    );
+    assert.ok(
+      hits.includes("../lib/sibling-alias.js"),
+      `expected the symlink-indirection sibling hit, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SPEC-10b: a PACKAGE/SUBPATH-IMPORT ALIAS (package.json's own \"imports\" field) resolving to a real sibling file is caught", () => {
+  const { dir, toolsDir } = buildResolverFixture({
+    "package.json": JSON.stringify({ name: "fixture", imports: { "#sibling": "./tools/sibling.ts" } }),
+  });
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports('import { x } from "#sibling";\n', importing, toolsDir);
+    assert.ok(
+      hits.includes("#sibling"),
+      `expected the package-alias sibling hit, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("OBT-9: import.meta.resolve(...) of a sibling, handed to a require obtained via process.getBuiltinModule (OBT-2 specifically), is caught by the SPECIFIER check itself - not merely by the separate, already-banned process.getBuiltinModule acquisition", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const source = [
+      'const resolvedUrl = import.meta.resolve("../tools/sibling.js");',
+      'const req = process.getBuiltinModule("node:module").createRequire(import.meta.url);',
+      "req(resolvedUrl);",
+      "",
+    ].join("\n");
+    const hits = findSiblingToolImports(source, importing, toolsDir);
+    // The kill criterion is the SPECIFIER hit specifically - a bare
+    // non-empty check would pass even if only the (also-real, separately
+    // owned) process.getBuiltinModule acquisition hit fired, which would
+    // prove nothing about whether this guard's specifier-resolution logic
+    // ever looked at import.meta.resolve's own argument at all.
+    assert.ok(
+      hits.includes("../tools/sibling.js"),
+      `expected the import.meta.resolve specifier itself to be flagged as a sibling reference, got: ${JSON.stringify(hits)}`
+    );
+    assert.ok(
+      hits.some((h) => h.includes("dangerous properties")),
+      `expected the process.getBuiltinModule acquisition to ALSO be flagged (both are real), got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("EVA-2: a re-export BARREL (outside tools/) that itself re-exports a sibling is caught transitively - the importing file never names the sibling directly", () => {
+  const { dir, toolsDir } = buildResolverFixture({
+    "barrel.ts": 'export * from "./tools/sibling.js";\n',
+  });
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports('export * from "../barrel.js";\n', importing, toolsDir);
+    const transitiveHit = hits.find(
+      (h) => h.includes("../barrel.js") && h.includes("transitively") && h.includes("sibling.ts")
+    );
+    assert.ok(
+      transitiveHit,
+      `expected a transitive-barrel hit naming both the barrel and the sibling, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("green control: a permitted barrel that does NOT reach any sibling is never flagged, even though it's followed transitively", () => {
+  const { dir, toolsDir } = buildResolverFixture({
+    "core-barrel.ts": "export const x = 1;\n",
+  });
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports('export * from "../core-barrel.js";\n', importing, toolsDir);
+    assert.deepEqual(hits, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("green control: an absolute path, file:// URL, extensionless, or directory specifier pointing OUTSIDE tools/ is never flagged", () => {
+  const { dir, toolsDir } = buildResolverFixture({ "registry.ts": "export const marker = 3;\n" });
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const absSpecifier = path.join(dir, "registry.js");
+    const hits = findSiblingToolImports(
+      `import { x } from "${absSpecifier}";\n`,
+      importing,
+      toolsDir
+    );
+    assert.deepEqual(hits, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SELF-2 setup check: the real resolver's own compare uses path.relative-based containment on canonical realpaths, never a prefix/suffix string test - a sibling directory that merely shares a string prefix (tools-backup/) is never mistaken for tools/ itself", () => {
+  const { dir, toolsDir } = buildResolverFixture({
+    "tools-backup/sibling.ts": "export const marker = 99;\n",
+  });
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const backupAbs = path.join(dir, "tools-backup", "sibling.js");
+    const hits = findSiblingToolImports(
+      `import { x } from "${backupAbs}";\n`,
+      importing,
+      toolsDir
+    );
+    assert.deepEqual(
+      hits,
+      [],
+      "a same-string-prefix sibling directory (tools-backup/) must never be mistaken for tools/ itself"
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // --- combined guard: state-declaration checks ---

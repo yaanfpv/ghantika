@@ -10,6 +10,9 @@
  * of the exact characters between them.
  */
 import ts from "typescript";
+import { createRequire } from "node:module";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 /**
  * Parses `sourceText` (the contents of `fileName`) into a real TypeScript
@@ -47,6 +50,34 @@ export function forEachDescendant(node, visit) {
  */
 export function isDynamicImportCall(node) {
   return ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword;
+}
+
+/**
+ * True for a `CallExpression` that IS `import.meta.resolve(...)` - a
+ * `CallExpression` whose callee is a `PropertyAccessExpression` named
+ * `resolve`, whose own base is the `import.meta` `MetaProperty` node
+ * (`ts.isMetaProperty` with `keywordToken === SyntaxKind.ImportKeyword` and
+ * `name.text === "meta"`). This performs REAL module resolution at runtime,
+ * given a specifier, following the same base-relative rules a static or
+ * dynamic import would - so its argument is exactly as much a module
+ * specifier as a `require(...)`/`import(...)` call's is, and callers that
+ * care about a specifier's RESOLVED TARGET (a sibling file, a forbidden
+ * package subpath) need to see it the same way. Previously unrecognized by
+ * `collectModuleSpecifiers` entirely: `import.meta.resolve("../tools/
+ * sibling.js")` handed to `process.getBuiltinModule("node:module")
+ * .createRequire(...)` reached a sibling tools/*.ts file with nothing here
+ * ever inspecting the resolve call's own specifier argument.
+ */
+function isImportMetaResolveCall(node) {
+  if (!ts.isCallExpression(node)) return false;
+  const callee = node.expression;
+  if (!ts.isPropertyAccessExpression(callee) || callee.name.text !== "resolve") return false;
+  const base = callee.expression;
+  return (
+    ts.isMetaProperty(base) &&
+    base.keywordToken === ts.SyntaxKind.ImportKeyword &&
+    base.name.text === "meta"
+  );
 }
 
 /**
@@ -142,6 +173,11 @@ export function isCreateRequireCall(node) {
  *     same `ImportDeclaration` node kind)
  *   - a re-export (`export { a } from "x"`, `export * from "x"`)
  *   - a dynamic `import("x")` call
+ *   - `import.meta.resolve("x")` - performs REAL module resolution given a
+ *     specifier, following the same base-relative rules a static or
+ *     dynamic import would (see `isImportMetaResolveCall`'s own doc
+ *     comment) - a caller that cares about a specifier's resolved target
+ *     needs to see this the same way it sees an import or require
  *   - a `require("x")` call - the mechanism used to load a module doesn't
  *     change what target it resolves to, so a caller that cares about the
  *     RESOLVED TARGET (a sibling file, a forbidden package subpath) needs
@@ -191,6 +227,11 @@ export function collectModuleSpecifiers(sourceFile) {
       results.push({ node, text: firstArg ? stringLiteralText(firstArg) : undefined });
       return;
     }
+    if (isImportMetaResolveCall(node)) {
+      const [firstArg] = node.arguments;
+      results.push({ node, text: firstArg ? stringLiteralText(firstArg) : undefined });
+      return;
+    }
     if (isRequireCall(node) && isUnshadowedGlobalCallee(node, checker, checkedSourceFile)) {
       const [firstArg] = node.arguments;
       results.push({ node, text: firstArg ? stringLiteralText(firstArg) : undefined });
@@ -213,6 +254,91 @@ function isUnshadowedGlobalCallee(callExpression, checker, checkedSourceFile) {
   if (!ts.isIdentifier(callee)) return false;
   const symbol = checker.getSymbolAtLocation(callee);
   return symbol === undefined || isUnshadowedGlobalSymbol(symbol, checkedSourceFile);
+}
+
+/**
+ * Builds the ordered list of candidate specifiers `resolveModuleSpecifierRealPath`
+ * tries against Node's real CJS resolver, given the raw specifier text as it
+ * appears in source. Node's `require.resolve()` performs real filesystem
+ * resolution - it does NOT retry a `.ts` extension when a `.js`-suffixed
+ * specifier fails to resolve, does NOT append `.ts` to an extensionless
+ * specifier, and does NOT try `index.ts` for a directory-shaped specifier
+ * (verified empirically: it tries `index.js`, never `index.ts`, and a bare
+ * `.js` swap is not attempted for any of these at all) - this repo's
+ * NodeNext convention writes every internal specifier with a `.js`
+ * extension that resolves to a same-named `.ts` SOURCE file, so a resolver
+ * that only tried the specifier exactly as written would fail on every
+ * real internal import in this codebase. Order matters only in that the
+ * first successful resolution wins; at most one of these candidates can
+ * ever exist on a real, well-formed filesystem for internal repo specifiers:
+ *
+ *   1. the specifier as written (handles a `file://` URL, converted to a
+ *      plain path first, since `require.resolve()` does not accept one
+ *      directly - verified empirically; and handles any specifier that
+ *      already names a real, existing file exactly, `.ts` included)
+ *   2. if it ends in `.js`, that same path with `.ts` substituted (the
+ *      NodeNext source-to-source convention this repo's real specifiers
+ *      use throughout)
+ *   3. otherwise (extensionless, or a directory-shaped specifier - no
+ *      trailing slash case), the same path with `.ts` appended (an
+ *      extensionless sibling reference), and separately its own
+ *      `index.ts` (a directory reference with no explicit index file
+ *      named)
+ *   4. a specifier already ending in `/` (an explicit directory
+ *      reference) tries only its own `index.ts`, never a bare `.ts`
+ *      append onto the trailing slash itself
+ */
+function candidateResolveSpecifiers(rawSpecifier) {
+  const base = rawSpecifier.startsWith("file://") ? fileURLToPath(rawSpecifier) : rawSpecifier;
+  if (base.endsWith(".js")) {
+    return [base, `${base.slice(0, -3)}.ts`];
+  }
+  if (base.endsWith("/")) {
+    return [base, `${base}index.ts`];
+  }
+  return [base, `${base}.ts`, `${base}/index.ts`];
+}
+
+/**
+ * Resolves `rawSpecifier` (as written in source, relative to
+ * `fromAbsFilePath`) to its REAL, canonical filesystem path via Node's own
+ * CJS resolver (`createRequire(fromAbsFilePath).resolve(...)`, tried
+ * against each of `candidateResolveSpecifiers`'s candidates in order until
+ * one succeeds) followed by `realpathSync` on the result - so a symlink or
+ * a package/subpath-import alias collapses to the same real path a direct
+ * reference to the real file would produce, and an absolute path, a
+ * `file://` URL, or a bare `#subpath-import` alias are each resolved
+ * exactly as Node would resolve them at runtime, not by inspecting the
+ * specifier's own literal text. `createRequire`'s resolution context is
+ * `fromAbsFilePath`'s own directory - it honors a relative specifier's base
+ * exactly as Node's real module system would, and (verified empirically)
+ * does not require `fromAbsFilePath` itself to exist on disk for a
+ * relative/absolute/`file://` candidate to resolve, only for a
+ * package/subpath-import alias, which needs a real `package.json`
+ * ancestor to consult.
+ *
+ * Returns `undefined` when NO candidate resolves to a real file - this is
+ * not a violation by itself; the caller decides whether an unresolvable
+ * specifier is a legitimate external package (the overwhelmingly common
+ * case) or should fail closed for its own rule.
+ *
+ * @param {string} rawSpecifier
+ * @param {string} fromAbsFilePath
+ * @returns {string | undefined}
+ */
+export function resolveModuleSpecifierRealPath(rawSpecifier, fromAbsFilePath) {
+  const req = createRequire(fromAbsFilePath);
+  for (const candidate of candidateResolveSpecifiers(rawSpecifier)) {
+    try {
+      const resolved = req.resolve(candidate);
+      return realpathSync(resolved);
+    } catch {
+      // This candidate doesn't exist on disk (or isn't resolvable at all,
+      // e.g. a bare package name with no matching node_modules entry) -
+      // try the next one.
+    }
+  }
+  return undefined;
 }
 
 /**
