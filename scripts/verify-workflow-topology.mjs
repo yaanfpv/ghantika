@@ -18,18 +18,38 @@
  * The literal-success search is bound to the job's CONTROLLING expression
  * only - the specific `env` value some step's `run` script actually reads
  * to decide pass/fail (see `collectControllingExpressionText`) - and, once
- * found there, is rejected if it is released by a trailing `||`
- * disjunction rather than genuinely AND-conjoined with the rest of the
- * expression (see `hasLiteralSuccessCheck`). Both restrictions close a
- * proven pair of bypasses that a plain "does this substring appear
- * anywhere on the job" search could not: (1) `needs.build.result ==
- * 'success' || true`, which makes the clause vacuously true regardless of
+ * found there, is rejected if it sits inside a `||` disjunction on EITHER
+ * side rather than being genuinely AND-conjoined with the rest of the
+ * expression (see `hasLiteralSuccessCheck`, `isFollowedByDisjunction`,
+ * `isPrecededByDisjunction`). These restrictions close a proven set of
+ * bypasses that a plain "does this substring appear anywhere on the job"
+ * search could not: (1) `needs.build.result == 'success' || true`, a
+ * trailing disjunction that makes the clause vacuously true regardless of
  * the job's real result while the substring search still finds an
- * unbroken "== 'success'" right after the marker; and (2) removing a job
- * from the REAL controlling expression while leaving decoy literal text
- * (an unused env entry, a comment inside an unrelated step, a step that
- * never runs) elsewhere on the job, which a search over the job's ENTIRE
- * flattened env/run/if text would still find and wrongly call clean.
+ * unbroken "== 'success'" right after the marker; (2) `(true ||
+ * needs.build.result == 'success')`, the same vacuous-truth bypass
+ * mirrored onto a LEADING disjunction - which side of the literal the
+ * `||` is written on is an implementation detail, not a different class;
+ * and (3) removing a job from the REAL controlling expression while
+ * leaving decoy literal text (an unused env entry, a comment inside an
+ * unrelated step, a step that never runs) elsewhere on the job, which a
+ * search over the job's ENTIRE flattened env/run/if text would still find
+ * and wrongly call clean.
+ *
+ * A fourth bypass sits one level up, in which STEP counts as controlling
+ * at all (see `stepIsUnconditionallyControlling`): a step's own `if`
+ * being anything other than absent or literally `true` - a computed
+ * expression, say - means this file cannot confirm it actually executes,
+ * so it is excluded from the search entirely, rather than assumed to run.
+ * The earlier version of this check asked the opposite question (does
+ * the step run at all, treating anything but the literal string "false"
+ * as running), which failed OPEN: a step disabled by a usually-false
+ * computed condition still had its env text searched and could satisfy a
+ * job's check even though that check might never actually execute at
+ * runtime. Requiring the controlling step to be unconditional instead
+ * fails CLOSED - an edit that makes the controlling step conditional
+ * stops this file from trusting it, which then reports every job's
+ * literal-success check as missing.
  */
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -149,11 +169,51 @@ function isFollowedByDisjunction(remainder) {
 }
 
 /**
+ * The mirror of `isFollowedByDisjunction`: whether `precedingText` (the
+ * text immediately BEFORE a matched `needs.<id>.result == 'success'`
+ * literal) ends - after skipping only whitespace and any opening parens a
+ * grouped clause like `(needs.x.result == 'success')` would interpose -
+ * in a `||` disjunction.
+ *
+ * The bypass this closes is the mirror image of the trailing case:
+ * `(true || needs.build.result == 'success') && ...` presents the literal
+ * with nothing but `)` then `&&` AFTER it, so a trailing-only check
+ * accepts it - but the clause is exactly as vacuously true as `needs.
+ * build.result == 'success' || true` is, since `true ||` needs nothing
+ * else to be true. The class this guards against is "the literal sits
+ * inside a disjunction", and which side of the literal the `||` is
+ * written on is an implementation detail of how someone phrases it, not a
+ * different bypass.
+ *
+ * @param {string} precedingText
+ * @returns {boolean}
+ */
+function isPrecededByDisjunction(precedingText) {
+  let text = precedingText;
+  for (;;) {
+    const trimmed = text.trimEnd();
+    if (trimmed.endsWith("(")) {
+      text = trimmed.slice(0, -1);
+      continue;
+    }
+    text = trimmed;
+    break;
+  }
+  return text.endsWith("||");
+}
+
+/**
  * Scans `expressionText` for every occurrence of `needs.<jobId>.result`
  * and returns true if any of them is immediately followed (modulo
  * whitespace) by a literal `== 'success'`/`== "success"` comparison that
- * is not, in turn, immediately released into a `||` disjunction (see
- * `isFollowedByDisjunction`).
+ * is not itself sitting inside a `||` disjunction on EITHER side - not
+ * immediately released into one after the literal (see
+ * `isFollowedByDisjunction`: `needs.x.result == 'success' || true`), and
+ * not immediately entered from one before the marker (see
+ * `isPrecededByDisjunction`: `(true || needs.x.result == 'success')`).
+ * Both spellings make the surrounding clause true regardless of the job's
+ * actual result, since a disjunction only needs one side to hold - which
+ * side of the literal it is written on does not change that.
  *
  * `expressionText` is expected to be the job's CONTROLLING expression text
  * (see `collectControllingExpressionText`), not the job's entire
@@ -176,7 +236,11 @@ export function hasLiteralSuccessCheck(expressionText, jobId) {
       return false;
     }
     const remainder = matchLiteralSuccessRemainder(expressionText.slice(at + marker.length));
-    if (remainder !== null && !isFollowedByDisjunction(remainder)) {
+    if (
+      remainder !== null &&
+      !isFollowedByDisjunction(remainder) &&
+      !isPrecededByDisjunction(expressionText.slice(0, at))
+    ) {
       return true;
     }
     searchFrom = at + marker.length;
@@ -193,19 +257,42 @@ export function normalizeNeeds(needs) {
 }
 
 /**
- * Whether GitHub Actions would actually execute `step` at all - i.e. its
- * `if` is not the literal, statically-always-false string "false". GitHub
- * Actions `if:` conditions are themselves a small expression language this
- * file deliberately does not evaluate (see `matchLiteralSuccessRemainder`'s
- * comment on why this file sticks to plain string scanning); this only
- * catches the simplest, most literal way to disable a step, not every
- * conditional expression that could resolve to false at runtime.
+ * Whether `step`'s own `if` can be TRUSTED to mean "this step
+ * unconditionally executes" - a POSITIVE requirement, not a guess at
+ * whether some other condition happens to be resolvable. Exactly two
+ * shapes qualify: no `if` at all, or an `if` that is the literal `true`
+ * (as a YAML boolean or as the string `"true"`). Anything else - `false`,
+ * `always()`, or any computed GitHub Actions expression - means this file
+ * cannot confirm the step actually runs, so it must not be trusted as a
+ * job's controlling step.
+ *
+ * This used to ask the opposite question (`stepActuallyRuns`: does
+ * GitHub Actions actually execute this step, treating anything other
+ * than the literal string "false" as running) - which failed OPEN. A
+ * step disabled by a computed, usually-false `if` still counted as
+ * running, so its env text still entered the search corpus and could
+ * satisfy a job's literal-success check even though that step's real
+ * runtime behavior is to be skipped - reporting "checked" for a job whose
+ * only real check might never execute. Requiring the controlling step to
+ * be unconditional instead fails CLOSED: an edit that gives the
+ * controlling step any conditional `if` makes this file stop trusting it
+ * (see `collectControllingExpressionText`), which then makes every job's
+ * literal-success check report missing - noisy if that edit was
+ * legitimate, but never silently blind to it either way.
+ *
+ * This is entirely separate from a JOB-level `if` (e.g. `gate`'s own
+ * `if: always()`, required so a failed dependency doesn't leave `gate`
+ * marked "skipped" instead of run) - this function only ever inspects a
+ * STEP's own `if`, never a job's.
  *
  * @param {any} step
  * @returns {boolean}
  */
-function stepActuallyRuns(step) {
-  return typeof step?.if !== "string" || step.if.trim() !== "false";
+function stepIsUnconditionallyControlling(step) {
+  const condition = step?.if;
+  if (condition === undefined) return true;
+  if (condition === true) return true;
+  return typeof condition === "string" && condition.trim() === "true";
 }
 
 /**
@@ -227,17 +314,20 @@ function stepActuallyRuns(step) {
  *
  * "actually reads ... while deciding whether to exit non-zero" is, like
  * the rest of this file, plain string scanning rather than a shell
- * parser: a step counts as controlling when it (a) actually runs (see
- * `stepActuallyRuns`), (b) has a `run` script, (c) that script contains
- * the literal substring "exit" (so the script can plausibly terminate the
- * job, not merely log something), and (d) that script also shell-
- * references one of its own env keys (`$KEY` or `${KEY}`, checked against
- * the merged job-level + step-level env). This matches the real `gate`
- * job's single "require every job above to have literally succeeded" step
- * exactly, and generalizes to any workflow shaped the same way (one or
- * more steps that read an env-carried boolean expression and exit
- * non-zero when it isn't "true"), without hard-coding the variable's
- * name.
+ * parser: a step counts as controlling when it (a) is UNCONDITIONAL (see
+ * `stepIsUnconditionallyControlling` - no `if` at all, or a literal
+ * `true`; anything else means this file cannot trust that the step
+ * genuinely runs, so it is excluded rather than assumed to run), (b) has
+ * a `run` script, (c) that script contains the literal substring "exit"
+ * (so the script can plausibly terminate the job, not merely log
+ * something), and (d) that script also shell-references one of its own
+ * env keys (`$KEY` or `${KEY}`, checked against the merged job-level +
+ * step-level env). This matches the real `gate` job's single "require
+ * every job above to have literally succeeded" step exactly (which has
+ * no `if` today), and generalizes to any workflow shaped the same way
+ * (one or more unconditional steps that read an env-carried boolean
+ * expression and exit non-zero when it isn't "true"), without
+ * hard-coding the variable's name.
  *
  * @param {any} job
  * @returns {string} the controlling expression text (empty if none found)
@@ -246,7 +336,7 @@ export function collectControllingExpressionText(job) {
   const texts = [];
   const jobEnv = job?.env ?? {};
   for (const step of job?.steps ?? []) {
-    if (!stepActuallyRuns(step)) continue;
+    if (!stepIsUnconditionallyControlling(step)) continue;
     if (typeof step.run !== "string" || !step.run.includes("exit")) continue;
     const env = { ...jobEnv, ...(step.env ?? {}) };
     for (const [key, value] of Object.entries(env)) {

@@ -120,6 +120,43 @@ test("mutation control: a trailing || true disjunction after the literal-success
   assert.deepEqual(verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID), []);
 });
 
+// Bypass C, found in Manager review as a stated hypothesis and verified
+// before implementing anything: a `||` disjunction can just as easily sit
+// BEFORE the matched literal as after it (`(true || needs.build.result ==
+// 'success')`), which the original bypass-A fix did not check for - it
+// only looked at what FOLLOWS the literal. The clause is exactly as
+// vacuously true either way, since `true ||` needs nothing else to hold;
+// which side of the literal the `||` is written on is not a different
+// bypass, it is the same class mirrored.
+test("mutation control: a leading disjunction before the literal-success check is caught (bypass C)", () => {
+  const workflow = loadWorkflow();
+  const mutated = structuredClone(workflow);
+  const step = mutated.jobs[AGGREGATE_JOB_ID].steps[0];
+  const original = step.env.ALL_SUCCEEDED;
+
+  step.env.ALL_SUCCEEDED = original.replace(
+    "needs.build.result == 'success' &&",
+    "(true || needs.build.result == 'success') &&"
+  );
+  assert.notEqual(step.env.ALL_SUCCEEDED, original, "the mutation should have changed the text");
+
+  const topologyErrors = verifyTopology(mutated.jobs, AGGREGATE_JOB_ID);
+  assert.ok(
+    topologyErrors.some((error) => error.includes('"build"') && error.includes("never checks")),
+    `expected verifyTopology to flag the vacuously-true build clause, got: ${JSON.stringify(topologyErrors)}`
+  );
+  const independentErrors = verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID);
+  assert.ok(
+    independentErrors.some((error) => error.includes('"build"') && error.includes("never checks")),
+    `expected verifyIndependentRequiredJobs to flag the vacuously-true build clause, got: ${JSON.stringify(independentErrors)}`
+  );
+
+  // Revert and confirm clean again.
+  step.env.ALL_SUCCEEDED = original;
+  assert.deepEqual(verifyTopology(mutated.jobs, AGGREGATE_JOB_ID), []);
+  assert.deepEqual(verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID), []);
+});
+
 // Bypass B, found in QA review: removing a job's clause from the REAL
 // controlling expression (the env value the gate step's run script
 // actually reads) while leaving the decoy literal text
@@ -161,6 +198,48 @@ test("mutation control: a decoy literal-success check in an unused env entry doe
   delete step.env.DECOY_UNUSED;
   assert.deepEqual(verifyTopology(mutated.jobs, AGGREGATE_JOB_ID), []);
   assert.deepEqual(verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID), []);
+});
+
+// Bypass D, found in Manager review while checking the if:"false" question
+// above: the controlling step's own `if` being anything other than absent
+// or literally true - a computed, usually-false GitHub Actions expression,
+// say - previously still counted as "running" (the old stepActuallyRuns
+// only excluded the literal string "false"), so the step's real,
+// still-present literal-success text kept satisfying the check even
+// though that step might never actually execute at runtime. A gate whose
+// own required-success step is silently skipped would report success
+// trivially, regardless of what actually failed - defeating the WHOLE
+// aggregate check in one move, not just one job's clause the way A/B/C
+// each do. The gate's JOB-level `if: always()` (required, untouched by
+// this test) is a completely separate concern from this STEP-level `if`;
+// see stepIsUnconditionallyControlling's own docs for why they need
+// opposite treatment.
+test("mutation control: a conditional if on the controlling step itself is caught (bypass D)", () => {
+  const workflow = loadWorkflow();
+  const mutated = structuredClone(workflow);
+  const step = mutated.jobs[AGGREGATE_JOB_ID].steps[0];
+  assert.equal(step.if, undefined, "test assumption: the real controlling step has no if today");
+
+  step.if = "${{ github.run_number > 999999 }}";
+
+  const topologyErrors = verifyTopology(mutated.jobs, AGGREGATE_JOB_ID);
+  assert.ok(
+    topologyErrors.length > 0,
+    `expected verifyTopology to flag every job once the controlling step can't be trusted to run, got: ${JSON.stringify(topologyErrors)}`
+  );
+  const independentErrors = verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID);
+  assert.ok(
+    independentErrors.length > 0,
+    `expected verifyIndependentRequiredJobs to flag every job once the controlling step can't be trusted to run, got: ${JSON.stringify(independentErrors)}`
+  );
+
+  // Revert and confirm clean again. Also confirm the job-level if:
+  // always() (a completely separate concern) is untouched by this
+  // mutation and still exactly "always()".
+  delete step.if;
+  assert.deepEqual(verifyTopology(mutated.jobs, AGGREGATE_JOB_ID), []);
+  assert.deepEqual(verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID), []);
+  assert.equal(mutated.jobs[AGGREGATE_JOB_ID].if, "always()");
 });
 
 test("no job found under the given aggregate id is reported, not thrown", () => {
