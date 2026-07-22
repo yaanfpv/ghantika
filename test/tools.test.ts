@@ -152,7 +152,12 @@ test('run() with a relative PATH entry (".") and a matching cwd actually spawns 
   // false-negative diagnostic - a real, deterministic side effect proves
   // the child actually executed.
   const deadline = Date.now() + 3000;
-  while (!fs.existsSync(marker) && Date.now() < deadline) {
+  let observed = "";
+  while (Date.now() < deadline) {
+    if (fs.existsSync(marker)) {
+      observed = fs.readFileSync(marker, "utf8").trim();
+      if (observed === "ran") break;
+    }
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   assert.equal(
@@ -160,7 +165,11 @@ test('run() with a relative PATH entry (".") and a matching cwd actually spawns 
     true,
     "the fixture executable must have actually run and written its marker file"
   );
-  assert.equal(fs.readFileSync(marker, "utf8").trim(), "ran");
+  assert.equal(
+    observed,
+    "ran",
+    "the fixture's marker file must contain the expected content once fully written, not just exist"
+  );
 });
 
 test("run: a label over 64 characters is a schema validation error (isError: true)", () => {
