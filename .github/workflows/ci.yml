@@ -105,8 +105,6 @@ jobs:
       - run: npm run coverage
       - name: enforce the absolute coverage floor (blocking)
         run: npm run check:coverage-floor
-      - name: DELIBERATE PLANTED FAILURE - proof that gate goes red for the right reason (removed in the very next commit)
-        run: exit 1
       - name: report coverage delta vs baseline (informational only)
         if: ${{ !cancelled() }}
         run: npm run report:coverage-delta
