@@ -117,12 +117,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     # scripts/run-tests.mjs (see its own header) is what this job's own
     # test step below now runs: a per-test --test-timeout alone cannot name
-    # which file is still running when the whole job stalls, so this
-    # wrapper also runs an idle watchdog and a wall-clock cap that report
-    # the stuck file directly, instead of leaving this job to die at the
-    # 15-minute ceiling below with no diagnostic. This job must run the
-    # SAME wrapper `npm test` runs locally, not a second, separately-
-    # spelled node --test invocation that could silently drift from it.
+    # which files are still unaccounted for when the whole job stalls.
+    # This wrapper's idle watchdog does that - it lists every file with no
+    # completion event of its own once nothing has happened for too long,
+    # without claiming to know why - and a wall-clock cap bounds the whole
+    # run, instead of leaving this job to die at the 15-minute ceiling
+    # below with no diagnostic. This job must run the SAME wrapper
+    # `npm test` runs locally, not a second, separately-spelled node
+    # --test invocation that could silently drift from it.
     timeout-minutes: 15
     strategy:
       fail-fast: false
