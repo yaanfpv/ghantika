@@ -891,6 +891,24 @@ test("green control (SPEC-2..5 harness): a dynamic import() of a legitimate, unr
   }
 });
 
+test("EVA-3: a specifier assembled at runtime so it is not statically resolvable (an array .join(...)) fails CLOSED, never silently skipped", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports(
+      'const parts = ["../", "tools/", "sibling.js"];\nimport(parts.join(""));\n',
+      importing,
+      toolsDir
+    );
+    assert.ok(
+      hits.some((h) => h.includes("computed/non-literal")),
+      `expected the assembled specifier to fail closed, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("SPEC-7: an ABSOLUTE PATH specifier pointing at a real sibling file is caught - the fast path skips non-dot specifiers entirely, only the real resolver sees this", () => {
   const { dir, toolsDir } = buildResolverFixture();
   try {
