@@ -4,8 +4,22 @@ import { test } from "node:test";
 import {
   AGGREGATE_JOB_ID,
   findContinueOnError,
+  findGateOwnContinueOnError,
   loadWorkflow,
 } from "../scripts/lint-workflow-jobs.mjs";
+
+// `findContinueOnError`'s exclusion of the aggregate by id and
+// `findGateOwnContinueOnError`'s check of the aggregate against itself are
+// deliberately two SEPARATE, complementary checks, not one superseding the
+// other. `findContinueOnError` answers "does any job the aggregate depends
+// on hide a failure behind continue-on-error"; the aggregate is excluded
+// from that question on purpose, because the aggregate does not depend on
+// itself. `findGateOwnContinueOnError` answers the other question that
+// exclusion leaves open: does the aggregate itself (or one of its own
+// steps) hide a failure the same way. The test below at "continue-on-error
+// on the aggregate job itself is not flagged" is not an oversight left over
+// from before `findGateOwnContinueOnError` existed - it still documents
+// true, current behavior of `findContinueOnError` specifically.
 
 test("no job the gate depends on sets continue-on-error: true", () => {
   const workflow = loadWorkflow();
@@ -40,6 +54,40 @@ test("continue-on-error on the aggregate job itself is not flagged (it is exclud
   mutated.jobs[AGGREGATE_JOB_ID]["continue-on-error"] = true;
 
   assert.deepEqual(findContinueOnError(mutated.jobs, AGGREGATE_JOB_ID), []);
+});
+
+// --- The gate aggregate's OWN continue-on-error (findGateOwnContinueOnError) ---
+//
+// findContinueOnError's exclusion of the aggregate above is exactly the gap
+// findGateOwnContinueOnError exists to close: nothing before it checked
+// whether the aggregate carries a continue-on-error on itself, which would
+// let the one required check branch protection actually points at report
+// success while its own literal-success check had failed.
+
+test("mutation control: a planted continue-on-error on the gate job itself is caught", () => {
+  const workflow = loadWorkflow();
+  const mutated = structuredClone(workflow);
+  mutated.jobs[AGGREGATE_JOB_ID]["continue-on-error"] = true;
+
+  assert.deepEqual(findGateOwnContinueOnError(mutated.jobs, AGGREGATE_JOB_ID), [
+    `"${AGGREGATE_JOB_ID}" job level`,
+  ]);
+
+  delete mutated.jobs[AGGREGATE_JOB_ID]["continue-on-error"];
+  assert.deepEqual(findGateOwnContinueOnError(mutated.jobs, AGGREGATE_JOB_ID), []);
+});
+
+test("mutation control: a planted continue-on-error on one of the gate job's own steps is caught", () => {
+  const workflow = loadWorkflow();
+  const mutated = structuredClone(workflow);
+  mutated.jobs[AGGREGATE_JOB_ID].steps.at(-1)["continue-on-error"] = true;
+
+  assert.deepEqual(findGateOwnContinueOnError(mutated.jobs, AGGREGATE_JOB_ID), [
+    `"${AGGREGATE_JOB_ID}".steps[${mutated.jobs[AGGREGATE_JOB_ID].steps.length - 1}]`,
+  ]);
+
+  delete mutated.jobs[AGGREGATE_JOB_ID].steps.at(-1)["continue-on-error"];
+  assert.deepEqual(findGateOwnContinueOnError(mutated.jobs, AGGREGATE_JOB_ID), []);
 });
 
 // --- Mandatory protection: expression-valued continue-on-error ---
