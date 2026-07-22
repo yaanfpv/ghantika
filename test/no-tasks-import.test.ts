@@ -519,14 +519,21 @@ test("green control: createRequire imported from a package OTHER than node:modul
 });
 
 // ---------------------------------------------------------------------------
-// The guard resolves named lexical references; a value obtained through a
-// function object's own constructor property, a reflective string-key
-// lookup on globalThis, or a Node builtin-module API is not a named
-// reference and is not detected - see findCreateRequireImports's own doc
-// comment for the full boundary. These three controls make that limit an
-// executable fact: each is a real acquisition route, verified to execute
-// on a real Node runtime, and each is asserted here to produce NO detection
-// so the boundary is visible rather than silently assumed.
+// The guard resolves named lexical references and statically-readable
+// property keys; a value obtained through a function object's own
+// constructor property, or a reflective string-key lookup on globalThis, is
+// neither and is not detected - see findCreateRequireImports's own doc
+// comment for the full boundary. These two controls make that limit an
+// executable fact: each is a real acquisition route, verified to execute on
+// a real Node runtime, and each is asserted here to produce NO detection so
+// the boundary is visible rather than silently assumed.
+//
+// process.getBuiltinModule is NOT in this list - a prior version of this
+// guard treated it as out of scope for the same reason as the two below,
+// which was wrong: it routes through a real, unshadowed lexical reference
+// (process) and a real, statically-readable property key
+// ("getBuiltinModule"), the same acquisition-site shape this guard already
+// resolves for the four bare globals - see the dedicated section below.
 // ---------------------------------------------------------------------------
 
 test("documented out of scope: obtaining the Function constructor via an ordinary function object's own .constructor property is not detected", () => {
@@ -539,10 +546,91 @@ test('documented out of scope: obtaining the global eval via Reflect.get(globalT
   assert.deepEqual(hits, []);
 });
 
-test('documented out of scope: reaching createRequire via process.getBuiltinModule("node:module") (a Node builtin-module API, no import/require syntax) is not detected', () => {
+// ---------------------------------------------------------------------------
+// process.getBuiltinModule - REGRESSION: Vera's exact executable fixture.
+// Reaches createRequire via a supported Node builtin-module API with no
+// import/require syntax naming "node:module" anywhere - previously
+// undetected (see the "documented out of scope" section this test replaces,
+// git-blame for the prior wording), now flagged at the property-access
+// acquisition site the same way the four bare globals are.
+// ---------------------------------------------------------------------------
+
+test('REGRESSION: process.getBuiltinModule("node:module").createRequire(...) IS now detected (Vera\'s fixture, prior out-of-scope ruling overturned)', () => {
   const hits = findTasksImports(
     'const r = process.getBuiltinModule("node:module").createRequire(import.meta.url);\n' +
       'r("@modelcontextprotocol/sdk/experimental/tasks");\n'
   );
+  assert.ok(
+    hits.some((hit) => hit.includes("process.getBuiltinModule")),
+    `expected a process.getBuiltinModule violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("process.getBuiltinModule is flagged at the ACQUISITION site regardless of invocation shape - stored, aliased, never immediately called", () => {
+  const hits = findTasksImports(
+    "const acquire = process.getBuiltinModule;\nconst mod = acquire('node:module');\n"
+  );
+  assert.ok(
+    hits.some((hit) => hit.includes("process.getBuiltinModule")),
+    `expected the aliased acquisition to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test('process.getBuiltinModule via bracket notation ("computed" but statically foldable) is still detected', () => {
+  const hits = findTasksImports('const m = process["getBuiltinModule"]("node:module");\n');
+  assert.ok(
+    hits.some((hit) => hit.includes("process.getBuiltinModule")),
+    `expected the bracket-notation access to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("process.getBuiltinModule via a folded string-concatenation key is still detected", () => {
+  const hits = findTasksImports('const m = process["getBuiltin" + "Module"]("node:module");\n');
+  assert.ok(
+    hits.some((hit) => hit.includes("process.getBuiltinModule")),
+    `expected the concatenated-key access to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("fail-closed: a COMPUTED, non-statically-foldable property key on process is flagged - this guard cannot prove it does not reach .getBuiltinModule", () => {
+  const hits = findTasksImports("const key = getKey();\nconst m = process[key]();\n");
+  assert.ok(
+    hits.some((hit) => hit.includes("computed property of process")),
+    `expected an unresolvable-process-access violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a LOCALLY SHADOWED process (never the real global) accessing .getBuiltinModule is never flagged", () => {
+  const hits = findTasksImports(
+    "function f(process: { getBuiltinModule: (id: string) => unknown }) {\n" +
+      '  return process.getBuiltinModule("node:module");\n' +
+      "}\n"
+  );
   assert.deepEqual(hits, []);
+});
+
+test("green control: every OTHER property of the real process global stays completely unflagged - only .getBuiltinModule is dangerous", () => {
+  const hits = findTasksImports(
+    "const a = process.env;\n" +
+      "const b = process.platform;\n" +
+      "const c = process.cwd();\n" +
+      "const d = process.argv;\n" +
+      'process.kill(1, "SIGTERM");\n'
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("green control: process.getBuiltinModule called with a DIFFERENT builtin (not node:module) is still flagged at the acquisition site - the property reference itself is the violation, independent of the argument", () => {
+  // This is deliberately NOT a green control in the usual sense: the
+  // acquisition-site design (see ts-ast.mjs's own header) flags the bare
+  // process.getBuiltinModule REFERENCE, unconditionally on what it is
+  // later called with - the same principle that makes `const r = require;
+  // r("anything")` a violation at `r`'s own definition, not at the call.
+  // A real green control for "process.getBuiltinModule genuinely unused"
+  // is the passing test suite everywhere this string never appears.
+  const hits = findTasksImports('const fsModule = process.getBuiltinModule("fs");\n');
+  assert.ok(
+    hits.some((hit) => hit.includes("process.getBuiltinModule")),
+    `expected the acquisition itself to be flagged regardless of argument, got: ${JSON.stringify(hits)}`
+  );
 });

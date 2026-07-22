@@ -149,11 +149,15 @@ const UNRESOLVABLE_SIBLING_SPECIFIER_LABEL =
  * a name-only callee check would need to see past that alias to catch the
  * later `makeLoader(...)` call, which it structurally cannot do.
  *
- * @param {"named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access"} kind
+ * @param {"named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access" | "process-getbuiltinmodule-access" | "unresolvable-process-access"} kind
  * @returns {string}
  */
 function createRequireImportBindingLabel(kind) {
   switch (kind) {
+    case "process-getbuiltinmodule-access":
+      return "<references process.getBuiltinModule - reaches createRequire (and any other builtin module) via a Node builtin-module API with no import/require syntax naming its target anywhere, forbidden outright at the point of reference the same as the four bare globals, regardless of what specifier it is later called with or how the reference is stored/aliased>";
+    case "unresolvable-process-access":
+      return "<accesses a computed property of process whose key can't be resolved statically - cannot verify it avoids .getBuiltinModule, failing closed>";
     case "namespace":
       return '<imports the whole node:module namespace ("import * as ...") - exposes createRequire via property access, forbidden outright the same as importing createRequire by name, regardless of the local namespace alias chosen>';
     case "default":

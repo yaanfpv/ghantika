@@ -250,7 +250,26 @@ const SYNTHETIC_GLOBALS_SOURCE = [
   "declare var require: any;",
   "declare var module: any;",
   "declare var globalThis: any;",
+  "declare var process: any;",
 ].join("\n");
+
+/**
+ * The one `process` property this guard cares about. `process` itself is
+ * NOT flagged outright the way `eval`/`Function`/`require`/`module` are -
+ * unlike those four, it is used extensively and legitimately throughout
+ * this codebase (`.env`, `.platform`, `.cwd()`, `.kill()`, and more), so
+ * treating a bare `process` reference as a violation would be wildly
+ * over-broad. Only `.getBuiltinModule` is dangerous: `process
+ * .getBuiltinModule(id)` returns a real builtin module's namespace object
+ * DIRECTLY, by specifier, completely independent of any `import`/
+ * `require` syntax - calling it with `"node:module"`/`"module"` reaches
+ * `createRequire` exactly as a namespace import would, through a route
+ * with no import specifier and no `require`/`module`/`eval`/`Function`
+ * identifier anywhere in source. This codebase's frozen ESM architecture
+ * has no legitimate reason to call this API at all (verified: the real
+ * `src/` tree contains no reference to it).
+ */
+const PROCESS_DANGEROUS_PROPERTY = "getBuiltinModule";
 
 /**
  * Builds a real `ts.Program` (and its `TypeChecker`) over exactly two
@@ -690,6 +709,40 @@ function foldConstantString(node) {
  *     case (`const alias = module; alias.require(...)`) close via the same
  *     acquisition-site principle as the other three, instead of needing a
  *     dedicated two-step "traces to module, AND accesses .require" check.
+ *   - `process.getBuiltinModule` - a FIFTH acquisition site, narrower in
+ *     shape than the four bare globals above: unlike them, bare `process`
+ *     is NOT flagged (it is used extensively and legitimately throughout
+ *     this codebase), only the specific property
+ *     `.getBuiltinModule` is - resolved the same PropertyAccessExpression/
+ *     ElementAccessExpression + static-key-text machinery this file
+ *     already uses for `globalThis.eval`-shaped access, just applied to a
+ *     different unshadowed base identifier and a different single
+ *     dangerous key (`PROCESS_DANGEROUS_PROPERTY`, not the four-name set).
+ *     `process.getBuiltinModule("node:module").createRequire(...)` is
+ *     flagged at the `process.getBuiltinModule` property-access itself -
+ *     the same acquisition-site principle as the other four, so storage,
+ *     aliasing, or any invocation shape downstream of that reference is
+ *     already covered without a separate check. A COMPUTED, non-
+ *     statically-foldable key on an unshadowed `process` base
+ *     (`process[someComputedExpr]`) FAILS CLOSED the same way an
+ *     unresolvable `globalThis[...]` access does, verified against the
+ *     real `src/` tree, which contains zero computed access on `process`
+ *     of any kind today.
+ *
+ * WHY `process.getBuiltinModule` MOVED HERE, NOT LEFT DOCUMENTED-BUT-
+ * UNCAUGHT: an earlier version of this guard treated it as out of scope
+ * alongside the two forms below, reasoning that all three "reach the same
+ * capability WITHOUT a lexical reference to its name or a `"node:module"`
+ * import specifier." That framing was wrong for THIS one specifically:
+ * `process.getBuiltinModule` still routes through a real, unshadowed
+ * lexical reference (`process`) followed by a real, statically-readable
+ * property key (`"getBuiltinModule"`) - exactly the acquisition-site shape
+ * this file already resolves for `globalThis.eval` and the four bare
+ * globals, just with a narrower base (one property of `process`, not the
+ * whole identifier). It was closeable with the SAME machinery already
+ * proven here, not a new mechanism. The two forms below are genuinely
+ * different in kind, not merely unenumerated: neither routes through a
+ * lexical reference to a forbidden name OR an import specifier AT ALL.
  *
  * OUT OF SCOPE, DELIBERATELY, NOT BY OVERSIGHT: a statement-level
  * `import type`/`export type` declaration or an individual specifier
@@ -697,39 +750,43 @@ function foldConstantString(node) {
  * no runtime capability under any of the shapes above); a `typeof X` used
  * AS A TYPE (`type T = typeof eval`, erased the same way - contrast with
  * `typeof eval === "function"`, a genuine runtime reference this guard
- * DOES flag); and three REFLECTIVE/STRUCTURAL acquisition forms that reach
- * the same capability WITHOUT a lexical reference to its name or a
- * `"node:module"` import specifier anywhere in source, each verified to
- * execute on a real Node runtime:
+ * DOES flag); and two REFLECTIVE/STRUCTURAL acquisition forms that reach a
+ * forbidden primitive WITHOUT a lexical reference to its name and WITHOUT
+ * an import specifier, each verified to execute on a real Node runtime:
  *
  *   - `(() => 1).constructor` - the `Function` constructor via any
  *     ordinary function object's own `.constructor` property. No
- *     identifier named `Function` appears anywhere.
+ *     identifier named `Function` appears anywhere - `.constructor` is a
+ *     property every function object carries by virtue of being a
+ *     function, not a named acquisition site this file can resolve by
+ *     provenance.
  *   - `Reflect.get(globalThis, "eval")` - the global `eval` via a runtime
- *     STRING passed to `Reflect.get`, never an identifier reference.
- *   - `process.getBuiltinModule("node:module").createRequire(...)` -
- *     `createRequire` via a supported Node builtin-module API, with no
- *     `import`/`require` syntax naming `"node:module"` anywhere.
+ *     STRING passed to `Reflect.get`, never an identifier reference or a
+ *     property-access node this file's static-key-text machinery can read
+ *     - `Reflect.get`'s second argument is an arbitrary VALUE expression,
+ *     not a syntactic key.
  *
- * An AST walker COULD be taught to pattern-match these three specific
+ * An AST walker COULD be taught to pattern-match these two specific
  * spellings, but that would not close the class it looks like it closes:
- * none of the three routes its capability through a LEXICAL REFERENCE to
- * the primitive's own name or a `"node:module"` import specifier - the
- * first routes through the STRUCTURE of an ordinary value (any function
- * has a `.constructor`), the second through a runtime STRING handed to
- * `Reflect.get` (not a lexical binding at all), the third through a
- * different, unrelated Node API. Detecting these three named spellings
- * would not prove the absence of the broader reflective/structural
- * acquisition class they belong to - the next unenumerated form in that
- * same class would still walk straight through, so matching exactly these
- * three would re-manufacture the appearance of closure rather than
- * deliver it. This guard's real job, evidenced by every escape route
+ * neither routes its capability through a LEXICAL REFERENCE to the
+ * primitive's own name, an import specifier, OR a statically-readable
+ * property key on a resolvable base - the first routes through the
+ * STRUCTURE of an ordinary value (any function has a `.constructor`), the
+ * second through a runtime VALUE handed to a generic reflection function
+ * (not a syntactic key at all). Detecting these two named spellings would
+ * not prove the absence of the broader reflective/structural acquisition
+ * class they belong to - the next unenumerated form in that same class
+ * (a different generic-object property every value shares, a different
+ * generic reflection API) would still walk straight through, so matching
+ * exactly these two would re-manufacture the appearance of closure rather
+ * than deliver it. This guard's real job, evidenced by every escape route
  * closed above, is stopping this codebase from reintroducing CommonJS
- * interop by ordinary habit or accident - a hygiene guard against
- * carelessness, not a runtime security boundary against a deliberate
- * adversary evading it. Each of the three routes above has a dedicated,
- * PASSING control whose assertion is that this guard produces NO
- * detection for it (see test/module-boundaries.test.ts and
+ * interop or arbitrary builtin-module access by ordinary habit or
+ * accident, through any route this file can resolve by provenance - a
+ * hygiene guard against carelessness, not a runtime security boundary
+ * against a deliberate adversary evading it. Each of the two routes above
+ * has a dedicated, PASSING control whose assertion is that this guard
+ * produces NO detection for it (see test/module-boundaries.test.ts and
  * test/no-tasks-import.test.ts) - the boundary is an executable fact a
  * future change can verify against, never a silent gap: if one of these
  * routes is later closed, its control fails and says so, which only
@@ -740,7 +797,7 @@ function foldConstantString(node) {
  * checked per-specifier, never treated as clearing the whole clause.
  *
  * @param {import("typescript").SourceFile} sourceFile
- * @returns {{ node: import("typescript").Node, kind: "named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access" }[]}
+ * @returns {{ node: import("typescript").Node, kind: "named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access" | "process-getbuiltinmodule-access" | "unresolvable-process-access" }[]}
  */
 export function findCreateRequireImports(sourceFile) {
   const hits = [];
@@ -893,15 +950,41 @@ export function findCreateRequireImports(sourceFile) {
     // than silently passed. ---
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const base = unwrapParens(node.expression);
-      if (!isUnshadowedGlobalThisReference(base, checker, checkedSourceFile)) return;
-      const key = accessKeyText(node);
-      if (key === undefined) {
-        hits.push({ node, kind: "unresolvable-globalthis-access" });
+
+      if (isUnshadowedGlobalThisReference(base, checker, checkedSourceFile)) {
+        const key = accessKeyText(node);
+        if (key === undefined) {
+          hits.push({ node, kind: "unresolvable-globalthis-access" });
+          return;
+        }
+        if (FORBIDDEN_GLOBAL_NAMES.has(key)) {
+          hits.push({ node, kind: GLOBAL_NAME_TO_KIND[key] });
+        }
         return;
       }
-      if (FORBIDDEN_GLOBAL_NAMES.has(key)) {
-        hits.push({ node, kind: GLOBAL_NAME_TO_KIND[key] });
+
+      // --- process.getBuiltinModule / process["getBuiltinModule"] - see
+      // PROCESS_DANGEROUS_PROPERTY's own doc comment for why bare
+      // `process` is not flagged the way the four globals above are, and
+      // why this ONE property is. A computed, non-statically-foldable key
+      // on an unshadowed `process` base fails closed the same way an
+      // unresolvable `globalThis[...]` access does above - this guard
+      // cannot prove it does NOT reach `.getBuiltinModule`. ---
+      if (ts.isIdentifier(base) && base.text === "process") {
+        const symbol = checker.getSymbolAtLocation(base);
+        if (symbol === undefined || isUnshadowedGlobalSymbol(symbol, checkedSourceFile)) {
+          const key = accessKeyText(node);
+          if (key === undefined) {
+            hits.push({ node, kind: "unresolvable-process-access" });
+            return;
+          }
+          if (key === PROCESS_DANGEROUS_PROPERTY) {
+            hits.push({ node, kind: "process-getbuiltinmodule-access" });
+          }
+        }
+        return;
       }
+
       return;
     }
 
