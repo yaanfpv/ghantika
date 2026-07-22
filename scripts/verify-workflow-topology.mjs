@@ -17,39 +17,64 @@
  *
  * The literal-success search is bound to the job's CONTROLLING expression
  * only - the specific `env` value some step's `run` script actually reads
- * to decide pass/fail (see `collectControllingExpressionText`) - and, once
- * found there, is rejected if it sits inside a `||` disjunction on EITHER
- * side rather than being genuinely AND-conjoined with the rest of the
- * expression (see `hasLiteralSuccessCheck`, `isFollowedByDisjunction`,
- * `isPrecededByDisjunction`). These restrictions close a proven set of
- * bypasses that a plain "does this substring appear anywhere on the job"
- * search could not: (1) `needs.build.result == 'success' || true`, a
- * trailing disjunction that makes the clause vacuously true regardless of
- * the job's real result while the substring search still finds an
- * unbroken "== 'success'" right after the marker; (2) `(true ||
- * needs.build.result == 'success')`, the same vacuous-truth bypass
- * mirrored onto a LEADING disjunction - which side of the literal the
- * `||` is written on is an implementation detail, not a different class;
- * and (3) removing a job from the REAL controlling expression while
- * leaving decoy literal text (an unused env entry, a comment inside an
- * unrelated step, a step that never runs) elsewhere on the job, which a
- * search over the job's ENTIRE flattened env/run/if text would still find
- * and wrongly call clean.
+ * to decide pass/fail (see `collectControllingExpressionText`). Establishing
+ * that a job's check is genuinely load-bearing is NOT a text-adjacency
+ * question - three successive fixes here each closed one named spelling of
+ * "a `||` sits near the literal" (a trailing `|| true`, a leading `(true ||
+ * ...)`, then a THIRD spelling where one extra `&&`/`||` operand sits
+ * between the literal and the disjunction that actually governs it under
+ * real operator precedence, e.g. `needs.build.result == 'success' && false
+ * || true`) and each was defeated by the next spelling, because adjacency
+ * can never bound "how far away can the disjunction be" - there is always
+ * one more operand of distance.
  *
- * A fourth bypass sits one level up, in which STEP counts as controlling
- * at all (see `stepIsUnconditionallyControlling`): a step's own `if`
- * being anything other than absent or literally `true` - a computed
- * expression, say - means this file cannot confirm it actually executes,
- * so it is excluded from the search entirely, rather than assumed to run.
- * The earlier version of this check asked the opposite question (does
- * the step run at all, treating anything but the literal string "false"
- * as running), which failed OPEN: a step disabled by a usually-false
- * computed condition still had its env text searched and could satisfy a
- * job's check even though that check might never actually execute at
- * runtime. Requiring the controlling step to be unconditional instead
- * fails CLOSED - an edit that makes the controlling step conditional
- * stops this file from trusting it, which then reports every job's
- * literal-success check as missing.
+ * WHAT THIS FILE NOW ESTABLISHES, so it does not need re-deriving by hand:
+ * `hasLiteralSuccessCheck(expressionText, jobId)` parses `expressionText`
+ * into a small boolean-expression tree (`parseControllingExpression`,
+ * `&&`/`||`/parentheses/`true`/`false`/`needs.<id>.result == 'success'`
+ * comparisons only - GitHub Actions binds `&&` tighter than `||`, same as
+ * JS, and the parser respects that), then evaluates that tree under
+ * three-valued (Kleene) logic with `jobId`'s OWN success-comparison node(s)
+ * forced to `FALSE` - EVERY occurrence of it, not merely the first match -
+ * and every OTHER job's comparison, and anything outside the understood
+ * grammar, left `UNKNOWN` (see `evaluateForcingJobFalse`). The check reports
+ * "safe" only when that forced evaluation is a DEFINITE `FALSE` - meaning no
+ * matter what any other unknown resolves to at real runtime, this job
+ * failing to succeed makes the whole expression un-satisfiable. That is the
+ * actual property "genuinely AND-conjoined with the complete expression, not
+ * released by an OR anywhere" was always claiming; evaluating it under
+ * precedence is what makes it true instead of assumed, and it is not bounded
+ * by how many operators of distance separate the literal from a disjunction
+ * - any such distance falls out of the same evaluation.
+ *
+ * THE BOUNDARY - what this does NOT establish: the grammar understood is
+ * deliberately narrow (`&&`, `||`, parentheses, the literal booleans `true`/
+ * `false`, and exactly the `needs.<id>.result == 'success'`/`== "success"`
+ * comparison shape). Negation (`!`), function calls (`always()`,
+ * `contains(...)`), any OTHER comparison operator or literal (`!=`, `<`,
+ * `== 'failure'`), and anything the parser cannot make sense of at all
+ * (malformed/unbalanced input) are NOT understood - they become an opaque
+ * `UNKNOWN` leaf. Because `UNKNOWN` can never make an evaluation resolve to
+ * a definite `FALSE` on its own, an expression using any of those
+ * constructs is reported as NOT ESTABLISHED (the job's check is flagged as
+ * missing) rather than silently accepted - this file fails CLOSED on
+ * anything outside the grammar it actually understands, it does not attempt
+ * to understand a wider GitHub Actions expression grammar and does not
+ * claim to.
+ *
+ * A separate, one-level-up bypass concerns which STEP counts as controlling
+ * at all (see `stepIsUnconditionallyControlling`): a step's own `if` being
+ * anything other than absent or literally `true` - a computed expression,
+ * say - means this file cannot confirm it actually executes, so it is
+ * excluded from the search entirely, rather than assumed to run. The
+ * earlier version of this check asked the opposite question (does the step
+ * run at all, treating anything but the literal string "false" as running),
+ * which failed OPEN: a step disabled by a usually-false computed condition
+ * still had its env text searched and could satisfy a job's check even
+ * though that check might never actually execute at runtime. Requiring the
+ * controlling step to be unconditional instead fails CLOSED - an edit that
+ * makes the controlling step conditional stops this file from trusting it,
+ * which then reports every job's literal-success check as missing.
  */
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -103,117 +128,236 @@ export function loadWorkflow(filePath = WORKFLOW_PATH) {
 }
 
 /**
- * If `rest` (the text immediately following a `needs.<id>.result` marker)
- * goes on, after only whitespace, to compare that result against the
- * literal string "success" with `==`, returns the text remaining right
- * after that literal - so the caller can inspect what comes next (a real
- * `&&` conjunction, the end of the expression, or a `||` disjunction).
- * Returns `null` when `rest` does not open with a literal-success
- * comparison at all.
+ * Splits `text` on every top-level occurrence of `operator` (`"&&"` or
+ * `"||"`) - "top-level" meaning at paren-depth 0, so an occurrence nested
+ * inside `(...)` is never a split point. Depth is tracked by a plain
+ * left-to-right scan; an unmatched closing paren drives depth negative,
+ * which this function does not special-case or throw on - it simply means
+ * depth is never again 0 for the rest of the scan (since it would have to
+ * climb back through zero from below), so no further split point is found
+ * there either. That is deliberate: malformed input degrades to "no
+ * top-level split found" (the whole text returned as one piece), which
+ * downstream ends up an unrecognized, and therefore `UNKNOWN`, atom - never
+ * a crash and never a split made up from a false read of the structure.
  *
- * Written as plain string scanning rather than a dynamically-built regular
- * expression: the marker text itself comes from a job id parsed out of the
- * workflow file, and building a RegExp out of untrusted-shaped input is a
- * pattern static analysis (rightly) flags, even though a job id here can
- * only ever be workflow-author-controlled text, never end-user input.
+ * @param {string} text
+ * @param {"&&" | "||"} operator
+ * @returns {string[]}
+ */
+function splitTopLevel(text, operator) {
+  const parts = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    else if (depth === 0 && text.startsWith(operator, i)) {
+      parts.push(text.slice(start, i));
+      i += operator.length - 1;
+      start = i + 1;
+    }
+  }
+  parts.push(text.slice(start));
+  return parts;
+}
+
+/**
+ * If `text`, once trimmed, is wrapped in a SINGLE pair of parentheses that
+ * genuinely encloses the whole thing - not two adjacent balanced groups
+ * sitting next to each other with no operator between them, like `(a) (b)`
+ * - returns the inner content (still untrimmed of its own surrounding
+ * whitespace). Returns `null` otherwise.
  *
- * @param {string} rest
+ * "Genuinely encloses the whole thing" is checked by scanning depth from
+ * the first `(` and confirming it first returns to 0 exactly at the LAST
+ * character, not earlier - `(a) (b)` returns to depth 0 right after `(a)`,
+ * well before the string ends, so it is correctly refused here (and falls
+ * through to being treated as a single unrecognized atom, not silently
+ * misread as one enclosing group).
+ *
+ * @param {string} text
  * @returns {string | null}
  */
-function matchLiteralSuccessRemainder(rest) {
-  const afterWhitespace = rest.trimStart();
-  if (!afterWhitespace.startsWith("==")) {
-    return null;
-  }
-  const afterOperator = afterWhitespace.slice(2).trimStart();
-  for (const literal of ["'success'", '"success"']) {
-    if (afterOperator.startsWith(literal)) {
-      return afterOperator.slice(literal.length);
+function stripOuterGroup(text) {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("(") || !trimmed.endsWith(")")) return null;
+  let depth = 0;
+  for (let i = 0; i < trimmed.length; i++) {
+    if (trimmed[i] === "(") depth++;
+    else if (trimmed[i] === ")") {
+      depth--;
+      if (depth === 0) {
+        return i === trimmed.length - 1 ? trimmed.slice(1, -1) : null;
+      }
     }
   }
   return null;
 }
 
 /**
- * Whether `remainder` (the text immediately following a matched
- * `needs.<id>.result == 'success'` literal) opens - after skipping only
- * whitespace and any closing parens a grouped clause like
- * `(needs.x.result == 'success')` would interpose - onto a `||`
- * disjunction.
+ * Classifies a single atom-level term - text with no top-level `&&`/`||`
+ * left to split on, and no single enclosing paren group left to strip -
+ * as one of exactly three node shapes this file understands:
  *
- * A disjunction there can make the whole clause true regardless of
- * whether `needs.<id>` actually succeeded: `... == 'success' || true` is
- * the textbook case, but `|| anything-else` is exactly as vacuous, since a
- * disjunction only needs ONE side to be true. This is therefore a general
- * rejection of "what follows is a `||`", not a special case for the
- * literal text `|| true`: a legitimate chain of required checks joins
- * every clause with `&&` (every side must be true for the chain to be
- * true), so the only place `||` is safe to allow is nowhere within a
- * clause this check is trusting to gate the job.
+ *  - `{ type: "literal", value: true | false }` for the bare words `true`/
+ *    `false`,
+ *  - `{ type: "successCheck", jobId }` for exactly `needs.<jobId>.result ==
+ *    'success'` or `== "success"` (job ids may contain letters, digits,
+ *    underscores and hyphens - real job ids in this repo's workflow use
+ *    hyphens, e.g. `changelog-presence`),
+ *  - `{ type: "unknown" }` for anything else at all: negation, a function
+ *    call, a different comparison operator or literal, a malformed or
+ *    truncated fragment - anything outside the three shapes above.
  *
- * @param {string} remainder
- * @returns {boolean}
+ * `unknown` is the deliberate catch-all this file's fail-closed behavior
+ * rests on: see `evaluateForcingJobFalse` for why an atom this file cannot
+ * classify can never, by itself, make a forced evaluation come out
+ * `FALSE` - which is the only outcome `hasLiteralSuccessCheck` accepts as
+ * safe.
+ *
+ * @param {string} text
+ * @returns {{ type: "literal", value: boolean } | { type: "successCheck", jobId: string } | { type: "unknown" }}
  */
-function isFollowedByDisjunction(remainder) {
-  let text = remainder;
-  for (;;) {
-    const trimmed = text.trimStart();
-    if (trimmed.startsWith(")")) {
-      text = trimmed.slice(1);
-      continue;
-    }
-    text = trimmed;
-    break;
-  }
-  return text.startsWith("||");
+function parseAtom(text) {
+  const trimmed = text.trim();
+  if (trimmed === "true") return { type: "literal", value: true };
+  if (trimmed === "false") return { type: "literal", value: false };
+  const match = trimmed.match(/^needs\.([A-Za-z0-9_-]+)\.result\s*==\s*(['"])success\2$/);
+  if (match) return { type: "successCheck", jobId: match[1] };
+  return { type: "unknown" };
 }
 
 /**
- * The mirror of `isFollowedByDisjunction`: whether `precedingText` (the
- * text immediately BEFORE a matched `needs.<id>.result == 'success'`
- * literal) ends - after skipping only whitespace and any opening parens a
- * grouped clause like `(needs.x.result == 'success')` would interpose -
- * in a `||` disjunction.
- *
- * The bypass this closes is the mirror image of the trailing case:
- * `(true || needs.build.result == 'success') && ...` presents the literal
- * with nothing but `)` then `&&` AFTER it, so a trailing-only check
- * accepts it - but the clause is exactly as vacuously true as `needs.
- * build.result == 'success' || true` is, since `true ||` needs nothing
- * else to be true. The class this guards against is "the literal sits
- * inside a disjunction", and which side of the literal the `||` is
- * written on is an implementation detail of how someone phrases it, not a
- * different bypass.
- *
- * @param {string} precedingText
- * @returns {boolean}
+ * @param {string} text
+ * @returns {object} an AST node - see `parseAtom`'s three leaf shapes, plus
+ *   `{ type: "and" | "or", children: object[] }` for a conjunction/
+ *   disjunction of two or more of the same.
  */
-function isPrecededByDisjunction(precedingText) {
-  let text = precedingText;
-  for (;;) {
-    const trimmed = text.trimEnd();
-    if (trimmed.endsWith("(")) {
-      text = trimmed.slice(0, -1);
-      continue;
-    }
-    text = trimmed;
-    break;
-  }
-  return text.endsWith("||");
+function parseAtomOrGroup(text) {
+  const inner = stripOuterGroup(text);
+  return inner === null ? parseAtom(text) : parseOrExpression(inner);
+}
+
+/** @param {string} text @returns {object} */
+function parseAndExpression(text) {
+  const parts = splitTopLevel(text, "&&");
+  if (parts.length === 1) return parseAtomOrGroup(parts[0]);
+  return { type: "and", children: parts.map(parseAtomOrGroup) };
+}
+
+/** @param {string} text @returns {object} */
+function parseOrExpression(text) {
+  const parts = splitTopLevel(text, "||");
+  if (parts.length === 1) return parseAndExpression(parts[0]);
+  return { type: "or", children: parts.map(parseAndExpression) };
 }
 
 /**
- * Scans `expressionText` for every occurrence of `needs.<jobId>.result`
- * and returns true if any of them is immediately followed (modulo
- * whitespace) by a literal `== 'success'`/`== "success"` comparison that
- * is not itself sitting inside a `||` disjunction on EITHER side - not
- * immediately released into one after the literal (see
- * `isFollowedByDisjunction`: `needs.x.result == 'success' || true`), and
- * not immediately entered from one before the marker (see
- * `isPrecededByDisjunction`: `(true || needs.x.result == 'success')`).
- * Both spellings make the surrounding clause true regardless of the job's
- * actual result, since a disjunction only needs one side to hold - which
- * side of the literal it is written on does not change that.
+ * Parses `expressionText` - the job's CONTROLLING expression text (see
+ * `collectControllingExpressionText`) - into the small boolean AST
+ * `evaluateForcingJobFalse` understands.
+ *
+ * The real text collected from a workflow's `${{ ... }}` GitHub Actions
+ * expression syntax still carries its `${{`/`}}` delimiters (this file
+ * only ever collects raw YAML string values - it does not evaluate GitHub
+ * Actions expressions, only this deliberately narrow subset of their
+ * grammar), so those markers are stripped globally before parsing; neither
+ * is part of the boolean grammar this file understands, and leaving either
+ * in place would make even a fully well-formed expression fail to parse as
+ * a single top-level structure.
+ *
+ * @param {string} expressionText
+ * @returns {object} an AST node (see `parseAtom`/`parseAndExpression`/`parseOrExpression`)
+ */
+export function parseControllingExpression(expressionText) {
+  const cleaned = expressionText.replace(/\$\{\{|\}\}/g, "");
+  return parseOrExpression(cleaned);
+}
+
+/**
+ * True if `node` (or any of its descendants) is a `successCheck` atom for
+ * exactly `jobId`. `hasLiteralSuccessCheck` uses this first, before any
+ * evaluation, so a job whose success comparison never appears in the
+ * expression at all is still reported as unchecked - matching the original
+ * behavior of "the marker was never found."
+ *
+ * @param {object} node
+ * @param {string} jobId
+ * @returns {boolean}
+ */
+function containsSuccessCheckForJob(node, jobId) {
+  if (node.type === "successCheck") return node.jobId === jobId;
+  if (node.type === "and" || node.type === "or") {
+    return node.children.some((child) => containsSuccessCheckForJob(child, jobId));
+  }
+  return false;
+}
+
+/**
+ * Evaluates `node` under three-valued (Kleene) logic, with EVERY
+ * `successCheck` atom for `jobId` - not merely the first one encountered;
+ * this function has no shared/mutable state, so an atom's evaluation
+ * never depends on whether an earlier occurrence of the same job's atom
+ * was already visited - forced to `FALSE`. Every OTHER job's `successCheck`
+ * atom, and every `unknown` atom (anything outside the grammar `parseAtom`
+ * understands: negation, function calls, other operators, malformed
+ * fragments), evaluates to `UNKNOWN`, since its real runtime value cannot
+ * be known statically and treating it as knowable in either direction
+ * would be unsound.
+ *
+ * Returns one of the three literal strings `"TRUE"`, `"FALSE"`, `"UNKNOWN"`:
+ *  - `AND`: `FALSE` if any child is `FALSE` (regardless of the others -
+ *    this is what makes an `unknown`/malformed sibling harmless when
+ *    ANDed with a job's now-forced-false check); `TRUE` only if every
+ *    child is `TRUE`; otherwise `UNKNOWN`.
+ *  - `OR`: `TRUE` if any child is `TRUE` (this is what makes a disjunction
+ *    with a literal `true` anywhere in it - adjacent to the literal or not
+ *    - correctly resolve `TRUE` regardless of the forced job); `FALSE`
+ *    only if every child is `FALSE`; otherwise `UNKNOWN`.
+ *
+ * `hasLiteralSuccessCheck` reports the job's check as established only
+ * when this returns a definite `FALSE` for the whole tree - meaning no
+ * matter what any `UNKNOWN` resolves to at real runtime, forcing this
+ * job's result away from `'success'` makes the entire expression
+ * unsatisfiable. Reporting "safe" on anything less certain (`UNKNOWN` or
+ * `TRUE`) would be exactly the class of bypass this file exists to close.
+ *
+ * @param {object} node
+ * @param {string} jobId
+ * @returns {"TRUE" | "FALSE" | "UNKNOWN"}
+ */
+export function evaluateForcingJobFalse(node, jobId) {
+  if (node.type === "literal") return node.value ? "TRUE" : "FALSE";
+  if (node.type === "successCheck") return node.jobId === jobId ? "FALSE" : "UNKNOWN";
+  if (node.type === "unknown") return "UNKNOWN";
+
+  const values = node.children.map((child) => evaluateForcingJobFalse(child, jobId));
+  if (node.type === "and") {
+    if (values.some((v) => v === "FALSE")) return "FALSE";
+    if (values.every((v) => v === "TRUE")) return "TRUE";
+    return "UNKNOWN";
+  }
+  // node.type === "or"
+  if (values.some((v) => v === "TRUE")) return "TRUE";
+  if (values.every((v) => v === "FALSE")) return "FALSE";
+  return "UNKNOWN";
+}
+
+/**
+ * Whether `expressionText` genuinely requires `needs.<jobId>.result ==
+ * 'success'` for the whole expression to be able to evaluate true - see
+ * this file's own top-of-file doc comment for the full property this
+ * establishes and its boundary. In short: parses `expressionText` into a
+ * small boolean AST (`parseControllingExpression`), confirms a
+ * success-check atom for `jobId` appears in it at all, then evaluates the
+ * whole tree with every occurrence of that atom forced `FALSE`
+ * (`evaluateForcingJobFalse`) - reporting safe only when that forced
+ * evaluation is a definite `FALSE`, regardless of how many operators of
+ * distance separate the literal from any disjunction, and regardless of
+ * whether the expression also contains constructs outside this file's
+ * understood grammar (which evaluate to `UNKNOWN` and can therefore never
+ * by themselves turn a forced evaluation `FALSE` into something else).
  *
  * `expressionText` is expected to be the job's CONTROLLING expression text
  * (see `collectControllingExpressionText`), not the job's entire
@@ -228,23 +372,9 @@ function isPrecededByDisjunction(precedingText) {
  * @returns {boolean}
  */
 export function hasLiteralSuccessCheck(expressionText, jobId) {
-  const marker = `needs.${jobId}.result`;
-  let searchFrom = 0;
-  for (;;) {
-    const at = expressionText.indexOf(marker, searchFrom);
-    if (at === -1) {
-      return false;
-    }
-    const remainder = matchLiteralSuccessRemainder(expressionText.slice(at + marker.length));
-    if (
-      remainder !== null &&
-      !isFollowedByDisjunction(remainder) &&
-      !isPrecededByDisjunction(expressionText.slice(0, at))
-    ) {
-      return true;
-    }
-    searchFrom = at + marker.length;
-  }
+  const ast = parseControllingExpression(expressionText);
+  if (!containsSuccessCheckForJob(ast, jobId)) return false;
+  return evaluateForcingJobFalse(ast, jobId) === "FALSE";
 }
 
 /**
@@ -358,9 +488,9 @@ export function collectControllingExpressionText(job) {
  *      `collectControllingExpressionText` - the text some step's `run`
  *      script actually reads to decide pass/fail, not the job's entire
  *      flattened env/run/if text), literally requires `needs.<id>.result
- *      == 'success'`, genuinely AND-conjoined with the rest of that
- *      expression rather than released by a trailing `||` disjunction
- *      (see `hasLiteralSuccessCheck`), for every job it depends on.
+ *      == 'success'`, genuinely a conjunct of the whole expression rather
+ *      than reachable to `true` through any disjunction (see
+ *      `hasLiteralSuccessCheck`), for every job it depends on.
  *
  * @param {Record<string, any>} jobs
  * @param {string} [aggregateId]
@@ -417,7 +547,7 @@ export function verifyTopology(jobs, aggregateId = AGGREGATE_JOB_ID) {
  * same coordinated deletion still leaves an id this check names by hand
  * and can report as missing.
  *
- * Reuses `hasLiteralSuccessCheck` - the same ADJACENCY-aware, disjunction-
+ * Reuses `hasLiteralSuccessCheck` - the same precedence-aware, disjunction-
  * rejecting check `verifyTopology` uses, not a weaker two-independent-
  * substrings test: `jobText.includes("needs.x.result") &&
  * jobText.includes("'success'")` would pass even when those two

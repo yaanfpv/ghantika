@@ -84,13 +84,14 @@ test("mutation control: weakening the literal-success check for one job is caugh
   );
 });
 
-// Bypass A, found in QA review: replacing a job's literal-success clause
-// with a trailing `|| true` disjunction (`needs.build.result == 'success'
-// || true`) left the old check clean, because it only looked for an
-// unbroken "== 'success'" right after the "needs.build.result" marker and
-// never noticed the disjunction that makes the whole clause vacuously
-// true regardless of build's actual result.
-test("mutation control: a trailing || true disjunction after the literal-success check is caught (bypass A)", () => {
+// A trailing `|| true` disjunction (`needs.build.result == 'success' ||
+// true`) makes the whole clause vacuously true regardless of build's
+// actual result. A plain adjacency check that only looks for an unbroken
+// "== 'success'" right after the "needs.build.result" marker misses the
+// disjunction entirely; the real check parses the expression and confirms
+// forcing build's result away from 'success' still makes the whole
+// expression unsatisfiable (see hasLiteralSuccessCheck's own doc comment).
+test("mutation control: a trailing || true disjunction after the literal-success check is caught", () => {
   const workflow = loadWorkflow();
   const mutated = structuredClone(workflow);
   const step = mutated.jobs[AGGREGATE_JOB_ID].steps[0];
@@ -120,15 +121,14 @@ test("mutation control: a trailing || true disjunction after the literal-success
   assert.deepEqual(verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID), []);
 });
 
-// Bypass C, found in Manager review as a stated hypothesis and verified
-// before implementing anything: a `||` disjunction can just as easily sit
-// BEFORE the matched literal as after it (`(true || needs.build.result ==
-// 'success')`), which the original bypass-A fix did not check for - it
-// only looked at what FOLLOWS the literal. The clause is exactly as
-// vacuously true either way, since `true ||` needs nothing else to hold;
-// which side of the literal the `||` is written on is not a different
-// bypass, it is the same class mirrored.
-test("mutation control: a leading disjunction before the literal-success check is caught (bypass C)", () => {
+// A `||` disjunction can just as easily sit BEFORE the matched literal as
+// after it (`(true || needs.build.result == 'success')`). The clause is
+// exactly as vacuously true either way, since `true ||` needs nothing else
+// to hold; which side of the literal the `||` is written on - or how many
+// operands separate it, see the class battery further below - does not
+// change whether build's result is genuinely necessary for the whole
+// expression to be true.
+test("mutation control: a leading disjunction before the literal-success check is caught", () => {
   const workflow = loadWorkflow();
   const mutated = structuredClone(workflow);
   const step = mutated.jobs[AGGREGATE_JOB_ID].steps[0];
@@ -157,15 +157,14 @@ test("mutation control: a leading disjunction before the literal-success check i
   assert.deepEqual(verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID), []);
 });
 
-// Bypass B, found in QA review: removing a job's clause from the REAL
-// controlling expression (the env value the gate step's run script
-// actually reads) while leaving the decoy literal text
-// "needs.build.result == 'success'" in some other, unused location on the
-// job - an env entry no run script ever reads - left the old check
-// clean, because it flattened the whole job's env/run/if text into one
-// blob and searched that, so the decoy satisfied it just as well as the
-// real clause it replaced.
-test("mutation control: a decoy literal-success check in an unused env entry does not substitute for the real one (bypass B)", () => {
+// Removing a job's clause from the REAL controlling expression (the env
+// value the gate step's run script actually reads) while leaving decoy
+// literal text "needs.build.result == 'success'" in some other, unused
+// location on the job - an env entry no run script ever reads - must not
+// substitute for the real clause it replaced. Restricting the search to
+// the job's controlling expression (collectControllingExpressionText),
+// not its entire flattened env/run/if text, is what closes this.
+test("mutation control: a decoy literal-success check in an unused env entry does not substitute for the real one", () => {
   const workflow = loadWorkflow();
   const mutated = structuredClone(workflow);
   const step = mutated.jobs[AGGREGATE_JOB_ID].steps[0];
@@ -200,21 +199,128 @@ test("mutation control: a decoy literal-success check in an unused env entry doe
   assert.deepEqual(verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID), []);
 });
 
-// Bypass D, found in Manager review while checking the if:"false" question
-// above: the controlling step's own `if` being anything other than absent
-// or literally true - a computed, usually-false GitHub Actions expression,
-// say - previously still counted as "running" (the old stepActuallyRuns
-// only excluded the literal string "false"), so the step's real,
-// still-present literal-success text kept satisfying the check even
-// though that step might never actually execute at runtime. A gate whose
-// own required-success step is silently skipped would report success
+// --- hasLiteralSuccessCheck: the non-adjacent-disjunction CLASS ---
+//
+// Three successive fixes to this file each closed one named spelling of
+// "a `||` sits near the literal" (adjacent trailing, then adjacent
+// leading), and each was defeated by a spelling with one more operand of
+// distance between the literal and the disjunction that actually governs
+// it under real GitHub Actions operator precedence (`&&` binds tighter
+// than `||`, same as JS). Adjacency can never bound "how far away", so the
+// production check now parses the expression and asks a semantic
+// question instead: does forcing this job's result away from 'success'
+// make the WHOLE expression provably false, regardless of every other
+// unknown (see hasLiteralSuccessCheck / evaluateForcingJobFalse's own doc
+// comments)? The battery below exercises that CLASS directly against
+// hasLiteralSuccessCheck - not two more rows for two specific strings,
+// but every combination of which side the disjunction is on and how many
+// extra operands sit between it and the literal.
+
+test("class battery: non-adjacent disjunctions on either side, at increasing operand distance, all bypass the check", () => {
+  const bypassed = [
+    // trailing, zero operands of distance (the original adjacent case)
+    "needs.build.result == 'success' || true",
+    // trailing, one extra && operand between the literal and the ||
+    "needs.build.result == 'success' && false || true",
+    // trailing, two extra && operands
+    "needs.build.result == 'success' && false && false || true",
+    // leading, zero operands of distance (the original adjacent case)
+    "true || needs.build.result == 'success'",
+    // leading, one extra && operand between the || and the literal
+    "true || false && needs.build.result == 'success'",
+    // leading, two extra && operands
+    "true || false && false && needs.build.result == 'success'",
+  ];
+  for (const expression of bypassed) {
+    assert.equal(
+      hasLiteralSuccessCheck(expression, "build"),
+      false,
+      `expected "${expression}" to be flagged as not establishing build's check`
+    );
+  }
+});
+
+test("class battery: legitimate AND-chains of any length still report the job's check as established (green controls)", () => {
+  const safe = [
+    "needs.build.result == 'success'",
+    "needs.build.result == 'success' && needs.lint.result == 'success'",
+    "needs.lint.result == 'success' && needs.build.result == 'success' && needs.test.result == 'success'",
+    "(needs.build.result == 'success') && needs.lint.result == 'success'",
+    "needs.build.result == 'success' && (needs.lint.result == 'success' && needs.test.result == 'success')",
+  ];
+  for (const expression of safe) {
+    assert.equal(
+      hasLiteralSuccessCheck(expression, "build"),
+      true,
+      `expected "${expression}" to establish build's check - a fix that overcorrects into flagging legitimate AND-chains is its own defect`
+    );
+  }
+});
+
+test("class battery: forcing applies to EVERY occurrence of the job's atom, not just the first match", () => {
+  // (X && X) || true reduces to "true" regardless of X, even though the
+  // FIRST occurrence, read in isolation, looks like a normal, safe
+  // AND-conjoined check. A first-match implementation that stopped at the
+  // first occurrence would miss that the second occurrence sits inside a
+  // structure the outer `|| true` makes irrelevant.
+  assert.equal(
+    hasLiteralSuccessCheck(
+      "needs.build.result == 'success' && needs.build.result == 'success' || true",
+      "build"
+    ),
+    false,
+    "both occurrences of build's atom must be forced together - a bypass reachable through either one must be caught"
+  );
+  // X || (X && false) reduces to exactly X, so this is genuinely safe -
+  // confirming multiple occurrences don't make the check overcorrect
+  // either, as long as every path back to true still requires X.
+  assert.equal(
+    hasLiteralSuccessCheck(
+      "needs.build.result == 'success' || (needs.build.result == 'success' && false)",
+      "build"
+    ),
+    true,
+    "X || (X && false) reduces to X - build's result is still genuinely necessary"
+  );
+});
+
+test("class battery: constructs outside the understood grammar are flagged, never silently accepted (fail closed)", () => {
+  const unsafe = [
+    // Negation: logically equivalent to a genuine success check, but this
+    // file does not understand `!` and must not guess that it does.
+    "!(needs.build.result != 'success')",
+    // A function call standing in for (or combined with) the check.
+    "success() || needs.build.result == 'success'",
+    "always() && needs.build.result == 'success' || true",
+    // A comparison operator, or a literal, outside the one shape this
+    // file understands (`== 'success'`/`== "success"` only).
+    "needs.build.result != 'failure'",
+    "needs.build.result == 'skipped'",
+    // Malformed/truncated fragments this file cannot parse at all.
+    "needs.build.result == 'success",
+    "(needs.build.result == 'success'",
+    "needs.build.result == 'success') && true",
+  ];
+  for (const expression of unsafe) {
+    assert.equal(
+      hasLiteralSuccessCheck(expression, "build"),
+      false,
+      `expected "${expression}" (outside the understood grammar) to be flagged, not silently accepted`
+    );
+  }
+});
+
+// The controlling step's own `if` being anything other than absent or
+// literally true - a computed, usually-false GitHub Actions expression,
+// say - must not still count as "running": a gate whose own
+// required-success step is silently skipped would report success
 // trivially, regardless of what actually failed - defeating the WHOLE
-// aggregate check in one move, not just one job's clause the way A/B/C
-// each do. The gate's JOB-level `if: always()` (required, untouched by
-// this test) is a completely separate concern from this STEP-level `if`;
-// see stepIsUnconditionallyControlling's own docs for why they need
-// opposite treatment.
-test("mutation control: a conditional if on the controlling step itself is caught (bypass D)", () => {
+// aggregate check in one move, not just one job's clause the way the
+// disjunction bypasses above each do. The gate's JOB-level `if: always()`
+// (required, untouched by this test) is a completely separate concern
+// from this STEP-level `if`; see stepIsUnconditionallyControlling's own
+// docs for why they need opposite treatment.
+test("mutation control: a conditional if on the controlling step itself is caught", () => {
   const workflow = loadWorkflow();
   const mutated = structuredClone(workflow);
   const step = mutated.jobs[AGGREGATE_JOB_ID].steps[0];
