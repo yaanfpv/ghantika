@@ -341,8 +341,8 @@ export function runOnce({ discovered, tracked, junitPath, options }) {
     // individual tests reported in but which then never let its own
     // process exit (isolation:'process' is node:test's default, so a
     // file's own top-level test:complete does not fire until its child
-    // process has actually exited - confirmed empirically, not assumed;
-    // see the SD verification report for the throwaway-fixture proof).
+    // process has actually exited - confirmed empirically against a
+    // throwaway fixture, not assumed).
     const filesWithOwnCompletion = new Set();
 
     function noteEvent(name, data) {
