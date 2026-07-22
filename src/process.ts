@@ -780,10 +780,14 @@ export interface WindowsKillResult {
  *     at all (see `killProcessTreeWindows` itself: no `await`, no
  *     `setTimeout`, nothing SIGTERM-shaped).
  *
- * A real `taskkill` only exists on Windows, so it is the suite's Windows
- * legs that run this against the actual utility. Everywhere else the call
- * fails with ENOENT and lands in the catch below, which exercises the
- * error-swallowing path but proves nothing about a real Windows kill.
+ * A real `taskkill` only exists on Windows, and with no Windows leg in
+ * this repo's CI matrix at all right now (temporarily removed; see
+ * CHANGELOG), nothing exercises this against the actual utility anywhere
+ * currently - this function's test degrades to shape-only coverage: it
+ * can still be checked for structure and logic, not against a real
+ * Windows kill. Everywhere the suite DOES run, the call fails with ENOENT
+ * and lands in the catch below, which exercises the error-swallowing path
+ * but proves nothing about a real Windows kill either.
  */
 export function killProcessTreeWindows(pid: number): WindowsKillResult {
   try {

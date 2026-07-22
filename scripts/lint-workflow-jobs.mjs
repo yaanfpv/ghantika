@@ -3,15 +3,20 @@
  * Structural lints over .github/workflows/ci.yml that go beyond the
  * needs/if topology scripts/verify-workflow-topology.mjs checks:
  *
- *  - no job the "gate" aggregate depends on may set `continue-on-error:
- *    true` anywhere, since that would let a step (and therefore the job)
- *    report success on GitHub's dashboard while actually having failed -
- *    exactly the kind of pass-that-isn't-a-pass the gate job exists to
- *    rule out.
+ *  - no job the "gate" aggregate depends on, and no aggregate itself
+ *    (job level or step level), may set `continue-on-error` to anything
+ *    other than absent or the literal `false` - not just the literal
+ *    boolean `true`, but also a quoted string or a GitHub Actions
+ *    expression, either of which GitHub treats identically to the
+ *    boolean at runtime. Any of those would let a step (and therefore the
+ *    job) report success on GitHub's dashboard while actually having
+ *    failed - exactly the kind of pass-that-isn't-a-pass the gate job
+ *    exists to rule out, including on the aggregate itself, which is the
+ *    one required check branch protection actually points at.
  *  - the `test` job's matrix has to cover every combination of operating
  *    system and Node version this project claims to support, so a leg
- *    can't quietly go missing (e.g. nobody notices Windows + Node 24 was
- *    dropped from the matrix).
+ *    can't quietly go missing (e.g. nobody notices a leg silently drops
+ *    from the matrix).
  *  - the workflow's job list must never contain a job pretending to be
  *    secret scanning or Dependabot - those are GitHub repository settings
  *    (and, for Dependabot, a separate .github/dependabot.yml config file),
@@ -211,8 +216,8 @@ export function verifyMatrixCompleteness(
  * directly - never against `EXPECTED_OS`/`EXPECTED_NODE`, which is
  * exactly the derivation `verifyMatrixCompleteness` above uses and which
  * a coordinated edit could shrink in lockstep with the real matrix. This
- * is the independent oracle the mutation matrix's SELF/KEEP/WIN sections
- * require.
+ * is the independent oracle that guarantees a coordinated edit like that
+ * is still caught.
  *
  * @param {any} job
  * @returns {{ missing: string[], extra: string[] }}
@@ -226,13 +231,13 @@ export function verifyIndependentMatrixLegs(job) {
 }
 
 /**
- * THE MANDATORY META-GUARD (mutation matrix row SELF-8): confirms
+ * THE MANDATORY META-GUARD: confirms
  * `INDEPENDENT_EXPECTED_LEGS` above is STILL a genuine hard-coded literal
  * - a plain array of string literals with no computed element - and not
  * quietly weakened back into a derived product of `EXPECTED_OS` x
- * `EXPECTED_NODE`. Proven necessary, not theoretical: QA mutated the
- * declaration to `EXPECTED_OS.flatMap((os) => EXPECTED_NODE.map((node) =>
- * \`${os}::${node}\`))` and the full guard-test suite still passed 10/10,
+ * `EXPECTED_NODE`. Proven necessary, not theoretical: a mutated
+ * declaration (`EXPECTED_OS.flatMap((os) => EXPECTED_NODE.map((node) =>
+ * \`${os}::${node}\`))`) still let the full guard-test suite pass,
  * because nothing checked the declaration's own SHAPE. Every other check
  * in this file only ever reads the exported VALUE of
  * `INDEPENDENT_EXPECTED_LEGS`, which looks identical whether it came from
@@ -307,7 +312,7 @@ function main() {
   const continueOnErrorOffenders = findContinueOnError(jobs, AGGREGATE_JOB_ID);
   for (const jobId of continueOnErrorOffenders) {
     errors.push(
-      `job "${jobId}" sets continue-on-error: true, which would let it report success while actually failing`
+      `job "${jobId}" sets continue-on-error to something other than absent/false, which would let it report success while actually failing`
     );
   }
 

@@ -90,6 +90,42 @@ test("mutation control: a planted continue-on-error on one of the gate job's own
   assert.deepEqual(findGateOwnContinueOnError(mutated.jobs, AGGREGATE_JOB_ID), []);
 });
 
+// findGateOwnContinueOnError shares isContinueOnErrorViolation with
+// findContinueOnError above, so it needs the same non-literal-boolean
+// coverage: a quoted string or a GitHub Actions expression on the
+// aggregate itself must be caught too, not just the literal `true` the
+// two tests above exercise.
+
+test("mutation control (expression-valued, gate job level): an expression continue-on-error on the gate job itself is caught", () => {
+  const workflow = loadWorkflow();
+  const mutated = structuredClone(workflow);
+  mutated.jobs[AGGREGATE_JOB_ID]["continue-on-error"] = "${{ vars.ALLOW_GATE_FAILURE }}";
+
+  assert.deepEqual(findGateOwnContinueOnError(mutated.jobs, AGGREGATE_JOB_ID), [
+    `"${AGGREGATE_JOB_ID}" job level`,
+  ]);
+});
+
+test("mutation control (expression-valued, gate step level): an expression continue-on-error on one of the gate job's own steps is caught", () => {
+  const workflow = loadWorkflow();
+  const mutated = structuredClone(workflow);
+  mutated.jobs[AGGREGATE_JOB_ID].steps.at(-1)["continue-on-error"] = "${{ matrix.allow_failure }}";
+
+  assert.deepEqual(findGateOwnContinueOnError(mutated.jobs, AGGREGATE_JOB_ID), [
+    `"${AGGREGATE_JOB_ID}".steps[${mutated.jobs[AGGREGATE_JOB_ID].steps.length - 1}]`,
+  ]);
+});
+
+test('mutation control (quoted string "true", gate job level): a string "true" continue-on-error on the gate job itself is caught even though it is not the literal boolean', () => {
+  const workflow = loadWorkflow();
+  const mutated = structuredClone(workflow);
+  mutated.jobs[AGGREGATE_JOB_ID]["continue-on-error"] = "true";
+
+  assert.deepEqual(findGateOwnContinueOnError(mutated.jobs, AGGREGATE_JOB_ID), [
+    `"${AGGREGATE_JOB_ID}" job level`,
+  ]);
+});
+
 // --- Mandatory protection: expression-valued continue-on-error ---
 //
 // continue-on-error accepts more than a literal boolean `true` - GitHub
