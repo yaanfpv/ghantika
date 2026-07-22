@@ -160,13 +160,15 @@ function effectiveWindowsServerPath(): string | undefined {
  * (guarding against a "Windows env-key casing collision" regression) -
  * `effectivePathForLookup` below gates USE of this behind
  * `process.platform === "win32"`, so that internal branch never runs as
- * live code during local development on a non-Windows machine; it DOES
- * run for real, unmocked, on this repo's own CI (ci.yml's `test` job
- * matrix includes a `windows-latest` leg, where `process.platform`
- * genuinely is `"win32"`). The underlying case-insensitive-key-resolution
- * ALGORITHM this codebase implements is not itself platform-specific, and
- * is what this function isolates for direct verification independent of
- * `process.platform`.
+ * live code during local development on a non-Windows machine. There is
+ * currently no Windows leg in this repo's CI matrix at all (temporarily
+ * removed; see CHANGELOG), so that win32-gated call site is not exercised
+ * against a real Windows host anywhere right now. This function's own
+ * ALGORITHM stays directly verified independent of that: the case-
+ * insensitive-key-resolution logic is not itself platform-specific, and
+ * this file's own test suite exercises it against real PATH/Path/path
+ * casing-collision fixtures on whatever host the suite runs on - which is
+ * exactly what "exported as its own small, pure function" above is for.
  */
 export function resolveCaseInsensitivePathKey(
   env: Readonly<Record<string, string>>
@@ -292,10 +294,12 @@ function effectivePathForLookup(env: Readonly<Record<string, string>>): string {
  * On Windows, a bare command with no extension is tried against each
  * extension in `PATHEXT` (in addition to the bare name), matching
  * `cmd.exe`/`CreateProcess`'s own resolution. Everything below the
- * platform check is a best-effort reading of that documented behavior, so
- * it is the suite's Windows legs that exercise it against a real
- * `CreateProcess`; a macOS or Linux run returns at the first line and
- * never reaches any of it.
+ * platform check is a best-effort reading of that documented behavior. A
+ * macOS or Linux run returns at the first line and never reaches any of
+ * it, and, with no Windows leg in this repo's CI matrix at all right now
+ * (temporarily removed; see CHANGELOG), nothing exercises the rest of
+ * this function against a real `CreateProcess` anywhere either - the
+ * branch below is currently verified only by reading, not by execution.
  */
 function windowsExtensionCandidates(command: string): string[] {
   if (process.platform !== "win32") return [command];
