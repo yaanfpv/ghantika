@@ -316,6 +316,7 @@ async function reapOneJobOnShutdown(jobId: string): Promise<void> {
     try {
       killProcessTreeWindows(handle.pid);
     } catch (error) {
+      // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- jobId is this codebase's own randomUUID(), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
       console.error(`[ghantika] error killing job ${jobId}'s process tree during shutdown:`, error);
     }
     jobStore.markKilled(jobId, "SIGKILL-equiv");
@@ -348,6 +349,7 @@ async function reapOneJobOnShutdown(jobId: string): Promise<void> {
       },
     });
   } catch (error) {
+    // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- jobId is this codebase's own randomUUID(), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
     console.error(`[ghantika] error killing job ${jobId}'s process group during shutdown:`, error);
   }
 }
