@@ -788,7 +788,7 @@ function buildResolverFixture(
   return { dir, toolsDir };
 }
 
-test("SPEC-6 (re-verified against the real resolver): a relative sibling specifier resolves and compares correctly through the real resolver, not just the fast path", () => {
+test("a relative sibling specifier resolves and compares correctly through the real resolver, not just the fast path", () => {
   const { dir, toolsDir } = buildResolverFixture();
   try {
     const importing = path.join(toolsDir, "run.ts");
@@ -803,7 +803,9 @@ test("SPEC-6 (re-verified against the real resolver): a relative sibling specifi
 });
 
 // ---------------------------------------------------------------------------
-// SPEC-2..5: an ordinary static `import` cannot syntactically take a
+// FOUR NON-LITERAL SPECIFIER SHAPES - a no-substitution template literal, an
+// interpolated template, a string concatenation, and a computed/variable
+// expression. An ordinary static `import` cannot syntactically take a
 // template/interpolated/concatenated/computed specifier at all (a parse
 // error, never a kill) - each fixture here uses a PERMITTED loader form
 // instead (a dynamic `import()`, whose argument is an ordinary expression
@@ -812,7 +814,7 @@ test("SPEC-6 (re-verified against the real resolver): a relative sibling specifi
 // loader.
 // ---------------------------------------------------------------------------
 
-test("SPEC-2: a no-substitution TEMPLATE LITERAL specifier, via a permitted dynamic import(), is read as a literal and caught the same as a plain string", () => {
+test("a no-substitution TEMPLATE LITERAL specifier, via a permitted dynamic import(), is read as a literal and caught the same as a plain string", () => {
   const { dir, toolsDir } = buildResolverFixture();
   try {
     const importing = path.join(toolsDir, "run.ts");
@@ -826,7 +828,7 @@ test("SPEC-2: a no-substitution TEMPLATE LITERAL specifier, via a permitted dyna
   }
 });
 
-test("SPEC-3: an INTERPOLATED template specifier, via a permitted dynamic import(), fails CLOSED - a skip would be a fail", () => {
+test("an INTERPOLATED template specifier, via a permitted dynamic import(), fails CLOSED - a skip would be a fail", () => {
   const { dir, toolsDir } = buildResolverFixture();
   try {
     const importing = path.join(toolsDir, "run.ts");
@@ -844,7 +846,7 @@ test("SPEC-3: an INTERPOLATED template specifier, via a permitted dynamic import
   }
 });
 
-test("SPEC-4: a string-CONCATENATION specifier, via a permitted dynamic import(), fails CLOSED", () => {
+test("a string-CONCATENATION specifier, via a permitted dynamic import(), fails CLOSED", () => {
   const { dir, toolsDir } = buildResolverFixture();
   try {
     const importing = path.join(toolsDir, "run.ts");
@@ -862,7 +864,7 @@ test("SPEC-4: a string-CONCATENATION specifier, via a permitted dynamic import()
   }
 });
 
-test("SPEC-5: a COMPUTED/VARIABLE specifier, via a permitted dynamic import(), fails CLOSED", () => {
+test("a COMPUTED/VARIABLE specifier, via a permitted dynamic import(), fails CLOSED", () => {
   const { dir, toolsDir } = buildResolverFixture();
   try {
     const importing = path.join(toolsDir, "run.ts");
@@ -880,7 +882,7 @@ test("SPEC-5: a COMPUTED/VARIABLE specifier, via a permitted dynamic import(), f
   }
 });
 
-test("green control (SPEC-2..5 harness): a dynamic import() of a legitimate, unrelated, statically-resolvable specifier is never flagged", () => {
+test("green control (non-literal-specifier harness): a dynamic import() of a legitimate, unrelated, statically-resolvable specifier is never flagged", () => {
   const { dir, toolsDir } = buildResolverFixture();
   try {
     const importing = path.join(toolsDir, "run.ts");
@@ -891,7 +893,7 @@ test("green control (SPEC-2..5 harness): a dynamic import() of a legitimate, unr
   }
 });
 
-test("EVA-3: a specifier assembled at runtime so it is not statically resolvable (an array .join(...)) fails CLOSED, never silently skipped", () => {
+test("a specifier assembled at runtime so it is not statically resolvable (an array .join(...)) fails CLOSED, never silently skipped", () => {
   const { dir, toolsDir } = buildResolverFixture();
   try {
     const importing = path.join(toolsDir, "run.ts");
@@ -909,7 +911,7 @@ test("EVA-3: a specifier assembled at runtime so it is not statically resolvable
   }
 });
 
-test("SPEC-7: an ABSOLUTE PATH specifier pointing at a real sibling file is caught - the fast path skips non-dot specifiers entirely, only the real resolver sees this", () => {
+test("an ABSOLUTE PATH specifier pointing at a real sibling file is caught - the fast path skips non-dot specifiers entirely, only the real resolver sees this", () => {
   const { dir, toolsDir } = buildResolverFixture();
   try {
     const importing = path.join(toolsDir, "run.ts");
@@ -928,7 +930,7 @@ test("SPEC-7: an ABSOLUTE PATH specifier pointing at a real sibling file is caug
   }
 });
 
-test("SPEC-8a: an EXTENSIONLESS relative specifier resolving to a real sibling .ts file is caught", () => {
+test("an EXTENSIONLESS relative specifier resolving to a real sibling .ts file is caught", () => {
   const { dir, toolsDir } = buildResolverFixture();
   try {
     const importing = path.join(toolsDir, "run.ts");
@@ -946,7 +948,7 @@ test("SPEC-8a: an EXTENSIONLESS relative specifier resolving to a real sibling .
   }
 });
 
-test("SPEC-8b: a DIRECTORY-INDEX specifier (trailing slash, resolving to the real index.ts) is caught", () => {
+test("a DIRECTORY-INDEX specifier (trailing slash, resolving to the real index.ts) is caught", () => {
   const { dir, toolsDir } = buildResolverFixture();
   try {
     const importing = path.join(toolsDir, "run.ts");
@@ -960,7 +962,7 @@ test("SPEC-8b: a DIRECTORY-INDEX specifier (trailing slash, resolving to the rea
   }
 });
 
-test("SPEC-9: a file:// URL specifier pointing at a real sibling file is caught - a prefix/suffix text test on the raw specifier would never see through the URL encoding", () => {
+test("a file:// URL specifier pointing at a real sibling file is caught - a prefix/suffix text test on the raw specifier would never see through the URL encoding", () => {
   const { dir, toolsDir } = buildResolverFixture();
   try {
     const importing = path.join(toolsDir, "run.ts");
@@ -975,7 +977,7 @@ test("SPEC-9: a file:// URL specifier pointing at a real sibling file is caught 
   }
 });
 
-test("SPEC-10a: a SYMLINK located OUTSIDE tools/ whose real target sits INSIDE tools/ is caught - the fast path's pure path arithmetic on the symlink's own (outside-tools) path would miss this entirely, only realpath-following the resolved target catches it", () => {
+test("a SYMLINK located OUTSIDE tools/ whose real target sits INSIDE tools/ is caught - the fast path's pure path arithmetic on the symlink's own (outside-tools) path would miss this entirely, only realpath-following the resolved target catches it", () => {
   const { dir, toolsDir } = buildResolverFixture(
     {},
     { "lib/sibling-alias.ts": "tools/sibling.ts" }
@@ -996,7 +998,7 @@ test("SPEC-10a: a SYMLINK located OUTSIDE tools/ whose real target sits INSIDE t
   }
 });
 
-test('SPEC-10b: a PACKAGE/SUBPATH-IMPORT ALIAS (package.json\'s own "imports" field) resolving to a real sibling file is caught', () => {
+test('a PACKAGE/SUBPATH-IMPORT ALIAS (package.json\'s own "imports" field) resolving to a real sibling file is caught', () => {
   const { dir, toolsDir } = buildResolverFixture({
     "package.json": JSON.stringify({
       name: "fixture",
@@ -1015,7 +1017,7 @@ test('SPEC-10b: a PACKAGE/SUBPATH-IMPORT ALIAS (package.json\'s own "imports" fi
   }
 });
 
-test("OBT-9: import.meta.resolve(...) of a sibling, handed to a require obtained via process.getBuiltinModule (OBT-2 specifically), is caught by the SPECIFIER check itself - not merely by the separate, already-banned process.getBuiltinModule acquisition", () => {
+test("import.meta.resolve(...) of a sibling, handed to a require obtained via process.getBuiltinModule, is caught by the SPECIFIER check itself - not merely by the separate, already-banned process.getBuiltinModule acquisition", () => {
   const { dir, toolsDir } = buildResolverFixture();
   try {
     const importing = path.join(toolsDir, "run.ts");
@@ -1044,7 +1046,7 @@ test("OBT-9: import.meta.resolve(...) of a sibling, handed to a require obtained
   }
 });
 
-test("EVA-2: a re-export BARREL (outside tools/) that itself re-exports a sibling is caught transitively - the importing file never names the sibling directly", () => {
+test("a re-export BARREL (outside tools/) that itself re-exports a sibling is caught transitively - the importing file never names the sibling directly", () => {
   const { dir, toolsDir } = buildResolverFixture({
     "barrel.ts": 'export * from "./tools/sibling.js";\n',
   });
@@ -1096,7 +1098,7 @@ test("green control: an absolute path, file:// URL, extensionless, or directory 
   }
 });
 
-test("SELF-2 setup check: the real resolver's own compare uses path.relative-based containment on canonical realpaths, never a prefix/suffix string test - a sibling directory that merely shares a string prefix (tools-backup/) is never mistaken for tools/ itself", () => {
+test("the real resolver's own compare uses path.relative-based containment on canonical realpaths, never a prefix/suffix string test - a sibling directory that merely shares a string prefix (tools-backup/) is never mistaken for tools/ itself", () => {
   const { dir, toolsDir } = buildResolverFixture({
     "tools-backup/sibling.ts": "export const marker = 99;\n",
   });
