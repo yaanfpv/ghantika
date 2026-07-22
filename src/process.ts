@@ -497,13 +497,39 @@ export function identityElapsedTimesMatch(
  * Reads `pid`'s real elapsed wall-clock time from the OS via a real `ps`
  * invocation - `undefined` if `ps` reports nothing for this pid (it isn't
  * alive) or produces output this codebase can't parse.
+ *
+ * LOAD-BEARING AND POSIX-ONLY - deliberately, not an oversight. `ps` does
+ * not exist on a stock Windows install (there is no `ps.exe` on `PATH` on
+ * an ordinary end-user machine; some environments - e.g. this repo's own
+ * `windows-latest` CI, which bundles Git for Windows' MSYS layer - happen
+ * to have one on `PATH` anyway, but that is an environment accident, never
+ * something this codebase relies on). Calling this on win32 with no real
+ * `ps` on `PATH` throws `ENOENT`, which the catch above collapses to
+ * `undefined` - i.e. `checkProcessIdentity` below would report a genuinely
+ * ALIVE Windows process as `"not-found"`, purely because `ps` isn't there,
+ * not because the process actually isn't.
+ *
+ * This is safe TODAY only because both of `checkProcessIdentity`'s real
+ * production callers gate on `process.platform === "win32"` and return
+ * BEFORE ever reaching it: `src/tools/kill.ts`'s handler branches to
+ * `killProcessTreeWindows` and returns early on win32; `src/server.ts`'s
+ * `reapOneJobOnShutdown` does the identical early-return. Verified against
+ * the real code, not assumed - grep both call sites for
+ * `process.platform === "win32"` before this function's own call if that
+ * ever changes. A THIRD caller that reaches `checkProcessIdentity` on
+ * win32 without the same platform gate would silently misreport a live
+ * process as gone - so any new caller of `checkProcessIdentity` MUST
+ * preserve that same early-return, not just avoid calling this function
+ * directly. (The two Windows-relevant `checkProcessIdentity` tests in
+ * `test/process.test.ts` are already correctly skipped there via
+ * `POSIX_PROCESS_GROUP_SKIP`, with the same reasoning stated inline.)
  */
 function readProcessElapsedSeconds(pid: number): number | undefined {
   let output: string;
   try {
     output = execFileSync("ps", ["-p", String(pid), "-o", "etime="], { encoding: "utf8" });
   } catch {
-    return undefined; // ps exits non-zero when there is no such pid
+    return undefined; // ps exits non-zero when there is no such pid (or, on win32, doesn't exist at all - see this function's own docs)
   }
   if (output.trim().length === 0) return undefined;
   return parseEtime(output);
@@ -529,6 +555,11 @@ function readProcessElapsedSeconds(pid: number): number | undefined {
  * Windows). It closes the realistic, common case (a long-dead job's pid
  * recycled by an unrelated later process) without pretending to close
  * every theoretical one.
+ *
+ * POSIX-ONLY, by construction (see `readProcessElapsedSeconds`'s own docs
+ * for exactly why) - never call this on win32 without first replicating
+ * the same early-return `src/tools/kill.ts` and `src/server.ts`'s
+ * `reapOneJobOnShutdown` both already have.
  */
 export function checkProcessIdentity(
   pid: number,

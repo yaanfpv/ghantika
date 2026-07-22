@@ -124,8 +124,18 @@ test("buildChildEnv merge mode layers caller vars OVER a minimal base, never the
   // curated minimal base (e.g. this test runner's own harness-injected
   // vars) - assert at least one such variable, if present on this host, is
   // NOT wholesale-inherited into the child's env.
+  //
+  // The curated minimal base is PLATFORM-DEPENDENT (PATH + HOME on POSIX;
+  // PATH + SystemRoot + USERPROFILE on Windows - see computeMinimalBaseEnv's
+  // own docs in src/process.ts) - derive the legitimate base-key set by
+  // calling buildChildEnv itself with no caller vars, rather than
+  // hardcoding a POSIX-only exclusion list. A hardcoded ["PATH", "HOME"]
+  // list previously misclassified Windows' own legitimate base keys
+  // (SystemRoot, USERPROFILE) as "leaked" full-process.env keys, when they
+  // were actually the curated base doing exactly what it's supposed to do.
+  const baseKeys = new Set(Object.keys(buildChildEnv("merge", {})));
   const serverOnlyKeys = Object.keys(process.env).filter(
-    (key) => key !== "PATH" && key !== "HOME" && key !== "CUSTOM_VAR"
+    (key) => !baseKeys.has(key) && key !== "CUSTOM_VAR"
   );
   const leaked = serverOnlyKeys.filter((key) => key in env);
   assert.deepEqual(
@@ -239,8 +249,17 @@ test("resolveExecutable returns undefined for a bare name that doesn't exist any
 
 test("resolveExecutable resolves an absolute path directly, without a PATH search", () => {
   const env = buildChildEnv("merge", {});
-  const resolved = resolveExecutable("/bin/sh", process.cwd(), env);
-  assert.equal(resolved, "/bin/sh");
+  // process.execPath is a real, absolute, definitely-executable path on
+  // EVERY platform this suite runs on (it's the actual running Node
+  // binary) - unlike a hardcoded POSIX path (`/bin/sh` does not exist at
+  // all on Windows, so resolveExecutable correctly returned undefined for
+  // it there, which is the right answer to the wrong fixture, not a bug).
+  // This exercises the real guarantee ("an absolute path is used as-is,
+  // never PATH-searched") without depending on any single platform's
+  // filesystem layout. test/e2e-server.test.ts's own replace-mode test
+  // uses this same process.execPath trick for the identical reason.
+  const resolved = resolveExecutable(process.execPath, process.cwd(), env);
+  assert.equal(resolved, process.execPath);
 });
 
 test("resolveExecutable returns undefined for a nonexistent absolute path", () => {
@@ -249,15 +268,41 @@ test("resolveExecutable returns undefined for a nonexistent absolute path", () =
   assert.equal(resolved, undefined);
 });
 
-test("resolveExecutable returns undefined for an existing file that lacks the execute bit", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-noexec-"));
-  const file = path.join(dir, "not-executable");
-  fs.writeFileSync(file, "#!/bin/sh\necho no\n");
-  fs.chmodSync(file, 0o644);
-  const env = buildChildEnv("merge", {});
-  const resolved = resolveExecutable(file, process.cwd(), env);
-  assert.equal(resolved, undefined);
-});
+// Windows has no POSIX execute-permission bit at all - fs.chmodSync on
+// Windows only toggles the read-only attribute, never anything execute-
+// related, so there is no filesystem-level signal left for
+// resolveExecutable to observe here. This is NOT the PATH-search case
+// either (see windowsExtensionCandidates' own docs): resolveExecutable
+// treats a path containing a separator as a literal path and deliberately
+// skips PATHEXT/extension matching for it, mirroring POSIX execvp's own
+// "an explicit path bypasses search" semantics - so there is no
+// alternate Windows-native signal (like a recognized extension) this
+// access pattern could check instead. The guarantee this test protects -
+// "an existing-but-not-really-runnable file must not resolve" - genuinely
+// has no Windows form for an EXPLICIT-PATH lookup: resolveExecutable is
+// documented as a best-effort pre-flight check only ("not a spawn... a
+// real spawn can still race this"), and a genuinely non-runnable file
+// given this way still fails at the real spawn stage on every platform,
+// reported via spawnManaged's own onError - so nothing is silently
+// unguarded here, just less precise pre-flight on Windows specifically.
+const WINDOWS_NO_EXECUTE_BIT_SKIP =
+  process.platform === "win32"
+    ? "Windows has no POSIX execute-permission bit, and an explicit file path (as opposed to a bare PATH-searched name) deliberately skips extension-based matching too - there is no Windows-native signal left for this exact access pattern to check; a real spawn is still the defense-in-depth backstop for a genuinely non-runnable file (see this test's own comment above)"
+    : false;
+
+test(
+  "resolveExecutable returns undefined for an existing file that lacks the execute bit",
+  { skip: WINDOWS_NO_EXECUTE_BIT_SKIP },
+  () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-noexec-"));
+    const file = path.join(dir, "not-executable");
+    fs.writeFileSync(file, "#!/bin/sh\necho no\n");
+    fs.chmodSync(file, 0o644);
+    const env = buildChildEnv("merge", {});
+    const resolved = resolveExecutable(file, process.cwd(), env);
+    assert.equal(resolved, undefined);
+  }
+);
 
 test("resolveExecutable returns undefined for a directory (a directory is never a runnable command)", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-dircheck-"));
@@ -549,13 +594,39 @@ test("spawnManaged's synchronous-throw defense-in-depth path (a cwd that is a fi
   fs.writeFileSync(file, "x");
   const rec = recorder();
   const env = buildChildEnv("merge", {});
-  let returned: unknown;
+  let returned: ReturnType<typeof spawnManaged>;
   assert.doesNotThrow(() => {
     returned = spawnManaged({ argv: ["echo", "hi"], cwd: file, env }, callbacksFor(rec));
   });
-  assert.equal(returned, undefined);
-  assert.equal(rec.errors.length, 1);
-  assert.match(rec.errors[0]!, /ENOTDIR/);
+  if (process.platform === "win32") {
+    // The claim this function's own docs make - "a cwd that exists but is
+    // a FILE throws SYNCHRONOUSLY from spawn() itself (verified
+    // empirically: ENOTDIR)" - was verified on POSIX only (fork()+chdir()
+    // surfaces that failure synchronously there). On Windows, the
+    // equivalent CreateProcess-level cwd validation is ASYNCHRONOUS
+    // instead - reported via the child's own real `error` event, the SAME
+    // delivery path an ENOENT missing-binary failure already uses, not
+    // the synchronous-throw path this function's try/catch exists to
+    // catch. So on Windows a real (if doomed) ChildProcess comes back
+    // immediately, and onError fires slightly later - this is
+    // spawnManaged's SAME caller-facing contract ("never throws to the
+    // caller; onError always eventually fires for a spawn failure"),
+    // delivered on a different schedule, not a different guarantee. The
+    // real win32 error code/text for this specific case isn't
+    // independently verified here (no Windows dev machine available - see
+    // this repo's own stated honesty policy on unverified Windows
+    // claims elsewhere in this file), so only its eventual arrival is
+    // asserted below, never its exact wording.
+    assert.notEqual(returned, undefined);
+    await waitFor(() => rec.errors.length > 0);
+    assert.equal(rec.errors.length, 1);
+    assert.equal(typeof rec.errors[0], "string");
+    assert.ok(rec.errors[0]!.length > 0);
+  } else {
+    assert.equal(returned, undefined);
+    assert.equal(rec.errors.length, 1);
+    assert.match(rec.errors[0]!, /ENOTDIR/);
+  }
 });
 
 test("spawnManaged wires shellCommand through the platform shell (pipes/interpretation work)", async () => {
@@ -567,7 +638,21 @@ test("spawnManaged wires shellCommand through the platform shell (pipes/interpre
   );
   await waitFor(() => rec.exits.length > 0);
   assert.equal(rec.exits[0]!.code, 0);
-  assert.equal(Buffer.concat(rec.stdout).toString("utf8").trim(), "shell-one\nshell-two");
+  // The platform shell genuinely differs in output FORMATTING (POSIX sh
+  // uses "\n" line endings; Windows' cmd.exe - the real platform shell
+  // `shell: true` invokes there - uses "\r\n", plus its own echo
+  // whitespace quirks) - that's real, expected shell output shape, not a
+  // sign shell interpretation failed. What this test actually verifies is
+  // that "&&"-chaining ran BOTH echo commands, in order, through a real
+  // shell - so each line is normalized (CRLF-or-LF split, then trimmed)
+  // before comparing, rather than asserting one platform's exact
+  // byte-for-byte shell formatting as if it were universal.
+  const lines = Buffer.concat(rec.stdout)
+    .toString("utf8")
+    .split(/\r\n|\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  assert.deepEqual(lines, ["shell-one", "shell-two"]);
 });
 
 test("spawnManaged: stdout/stderr end events fire for a real completed process", async () => {
@@ -582,12 +667,55 @@ test("spawnManaged: stdout/stderr end events fire for a real completed process",
   assert.equal(Buffer.concat(rec.stderr).toString("utf8").trim(), "e");
 });
 
+/**
+ * The fixed, NAMED set of environment-variable NAMES that Node's own
+ * process-spawning dependency, libuv, force-injects into a WINDOWS child -
+ * regardless of `env.mode`, regardless of what this codebase passes to
+ * `child_process.spawn`, and with no way for this codebase to opt out
+ * short of not using `child_process` at all.
+ *
+ * SOURCED, not guessed - read directly from libuv's real, current source:
+ * `make_program_env()` in `src/win/process.c`
+ * (https://github.com/libuv/libuv/blob/v1.x/src/win/process.c), the same
+ * file Node.js itself vendors at `deps/uv/src/win/process.c`. For each name
+ * NOT already present in the env block being spawned (matched
+ * case-insensitively - Windows env keys are case-insensitive, per
+ * `resolveCaseInsensitivePathKey`'s own docs elsewhere in this codebase),
+ * libuv fills it in from `GetEnvironmentVariableW` called on the SPAWNING
+ * process - i.e. from THIS TEST's own `process.env` - and only if the
+ * spawning process actually has that variable set at all. So the real
+ * injected set on any one run is this list FILTERED to whichever names the
+ * spawning process happens to have set, minus whichever of them the caller
+ * already supplied explicitly (a caller-supplied value is never
+ * overridden).
+ *
+ * Deliberately does NOT include `ComSpec` - that belongs to a separate
+ * `shell: true`-only code path (deciding which binary to launch AS the
+ * shell), unrelated to which variables end up IN a spawned child's own
+ * environment; `spawnManaged`'s plain `argv` path this test exercises never
+ * goes through that code at all.
+ */
+const WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES: readonly string[] = [
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "LOGONSERVER",
+  "PATH",
+  "SYSTEMDRIVE",
+  "SYSTEMROOT",
+  "TEMP",
+  "USERDOMAIN",
+  "USERNAME",
+  "USERPROFILE",
+  "WINDIR",
+];
+
 test("spawnManaged: a command run with env replace mode sees ONLY the vars we gave it (real child, real echo of its own env)", async () => {
   const rec = recorder();
-  const env = buildChildEnv("replace", {
+  const vars = {
     MY_ONLY_VAR: "only-value",
     PATH: process.env.PATH ?? POSIX_DEFAULT_PATH,
-  });
+  };
+  const env = buildChildEnv("replace", vars);
   spawnManaged(
     { argv: ["node", "-e", "console.log(JSON.stringify(process.env))"], cwd: process.cwd(), env },
     callbacksFor(rec)
@@ -609,10 +737,25 @@ test("spawnManaged: a command run with env replace mode sees ONLY the vars we ga
   if (process.env.NODE_V8_COVERAGE !== undefined) {
     delete childEnv.NODE_V8_COVERAGE;
   }
-  assert.deepEqual(childEnv, {
-    MY_ONLY_VAR: "only-value",
-    PATH: process.env.PATH ?? POSIX_DEFAULT_PATH,
-  });
+  // Replace mode's contract - "the caller's vars, and nothing else" - is
+  // unconditionally true on POSIX (libuv's real POSIX spawn path passes
+  // whatever envp array it's given straight to exec, with no additions of
+  // its own). On Windows it is NOT unconditionally true: libuv
+  // force-injects WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES downstream of
+  // buildChildEnv, entirely outside this codebase's control (see that
+  // constant's own docs above) - so the expected env on Windows is the
+  // caller's vars PLUS whichever of those names the caller didn't already
+  // supply itself, filled in from this test's own real process.env.
+  const expected: Record<string, string> = { ...vars };
+  if (process.platform === "win32") {
+    const suppliedUpper = new Set(Object.keys(expected).map((key) => key.toUpperCase()));
+    for (const name of WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES) {
+      if (suppliedUpper.has(name)) continue; // caller already supplied this one - libuv never overrides an explicit value
+      const fromServer = process.env[name];
+      if (fromServer !== undefined) expected[name] = fromServer;
+    }
+  }
+  assert.deepEqual(childEnv, expected);
 });
 
 // ---------------------------------------------------------------------------
