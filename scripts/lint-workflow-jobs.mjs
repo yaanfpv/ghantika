@@ -23,14 +23,42 @@ import { fileURLToPath } from "node:url";
 import { load as loadYaml } from "js-yaml";
 
 import { isMainModule } from "./lib/is-main.mjs";
+import { forEachDescendant, parseSourceFile, ts } from "./lib/ts-ast.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const THIS_FILE_PATH = fileURLToPath(import.meta.url);
 
 export const WORKFLOW_PATH = path.join(REPO_ROOT, ".github", "workflows", "ci.yml");
 export const AGGREGATE_JOB_ID = "gate";
 export const TEST_JOB_ID = "test";
 export const EXPECTED_OS = ["ubuntu-latest", "macos-latest"];
 export const EXPECTED_NODE = ["22", "24"];
+
+/**
+ * The independent, hard-coded closed set of "<os>::<node>" legs the real
+ * `test` job matrix must contain - written directly here as a literal
+ * array of string literals, never derived from `EXPECTED_OS`/
+ * `EXPECTED_NODE` above. This is the PRODUCTION location the matrix
+ * mutation matrix (story-0057-windows-matrix-removal.md, SELF/KEEP/WIN
+ * sections) specifies: a constant declared only in a test file protects
+ * just that test, while this file's own `main()` - which CI's `lint` job
+ * actually runs - would keep shipping the weaker, derived check. A
+ * coordinated edit that shrinks BOTH the real workflow matrix AND
+ * `EXPECTED_OS`/`EXPECTED_NODE` together leaves this list untouched, so
+ * `verifyIndependentMatrixLegs` below still catches it.
+ *
+ * See `verifyIndependentLegsIsLiteral` for the SEPARATE, mandatory
+ * guarantee that this declaration STAYS a literal - the entry a coordinated
+ * edit would need to touch to defeat this list is exactly the shape that
+ * function is built to catch.
+ */
+export const INDEPENDENT_EXPECTED_LEGS = [
+  "ubuntu-latest::22",
+  "ubuntu-latest::24",
+  "macos-latest::22",
+  "macos-latest::24",
+];
+
 export const FORBIDDEN_JOB_IDS = [
   "secret-scan",
   "secret_scan",
@@ -96,6 +124,40 @@ export function findContinueOnError(jobs, aggregateId = AGGREGATE_JOB_ID) {
 }
 
 /**
+ * The gate aggregate's OWN `continue-on-error` usage - deliberately a
+ * SEPARATE check from `findContinueOnError` above, which excludes the
+ * aggregate by id on purpose (it is checking jobs the aggregate DEPENDS
+ * on, and the aggregate does not depend on itself). That exclusion left a
+ * real gap: nothing checked whether `gate` itself, or any of its own
+ * steps - including the one step that exits 1 when a required job did not
+ * literally succeed - carries a `continue-on-error` that would let GATE
+ * ITSELF report success while its own check failed. That is strictly
+ * worse than the excluded case, since `gate` is the one required check a
+ * branch-protection rule actually points at. Same
+ * `isContinueOnErrorViolation` predicate (only absent or literal `false`
+ * is safe), applied to the aggregate job and each of its own steps by
+ * index, so a violation names exactly where it was found.
+ *
+ * @param {Record<string, any>} jobs
+ * @param {string} [aggregateId]
+ * @returns {string[]} human-readable locations where the aggregate itself carries a forbidden continue-on-error
+ */
+export function findGateOwnContinueOnError(jobs, aggregateId = AGGREGATE_JOB_ID) {
+  const aggregate = jobs?.[aggregateId];
+  if (aggregate === undefined) return [];
+  const violations = [];
+  if (isContinueOnErrorViolation(aggregate["continue-on-error"])) {
+    violations.push(`"${aggregateId}" job level`);
+  }
+  (aggregate.steps ?? []).forEach((step, index) => {
+    if (isContinueOnErrorViolation(step?.["continue-on-error"])) {
+      violations.push(`"${aggregateId}".steps[${index}]`);
+    }
+  });
+  return violations;
+}
+
+/**
  * Cross-products a matrix's `os` and `node` axes, honoring `exclude`
  * entries, into a flat list of "<os>::<node>" leg keys.
  *
@@ -146,6 +208,91 @@ export function verifyMatrixCompleteness(
 }
 
 /**
+ * Checks the real matrix's legs against `INDEPENDENT_EXPECTED_LEGS`
+ * directly - never against `EXPECTED_OS`/`EXPECTED_NODE`, which is
+ * exactly the derivation `verifyMatrixCompleteness` above uses and which
+ * a coordinated edit could shrink in lockstep with the real matrix. This
+ * is the independent oracle the mutation matrix's SELF/KEEP/WIN sections
+ * require.
+ *
+ * @param {any} job
+ * @returns {{ missing: string[], extra: string[] }}
+ */
+export function verifyIndependentMatrixLegs(job) {
+  const actualLegs = computeMatrixLegs(job?.strategy?.matrix);
+  const actualSet = new Set(actualLegs);
+  const missing = INDEPENDENT_EXPECTED_LEGS.filter((leg) => !actualSet.has(leg));
+  const extra = actualLegs.filter((leg) => !INDEPENDENT_EXPECTED_LEGS.includes(leg));
+  return { missing, extra };
+}
+
+/**
+ * THE MANDATORY META-GUARD (mutation matrix row SELF-8): confirms
+ * `INDEPENDENT_EXPECTED_LEGS` above is STILL a genuine hard-coded literal
+ * - a plain array of string literals with no computed element - and not
+ * quietly weakened back into a derived product of `EXPECTED_OS` x
+ * `EXPECTED_NODE`. Proven necessary, not theoretical: QA mutated the
+ * declaration to `EXPECTED_OS.flatMap((os) => EXPECTED_NODE.map((node) =>
+ * \`${os}::${node}\`))` and the full guard-test suite still passed 10/10,
+ * because nothing checked the declaration's own SHAPE. Every other check
+ * in this file only ever reads the exported VALUE of
+ * `INDEPENDENT_EXPECTED_LEGS`, which looks identical whether it came from
+ * a literal or a derivation that happens to currently agree with it - the
+ * escape is invisible from the value alone, which is why this reads the
+ * declaration's SOURCE instead.
+ *
+ * Parses THIS FILE'S OWN source text (via the same real TypeScript AST
+ * machinery `scripts/lib/ts-ast.mjs` already uses for the module-loader
+ * guards, not string matching) and walks it looking for the
+ * `INDEPENDENT_EXPECTED_LEGS` variable declaration. Passes only when its
+ * initializer is an `ArrayLiteralExpression` whose every element is a
+ * plain string literal (or no-substitution template) - fails closed on
+ * anything else: a call expression, a spread, an identifier reference
+ * (which would mean it now reads from somewhere else, e.g.
+ * `EXPECTED_OS`), a template with interpolation, or the declaration being
+ * missing entirely.
+ *
+ * @param {string} [sourceText] defaults to reading this file's own source from disk
+ * @returns {{ isLiteral: boolean, reason?: string }}
+ */
+export function verifyIndependentLegsIsLiteral(sourceText = readFileSync(THIS_FILE_PATH, "utf8")) {
+  const sourceFile = parseSourceFile(THIS_FILE_PATH, sourceText);
+  let declaration;
+  forEachDescendant(sourceFile, (node) => {
+    if (declaration !== undefined) return;
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.name.text === "INDEPENDENT_EXPECTED_LEGS"
+    ) {
+      declaration = node;
+    }
+  });
+
+  if (declaration === undefined) {
+    return { isLiteral: false, reason: "INDEPENDENT_EXPECTED_LEGS declaration not found at all" };
+  }
+  const initializer = declaration.initializer;
+  if (initializer === undefined || !ts.isArrayLiteralExpression(initializer)) {
+    return {
+      isLiteral: false,
+      reason: "INDEPENDENT_EXPECTED_LEGS is not initialized with a plain array literal",
+    };
+  }
+  for (const element of initializer.elements) {
+    const isPlainString =
+      ts.isStringLiteral(element) || ts.isNoSubstitutionTemplateLiteral(element);
+    if (!isPlainString) {
+      return {
+        isLiteral: false,
+        reason: `INDEPENDENT_EXPECTED_LEGS contains a non-literal element (kind ${ts.SyntaxKind[element.kind]}) - it is no longer a genuine hard-coded closed set`,
+      };
+    }
+  }
+  return { isLiteral: true };
+}
+
+/**
  * @param {Record<string, any>} jobs
  * @returns {string[]} forbidden job ids present in the workflow
  */
@@ -165,6 +312,13 @@ function main() {
     );
   }
 
+  const gateOwnOffenders = findGateOwnContinueOnError(jobs, AGGREGATE_JOB_ID);
+  for (const location of gateOwnOffenders) {
+    errors.push(
+      `${location} sets continue-on-error to something other than absent/false, which would let the aggregate itself report success while its own required-success check failed`
+    );
+  }
+
   const testJob = jobs[TEST_JOB_ID];
   if (!testJob) {
     errors.push(`no "${TEST_JOB_ID}" job found in the workflow`);
@@ -173,6 +327,21 @@ function main() {
     for (const leg of missingLegs) {
       errors.push(`"${TEST_JOB_ID}" matrix is missing the ${leg.replace("::", " / node ")} leg`);
     }
+
+    const independentResult = verifyIndependentMatrixLegs(testJob);
+    for (const leg of independentResult.missing) {
+      errors.push(`"${TEST_JOB_ID}" matrix is missing the independently-required leg ${leg}`);
+    }
+    for (const leg of independentResult.extra) {
+      errors.push(
+        `"${TEST_JOB_ID}" matrix contains ${leg}, which is not in the independent expected-legs list`
+      );
+    }
+  }
+
+  const literalCheck = verifyIndependentLegsIsLiteral();
+  if (!literalCheck.isLiteral) {
+    errors.push(`meta-guard failure: ${literalCheck.reason}`);
   }
 
   const forbiddenJobs = findForbiddenGovernanceJobs(jobs);
@@ -190,7 +359,7 @@ function main() {
     return;
   }
   console.log(
-    `${path.relative(REPO_ROOT, WORKFLOW_PATH)} is clean: no continue-on-error, full test matrix, no fake governance jobs`
+    `${path.relative(REPO_ROOT, WORKFLOW_PATH)} is clean: no continue-on-error (including on gate itself), full test matrix against both the derived and independent oracles, no fake governance jobs`
   );
 }
 

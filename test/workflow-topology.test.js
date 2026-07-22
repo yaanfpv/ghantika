@@ -3,7 +3,11 @@ import { test } from "node:test";
 
 import {
   AGGREGATE_JOB_ID,
+  collectJobText,
+  hasLiteralSuccessCheck,
   loadWorkflow,
+  normalizeNeeds,
+  verifyIndependentRequiredJobs,
   verifyTopology,
 } from "../scripts/verify-workflow-topology.mjs";
 
@@ -117,18 +121,41 @@ const INDEPENDENT_REQUIRED_JOB_IDS = [
 test("independent inventory: gate.needs and gate's literal success-checks cover every hard-coded required job", () => {
   const workflow = loadWorkflow();
   const gate = workflow.jobs[AGGREGATE_JOB_ID];
-  const needs = normalizeNeedsForTest(gate.needs);
-  const jobText = flattenJobTextForTest(gate);
+  const needs = normalizeNeeds(gate.needs);
+  const jobText = collectJobText(gate);
   for (const jobId of INDEPENDENT_REQUIRED_JOB_IDS) {
     assert.ok(
       needs.includes(jobId),
       `gate.needs is missing the independently-required job "${jobId}"`
     );
+    // hasLiteralSuccessCheck (imported from production, not reimplemented
+    // here) is ADJACENCY-aware: it requires the SAME jobId's own
+    // "needs.<id>.result" marker to be immediately followed by
+    // "== 'success'"/"== \"success\"", not merely that both substrings
+    // appear SOMEWHERE in the job text independently of each other. A
+    // weaker two-independent-substrings check
+    // (jobText.includes("needs.x.result") && jobText.includes("'success'"))
+    // would pass even when those two pieces belong to two DIFFERENT jobs'
+    // checks - exactly the kind of paired-shrink escape this independent
+    // inventory exists to close, so reusing the same non-vacuous mechanism
+    // here (not a hand-rolled weaker one) matters as much as the
+    // independent job-id list does.
     assert.ok(
-      jobText.includes(`needs.${jobId}.result`) && jobText.includes("'success'"),
+      hasLiteralSuccessCheck(jobText, jobId),
       `gate does not appear to literally check needs.${jobId}.result == 'success'`
     );
   }
+});
+
+// Proves the SHIPPED production check (the one "guards"/lint invokes, via
+// npm run verify:workflow-topology) actually agrees with this test file's
+// own independently-hardcoded list against the real workflow - so a drift
+// between the two hardcoded copies (this file's INDEPENDENT_REQUIRED_JOB_IDS
+// above and verify-workflow-topology.mjs's own) would show up as a real
+// test failure here, not silently diverge unnoticed.
+test("the shipped verifyIndependentRequiredJobs check is clean against the real workflow", () => {
+  const workflow = loadWorkflow();
+  assert.deepEqual(verifyIndependentRequiredJobs(workflow.jobs, AGGREGATE_JOB_ID), []);
 });
 
 // Mutation control: a coordinated deletion of a whole job - "coverage",
@@ -160,24 +187,16 @@ test("mutation control (paired deletion): wholesale-deleting the coverage job is
   );
 
   // The independent inventory never derived its expectations from the
-  // workflow file, so the same mutated file still fails it.
-  const needs = normalizeNeedsForTest(mutated.jobs[AGGREGATE_JOB_ID].needs);
+  // workflow file, so the same mutated file still fails it - proven two
+  // ways: this file's own hardcoded list directly, and the shipped
+  // production function against the same mutated jobs.
+  const needs = normalizeNeeds(mutated.jobs[AGGREGATE_JOB_ID].needs);
   const missing = INDEPENDENT_REQUIRED_JOB_IDS.filter((jobId) => !needs.includes(jobId));
   assert.deepEqual(missing, ["coverage"]);
+
+  const productionErrors = verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID);
+  assert.ok(
+    productionErrors.some((error) => error.includes("coverage")),
+    `expected the shipped check to name "coverage", got: ${JSON.stringify(productionErrors)}`
+  );
 });
-
-function normalizeNeedsForTest(needs) {
-  if (!needs) return [];
-  return Array.isArray(needs) ? needs : [needs];
-}
-
-function flattenJobTextForTest(job) {
-  const parts = [];
-  if (job?.env) parts.push(JSON.stringify(job.env));
-  for (const step of job?.steps ?? []) {
-    if (step.run) parts.push(step.run);
-    if (step.env) parts.push(JSON.stringify(step.env));
-    if (step.if) parts.push(step.if);
-  }
-  return parts.join("\n");
-}

@@ -28,6 +28,37 @@ export const WORKFLOW_PATH = path.join(REPO_ROOT, ".github", "workflows", "ci.ym
 export const AGGREGATE_JOB_ID = "gate";
 
 /**
+ * The independent, hard-coded inventory of jobs `gate` must require - read
+ * directly off the real `ci.yml`'s job set and written here as a literal
+ * array, never derived from the workflow file `verifyTopology` below
+ * parses. `verifyTopology` computes "which jobs must gate depend on" as
+ * `Object.keys(jobs)` on the SAME file it is checking, so a coordinated
+ * edit that deletes a job ENTIRELY - not just from `gate.needs`, but the
+ * job definition itself, plus its `needs` edge, plus its clause in
+ * `gate`'s success-expression, all at once - removes that job from
+ * consideration everywhere in the same motion, and `verifyTopology` has
+ * nothing left in the mutated file to compare it against.
+ * `verifyIndependentRequiredJobs` below checks against THIS list instead,
+ * so a coordinated deletion like that still gets caught, by name.
+ */
+export const INDEPENDENT_REQUIRED_JOB_IDS = [
+  "build",
+  "typecheck",
+  "lint",
+  "test",
+  "format",
+  "coverage",
+  "codeql",
+  "semgrep",
+  "zizmor",
+  "actionlint",
+  "changelog-presence",
+  "guards",
+  "sha-parity",
+  "install-repro",
+];
+
+/**
  * @param {string} [filePath]
  * @returns {{ jobs: Record<string, any> }}
  */
@@ -67,7 +98,7 @@ function looksLikeEqualsSuccess(rest) {
  * @param {string} jobId
  * @returns {boolean}
  */
-function hasLiteralSuccessCheck(jobText, jobId) {
+export function hasLiteralSuccessCheck(jobText, jobId) {
   const marker = `needs.${jobId}.result`;
   let searchFrom = 0;
   for (;;) {
@@ -86,7 +117,7 @@ function hasLiteralSuccessCheck(jobText, jobId) {
  * @param {string[] | string | undefined} needs
  * @returns {string[]}
  */
-function normalizeNeeds(needs) {
+export function normalizeNeeds(needs) {
   if (!needs) return [];
   return Array.isArray(needs) ? needs : [needs];
 }
@@ -100,7 +131,7 @@ function normalizeNeeds(needs) {
  * @param {any} job
  * @returns {string}
  */
-function collectJobText(job) {
+export function collectJobText(job) {
   const parts = [];
   if (job?.env) parts.push(JSON.stringify(job.env));
   for (const step of job?.steps ?? []) {
@@ -162,9 +193,66 @@ export function verifyTopology(jobs, aggregateId = AGGREGATE_JOB_ID) {
   return errors;
 }
 
+/**
+ * Checks `jobs[aggregateId]` against `INDEPENDENT_REQUIRED_JOB_IDS`
+ * instead of `Object.keys(jobs)` - see that constant's own doc comment for
+ * why: `verifyTopology` above derives its own expectations from the same
+ * file it is checking, so a coordinated edit that deletes a job entirely
+ * (its definition, its `needs` edge, and its clause in `gate`'s
+ * success-expression, all at once) removes that job from consideration on
+ * BOTH sides of `verifyTopology`'s comparison in the same motion, leaving
+ * nothing in the mutated file for it to notice against. This function's
+ * expectation is a literal array written directly in this file, so that
+ * same coordinated deletion still leaves an id this check names by hand
+ * and can report as missing.
+ *
+ * Reuses `hasLiteralSuccessCheck` - the same ADJACENCY-aware check
+ * `verifyTopology` uses, not a weaker two-independent-substrings test:
+ * `jobText.includes("needs.x.result") && jobText.includes("'success'")`
+ * would pass even when those two substrings belong to two DIFFERENT
+ * jobs' checks rather than the same one, which is exactly the escape a
+ * paired-shrink mutation could walk through undetected.
+ *
+ * @param {Record<string, any>} jobs
+ * @param {string} [aggregateId]
+ * @returns {string[]} human-readable problems found; empty means clean.
+ */
+export function verifyIndependentRequiredJobs(jobs, aggregateId = AGGREGATE_JOB_ID) {
+  const errors = [];
+  const aggregate = jobs?.[aggregateId];
+  if (!aggregate) {
+    return [`no "${aggregateId}" job found in the workflow`];
+  }
+
+  const needs = normalizeNeeds(aggregate.needs);
+  const jobText = collectJobText(aggregate);
+
+  for (const jobId of INDEPENDENT_REQUIRED_JOB_IDS) {
+    if (jobs?.[jobId] === undefined) {
+      errors.push(
+        `"${jobId}" is on the independent required-job list but no longer exists as a job in the workflow at all`
+      );
+      continue;
+    }
+    if (!needs.includes(jobId)) {
+      errors.push(`"${aggregateId}".needs is missing "${jobId}" (independent required-job list)`);
+    }
+    if (!hasLiteralSuccessCheck(jobText, jobId)) {
+      errors.push(
+        `"${aggregateId}" never checks that needs.${jobId}.result == 'success' literally for "${jobId}" (independent required-job list) - a skip or a non-success result would not be caught`
+      );
+    }
+  }
+
+  return errors;
+}
+
 function main() {
   const workflow = loadWorkflow();
-  const errors = verifyTopology(workflow.jobs, AGGREGATE_JOB_ID);
+  const errors = [
+    ...verifyTopology(workflow.jobs, AGGREGATE_JOB_ID),
+    ...verifyIndependentRequiredJobs(workflow.jobs, AGGREGATE_JOB_ID),
+  ];
   if (errors.length > 0) {
     for (const error of errors) {
       console.error(`workflow topology error: ${error}`);
