@@ -25,6 +25,18 @@ import { parsesAsPgid, waitForFile } from "./harness.ts";
  * Further down this file: cleanup REAPS every live job's whole process tree
  * before the process exits, proven with a real external `pgrep` oracle
  * across all three triggers independently.
+ *
+ * Windows only proves this for stdin EOF. `.kill('SIGTERM')`/`.kill('SIGINT')`
+ * from a separate process (this test file's own parent process included)
+ * is delivered on Windows via Win32's `TerminateProcess`, an unconditional,
+ * non-cooperative kill with no notification mechanism any handler in the
+ * target process can intercept - confirmed against Node's own documented
+ * `subprocess.kill()` behavior, and against a real windows-latest CI
+ * failure, not assumed. So the SIGTERM/SIGINT variants of the test below,
+ * and the SIGTERM-driven green control further down, are Windows-skipped
+ * rather than weakened - see `WINDOWS_KILL_UNINTERCEPTABLE_SKIP` below for
+ * the full citation, and the Windows-only orphan-proof test near the end of
+ * this file for what that actually costs a real job.
  */
 
 // The three whole-tree-reap tests below confirm their result via a real
@@ -38,6 +50,38 @@ const PGREP_ORACLE_SKIP =
     ? "confirms the result via a real external `pgrep -g`, POSIX-only"
     : false;
 
+// UNLIKE the tooling gap above, this next skip is a real, confirmed
+// PRODUCT/PLATFORM fact, not a missing test oracle - do not merge the two.
+// `child.kill('SIGTERM')`/`child.kill('SIGINT')`, called by a separate
+// process against a running Windows process, is delivered by Node's own
+// `subprocess.kill()` via Win32's `TerminateProcess()`. Node's own docs
+// (process.html, "Signal Events"): "Sending SIGINT, SIGTERM, and SIGKILL
+// will cause the unconditional termination of the target process, and
+// afterwards, subprocess will report that the process was terminated by
+// signal" - and separately (child_process.html, "subprocess.kill()"): "the
+// signal argument will be ignored except for 'SIGKILL', 'SIGTERM',
+// 'SIGINT' and 'SIGQUIT', and the process will always be killed forcefully
+// and abruptly (similar to 'SIGKILL')." `TerminateProcess` is a hard
+// OS-level kill with no notification any handler in the target process can
+// intercept, on any platform, by design - `process.once("SIGTERM", ...)`
+// in src/server.ts genuinely never runs. This isn't theoretical: a real
+// windows-latest CI run (29866396802) showed exactly this - "SIGTERM
+// reaches the real cleanup path", "SIGINT reaches the real cleanup path
+// too", and the SIGTERM-driven green control further down this file all
+// failed with the SAME shape (`code: null`, never `0`), regardless of what
+// src/server.ts's handler does, because that handler is never reached at
+// all.
+//
+// So this is honestly documented as an open Windows platform limitation
+// (README's "Windows shutdown behavior" section; src/server.ts's own
+// `attachProcessShutdownHandlers` doc comment), never silently accepted -
+// see the Windows-only orphan-proof test near the end of this file, which
+// measures what this actually costs a real running job.
+const WINDOWS_KILL_UNINTERCEPTABLE_SKIP =
+  process.platform === "win32"
+    ? "Windows delivers an external kill via TerminateProcess(), which no handler in the target process can intercept (confirmed against Node's own documented subprocess.kill() behavior and a real windows-latest CI failure) - this is a real, open platform limitation, not a test-harness gap; see README's Windows shutdown behavior section and this file's Windows-only orphan-proof test"
+    : false;
+
 // Each test waits for a REAL completed initialize handshake (not a fixed
 // sleep) before sending its signal/EOF - a blind `setTimeout` was flaky
 // under full-suite load (many test files spawn real child processes
@@ -47,29 +91,37 @@ const PGREP_ORACLE_SKIP =
 // regardless of system load, and is also more representative of a real
 // client's lifecycle (connect, then eventually disconnect).
 
-test("SIGTERM reaches the real cleanup path: stderr shows the shutdown diagnostic, process exits 0", async () => {
-  const server = spawnServer();
-  await completeHandshake(server);
-  server.child.kill("SIGTERM");
-  const { code, signal } = await server.waitForExit();
-  assert.equal(
-    code,
-    0,
-    "the server's own SIGTERM handler must call process.exit(0), not be torn down by the default signal behavior"
-  );
-  assert.equal(signal, null);
-  assert.match(server.stderrText(), /\[ghantika\] shutting down \(SIGTERM\)/);
-});
+test(
+  "SIGTERM reaches the real cleanup path: stderr shows the shutdown diagnostic, process exits 0",
+  { skip: WINDOWS_KILL_UNINTERCEPTABLE_SKIP },
+  async () => {
+    const server = spawnServer();
+    await completeHandshake(server);
+    server.child.kill("SIGTERM");
+    const { code, signal } = await server.waitForExit();
+    assert.equal(
+      code,
+      0,
+      "the server's own SIGTERM handler must call process.exit(0), not be torn down by the default signal behavior"
+    );
+    assert.equal(signal, null);
+    assert.match(server.stderrText(), /\[ghantika\] shutting down \(SIGTERM\)/);
+  }
+);
 
-test("SIGINT reaches the real cleanup path too", async () => {
-  const server = spawnServer();
-  await completeHandshake(server);
-  server.child.kill("SIGINT");
-  const { code, signal } = await server.waitForExit();
-  assert.equal(code, 0);
-  assert.equal(signal, null);
-  assert.match(server.stderrText(), /\[ghantika\] shutting down \(SIGINT\)/);
-});
+test(
+  "SIGINT reaches the real cleanup path too",
+  { skip: WINDOWS_KILL_UNINTERCEPTABLE_SKIP },
+  async () => {
+    const server = spawnServer();
+    await completeHandshake(server);
+    server.child.kill("SIGINT");
+    const { code, signal } = await server.waitForExit();
+    assert.equal(code, 0);
+    assert.equal(signal, null);
+    assert.match(server.stderrText(), /\[ghantika\] shutting down \(SIGINT\)/);
+  }
+);
 
 test("stdin EOF (the client closing its side of the pipe) reaches the real cleanup path", async () => {
   const server = spawnServer();
@@ -298,26 +350,165 @@ test(
   }
 );
 
-test("green control: a job that has already exited BEFORE shutdown is simply left alone - shutdown never errors or hangs on an already-terminal job", async () => {
-  const server = spawnServer();
-  await completeHandshake(server);
-  server.send({
-    jsonrpc: "2.0",
-    id: 701,
-    method: "tools/call",
-    params: { name: "run", arguments: { command: ["true"] } },
-  });
-  const runLine = await server.nextLine();
-  const runBody = runLine.parsed as RunResponseBody;
-  assert.notEqual(runBody.result?.isError, true);
+test(
+  "green control: a job that has already exited BEFORE shutdown is simply left alone - shutdown never errors or hangs on an already-terminal job",
+  { skip: WINDOWS_KILL_UNINTERCEPTABLE_SKIP },
+  async () => {
+    const server = spawnServer();
+    await completeHandshake(server);
+    server.send({
+      jsonrpc: "2.0",
+      id: 701,
+      method: "tools/call",
+      params: { name: "run", arguments: { command: ["true"] } },
+    });
+    const runLine = await server.nextLine();
+    const runBody = runLine.parsed as RunResponseBody;
+    assert.notEqual(runBody.result?.isError, true);
 
-  // Give the (near-instant) `true` child a real moment to actually exit
-  // before shutdown ever runs, so this exercises the "nothing left to
-  // reap" path, not a race against a still-live job.
-  await new Promise((resolve) => setTimeout(resolve, 200));
+    // Give the (near-instant) `true` child a real moment to actually exit
+    // before shutdown ever runs, so this exercises the "nothing left to
+    // reap" path, not a race against a still-live job.
+    await new Promise((resolve) => setTimeout(resolve, 200));
 
-  server.child.kill("SIGTERM");
-  const { code, signal } = await server.waitForExit();
-  assert.equal(code, 0, "shutdown must still exit cleanly when there is nothing live left to reap");
-  assert.equal(signal, null);
-});
+    server.child.kill("SIGTERM");
+    const { code, signal } = await server.waitForExit();
+    assert.equal(
+      code,
+      0,
+      "shutdown must still exit cleanly when there is nothing live left to reap"
+    );
+    assert.equal(signal, null);
+  }
+);
+
+// =============================================================================
+// Windows: the real, open gap - measured, not assumed.
+//
+// The tests above establish WHY a Windows `.kill()` can't reach
+// src/server.ts's cleanup path at all (TerminateProcess, unconditional, no
+// notification any handler can intercept). That explains a bad EXIT CODE,
+// but doesn't by itself prove a job is actually left running - "no clean
+// exit code" and "an orphaned process" are different bugs, and only one of
+// them matters to a real user. This test measures the real one directly:
+// a real job's real OS process, checked with a real external `tasklist`
+// query AFTER a non-stdin kill - never this codebase's own `jobStore`
+// bookkeeping, which is inside the process that just got torn down and so
+// can't witness its own outcome either way.
+// =============================================================================
+
+const NOT_WINDOWS_SKIP =
+  process.platform !== "win32"
+    ? "proves a Windows-only orphan gap via a real external `tasklist` oracle; this file's POSIX pgrep-oracle tests above already cover the equivalent POSIX case"
+    : false;
+
+/**
+ * True when a real, external `tasklist` query finds a live process with
+ * exactly this pid - the Windows-side counterpart to this file's own
+ * `pgrepGroupMembers`. Matched as a quoted CSV field (`"<pid>"`), not a bare
+ * substring search, so pid 12 can never accidentally match a real row for
+ * pid 123. Absence is "no such row in the CSV output," never inferred from
+ * `tasklist`'s own (possibly localized) "nothing found" info line.
+ */
+function windowsTaskAlive(pid: number): boolean {
+  let output: string;
+  try {
+    output = execFileSync("tasklist", ["/fi", `PID eq ${pid}`, "/fo", "csv", "/nh"], {
+      encoding: "utf8",
+    });
+  } catch {
+    // A non-zero tasklist exit is itself "found nothing" on some Windows
+    // builds - treated the same as an output with no matching row.
+    return false;
+  }
+  return output.includes(`"${pid}"`);
+}
+
+async function waitForWindowsTaskState(
+  pid: number,
+  expectAlive: boolean,
+  timeoutMs: number
+): Promise<boolean> {
+  const start = Date.now();
+  for (;;) {
+    const alive = windowsTaskAlive(pid);
+    if (alive === expectAlive) return alive;
+    if (Date.now() - start > timeoutMs) return alive;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+test(
+  "Windows: a non-stdin kill (SIGTERM, the only path an external MCP host actually has) leaves a live job's REAL process running - proven by a real external `tasklist` query, never this codebase's own bookkeeping. Predeclared: the child survives, because src/server.ts's shutdown handler never runs at all here (see WINDOWS_KILL_UNINTERCEPTABLE_SKIP above). This documents the real, currently open Windows gap - see README's Windows shutdown behavior section.",
+  { skip: NOT_WINDOWS_SKIP },
+  async () => {
+    const server = spawnServer();
+    await completeHandshake(server);
+
+    const dir = makeTempDir();
+    const marker = path.join(dir, "pid.txt");
+    // A plain node child (never a shell, so no cmd.exe quoting to worry
+    // about) that writes its OWN pid - read from inside that process
+    // itself, never from this test's or the server's own bookkeeping - to
+    // a marker file, then blocks indefinitely so it's still alive whenever
+    // this test gets around to checking it.
+    const markerScript =
+      "require('fs').writeFileSync(process.argv[1], String(process.pid) + '\\n'); setInterval(() => {}, 1000);";
+
+    server.send({
+      jsonrpc: "2.0",
+      id: 800,
+      method: "tools/call",
+      params: {
+        name: "run",
+        arguments: { command: [process.execPath, "-e", markerScript, marker] },
+      },
+    });
+    const runLine = await server.nextLine();
+    const runBody = runLine.parsed as RunResponseBody;
+    assert.equal(runBody.error, undefined);
+    assert.notEqual(
+      runBody.result?.isError,
+      true,
+      `run() must succeed: ${JSON.stringify(runBody)}`
+    );
+
+    const pidText = await waitForFile(marker, { until: parsesAsPgid });
+    const pid = Number(pidText.trim());
+    assert.ok(
+      Number.isInteger(pid) && pid > 0,
+      `expected a real numeric pid from the marker file, got: ${JSON.stringify(pidText)}`
+    );
+
+    const aliveBefore = await waitForWindowsTaskState(pid, true, 3000);
+    assert.equal(
+      aliveBefore,
+      true,
+      `expected the job's real process (pid ${pid}) to be alive BEFORE shutdown, tasklist disagreed`
+    );
+
+    // The non-stdin path - exactly the mechanism the (Windows-skipped)
+    // SIGTERM test above uses, and exactly what any real MCP host's own
+    // process-management code does to end a subprocess it no longer wants.
+    server.child.kill("SIGTERM");
+    await server.waitForExit();
+
+    // THE measurement: a real, independent `tasklist` query AFTER shutdown.
+    // Predeclared red: still alive, because TerminateProcess killed the
+    // server before reapLiveJobsOnShutdown ever got a chance to run.
+    const aliveAfter = await waitForWindowsTaskState(pid, false, 2000);
+    assert.equal(
+      aliveAfter,
+      true,
+      `expected the orphaned job's real process (pid ${pid}) to still be running after a non-stdin SIGTERM kill - tasklist reported it gone instead, which would mean this known Windows gap has actually closed (if so, update this test, WINDOWS_KILL_UNINTERCEPTABLE_SKIP, src/server.ts's shutdown-handler doc comment, and the README accordingly)`
+    );
+
+    // This test's own cleanup, not the server's (which is dead): kill the
+    // now-orphaned process directly so it doesn't outlive this test run.
+    try {
+      execFileSync("taskkill", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore" });
+    } catch {
+      // already gone - fine
+    }
+  }
+);

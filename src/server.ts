@@ -93,14 +93,21 @@ export interface GhantikaServer {
   /**
    * Runs cleanup exactly once, however many times or from however many
    * signal handlers it's called. Guarantees orphan-proof
-   * teardown for real: a real running job leaves a real live child
-   * process behind, so closing the transport alone is not enough - it
-   * never touches `jobStore` or any live child, and a job started before
-   * shutdown would otherwise stay alive and orphaned after this server
-   * process exits cleanly. This REAPS every still-live (`starting`/
-   * `running`) job's whole process tree before the transport closes - see
-   * `reapLiveJobsOnShutdown`'s own docs for exactly how, and why it reuses
-   * process.ts's real kill machinery rather than a second one.
+   * teardown for real WHENEVER IT RUNS: a real running job leaves a real
+   * live child process behind, so closing the transport alone is not
+   * enough - it never touches `jobStore` or any live child, and a job
+   * started before shutdown would otherwise stay alive and orphaned after
+   * this server process exits cleanly. This REAPS every still-live
+   * (`starting`/`running`) job's whole process tree before the transport
+   * closes - see `reapLiveJobsOnShutdown`'s own docs for exactly how, and
+   * why it reuses process.ts's real kill machinery rather than a second
+   * one.
+   *
+   * "Whenever it runs" is doing real work in that first sentence: on
+   * Windows, an external kill can end this whole process before this
+   * function ever gets called at all - see `attachProcessShutdownHandlers`'s
+   * own doc comment for the full platform-limit citation, and the README's
+   * "Windows shutdown behavior" section for the user-facing version.
    */
   shutdown(reason: string): Promise<void>;
 }
@@ -611,6 +618,36 @@ export async function runServer(): Promise<GhantikaServer> {
   return instance;
 }
 
+/**
+ * Wires all three shutdown triggers (SIGTERM, SIGINT, stdin EOF) to the
+ * same `shutdown()`/reap path.
+ *
+ * All three are equally reliable on POSIX. On Windows, only stdin EOF is:
+ * `process.once("SIGTERM"/"SIGINT", ...)` below is real, registerable
+ * Node.js API on Windows too, but it only fires for a signal genuinely
+ * delivered to THIS process by its own runtime (e.g. a real Ctrl+C at an
+ * attached, non-raw-mode console). An external kill from a SEPARATE
+ * process - which is exactly how a real MCP host actually ends this
+ * server, via that host's own `child_process.kill()` call or equivalent,
+ * and exactly what Task Manager/`taskkill` do too - calls Win32's
+ * `TerminateProcess()` on this process directly. That's confirmed against
+ * Node's own documented `subprocess.kill()` behavior (see
+ * `test/shutdown.test.ts`'s `WINDOWS_KILL_UNINTERCEPTABLE_SKIP` for the
+ * exact citations), not assumed: `TerminateProcess` is an unconditional,
+ * non-cooperative OS-level kill with no notification mechanism any
+ * userspace handler - this one included - can intercept, on any platform,
+ * by Windows' own design. So on Windows the SIGTERM/SIGINT handlers below
+ * are real and correctly wired, but an external kill never reaches them;
+ * this isn't a bug in this function or a gap in `performShutdown`, it's a
+ * platform limit with no code-level fix available. The practical
+ * consequence - a job still running at that moment is left orphaned,
+ * because `reapLiveJobsOnShutdown` never gets to run - is measured
+ * directly (real external `tasklist` oracle, not this codebase's own
+ * bookkeeping) by `test/shutdown.test.ts`'s Windows-only orphan-proof test,
+ * and documented for users in the README's "Windows shutdown behavior"
+ * section: on Windows, closing this server's stdin is the only shutdown
+ * path guaranteed to reap its live jobs.
+ */
 function attachProcessShutdownHandlers(instance: GhantikaServer): void {
   const onSignal = (signal: NodeJS.Signals): void => {
     instance
