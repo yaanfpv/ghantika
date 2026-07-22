@@ -29,6 +29,15 @@ import { isMainModule } from "../scripts/lib/is-main.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
+// The platform's real npm launcher, invoked directly with no shell
+// fallback - `npm` itself is a POSIX shell script on macOS/Linux but a
+// `.cmd` batch launcher on Windows, so a bare `spawnSync("npm", ...)` with
+// no `shell: true` (Node's own documented default) never resolves there.
+// Naming the platform launcher explicitly is what the four
+// real-executable-proof tests below need to keep proving genuine
+// execution on every platform they run on, not just POSIX.
+const NPM_BIN = process.platform === "win32" ? "npm.cmd" : "npm";
+
 test("the documented install step never uses npm install", () => {
   for (const target of DEFAULT_TARGETS) {
     const hits = checkFile(target);
@@ -201,7 +210,7 @@ test("mutation control: mixed case (`Npm Install`) is caught", () => {
   assert.equal(hits[0].kind, "install");
 });
 
-test("real-executable proof: each of the quoted/option/continuation POSIX forms genuinely runs as npm install (--dry-run, no network/lockfile effects)", () => {
+test("real-executable proof: each of the quoted/option POSIX forms genuinely runs as npm install (--dry-run, no network/lockfile effects)", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ghantika-real-npm-forms-"));
   try {
     writeFileSync(
@@ -213,19 +222,25 @@ test("real-executable proof: each of the quoted/option/continuation POSIX forms 
       const guardHits = findNpmInstallInvocations(form);
       assert.equal(guardHits.length, 1, `guard must flag: ${form}`);
 
-      const [cmd, ...args] = form.replace(/['"]/g, "").split(/\s+/);
+      const [, ...args] = form.replace(/['"]/g, "").split(/\s+/);
+      const spawnOptions = {
+        cwd: dir,
+        encoding: "utf8",
+      };
+      assert.equal(
+        spawnOptions.shell,
+        undefined,
+        "this row invokes the real npm launcher directly - no shell fallback"
+      );
       const result = spawnSync(
-        cmd,
+        NPM_BIN,
         [...args, "--dry-run", "--ignore-scripts", "--no-package-lock"],
-        {
-          cwd: dir,
-          encoding: "utf8",
-        }
+        spawnOptions
       );
       assert.equal(
         result.status,
         0,
-        `expected "${form}" to actually run as a real npm install (dry-run): ${result.stderr}`
+        `expected "${form}" to actually run as a real npm install (dry-run) via ${NPM_BIN}: ${result.stderr}`
       );
     }
   } finally {
@@ -513,16 +528,22 @@ test("real-executable proof: `npm --prefix <dir> install` and `npm -C <dir> inst
       const guardHits = findNpmInstallInvocations(form);
       assert.equal(guardHits.length, 1, `guard must flag: ${form}`);
 
-      const [cmd, ...args] = form.split(/\s+/);
+      const [, ...args] = form.split(/\s+/);
+      const spawnOptions = { encoding: "utf8" };
+      assert.equal(
+        spawnOptions.shell,
+        undefined,
+        "this row invokes the real npm launcher directly - no shell fallback"
+      );
       const result = spawnSync(
-        cmd,
+        NPM_BIN,
         [...args, "--dry-run", "--ignore-scripts", "--no-package-lock"],
-        { encoding: "utf8" }
+        spawnOptions
       );
       assert.equal(
         result.status,
         0,
-        `expected "${form}" to actually run as a real npm install (dry-run): ${result.stderr}`
+        `expected "${form}" to actually run as a real npm install (dry-run) via ${NPM_BIN}: ${result.stderr}`
       );
     }
   } finally {
@@ -560,15 +581,25 @@ test("real-executable proof: a quoted executable name genuinely runs as npm inst
     const guardHits = findNpmInstallInvocations(form);
     assert.equal(guardHits.length, 1, `guard must flag: ${form}`);
 
-    const [cmd, ...args] = form.replace(/['"]/g, "").split(/\s+/);
-    const result = spawnSync(cmd, [...args, "--dry-run", "--ignore-scripts", "--no-package-lock"], {
+    const [, ...args] = form.replace(/['"]/g, "").split(/\s+/);
+    const spawnOptions = {
       cwd: dir,
       encoding: "utf8",
-    });
+    };
+    assert.equal(
+      spawnOptions.shell,
+      undefined,
+      "this row invokes the real npm launcher directly - no shell fallback"
+    );
+    const result = spawnSync(
+      NPM_BIN,
+      [...args, "--dry-run", "--ignore-scripts", "--no-package-lock"],
+      spawnOptions
+    );
     assert.equal(
       result.status,
       0,
-      `expected '${form}' to actually run as a real npm install (dry-run): ${result.stderr}`
+      `expected '${form}' to actually run as a real npm install (dry-run) via ${NPM_BIN}: ${result.stderr}`
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -684,18 +715,24 @@ test('real-executable proof (conceptual): execFileSync("npm", ["install", ...]) 
     const guardHits = findForbiddenChildProcessNpmCalls('execFileSync("npm", ["install"]);');
     assert.equal(guardHits.length, 1, 'guard must flag execFileSync("npm", ["install"])');
 
+    const spawnOptions = {
+      cwd: dir,
+      encoding: "utf8",
+    };
+    assert.equal(
+      spawnOptions.shell,
+      undefined,
+      "this row invokes the real npm launcher directly - no shell fallback"
+    );
     const result = spawnSync(
-      "npm",
+      NPM_BIN,
       ["install", "--dry-run", "--ignore-scripts", "--no-package-lock"],
-      {
-        cwd: dir,
-        encoding: "utf8",
-      }
+      spawnOptions
     );
     assert.equal(
       result.status,
       0,
-      `expected the programmatic form to actually run as a real npm install (dry-run): ${result.stderr}`
+      `expected the programmatic form to actually run as a real npm install (dry-run) via ${NPM_BIN}: ${result.stderr}`
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });

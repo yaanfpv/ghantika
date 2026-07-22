@@ -119,23 +119,71 @@ test("run: an invalid binary produces a real (non-error) job whose state is fail
 // executable living in the job's requested cwd, with env: {PATH: "."} -
 // a real, legal relative PATH entry that must be resolved against the
 // CHILD's cwd, never this server's own process.cwd().
+/**
+ * Places a real, directly-executable binary at `dest`, reached from
+ * `target` (an existing absolute path to a real platform-native
+ * executable) - never a POSIX shebang script (which Windows cannot
+ * execute at all) and never a chmod call. A symlink is tried first: the
+ * OS loads the TARGET file from its own real location when the link is
+ * executed, so this is immune to a build whose executable depends on a
+ * sibling shared library resolved relative to its own path (verified:
+ * copying such a build's binary elsewhere breaks it, a plain symlink to
+ * the original location does not). `copyFileSync` is the fallback for a
+ * host that refuses unprivileged symlink creation - it already preserves
+ * the source file's own executable permission bit, so no chmod is ever
+ * needed either way.
+ */
+function createRelocatedExecutableFixture(target: string, dest: string): void {
+  try {
+    fs.symlinkSync(target, dest, process.platform === "win32" ? "file" : undefined);
+  } catch {
+    fs.copyFileSync(target, dest);
+  }
+}
+
 test('run() with a relative PATH entry (".") and a matching cwd actually spawns the fixture - never a false spawn-error', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-run-relpath-"));
   const marker = path.join(dir, "ran-marker.txt");
-  const fixture = path.join(dir, "gh-relative-tool");
-  fs.writeFileSync(fixture, `#!/bin/sh\necho ran > '${marker}'\n`);
-  fs.chmodSync(fixture, 0o755);
+  // A genuine platform-native executable (a real PE on Windows, a real
+  // Mach-O/ELF on macOS/Linux) reached through a GENUINELY RELATIVE PATH
+  // entry - never a shebang script, chmod call, extensionless data file,
+  // or .cmd/.bat assumption (see createRelocatedExecutableFixture's docs).
+  const fixtureName = process.platform === "win32" ? "gh-relative-tool.exe" : "gh-relative-tool";
+  const fixture = path.join(dir, fixtureName);
+  createRelocatedExecutableFixture(process.execPath, fixture);
+  // The real side effect this row observes: the fixture (the real Node.js
+  // binary) is invoked with `-e <code>` to write a marker file - a
+  // genuine, external, OS-level action, never this codebase's own job
+  // bookkeeping.
+  const markerCode = `require("fs").writeFileSync(${JSON.stringify(marker)}, "ran")`;
   assert.notEqual(
     process.cwd(),
     dir,
     "sanity: the server's own cwd must genuinely differ from the job's cwd"
   );
 
-  const result = runTool.handler({
-    command: ["gh-relative-tool"],
+  const pathVars = { PATH: "." };
+  // This row's whole point is a RELATIVE PATH entry specifically - an
+  // absolute equivalent (or no entry at all) would resolve the fixture
+  // for an entirely different reason and prove nothing about relative
+  // resolution. Asserted directly on the literal value passed, not
+  // inferred from whether the spawn happened to succeed.
+  assert.equal(
+    pathVars.PATH,
+    ".",
+    "this row must exercise a genuinely RELATIVE PATH entry, not merely some PATH entry that happens to work"
+  );
+  const runArgs: Record<string, unknown> = {
+    command: [fixtureName, "-e", markerCode],
     cwd: dir,
-    env: { mode: "merge", vars: { PATH: "." } },
-  });
+    env: { mode: "merge", vars: pathVars },
+  };
+  assert.equal(
+    runArgs.shell,
+    undefined,
+    "this row must resolve the relative PATH entry itself, never a shell fallback"
+  );
+  const result = runTool.handler(runArgs);
   assert.notEqual(result.isError, true);
   const structured = result.structuredContent as Record<string, unknown>;
   assert.notEqual(
