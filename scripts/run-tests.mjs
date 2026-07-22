@@ -145,22 +145,20 @@ export function parseArgs(argv) {
   const options = {
     // Matches the --test-timeout=30000 already in package.json's test and
     // coverage scripts and in ci.yml's test job at the time this file was
-    // written (checked directly, not assumed) - a1's per-test bound.
+    // written (checked directly, not assumed).
     testTimeoutMs: 30_000,
     // No event of any kind (not just no test finishing - ANY event,
     // including test:start on some other still-running test) for this
     // long means something is stuck badly enough that the test runner
-    // itself has gone quiet. See the header doc comment and the a4
-    // measurement recorded in this repo's commit history for where 60s
-    // comes from: real local suite runs land well under half of this
-    // between any two consecutive events even on the slowest file.
+    // itself has gone quiet. 60s is deliberately generous: real local
+    // suite runs land well under half of this between any two
+    // consecutive events even on the slowest file.
     idleTimeoutMs: 60_000,
     // Backstop for the whole run regardless of how the time is spent -
     // catches a death by a thousand near-idle-but-not-quite-idle cuts
     // that never individually trips the idle watchdog. 600s against a
-    // measured healthy full-suite run in the low tens of seconds (see the
-    // commit history / SD report for the exact figures) leaves an order
-    // of magnitude of headroom.
+    // measured healthy full-suite run in the low tens of seconds leaves
+    // an order of magnitude of headroom.
     wallTimeoutMs: 600_000,
     // How long the process is allowed to keep breathing after the test
     // runner's own event stream says every file is done before that is

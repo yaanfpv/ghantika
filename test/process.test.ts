@@ -35,13 +35,12 @@ import {
 // spawning bare `sleep`) - none of that has a win32 equivalent to run
 // against, so these skip there rather than hang or fail on a platform gap
 // this test is not measuring. This is a TEST-HARNESS gap, not a product
-// scope decision (OD-5: Windows is a supported platform) - the real
-// question of whether src/process.ts's own win32 kill path (taskkill-based
-// process-tree termination) actually works is separate, tracked work, not
-// answered by skipping these.
+// scope decision. Windows is a supported platform; whether src/process.ts's
+// own win32 kill path (taskkill-based process-tree termination) actually
+// works is a separate question, not answered by skipping these.
 const POSIX_PROCESS_GROUP_SKIP =
   process.platform === "win32"
-    ? "exercises a real POSIX process-group primitive (ps/pgrep/negative-pid kill) with no win32 equivalent path here - see the Windows process-tree kill verification story"
+    ? "exercises a real POSIX process-group primitive (ps/pgrep/negative-pid kill) with no win32 equivalent path here"
     : false;
 
 // A structural guarantee: a real child's stdout must never

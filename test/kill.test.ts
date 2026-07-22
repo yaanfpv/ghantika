@@ -216,13 +216,13 @@ test(
     // A real shell-forked process tree, tracked via a real external
     // `pgrep -g`, has no Windows equivalent path exercised anywhere in
     // this codebase's own source or this harness - a test-harness gap,
-    // not a product scope decision (OD-5: Windows is a supported
-    // platform; the real question of whether src/tools/kill.ts's win32
-    // branch actually reaps a Windows process tree is separate, tracked
-    // work).
+    // not a product scope decision. Windows is a supported platform;
+    // whether src/tools/kill.ts's win32 branch actually reaps a Windows
+    // process tree is a separate question this test doesn't answer by
+    // skipping.
     skip:
       process.platform === "win32"
-        ? "real shell-forked process tree tracked via `pgrep -g`, POSIX-only - see the Windows process-tree kill verification story"
+        ? "real shell-forked process tree tracked via `pgrep -g`, POSIX-only"
         : false,
   },
   async () => {

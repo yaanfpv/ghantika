@@ -29,12 +29,13 @@ import { parsesAsPgid, waitForFile } from "./harness.ts";
 
 // The three whole-tree-reap tests below confirm their result via a real
 // external `pgrep -g <pgid>` call, which has no Windows equivalent path -
-// a test-harness gap, not a product scope decision (OD-5: Windows is a
-// supported platform; the real question of whether cleanup actually reaps
-// a live job's process tree on Windows is separate, tracked work).
+// a test-harness gap, not a product scope decision. Windows is a
+// supported platform; whether cleanup actually reaps a live job's
+// process tree there is a separate question this test doesn't answer by
+// skipping.
 const PGREP_ORACLE_SKIP =
   process.platform === "win32"
-    ? "confirms the result via a real external `pgrep -g`, POSIX-only - see the Windows process-tree kill verification story"
+    ? "confirms the result via a real external `pgrep -g`, POSIX-only"
     : false;
 
 // Each test waits for a REAL completed initialize handshake (not a fixed

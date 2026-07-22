@@ -271,9 +271,9 @@ test(
   {
     // Spawns the bare `sleep` binary and cleans up via a negative-pid
     // process-group kill, neither of which has a Windows equivalent here -
-    // a test-harness gap tracked separately (OD-5: Windows is a supported
-    // platform; only this harness's real POSIX process-group primitives
-    // are not).
+    // a test-harness gap, not a product scope decision. Windows is a
+    // supported platform; only this harness's real POSIX process-group
+    // primitives are not.
     skip:
       process.platform === "win32"
         ? "spawns bare `sleep` and cleans up via a negative-pid process-group kill, both POSIX-only"

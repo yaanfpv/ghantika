@@ -35,13 +35,13 @@ import {
 // The three tests below build real, multi-descendant process trees via
 // startNoisyJobs and confirm them with a real external `pgrep -g <pgid>`
 // call, neither of which has a Windows equivalent path exercised anywhere
-// in this codebase - a test-harness gap, not a product scope decision
-// (OD-5: Windows is a supported platform; the real question of whether a
-// live job's whole process tree is actually reaped on Windows is
-// separate, tracked work).
+// in this codebase - a test-harness gap, not a product scope decision.
+// Windows is a supported platform; whether a live job's whole process
+// tree is actually reaped there is a separate question this test doesn't
+// answer by skipping.
 const PGREP_ORACLE_SKIP =
   process.platform === "win32"
-    ? "builds/confirms a real process-group tree via startNoisyJobs + pgrep -g, POSIX-only - see the Windows process-tree kill verification story"
+    ? "builds/confirms a real process-group tree via startNoisyJobs + pgrep -g, POSIX-only"
     : false;
 
 const spawned: SpawnedServer[] = [];
