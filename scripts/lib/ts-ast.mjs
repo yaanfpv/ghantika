@@ -1138,6 +1138,22 @@ function foldConstantString(node) {
  *     case (`const alias = module; alias.require(...)`) close via the same
  *     acquisition-site principle as the other three, instead of needing a
  *     dedicated two-step "traces to module, AND accesses .require" check.
+ *   - `globalThis`-QUALIFIED ACCESS to any of the four bare globals above -
+ *     `globalThis.eval`/`globalThis["eval"]`, and the same for
+ *     `Function`/`require`/`module` - resolved through the SAME
+ *     unshadowed-global-or-one-hop-alias machinery the bare-identifier
+ *     forms above use (`isUnshadowedGlobalThisReference`): the base is
+ *     `globalThis` written directly, OR a single local `const`/`let` that
+ *     comes to hold it, either via its own declaration initializer
+ *     (`const g = globalThis; g.eval(x)`) or a later bare reassignment
+ *     with no initializer of its own (`let g; g = globalThis; g.eval(x)`) -
+ *     one hop either way, matching this file's "verified shapes close, a
+ *     shape outside this list may not" posture elsewhere; a two-hop chain
+ *     (`const g = globalThis; const h = g; h.eval(x)`) is a documented
+ *     boundary, not chased. A COMPUTED key on an unshadowed `globalThis`
+ *     base that can't be resolved statically (`globalThis[someComputedExpr]`)
+ *     FAILS CLOSED (`unresolvable-globalthis-access`) rather than silently
+ *     passing - this guard cannot prove it does NOT reach one of the four.
  *   - `process`'s dangerous properties - a FIFTH acquisition site, narrower
  *     in shape than the four bare globals above: unlike them, bare
  *     `process` is NOT flagged (it is used extensively and legitimately
@@ -1203,6 +1219,23 @@ function foldConstantString(node) {
  *     expression, before any globalThis/process-specific destructuring
  *     check runs, for the identical reason the direct property-access
  *     form is unconditional on its base.
+ *   - DESCRIPTOR READ - `Object.getOwnPropertyDescriptor(target, key)`
+ *     reaches the same value a direct property access would (an accessor
+ *     descriptor's `.get`, or a data descriptor's `.value`) without ever
+ *     writing the target's key as a real property-access AST node at all,
+ *     so it needs its own recognition rather than falling out of the
+ *     access-based checks above for free. Flagged at the CALL itself,
+ *     unconditional on whether the descriptor's value is ever actually
+ *     extracted, when: the KEY (resolved through the same one-hop-alias
+ *     machinery as a computed `.constructor` key) folds to `"constructor"`
+ *     on ANY target; or the TARGET resolves to the real, unshadowed
+ *     `globalThis`/`process` (through the same base resolution a direct
+ *     property access uses) and the key names one of their respective
+ *     dangerous properties, or is itself unresolvable (failing closed the
+ *     same way an unresolvable direct access does). `Object` itself is
+ *     resolved through the same unshadowed-global-or-one-hop-alias check
+ *     as `globalThis`/`process`, so a locally shadowed `Object` stays
+ *     green.
  *   - A CAST OR NON-NULL ASSERTION sitting directly on an acquisition base
  *     no longer defeats symbol resolution: `globalThis!.eval(x)` and
  *     `(globalThis as typeof globalThis).eval(x)` both walked straight
