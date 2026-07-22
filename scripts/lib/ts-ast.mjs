@@ -50,18 +50,35 @@ export function isDynamicImportCall(node) {
 }
 
 /**
- * Unwraps any number of parenthesized-expression wrappers - `("x")` and
- * `"x"` must resolve identically, since parentheses are never meaningful
- * around a plain string/template literal (verified: `import(("x"))`
- * parses its argument as a `ParenthesizedExpression` wrapping a
- * `StringLiteral`, not a `StringLiteral` directly).
+ * Unwraps any number of syntax layers that are transparent at runtime -
+ * parentheses, a non-null assertion (`x!`), an `as`/`satisfies` type
+ * wrapper - in any combination and order. All four are erased by
+ * TypeScript at emit and change nothing about which value the expression
+ * evaluates to, so `(x)`, `x!`, `x as T`, and `x satisfies T` must all
+ * resolve identically to bare `x` for every check in this file that asks
+ * "what value does this expression actually read at runtime."
+ *
+ * Originally handled only parentheses (named `unwrapParens`) - broadened
+ * after `(globalThis as typeof globalThis).eval(x)` and `globalThis!.eval(x)`
+ * were proven to walk straight through the narrower version: a cast or a
+ * non-null assertion sitting directly on an acquisition-site base changed
+ * the node's shape from a bare `Identifier` to an `AsExpression`/
+ * `NonNullExpression`, which every base-expression check in this file
+ * requires before it will even look at symbol resolution.
  */
-function unwrapParens(node) {
+function unwrapTransparentWrapper(node) {
   let current = node;
-  while (ts.isParenthesizedExpression(current)) {
-    current = current.expression;
+  for (;;) {
+    if (ts.isParenthesizedExpression(current)) {
+      current = current.expression;
+    } else if (ts.isNonNullExpression(current)) {
+      current = current.expression;
+    } else if (ts.isAsExpression(current) || ts.isSatisfiesExpression(current)) {
+      current = current.expression;
+    } else {
+      return current;
+    }
   }
-  return current;
 }
 
 /**
@@ -74,7 +91,7 @@ function unwrapParens(node) {
  */
 export function stringLiteralText(node) {
   if (node === undefined) return undefined;
-  const unwrapped = unwrapParens(node);
+  const unwrapped = unwrapTransparentWrapper(node);
   return ts.isStringLiteralLike(unwrapped) ? unwrapped.text : undefined;
 }
 
@@ -258,25 +275,39 @@ const SYNTHETIC_GLOBALS_SOURCE = [
   "declare var globalThis: any;",
   "declare var process: any;",
   "declare var Reflect: any;",
+  "declare var Object: any;",
 ].join("\n");
 
 /**
- * The one `process` property this guard cares about. `process` itself is
+ * The `process` properties this guard cares about. `process` itself is
  * NOT flagged outright the way `eval`/`Function`/`require`/`module` are -
  * unlike those four, it is used extensively and legitimately throughout
  * this codebase (`.env`, `.platform`, `.cwd()`, `.kill()`, and more), so
  * treating a bare `process` reference as a violation would be wildly
- * over-broad. Only `.getBuiltinModule` is dangerous: `process
- * .getBuiltinModule(id)` returns a real builtin module's namespace object
- * DIRECTLY, by specifier, completely independent of any `import`/
- * `require` syntax - calling it with `"node:module"`/`"module"` reaches
- * `createRequire` exactly as a namespace import would, through a route
- * with no import specifier and no `require`/`module`/`eval`/`Function`
- * identifier anywhere in source. This codebase's frozen ESM architecture
- * has no legitimate reason to call this API at all (verified: the real
- * `src/` tree contains no reference to it).
+ * over-broad. Three properties are dangerous:
+ *
+ *   - `.getBuiltinModule` - `process.getBuiltinModule(id)` returns a real
+ *     builtin module's namespace object DIRECTLY, by specifier, completely
+ *     independent of any `import`/`require` syntax - calling it with
+ *     `"node:module"`/`"module"` reaches `createRequire` exactly as a
+ *     namespace import would, through a route with no import specifier
+ *     and no `require`/`module`/`eval`/`Function` identifier anywhere in
+ *     source.
+ *   - `.dlopen` - loads a native addon (a compiled `.node` binary)
+ *     directly into the process, a strictly more dangerous capability
+ *     than any of the module-loading forms above.
+ *   - `.binding` - Node's internal (unstable, undocumented) native-binding
+ *     loader, one more sibling acquisition route on the same permitted
+ *     `process` base that banning only `.getBuiltinModule` left open -
+ *     closing a single named property and stopping there is exactly the
+ *     "enumerate one spelling" incompleteness this file's design
+ *     otherwise rejects.
+ *
+ * This codebase's frozen ESM architecture has no legitimate reason to
+ * call any of these three (verified: the real `src/` tree contains no
+ * reference to any of them).
  */
-const PROCESS_DANGEROUS_PROPERTY = "getBuiltinModule";
+const PROCESS_DANGEROUS_PROPERTIES = new Set(["getBuiltinModule", "dlopen", "binding"]);
 
 /**
  * The property name `.constructor` - flagged UNCONDITIONALLY, on ANY
@@ -427,6 +458,19 @@ function isValueReferenceCandidate(node) {
 }
 
 /**
+ * True when `declaration` is an ambient `declare` - `declare const X: T;`,
+ * or a declaration nested inside a `declare global { ... }`/`declare
+ * module "..." { ... }` block. An ambient declaration is TypeScript-only:
+ * it is fully erased at emit and produces no runtime binding whatsoever,
+ * so a reference to a name that resolves ONLY to an ambient declaration in
+ * this file is not actually shadowed at runtime - the name still reads
+ * whatever it would have read had the `declare` never been written.
+ */
+function isAmbientDeclaration(declaration) {
+  return (ts.getCombinedModifierFlags(declaration) & ts.ModifierFlags.Ambient) !== 0;
+}
+
+/**
  * True when `symbol` resolves to a declaration OUTSIDE `checkedSourceFile`
  * - the real global, since the only two files this guard's `Program` ever
  * contains are the file under test and the synthetic globals file, so "not
@@ -434,43 +478,202 @@ function isValueReferenceCandidate(node) {
  * are the same fact. `false` for a symbol whose declarations sit in
  * `checkedSourceFile` (a real local shadow: a `const`, a parameter, an
  * import binding, a catch clause, a `for`/`for-of` declaration, a class
- * name - any of them).
+ * name - any of them) - UNLESS every one of those in-file declarations is
+ * itself ambient (`isAmbientDeclaration`), in which case none of them
+ * produces a real runtime binding and the reference still reads the true
+ * global at runtime: `declare const Reflect: {...}; Reflect.get(...)`
+ * type-checks as if `Reflect` were locally declared, but emits no
+ * `Reflect` declaration at all, so the compiled reference is the real
+ * global. Treating an in-file declaration as a shadow only when it
+ * actually EMITS is what closes that gap without weakening the ordinary
+ * case: a real (non-ambient) local `const`/parameter/import still shadows
+ * exactly as before.
  */
 function isUnshadowedGlobalSymbol(symbol, checkedSourceFile) {
   if (symbol === undefined) return false;
   const declarations = symbol.declarations ?? [];
-  return (
-    declarations.length > 0 && declarations.every((d) => d.getSourceFile() !== checkedSourceFile)
+  if (declarations.length === 0) return false;
+  return declarations.every(
+    (d) => d.getSourceFile() !== checkedSourceFile || isAmbientDeclaration(d)
   );
 }
 
 /**
- * True for an (already paren-unwrapped) `Identifier` node reading
- * `globalThis`, shadow-aware like every other reference this guard
- * checks. `globalThis` needs a HYBRID approach unlike `eval`/`Function`/
- * `require`/`module`: a PARAMETER, catch-binding, or `for`/`for-of`
- * shadow resolves normally through `checker.getSymbolAtLocation` (proven
- * empirically - those go through `isUnshadowedGlobalSymbol` below exactly
- * like the other four names), but a MODULE-OR-BLOCK-SCOPE `const`/`let`
- * shadow does not: `globalThis` has intrinsic compiler support, and a
- * later reference to it resolves to a symbol with NO `.declarations` at
- * all regardless of whether a `const globalThis = {...}` precedes it
- * (verified empirically against the installed 5.9.3 package) - so
- * "declared outside this file" is unanswerable from the symbol alone in
- * that specific shape. When the symbol resolves with real declarations,
- * trust them; when it resolves with none, fall back to a real lexical
- * scope walk (`hasEnclosingLocalDeclaration`) to answer the same question
- * the checker could not.
+ * True when `node` (already unwrapped of transparent syntax) resolves -
+ * directly, or through exactly ONE local alias hop - to the real,
+ * unshadowed global named `targetName` (`"globalThis"` or `"process"`).
+ *
+ * The DIRECT case handles `globalThis`/`process` written literally.
+ * `globalThis` needs a HYBRID approach unlike every other name this guard
+ * resolves: a PARAMETER, catch-binding, or `for`/`for-of` shadow resolves
+ * normally through `checker.getSymbolAtLocation` (proven empirically -
+ * those go through the same declarations-based check as every other
+ * name), but a MODULE-OR-BLOCK-SCOPE `const`/`let` shadow does not:
+ * `globalThis` has intrinsic compiler support, and a later reference to it
+ * resolves to a symbol with NO `.declarations` at all regardless of
+ * whether a `const globalThis = {...}` precedes it (verified empirically
+ * against the installed 5.9.3 package) - so "declared outside this file"
+ * is unanswerable from the symbol alone in that specific shape, and this
+ * falls back to a real lexical scope walk (`hasEnclosingLocalDeclaration`)
+ * for `globalThis` specifically. `process` carries no such intrinsic
+ * compiler support, so it never hits that no-declarations case in
+ * practice - the fallback simply never fires for it.
+ *
+ * The ONE-HOP ALIAS case handles TWO distinct ways a local binding can come
+ * to hold the real target, both verified to actually occur and both
+ * covered here: an INITIALIZER (`const g = globalThis; g.eval(x)` /
+ * `const p = process; p.getBuiltinModule(...)`), and a bare REASSIGNMENT
+ * with no initializer of its own (`let g; g = globalThis; g.eval(x)`) -
+ * the second form is exactly as real an acquisition as the first, and
+ * omitting it left a genuine gap: a variable declared without an
+ * initializer (`decl.initializer === undefined`) was previously treated as
+ * never-aliased, even when the very next statement assigned it the real
+ * global. `g`/`p` are ordinary local bindings, so the direct check above
+ * correctly says they are NOT `globalThis`/`process` by name in either
+ * form - but the acquisition is just as real as if the alias had never
+ * existed. When the direct check fails, this looks at whether `node`
+ * resolves to a symbol with EXACTLY ONE declaration in this file that is a
+ * `const`/`let`, and then checks BOTH forms: (a) the declaration's own
+ * initializer, if any, resolving (after unwrapping) to a direct reference
+ * to the real target; (b) failing that, a bare `<name> = <target>`
+ * assignment anywhere else in the file whose left side resolves to this
+ * SAME symbol (`findReassignmentAliasTarget`, compared by symbol identity,
+ * not by text - two different local variables that happen to share a name
+ * in different scopes never collide). Either form is ONE hop, not a
+ * chain - this is the verified boundary (mirrors this file's "verified
+ * shapes close, a shape outside this list may not" posture elsewhere): a
+ * two-hop alias (`const g = globalThis; const h = g; h.eval(x)`, or
+ * `let g; g = globalThis; let h; h = g; h.eval(x)`) is not chased here and
+ * would be a further row if demonstrated, not a claim this function
+ * silently already covers.
  */
-function isUnshadowedGlobalThisReference(node, checker, checkedSourceFile) {
-  if (!ts.isIdentifier(node) || node.text !== "globalThis") return false;
+function isUnshadowedGlobalOrOneHopAlias(node, targetName, checker, checkedSourceFile) {
+  if (!ts.isIdentifier(node)) return false;
+
+  if (node.text === targetName) {
+    const symbol = checker.getSymbolAtLocation(node);
+    // `globalThis` has intrinsic compiler support: a reference to it
+    // resolves to a symbol with NO `.declarations` at all regardless of
+    // whether a `const globalThis = {...}` shadow precedes it (verified
+    // empirically against the installed 5.9.3 package) - and that
+    // "truthy symbol, empty .declarations" shape is what actually occurs
+    // here, not `symbol === undefined` (also verified empirically; an
+    // earlier version of this check only tested for `undefined` and
+    // silently mis-classified this exact case as shadowed, regressing
+    // detection of a bare, unaliased `globalThis.eval(...)` entirely).
+    // Checking `declarations.length === 0` catches both possible shapes
+    // uniformly. `process`/`Object` carry no such intrinsic compiler
+    // support (both are declared in the synthetic globals file), so they
+    // never hit this branch in practice - it exists for `globalThis`
+    // specifically, and this falls back to a real lexical scope walk
+    // (`hasEnclosingLocalDeclaration`) to answer the same question the
+    // checker's symbol resolution could not for that one name.
+    const declarations = symbol?.declarations ?? [];
+    if (declarations.length === 0) {
+      return targetName === "globalThis" && !hasEnclosingLocalDeclaration(node, targetName);
+    }
+    return isUnshadowedGlobalSymbol(symbol, checkedSourceFile);
+  }
+
+  // One-hop local alias: `node` names some OTHER local binding - check
+  // whether that binding is a single const/let in this file, via either
+  // its own initializer or a later bare reassignment (see this function's
+  // own header comment for why both forms are checked).
   const symbol = checker.getSymbolAtLocation(node);
   if (symbol === undefined) return false;
   const declarations = symbol.declarations ?? [];
-  if (declarations.length > 0) {
-    return declarations.every((d) => d.getSourceFile() !== checkedSourceFile);
+  if (declarations.length !== 1) return false;
+  const [decl] = declarations;
+  if (!ts.isVariableDeclaration(decl)) return false;
+  if (decl.getSourceFile() !== checkedSourceFile) return false;
+
+  if (decl.initializer !== undefined) {
+    const initializer = unwrapTransparentWrapper(decl.initializer);
+    if (
+      ts.isIdentifier(initializer) &&
+      initializer.text === targetName &&
+      isUnshadowedGlobalOrOneHopAlias(initializer, targetName, checker, checkedSourceFile)
+    ) {
+      return true;
+    }
   }
-  return !hasEnclosingLocalDeclaration(node, "globalThis");
+
+  return findReassignmentAliasTarget(symbol, targetName, checker, checkedSourceFile);
+}
+
+/**
+ * Scans every `<identifier> = <expr>` assignment in `checkedSourceFile`
+ * for one whose LEFT side resolves (by SYMBOL IDENTITY, not text - two
+ * unrelated variables that happen to share a name in different scopes
+ * never collide) to `variableSymbol`, and whose RIGHT side (after
+ * unwrapping) is itself a direct, unshadowed reference to `targetName`.
+ * This is the bare-reassignment half of the one-hop alias check above:
+ * `let g; g = globalThis;` carries no initializer for `g`'s own
+ * declaration to inspect, so the acquisition is only visible by looking
+ * for a later WRITE to the same binding. One hop only, matching the
+ * declaration-initializer form: a reassignment FROM another alias
+ * (`g = someOtherAlias`) is not chased here.
+ */
+function findReassignmentAliasTarget(variableSymbol, targetName, checker, checkedSourceFile) {
+  let matched = false;
+  forEachDescendant(checkedSourceFile, (node) => {
+    if (matched) return;
+    if (
+      !ts.isBinaryExpression(node) ||
+      node.operatorToken.kind !== ts.SyntaxKind.EqualsToken ||
+      !ts.isIdentifier(node.left)
+    ) {
+      return;
+    }
+    if (checker.getSymbolAtLocation(node.left) !== variableSymbol) return;
+    const rhs = unwrapTransparentWrapper(node.right);
+    if (
+      ts.isIdentifier(rhs) &&
+      rhs.text === targetName &&
+      isUnshadowedGlobalOrOneHopAlias(rhs, targetName, checker, checkedSourceFile)
+    ) {
+      matched = true;
+    }
+  });
+  return matched;
+}
+
+/**
+ * True for an (already unwrapped) `Identifier` node reading `globalThis`,
+ * directly or through one local alias hop - see
+ * `isUnshadowedGlobalOrOneHopAlias` for the shared design both this and
+ * the `process` check below build on.
+ */
+function isUnshadowedGlobalThisReference(node, checker, checkedSourceFile) {
+  return isUnshadowedGlobalOrOneHopAlias(node, "globalThis", checker, checkedSourceFile);
+}
+
+/**
+ * True for an (already unwrapped) `Identifier` node reading `process`,
+ * directly or through one local alias hop - see
+ * `isUnshadowedGlobalOrOneHopAlias`. Unlike `globalThis`, `process` is not
+ * itself banned (it is used extensively and legitimately throughout this
+ * codebase) - this only tells a caller whether a BASE expression resolves
+ * to the real `process`; the caller still decides which property access
+ * off that base is dangerous.
+ */
+function isUnshadowedProcessReference(node, checker, checkedSourceFile) {
+  return isUnshadowedGlobalOrOneHopAlias(node, "process", checker, checkedSourceFile);
+}
+
+/**
+ * True for an (already unwrapped) `Identifier` node reading `Object`,
+ * directly or through one local alias hop - see
+ * `isUnshadowedGlobalOrOneHopAlias`. Needed only for the
+ * `Object.getOwnPropertyDescriptor` acquisition check below: `Object`
+ * itself is not banned (it is a completely ordinary, extensively used
+ * global), so this only tells a caller whether a callee's base resolves to
+ * the real `Object`; the caller still decides whether the specific method
+ * being called off it (`getOwnPropertyDescriptor`) and its arguments amount
+ * to a violation.
+ */
+function isUnshadowedObjectReference(node, checker, checkedSourceFile) {
+  return isUnshadowedGlobalOrOneHopAlias(node, "Object", checker, checkedSourceFile);
 }
 
 /**
@@ -596,6 +799,53 @@ function accessKeyText(node) {
 }
 
 /**
+ * Resolves a plain expression to its literal string value, extending
+ * `foldConstantString`'s direct case through exactly ONE local alias hop
+ * when direct folding fails: `const k = "constructor"; use(k)` folds `k` to
+ * nothing on its own (`foldConstantString` only handles literals and `+`
+ * concatenation, never a variable reference), even though the value is
+ * exactly as statically determined as `use("constructor")` would have been
+ * - `k` can only ever hold `"constructor"`. When the expression is a bare
+ * Identifier resolving to a single `const`/`let` declared in THIS file with
+ * a literal (or literal-foldable) initializer, this resolves through that
+ * one hop. One hop only, matching this file's other one-hop alias
+ * resolution (`isUnshadowedGlobalOrOneHopAlias`) - a further indirection
+ * (the value itself assigned from another variable) is not chased here.
+ * Shared by `resolvedAccessKeyText` below (a computed element-access key)
+ * and the `Object.getOwnPropertyDescriptor` acquisition check further down
+ * (an ordinary call argument, not an access key) - both need the identical
+ * one-hop resolution, just applied to a different AST position.
+ */
+function resolveOneHopStringExpression(node, checker, checkedSourceFile) {
+  const direct = foldConstantString(node);
+  if (direct !== undefined) return direct;
+
+  const unwrapped = unwrapTransparentWrapper(node);
+  if (!ts.isIdentifier(unwrapped)) return undefined;
+  const symbol = checker.getSymbolAtLocation(unwrapped);
+  if (symbol === undefined) return undefined;
+  const declarations = symbol.declarations ?? [];
+  if (declarations.length !== 1) return undefined;
+  const [decl] = declarations;
+  if (!ts.isVariableDeclaration(decl) || decl.initializer === undefined) return undefined;
+  if (decl.getSourceFile() !== checkedSourceFile) return undefined;
+  return foldConstantString(decl.initializer);
+}
+
+/**
+ * Same as `accessKeyText`, extended to resolve a computed element-access
+ * key through exactly ONE local alias hop when direct folding fails - see
+ * `resolveOneHopStringExpression`'s own doc comment for the shared
+ * mechanism this builds on.
+ */
+function resolvedAccessKeyText(node, checker, checkedSourceFile) {
+  const direct = accessKeyText(node);
+  if (direct !== undefined) return direct;
+  if (!ts.isElementAccessExpression(node)) return undefined;
+  return resolveOneHopStringExpression(node.argumentExpression, checker, checkedSourceFile);
+}
+
+/**
  * Folds a string-producing expression to its literal text, beyond
  * `stringLiteralText`'s plain-literal case: a `+` concatenation chain of
  * string literals (`"re" + "quire"`) is exactly as statically resolvable
@@ -606,7 +856,7 @@ function accessKeyText(node) {
  */
 function foldConstantString(node) {
   if (node === undefined) return undefined;
-  const unwrapped = unwrapParens(node);
+  const unwrapped = unwrapTransparentWrapper(node);
   const direct = stringLiteralText(unwrapped);
   if (direct !== undefined) return direct;
   if (
@@ -851,7 +1101,7 @@ function foldConstantString(node) {
  * checked per-specifier, never treated as clearing the whole clause.
  *
  * @param {import("typescript").SourceFile} sourceFile
- * @returns {{ node: import("typescript").Node, kind: "named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access" | "process-getbuiltinmodule-access" | "unresolvable-process-access" | "reflect-reference" | "constructor-property-access" }[]}
+ * @returns {{ node: import("typescript").Node, kind: "named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access" | "process-dangerous-property-access" | "unresolvable-process-access" | "reflect-reference" | "constructor-property-access" }[]}
  */
 export function findCreateRequireImports(sourceFile) {
   const hits = [];
@@ -1003,21 +1253,27 @@ export function findCreateRequireImports(sourceFile) {
     // prove it does NOT reach one of the four, so it is flagged rather
     // than silently passed. ---
     if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
-      const base = unwrapParens(node.expression);
+      const base = unwrapTransparentWrapper(node.expression);
 
       // --- .constructor - see CONSTRUCTOR_PROPERTY_NAME's own doc
       // comment. Checked FIRST and unconditionally on the base
       // expression, before the globalThis/process-specific checks below:
       // every value carries this property regardless of where it came
       // from, so there is no "is the base the real global" question to
-      // ask first the way the other two checks below need to. ---
-      if (accessKeyText(node) === CONSTRUCTOR_PROPERTY_NAME) {
+      // ask first the way the other two checks below need to.
+      //
+      // Uses `resolvedAccessKeyText`, not plain `accessKeyText` - so
+      // `const k = "constructor"; obj[k]` is caught the same way
+      // `obj["constructor"]` already is: the key is exactly as statically
+      // determined in both cases, one is just spelled through a one-hop
+      // local alias. ---
+      if (resolvedAccessKeyText(node, checker, checkedSourceFile) === CONSTRUCTOR_PROPERTY_NAME) {
         hits.push({ node, kind: "constructor-property-access" });
         return;
       }
 
       if (isUnshadowedGlobalThisReference(base, checker, checkedSourceFile)) {
-        const key = accessKeyText(node);
+        const key = resolvedAccessKeyText(node, checker, checkedSourceFile);
         if (key === undefined) {
           hits.push({ node, kind: "unresolvable-globalthis-access" });
           return;
@@ -1028,24 +1284,26 @@ export function findCreateRequireImports(sourceFile) {
         return;
       }
 
-      // --- process.getBuiltinModule / process["getBuiltinModule"] - see
-      // PROCESS_DANGEROUS_PROPERTY's own doc comment for why bare
+      // --- process.getBuiltinModule / process.dlopen / process.binding
+      // (dotted or computed, direct or through one local alias hop) - see
+      // PROCESS_DANGEROUS_PROPERTIES's own doc comment for why bare
       // `process` is not flagged the way the four globals above are, and
-      // why this ONE property is. A computed, non-statically-foldable key
+      // why these three properties are. `isUnshadowedProcessReference`
+      // (not a literal `base.text === "process"` check) is what makes
+      // `const p = process; p.getBuiltinModule(...)` resolve the same as
+      // `process.getBuiltinModule(...)` - the one-hop alias case this
+      // check previously missed. A computed, non-statically-foldable key
       // on an unshadowed `process` base fails closed the same way an
       // unresolvable `globalThis[...]` access does above - this guard
-      // cannot prove it does NOT reach `.getBuiltinModule`. ---
-      if (ts.isIdentifier(base) && base.text === "process") {
-        const symbol = checker.getSymbolAtLocation(base);
-        if (symbol === undefined || isUnshadowedGlobalSymbol(symbol, checkedSourceFile)) {
-          const key = accessKeyText(node);
-          if (key === undefined) {
-            hits.push({ node, kind: "unresolvable-process-access" });
-            return;
-          }
-          if (key === PROCESS_DANGEROUS_PROPERTY) {
-            hits.push({ node, kind: "process-getbuiltinmodule-access" });
-          }
+      // cannot prove it does NOT reach one of the three. ---
+      if (isUnshadowedProcessReference(base, checker, checkedSourceFile)) {
+        const key = resolvedAccessKeyText(node, checker, checkedSourceFile);
+        if (key === undefined) {
+          hits.push({ node, kind: "unresolvable-process-access" });
+          return;
+        }
+        if (PROCESS_DANGEROUS_PROPERTIES.has(key)) {
+          hits.push({ node, kind: "process-dangerous-property-access" });
         }
         return;
       }
@@ -1079,12 +1337,29 @@ export function findCreateRequireImports(sourceFile) {
     // to check against, so it falls through this check untouched -
     // correctly green regardless of key spelling. ---
     if (ts.isObjectBindingPattern(node)) {
+      // --- .constructor via destructuring - `const { constructor: F } =
+      // anything` - UNCONDITIONAL on the destructuring source, the same
+      // way the property-access .constructor check above is unconditional
+      // on its base: every value carries a .constructor property
+      // regardless of where it came from, so there is no "is the source
+      // the real global" question to ask first. Runs for every
+      // ObjectBindingPattern regardless of whether it has a known
+      // initializer at all (a catch clause, a parameter with no default -
+      // the destructuring PATTERN itself names "constructor" as the key to
+      // pull, independent of what the runtime source turns out to be). ---
+      for (const element of node.elements) {
+        if (element.dotDotDotToken) continue;
+        if (bindingElementSourceKeyText(element) === CONSTRUCTOR_PROPERTY_NAME) {
+          hits.push({ node: element, kind: "constructor-property-access" });
+        }
+      }
+
       const parent = node.parent;
       const hasKnownInitializer =
         (ts.isVariableDeclaration(parent) || ts.isParameter(parent)) &&
         parent.initializer !== undefined;
       if (hasKnownInitializer) {
-        const source = unwrapParens(parent.initializer);
+        const source = unwrapTransparentWrapper(parent.initializer);
         if (isUnshadowedGlobalThisReference(source, checker, checkedSourceFile)) {
           for (const element of node.elements) {
             if (element.dotDotDotToken) continue; // a rest element carries no single source key
@@ -1095,6 +1370,22 @@ export function findCreateRequireImports(sourceFile) {
             }
             if (FORBIDDEN_GLOBAL_NAMES.has(key)) {
               hits.push({ node: element, kind: GLOBAL_NAME_TO_KIND[key] });
+            }
+          }
+        }
+        // --- `const { getBuiltinModule } = process` (direct or one-hop
+        // alias) - the same destructuring-is-an-acquisition reasoning as
+        // globalThis above, applied to process's dangerous properties. ---
+        if (isUnshadowedProcessReference(source, checker, checkedSourceFile)) {
+          for (const element of node.elements) {
+            if (element.dotDotDotToken) continue;
+            const key = bindingElementSourceKeyText(element);
+            if (key === undefined) {
+              hits.push({ node: element, kind: "unresolvable-process-access" });
+              continue;
+            }
+            if (PROCESS_DANGEROUS_PROPERTIES.has(key)) {
+              hits.push({ node: element, kind: "process-dangerous-property-access" });
             }
           }
         }
@@ -1115,7 +1406,16 @@ export function findCreateRequireImports(sourceFile) {
       node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
       ts.isObjectLiteralExpression(node.left)
     ) {
-      const source = unwrapParens(node.right);
+      // --- .constructor via assignment-destructuring - `({ constructor: F
+      // } = anything)` - unconditional on the source, same reasoning as
+      // the binding-pattern form above. ---
+      for (const property of node.left.properties) {
+        if (objectLiteralDestructurePropertyKeyText(property) === CONSTRUCTOR_PROPERTY_NAME) {
+          hits.push({ node: property, kind: "constructor-property-access" });
+        }
+      }
+
+      const source = unwrapTransparentWrapper(node.right);
       if (isUnshadowedGlobalThisReference(source, checker, checkedSourceFile)) {
         for (const property of node.left.properties) {
           const key = objectLiteralDestructurePropertyKeyText(property);
@@ -1125,6 +1425,18 @@ export function findCreateRequireImports(sourceFile) {
           }
           if (FORBIDDEN_GLOBAL_NAMES.has(key)) {
             hits.push({ node: property, kind: GLOBAL_NAME_TO_KIND[key] });
+          }
+        }
+      }
+      if (isUnshadowedProcessReference(source, checker, checkedSourceFile)) {
+        for (const property of node.left.properties) {
+          const key = objectLiteralDestructurePropertyKeyText(property);
+          if (key === undefined) {
+            hits.push({ node: property, kind: "unresolvable-process-access" });
+            continue;
+          }
+          if (PROCESS_DANGEROUS_PROPERTIES.has(key)) {
+            hits.push({ node: property, kind: "process-dangerous-property-access" });
           }
         }
       }

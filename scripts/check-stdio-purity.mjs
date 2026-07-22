@@ -14,9 +14,12 @@
  *     own doc comment for the full set and how it was verified);
  *   - declares a `const`/`let`/`var` whose initializer is (transitively,
  *     up to a bounded number of re-alias hops) the bare `process`
- *     identifier or `globalThis.process` - the ALIAS-CREATION itself is
- *     the trigger, since a later `.stdout` access on an unrecognized
- *     local name would otherwise escape the first check entirely.
+ *     identifier or `globalThis.process`, OR reassigns an already-declared
+ *     name to the same thing (`let p; p = process;`, as opposed to a
+ *     declaration's own initializer) - the ALIAS-CREATION event itself is
+ *     the trigger, whichever syntax expresses it, since a later `.stdout`
+ *     access on an unrecognized local name would otherwise escape the
+ *     first check entirely.
  *
  * Runs on the real TypeScript AST (see scripts/lib/ts-ast.mjs's header for
  * the full "why AST, not regex" rationale): comments are trivia attached
@@ -140,54 +143,84 @@ function isProcessOrGlobalThisProcessExpression(node) {
  * hops: c -> b -> a -> process); a chain deliberately built deeper than
  * this bound would still escape. Documented residual limitation (judgment
  * call, not full data-flow analysis): a genuinely adversarial, arbitrarily
- * long re-alias chain can still get through, and a chain that goes through
- * a bare REASSIGNMENT (`let x; x = process;`, as opposed to the
- * declaration's own initializer) is out of scope entirely - this check
- * closes the one-hop alias-creation case (`const x = process`/
- * `globalThis.process`) plus shallow multi-hop chains a real refactor
- * might plausibly produce; a hostile, deep chain built specifically to
+ * long re-alias chain can still get through - this check closes the
+ * one-hop alias-creation case (`const x = process`/`globalThis.process`,
+ * OR the bare-reassignment form `let x; x = process;`) plus shallow
+ * multi-hop chains a real refactor might plausibly produce, whichever
+ * syntax expresses each hop; a hostile, deep chain built specifically to
  * evade this guard is not something a purely syntactic, non-type-checking
- * AST pass can fully
- * close without becoming a real data-flow analyzer.
+ * AST pass can fully close without becoming a real data-flow analyzer.
  */
 const MAX_ALIAS_CHAIN_HOPS = 4;
 
 /**
  * True when `expression` is `process`/`globalThis.process` directly, OR
- * (up to `hopsRemaining` further hops) an identifier whose OWN declared
- * initializer resolves back to `process`/`globalThis.process` through
- * `declarationInitializersByName`. That map is built as a flat,
- * whole-file `name -> initializer` table (see
- * `collectVariableDeclarationInitializers`) rather than a real scope-
- * resolved binding table - a deliberate, documented simplification: a
- * purely syntactic AST pass has no type-checker-grade binder available,
+ * (up to `hopsRemaining` further hops) an identifier that was EVER
+ * assigned - by its own declaration's initializer, or by a later bare
+ * reassignment - a value which itself resolves back to
+ * `process`/`globalThis.process` through `assignedValuesByName`. That map
+ * is built as a flat, whole-file `name -> [every value ever assigned]`
+ * table (see `collectVariableAssignedValuesByName`) rather than a real
+ * scope-resolved binding table - a deliberate, documented simplification:
+ * a purely syntactic AST pass has no type-checker-grade binder available,
  * so a pathological case with two DIFFERENT same-named locals in
  * different scopes could resolve to the wrong declaration. Given this
  * guard's job is catching realistic mutants, not defending against a
  * maximally adversarial attacker, erring toward FALSE POSITIVE (the flat
  * map can only ever cause this to be MORE aggressive, never less, since
- * failing to find a name in the map simply stops the chain) is the safe
- * direction for a security guard.
+ * failing to find a name in the map simply stops the chain, and checking
+ * EVERY assigned value rather than only the most recent one can only add
+ * matches, never remove one) is the safe direction for a security guard.
  */
-function isProcessAliasChain(expression, declarationInitializersByName, hopsRemaining) {
+function isProcessAliasChain(expression, assignedValuesByName, hopsRemaining) {
   if (isProcessOrGlobalThisProcessExpression(expression)) return true;
   if (hopsRemaining <= 0) return false;
   if (!ts.isIdentifier(expression)) return false;
-  const upstreamInitializer = declarationInitializersByName.get(expression.text);
-  if (upstreamInitializer === undefined) return false;
-  return isProcessAliasChain(upstreamInitializer, declarationInitializersByName, hopsRemaining - 1);
+  const upstreamValues = assignedValuesByName.get(expression.text);
+  if (upstreamValues === undefined) return false;
+  return upstreamValues.some((value) =>
+    isProcessAliasChain(value, assignedValuesByName, hopsRemaining - 1)
+  );
 }
 
-/** A flat, whole-file map of every `const`/`let`/`var` declared NAME to its OWN initializer expression (see `isProcessAliasChain`'s doc comment for the deliberate scope-resolution simplification this implies). */
-function collectVariableDeclarationInitializers(sourceFile) {
+/**
+ * A flat, whole-file map of every locally-bound NAME to EVERY expression
+ * ever assigned to it - a `const`/`let`/`var`'s own declaration
+ * initializer, AND any later bare reassignment (`name = <expr>;`) found
+ * anywhere in the file. A name maps to an ARRAY, not a single value:
+ * `let p; p = somethingHarmless; p = process;` assigns `p` twice, and
+ * `isProcessAliasChain` only needs ONE of those values to resolve to
+ * `process` for the alias to be real - collecting every assignment rather
+ * than only the declaration's own initializer is what makes the bare-
+ * reassignment form (no initializer of its own to inspect) resolvable at
+ * all (see `isProcessAliasChain`'s doc comment for the deliberate scope-
+ * resolution simplification this implies).
+ */
+function collectVariableAssignedValuesByName(sourceFile) {
   const map = new Map();
+  const record = (name, value) => {
+    const existing = map.get(name);
+    if (existing === undefined) {
+      map.set(name, [value]);
+    } else {
+      existing.push(value);
+    }
+  };
   forEachDescendant(sourceFile, (node) => {
     if (
       ts.isVariableDeclaration(node) &&
       ts.isIdentifier(node.name) &&
       node.initializer !== undefined
     ) {
-      map.set(node.name.text, node.initializer);
+      record(node.name.text, node.initializer);
+      return;
+    }
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(node.left)
+    ) {
+      record(node.left.text, node.right);
     }
   });
   return map;
@@ -206,7 +239,7 @@ function collectVariableDeclarationInitializers(sourceFile) {
 export function findStdoutWrites(sourceText, fileName = "source.ts") {
   const hits = [];
   const sourceFile = parseSourceFile(fileName, sourceText);
-  const declarationInitializersByName = collectVariableDeclarationInitializers(sourceFile);
+  const assignedValuesByName = collectVariableAssignedValuesByName(sourceFile);
 
   forEachDescendant(sourceFile, (node) => {
     if (isProcessStdoutAccess(node)) {
@@ -223,11 +256,26 @@ export function findStdoutWrites(sourceText, fileName = "source.ts") {
       ts.isIdentifier(node.name) &&
       node.initializer !== undefined
     ) {
-      if (
-        isProcessAliasChain(node.initializer, declarationInitializersByName, MAX_ALIAS_CHAIN_HOPS)
-      ) {
+      if (isProcessAliasChain(node.initializer, assignedValuesByName, MAX_ALIAS_CHAIN_HOPS)) {
         hits.push(
           `const/let/var "${node.name.text}" aliases process (directly or through re-aliasing) - stdout could be reached through it`
+        );
+      }
+      return;
+    }
+    // --- a bare REASSIGNMENT (`p = process;`, as opposed to `p`'s own
+    // declaration initializer) is exactly as real an alias-creation event
+    // as a declaration with an initializer is - `let p;` carries no
+    // initializer of its own to inspect, so the assignment statement
+    // itself is the only place this alias becomes visible. ---
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(node.left)
+    ) {
+      if (isProcessAliasChain(node.right, assignedValuesByName, MAX_ALIAS_CHAIN_HOPS)) {
+        hits.push(
+          `"${node.left.text}" is reassigned to alias process (directly or through re-aliasing) - stdout could be reached through it`
         );
       }
     }

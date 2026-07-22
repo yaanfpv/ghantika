@@ -149,13 +149,13 @@ const UNRESOLVABLE_SIBLING_SPECIFIER_LABEL =
  * a name-only callee check would need to see past that alias to catch the
  * later `makeLoader(...)` call, which it structurally cannot do.
  *
- * @param {"named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access" | "process-getbuiltinmodule-access" | "unresolvable-process-access" | "reflect-reference" | "constructor-property-access"} kind
+ * @param {"named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access" | "process-dangerous-property-access" | "unresolvable-process-access" | "reflect-reference" | "constructor-property-access"} kind
  * @returns {string}
  */
 function createRequireImportBindingLabel(kind) {
   switch (kind) {
-    case "process-getbuiltinmodule-access":
-      return "<references process.getBuiltinModule - reaches createRequire (and any other builtin module) via a Node builtin-module API with no import/require syntax naming its target anywhere, forbidden outright at the point of reference the same as the four bare globals, regardless of what specifier it is later called with or how the reference is stored/aliased>";
+    case "process-dangerous-property-access":
+      return "<references one of process's dangerous properties (getBuiltinModule, dlopen, or binding) - directly, or through one local alias hop - each a route to native/builtin-loading capability with no import/require syntax naming its target anywhere, forbidden outright at the point of reference the same as the four bare globals, regardless of what specifier it is later called with or how the reference is stored/aliased>";
     case "unresolvable-process-access":
       return "<accesses a computed property of process whose key can't be resolved statically - cannot verify it avoids .getBuiltinModule, failing closed>";
     case "reflect-reference":

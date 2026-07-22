@@ -582,6 +582,93 @@ test("green control: an object literal's own 'constructor' property KEY (definin
 });
 
 // ---------------------------------------------------------------------------
+// globalThis/process ONE-HOP ALIAS - a local binding that comes to hold the
+// real globalThis/process, either via its own declaration initializer or a
+// later bare reassignment, is exactly as real an acquisition route as the
+// bare name would have been. REGRESSION coverage: a prior version of the
+// resolution helper only recognized `symbol === undefined` as the signal
+// that a `globalThis` reference is genuinely unshadowed, but the real
+// checker returns a TRUTHY symbol with an EMPTY `.declarations` array for
+// that exact case - so the direct, non-aliased form (`globalThis.eval(...)`
+// with no local shadow anywhere) silently stopped being detected at all.
+// That regression is caught here alongside the new alias coverage, since
+// both routes share the same underlying resolution function.
+// ---------------------------------------------------------------------------
+
+test("REGRESSION: a direct, unshadowed globalThis.eval(...) reference (no alias, no local shadow) is detected", () => {
+  const hits = findTasksImports("globalThis.eval('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the direct globalThis.eval access to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("REGRESSION: a direct, unshadowed globalThis['eval'] (computed) reference is detected too", () => {
+  const hits = findTasksImports("globalThis['eval']('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the direct computed globalThis['eval'] access to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a local const aliasing globalThis, then accessed through the alias, is caught - const g = globalThis; g.eval(x)", () => {
+  const hits = findTasksImports("const g = globalThis;\ng.eval('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the one-hop globalThis alias to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a local const aliasing process's BASE (not just its method), then accessed through the alias, is caught - const p = process; p.getBuiltinModule(...)", () => {
+  const hits = findTasksImports("const p = process;\np.getBuiltinModule('node:module');\n");
+  assert.ok(
+    hits.some((h) => h.includes("getBuiltinModule")),
+    `expected the one-hop process BASE alias to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a BARE REASSIGNMENT (no initializer on the variable's own declaration) aliasing globalThis is caught the same as a declaration initializer - let g; g = globalThis; g.eval(x)", () => {
+  const hits = findTasksImports("let g;\ng = globalThis;\ng.eval('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the bare-reassignment globalThis alias to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a bare reassignment aliasing process is caught the same way - let p; p = process; p.getBuiltinModule(...)", () => {
+  const hits = findTasksImports("let p;\np = process;\np.getBuiltinModule('node:module');\n");
+  assert.ok(
+    hits.some((h) => h.includes("getBuiltinModule")),
+    `expected the bare-reassignment process alias to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a reassignment aliasing globalThis AFTER an unrelated initializer is still caught - let g = 5; g = globalThis; g.eval(x)", () => {
+  const hits = findTasksImports("let g = 5;\ng = globalThis;\ng.eval('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the reassignment to be flagged despite the harmless initial value, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a locally SHADOWED globalThis aliased through a const is never flagged, even though the alias-resolution machinery now checks reassignments too", () => {
+  const hits = findTasksImports(
+    "const globalThis = { eval: () => 1 };\nconst g = globalThis;\ng.eval('1');\n"
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("green control: an unrelated bare reassignment (never process/globalThis) is never flagged", () => {
+  const hits = findTasksImports("let x;\nx = 5;\nvoid x;\n");
+  assert.deepEqual(hits, []);
+});
+
+test("documented boundary: a TWO-HOP alias chain is not chased (const g = globalThis; const h = g; h.eval(x)) - a further row if this shape is ever demonstrated live, not a claim this function already covers", () => {
+  const hits = findTasksImports("const g = globalThis;\nconst h = g;\nh.eval('1');\n");
+  assert.deepEqual(hits, []);
+});
+
+// ---------------------------------------------------------------------------
 // process.getBuiltinModule - REGRESSION: an executable fixture demonstrated
 // this route reaches createRequire via a supported Node builtin-module API
 // with no import/require syntax naming "node:module" anywhere - previously
@@ -595,7 +682,7 @@ test('REGRESSION: process.getBuiltinModule("node:module").createRequire(...) IS 
       'r("@modelcontextprotocol/sdk/experimental/tasks");\n'
   );
   assert.ok(
-    hits.some((hit) => hit.includes("process.getBuiltinModule")),
+    hits.some((hit) => hit.includes("getBuiltinModule")),
     `expected a process.getBuiltinModule violation, got: ${JSON.stringify(hits)}`
   );
 });
@@ -605,7 +692,7 @@ test("process.getBuiltinModule is flagged at the ACQUISITION site regardless of 
     "const acquire = process.getBuiltinModule;\nconst mod = acquire('node:module');\n"
   );
   assert.ok(
-    hits.some((hit) => hit.includes("process.getBuiltinModule")),
+    hits.some((hit) => hit.includes("getBuiltinModule")),
     `expected the aliased acquisition to be flagged, got: ${JSON.stringify(hits)}`
   );
 });
@@ -613,7 +700,7 @@ test("process.getBuiltinModule is flagged at the ACQUISITION site regardless of 
 test('process.getBuiltinModule via bracket notation ("computed" but statically foldable) is still detected', () => {
   const hits = findTasksImports('const m = process["getBuiltinModule"]("node:module");\n');
   assert.ok(
-    hits.some((hit) => hit.includes("process.getBuiltinModule")),
+    hits.some((hit) => hit.includes("getBuiltinModule")),
     `expected the bracket-notation access to be flagged, got: ${JSON.stringify(hits)}`
   );
 });
@@ -621,7 +708,7 @@ test('process.getBuiltinModule via bracket notation ("computed" but statically f
 test("process.getBuiltinModule via a folded string-concatenation key is still detected", () => {
   const hits = findTasksImports('const m = process["getBuiltin" + "Module"]("node:module");\n');
   assert.ok(
-    hits.some((hit) => hit.includes("process.getBuiltinModule")),
+    hits.some((hit) => hit.includes("getBuiltinModule")),
     `expected the concatenated-key access to be flagged, got: ${JSON.stringify(hits)}`
   );
 });
@@ -664,7 +751,7 @@ test("green control: process.getBuiltinModule called with a DIFFERENT builtin (n
   // is the passing test suite everywhere this string never appears.
   const hits = findTasksImports('const fsModule = process.getBuiltinModule("fs");\n');
   assert.ok(
-    hits.some((hit) => hit.includes("process.getBuiltinModule")),
+    hits.some((hit) => hit.includes("getBuiltinModule")),
     `expected the acquisition itself to be flagged regardless of argument, got: ${JSON.stringify(hits)}`
   );
 });
