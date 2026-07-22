@@ -836,3 +836,124 @@ test("green control: process.getBuiltinModule called with a DIFFERENT builtin (n
     `expected the acquisition itself to be flagged regardless of argument, got: ${JSON.stringify(hits)}`
   );
 });
+
+// ---------------------------------------------------------------------------
+// Six further acquisition shapes, each an idiomatic variant of a route
+// already closed above rather than a new mechanism - permanent regression
+// coverage for each specific spelling, since the acquisition-site checks
+// above were verified against a battery of fixtures but these six shapes
+// were not yet represented as their own dedicated test.
+// ---------------------------------------------------------------------------
+
+test("a destructured getBuiltinModule reached DIRECTLY off process (no intermediate alias variable) is caught the same way an aliased base is - const { getBuiltinModule } = process", () => {
+  const hits = findTasksImports(
+    "const { getBuiltinModule } = process;\n" +
+      "const m = getBuiltinModule('node:module');\n" +
+      "m.createRequire(import.meta.url);\n"
+  );
+  assert.ok(
+    hits.some((h) => h.includes("getBuiltinModule")),
+    `expected the direct destructure off process to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: destructuring a HARMLESS property directly off process is never flagged", () => {
+  const hits = findTasksImports("const { env } = process;\nvoid env;\n");
+  assert.deepEqual(hits, []);
+});
+
+test("a variable-keyed .constructor access, resolved through one local alias hop, is caught the same way a literal bracketed key already is - const k = 'constructor'; obj[k]", () => {
+  const hits = findTasksImports(
+    "const k = 'constructor';\nconst F = (() => 1)[k];\nF('return 1');\n"
+  );
+  assert.ok(
+    hits.some((h) => h.includes(".constructor")),
+    `expected the alias-resolved computed .constructor key to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a variable-keyed property access whose alias resolves to an UNRELATED string is never mistaken for a .constructor access", () => {
+  const hits = findTasksImports("const k = 'toString';\nconst t = ({})[k];\nvoid t;\n");
+  assert.deepEqual(hits, []);
+});
+
+test("a .constructor binding destructured directly off a NON-GLOBAL source (an arrow function, not globalThis/process) is caught - the ban is on the key, unconditional on where it's destructured from", () => {
+  const hits = findTasksImports("const { constructor: F } = (() => {});\nF('return 1');\n");
+  assert.ok(
+    hits.some((h) => h.includes(".constructor")),
+    `expected the destructured .constructor off a non-global source to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: destructuring a HARMLESS key off a non-global source is never flagged", () => {
+  const hits = findTasksImports("const { toString: t } = (() => {});\nvoid t;\n");
+  assert.deepEqual(hits, []);
+});
+
+test("a non-null assertion sitting directly on the globalThis base does not defeat detection - globalThis!.eval(x)", () => {
+  const hits = findTasksImports("globalThis!.eval('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the non-null-asserted globalThis base to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("an 'as' cast sitting directly on the globalThis base does not defeat detection either - (globalThis as typeof globalThis).eval(x)", () => {
+  const hits = findTasksImports("(globalThis as typeof globalThis).eval('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the cast globalThis base to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a non-null assertion sitting directly on the process base is caught the same way - process!.getBuiltinModule(...)", () => {
+  const hits = findTasksImports("process!.getBuiltinModule('node:module');\n");
+  assert.ok(
+    hits.some((h) => h.includes("getBuiltinModule")),
+    `expected the non-null-asserted process base to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a cast or non-null assertion on an UNRELATED, harmless base is never flagged", () => {
+  const hits = findTasksImports(
+    "const safe = { run: () => 1 };\nconst x = (safe as typeof safe)!.run();\nvoid x;\n"
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("process.dlopen is caught - one of the two process properties beyond getBuiltinModule this guard also treats as dangerous", () => {
+  const hits = findTasksImports("process.dlopen({ exports: {} }, './native.node');\n");
+  assert.ok(
+    hits.some((h) => h.includes("process's dangerous properties")),
+    `expected a process.dlopen violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("process.binding is caught the same way - Node's internal native-binding loader", () => {
+  const hits = findTasksImports("const b = process.binding('fs');\nvoid b;\n");
+  assert.ok(
+    hits.some((h) => h.includes("process's dangerous properties")),
+    `expected a process.binding violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("an AMBIENT 'declare const Reflect' does not actually shadow at runtime - the guard treats the reference as the real global, not a local shadow", () => {
+  const hits = findTasksImports(
+    "declare const Reflect: { get: (t: unknown, k: string) => unknown };\n" +
+      "const e = Reflect.get(globalThis, 'eval');\n" +
+      "e('1');\n"
+  );
+  assert.ok(
+    hits.some((h) => h.includes("references the global Reflect")),
+    `expected the ambient-shadowed Reflect reference to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a REAL (non-ambient) local Reflect declaration still shadows correctly - only the ambient, erased form fails to shadow", () => {
+  const hits = findTasksImports(
+    "const Reflect = { get: (t: unknown, k: string) => undefined };\n" +
+      "const e = Reflect.get(globalThis, 'eval');\n" +
+      "void e;\n"
+  );
+  assert.deepEqual(hits, []);
+});
