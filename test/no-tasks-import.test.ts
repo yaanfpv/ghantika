@@ -686,7 +686,7 @@ test('Object.getOwnPropertyDescriptor(globalThis, "eval")?.value reaches the rea
   );
 });
 
-test("Object.getOwnPropertyDescriptor(Object.getPrototypeOf(fn), \"constructor\")?.value reaches .constructor through a descriptor read off an ARBITRARY target - caught unconditionally on the key, the same as a direct .constructor access", () => {
+test('Object.getOwnPropertyDescriptor(Object.getPrototypeOf(fn), "constructor")?.value reaches .constructor through a descriptor read off an ARBITRARY target - caught unconditionally on the key, the same as a direct .constructor access', () => {
   const hits = findTasksImports(
     "const fn = () => {};\n" +
       "const F = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(fn), 'constructor')?.value;\n" +
@@ -698,8 +698,10 @@ test("Object.getOwnPropertyDescriptor(Object.getPrototypeOf(fn), \"constructor\"
   );
 });
 
-test("a descriptor read via computed/bracket Object[\"getOwnPropertyDescriptor\"] is caught too, not just the dotted spelling", () => {
-  const hits = findTasksImports("const d = Object['getOwnPropertyDescriptor'](globalThis, 'eval');\n");
+test('a descriptor read via computed/bracket Object["getOwnPropertyDescriptor"] is caught too, not just the dotted spelling', () => {
+  const hits = findTasksImports(
+    "const d = Object['getOwnPropertyDescriptor'](globalThis, 'eval');\n"
+  );
   assert.ok(hits.some((h) => h.includes("getOwnPropertyDescriptor")));
 });
 
@@ -736,7 +738,9 @@ test("green control: a LOCALLY SHADOWED Object is never flagged, even for a desc
 });
 
 test("green control: a descriptor read off an unrelated, harmless object with an unrelated key is never flagged", () => {
-  const hits = findTasksImports("const safe = {};\nconst d = Object.getOwnPropertyDescriptor(safe, 'eval');\n");
+  const hits = findTasksImports(
+    "const safe = {};\nconst d = Object.getOwnPropertyDescriptor(safe, 'eval');\n"
+  );
   assert.deepEqual(hits, []);
 });
 

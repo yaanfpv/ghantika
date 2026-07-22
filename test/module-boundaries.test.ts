@@ -630,7 +630,7 @@ test('Object.getOwnPropertyDescriptor(globalThis, "eval")?.value reaches the rea
   );
 });
 
-test("Object.getOwnPropertyDescriptor(Object.getPrototypeOf(fn), \"constructor\")?.value reaches .constructor through a descriptor read off an ARBITRARY target - caught unconditionally on the key, the same as a direct .constructor access", () => {
+test('Object.getOwnPropertyDescriptor(Object.getPrototypeOf(fn), "constructor")?.value reaches .constructor through a descriptor read off an ARBITRARY target - caught unconditionally on the key, the same as a direct .constructor access', () => {
   const hits = siblingImportsFrom(
     "const fn = () => {};\n" +
       "const F = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(fn), 'constructor')?.value;\n" +
@@ -793,7 +793,10 @@ test("SPEC-6 (re-verified against the real resolver): a relative sibling specifi
   try {
     const importing = path.join(toolsDir, "run.ts");
     const hits = findSiblingToolImports('import { x } from "./sibling.js";\n', importing, toolsDir);
-    assert.ok(hits.includes("./sibling.js"), `expected the sibling hit, got: ${JSON.stringify(hits)}`);
+    assert.ok(
+      hits.includes("./sibling.js"),
+      `expected the sibling hit, got: ${JSON.stringify(hits)}`
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -814,7 +817,10 @@ test("SPEC-2: a no-substitution TEMPLATE LITERAL specifier, via a permitted dyna
   try {
     const importing = path.join(toolsDir, "run.ts");
     const hits = findSiblingToolImports("import(`./sibling.js`);\n", importing, toolsDir);
-    assert.ok(hits.includes("./sibling.js"), `expected the template-literal sibling hit, got: ${JSON.stringify(hits)}`);
+    assert.ok(
+      hits.includes("./sibling.js"),
+      `expected the template-literal sibling hit, got: ${JSON.stringify(hits)}`
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -890,7 +896,11 @@ test("SPEC-7: an ABSOLUTE PATH specifier pointing at a real sibling file is caug
   try {
     const importing = path.join(toolsDir, "run.ts");
     const absSpecifier = path.join(toolsDir, "sibling.js");
-    const hits = findSiblingToolImports(`import { x } from "${absSpecifier}";\n`, importing, toolsDir);
+    const hits = findSiblingToolImports(
+      `import { x } from "${absSpecifier}";\n`,
+      importing,
+      toolsDir
+    );
     assert.ok(
       hits.includes(absSpecifier),
       `expected the absolute-path sibling hit, got: ${JSON.stringify(hits)}`
@@ -938,7 +948,10 @@ test("SPEC-9: a file:// URL specifier pointing at a real sibling file is caught 
     const importing = path.join(toolsDir, "run.ts");
     const fileUrl = pathToFileURL(path.join(toolsDir, "sibling.js")).href;
     const hits = findSiblingToolImports(`import { x } from "${fileUrl}";\n`, importing, toolsDir);
-    assert.ok(hits.includes(fileUrl), `expected the file:// URL sibling hit, got: ${JSON.stringify(hits)}`);
+    assert.ok(
+      hits.includes(fileUrl),
+      `expected the file:// URL sibling hit, got: ${JSON.stringify(hits)}`
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -965,9 +978,12 @@ test("SPEC-10a: a SYMLINK located OUTSIDE tools/ whose real target sits INSIDE t
   }
 });
 
-test("SPEC-10b: a PACKAGE/SUBPATH-IMPORT ALIAS (package.json's own \"imports\" field) resolving to a real sibling file is caught", () => {
+test('SPEC-10b: a PACKAGE/SUBPATH-IMPORT ALIAS (package.json\'s own "imports" field) resolving to a real sibling file is caught', () => {
   const { dir, toolsDir } = buildResolverFixture({
-    "package.json": JSON.stringify({ name: "fixture", imports: { "#sibling": "./tools/sibling.ts" } }),
+    "package.json": JSON.stringify({
+      name: "fixture",
+      imports: { "#sibling": "./tools/sibling.ts" },
+    }),
   });
   try {
     const importing = path.join(toolsDir, "run.ts");
@@ -1035,7 +1051,11 @@ test("green control: a permitted barrel that does NOT reach any sibling is never
   });
   try {
     const importing = path.join(toolsDir, "run.ts");
-    const hits = findSiblingToolImports('export * from "../core-barrel.js";\n', importing, toolsDir);
+    const hits = findSiblingToolImports(
+      'export * from "../core-barrel.js";\n',
+      importing,
+      toolsDir
+    );
     assert.deepEqual(hits, []);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -1065,11 +1085,7 @@ test("SELF-2 setup check: the real resolver's own compare uses path.relative-bas
   try {
     const importing = path.join(toolsDir, "run.ts");
     const backupAbs = path.join(dir, "tools-backup", "sibling.js");
-    const hits = findSiblingToolImports(
-      `import { x } from "${backupAbs}";\n`,
-      importing,
-      toolsDir
-    );
+    const hits = findSiblingToolImports(`import { x } from "${backupAbs}";\n`, importing, toolsDir);
     assert.deepEqual(
       hits,
       [],
