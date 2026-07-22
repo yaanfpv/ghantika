@@ -84,3 +84,100 @@ test("no job found under the given aggregate id is reported, not thrown", () => 
   const errors = verifyTopology({ build: {} }, "no-such-job");
   assert.deepEqual(errors, ['no "no-such-job" job found in the workflow']);
 });
+
+// --- Mandatory protection: paired-deletion independent required-job inventory ---
+//
+// verifyTopology derives "which jobs must gate depend on" from
+// Object.keys(jobs) on the SAME workflow file it is checking. So a
+// coordinated edit that deletes a job entirely - not just from gate.needs,
+// but the job definition itself, plus its needs entry, plus its clause in
+// gate's success-expression, all at once - removes that job from
+// consideration everywhere in the same motion, and verifyTopology has
+// nothing left to compare it against. The list below is read directly off
+// the real ci.yml's job set and hard-coded here, independent of the
+// workflow file - a coordinated deletion like that would ALSO have to
+// touch this file to keep the suite green.
+const INDEPENDENT_REQUIRED_JOB_IDS = [
+  "build",
+  "typecheck",
+  "lint",
+  "test",
+  "format",
+  "coverage",
+  "codeql",
+  "semgrep",
+  "zizmor",
+  "actionlint",
+  "changelog-presence",
+  "guards",
+  "sha-parity",
+  "install-repro",
+];
+
+test("independent inventory: gate.needs and gate's literal success-checks cover every hard-coded required job", () => {
+  const workflow = loadWorkflow();
+  const gate = workflow.jobs[AGGREGATE_JOB_ID];
+  const needs = normalizeNeedsForTest(gate.needs);
+  const jobText = flattenJobTextForTest(gate);
+  for (const jobId of INDEPENDENT_REQUIRED_JOB_IDS) {
+    assert.ok(
+      needs.includes(jobId),
+      `gate.needs is missing the independently-required job "${jobId}"`
+    );
+    assert.ok(
+      jobText.includes(`needs.${jobId}.result`) && jobText.includes("'success'"),
+      `gate does not appear to literally check needs.${jobId}.result == 'success'`
+    );
+  }
+});
+
+// Mutation control: a coordinated deletion of a whole job - "coverage",
+// chosen because it has nothing to do with Windows/OS matrix work - is
+// removed from the job list itself, from gate.needs, and from gate's
+// success-expression all at once, in a test-local mutated copy.
+// verifyTopology alone (proven below as a sanity check) reports this clean,
+// because it derives its own expectations from the same mutated file. The
+// independent inventory above never reads the workflow file for its
+// expectations, so it still catches the deletion.
+test("mutation control (paired deletion): wholesale-deleting the coverage job is invisible to verifyTopology alone but caught by the independent inventory", () => {
+  const workflow = loadWorkflow();
+  const mutated = structuredClone(workflow);
+  delete mutated.jobs.coverage;
+  mutated.jobs[AGGREGATE_JOB_ID].needs = mutated.jobs[AGGREGATE_JOB_ID].needs.filter(
+    (id) => id !== "coverage"
+  );
+  mutated.jobs[AGGREGATE_JOB_ID].steps[0].env.ALL_SUCCEEDED = mutated.jobs[
+    AGGREGATE_JOB_ID
+  ].steps[0].env.ALL_SUCCEEDED.replace("needs.coverage.result == 'success' &&", "");
+
+  // Sanity check: proves the escape is real. verifyTopology, given only
+  // this mutated file, has nothing left in it to compare "coverage"
+  // against, so it reports clean.
+  assert.deepEqual(
+    verifyTopology(mutated.jobs, AGGREGATE_JOB_ID),
+    [],
+    "sanity check: verifyTopology alone does not notice a wholesale job deletion - this is the escape this protection exists to close"
+  );
+
+  // The independent inventory never derived its expectations from the
+  // workflow file, so the same mutated file still fails it.
+  const needs = normalizeNeedsForTest(mutated.jobs[AGGREGATE_JOB_ID].needs);
+  const missing = INDEPENDENT_REQUIRED_JOB_IDS.filter((jobId) => !needs.includes(jobId));
+  assert.deepEqual(missing, ["coverage"]);
+});
+
+function normalizeNeedsForTest(needs) {
+  if (!needs) return [];
+  return Array.isArray(needs) ? needs : [needs];
+}
+
+function flattenJobTextForTest(job) {
+  const parts = [];
+  if (job?.env) parts.push(JSON.stringify(job.env));
+  for (const step of job?.steps ?? []) {
+    if (step.run) parts.push(step.run);
+    if (step.env) parts.push(JSON.stringify(step.env));
+    if (step.if) parts.push(step.if);
+  }
+  return parts.join("\n");
+}

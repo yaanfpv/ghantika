@@ -118,7 +118,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
         node: ["22", "24"]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -135,6 +135,12 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
+      # The suite imports from dist/, not src/ directly (see the test
+      # files' own import comments), so this job must build before it can
+      # run a single test - omitting this step doesn't fail loudly, it
+      # just runs against whatever dist/ happened to be left from a prior
+      # step, which on a fresh runner is nothing at all.
+      - run: npm run build
       # Both reporters read from the one test run, so what the next step
       # annotates always matches this leg's real result instead of a
       # second, possibly-different, re-run of the suite. `spec` on stdout

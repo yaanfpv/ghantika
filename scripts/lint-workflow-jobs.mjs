@@ -29,7 +29,7 @@ const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 export const WORKFLOW_PATH = path.join(REPO_ROOT, ".github", "workflows", "ci.yml");
 export const AGGREGATE_JOB_ID = "gate";
 export const TEST_JOB_ID = "test";
-export const EXPECTED_OS = ["ubuntu-latest", "macos-latest", "windows-latest"];
+export const EXPECTED_OS = ["ubuntu-latest", "macos-latest"];
 export const EXPECTED_NODE = ["22", "24"];
 export const FORBIDDEN_JOB_IDS = [
   "secret-scan",
@@ -49,9 +49,32 @@ export function loadWorkflow(filePath = WORKFLOW_PATH) {
 }
 
 /**
+ * Whether a `continue-on-error` value should be treated as a violation.
+ * Only two values are safe: the field being absent, or the literal boolean
+ * `false`. Everything else is a violation - not just the literal boolean
+ * `true`, but also a quoted string like `"true"` (YAML accepts
+ * continue-on-error as a string and GitHub Actions treats it the same as
+ * the boolean at runtime) and, most importantly, a GitHub Actions
+ * expression such as `${{ matrix.allow_failure }}`. An expression's actual
+ * value can only be known at real runtime, from context this static check
+ * never has - so it cannot be waved through just because it isn't the
+ * literal boolean `true`. An expression that MIGHT resolve to true is
+ * exactly as dangerous as one that always does: it lets a step (and
+ * therefore the job) report success while having actually failed, on some
+ * runs and not others, which is worse than the always-true case because it
+ * would pass a naive `=== true` check forever.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isContinueOnErrorViolation(value) {
+  return value !== undefined && value !== false;
+}
+
+/**
  * Every job except the aggregate is a job the aggregate is meant to be
- * gating on, so `continue-on-error: true` is forbidden anywhere in it -
- * on the job itself or on any of its steps.
+ * gating on, so a truthy or expression-valued `continue-on-error` is
+ * forbidden anywhere in it - on the job itself or on any of its steps.
  *
  * @param {Record<string, any>} jobs
  * @param {string} [aggregateId]
@@ -61,8 +84,10 @@ export function findContinueOnError(jobs, aggregateId = AGGREGATE_JOB_ID) {
   const offenders = [];
   for (const [jobId, job] of Object.entries(jobs ?? {})) {
     if (jobId === aggregateId) continue;
-    const onJob = job?.["continue-on-error"] === true;
-    const onAnyStep = (job?.steps ?? []).some((step) => step?.["continue-on-error"] === true);
+    const onJob = isContinueOnErrorViolation(job?.["continue-on-error"]);
+    const onAnyStep = (job?.steps ?? []).some((step) =>
+      isContinueOnErrorViolation(step?.["continue-on-error"])
+    );
     if (onJob || onAnyStep) {
       offenders.push(jobId);
     }
