@@ -18,6 +18,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/server";
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
 // import comment for why.
 import {
+  ALL_JOB_DIAGNOSTIC_REASONS,
   ALL_JOB_STATES,
   JobStore,
   MAX_BUFFER_BYTES,
@@ -27,6 +28,7 @@ import {
   createStreamBufferState,
   finalizeStreamBuffer,
   findUtf8SafeCutPoint,
+  isJobDiagnosticReason,
   isJobState,
   isTerminalJobState,
   jobStore,
@@ -158,15 +160,34 @@ test("markExited transitions to exited and records exit_code/ended_at, never sig
   assert.equal(typeof after.ended_at, "string");
 });
 
-test("markExited records signal (not exit_code) for a signal death, and NEVER produces state killed (reserved for a future kill tool)", () => {
+test("markExited maps a signalled death to state killed with the exact signal, never exited - a job the OS itself terminated via a signal (a crash, an external kill) is honestly killed, not exited", () => {
   const store = new JobStore();
   const record = store.createJob({ argv: ["echo"], cwd: "/tmp", env: {}, isShell: false });
   store.markExited(record.job_id, null, "SIGSEGV");
   const after = store.get(record.job_id)!;
-  assert.equal(after.state, "exited");
-  assert.notEqual(after.state, "killed");
-  assert.equal(after.exit_code, undefined);
+  assert.equal(after.state, "killed");
+  assert.notEqual(after.state, "exited");
+  assert.equal(
+    after.exit_code,
+    undefined,
+    "exit_code must be absent for a killed job (present iff exited)"
+  );
   assert.equal(after.signal, "SIGSEGV");
+  assert.equal(typeof after.ended_at, "string");
+});
+
+test("(green control) markExited with a null signal always stays exited+exit_code, never killed, whatever the exit code value", () => {
+  const store = new JobStore();
+  const record = store.createJob({ argv: ["echo"], cwd: "/tmp", env: {}, isShell: false });
+  store.markExited(record.job_id, 137, null);
+  const after = store.get(record.job_id)!;
+  assert.equal(after.state, "exited");
+  assert.equal(after.exit_code, 137);
+  assert.equal(
+    after.signal,
+    undefined,
+    "signal must be absent for an exited job (present iff killed)"
+  );
 });
 
 test("markExited is idempotent: a second call never overwrites the first terminal result", () => {
@@ -620,6 +641,48 @@ test("isJobState accepts exactly the five real states and rejects anything else"
 });
 
 // ---------------------------------------------------------------------------
+// Closed JobDiagnostic.reason enum
+// ---------------------------------------------------------------------------
+
+test("the JobDiagnostic.reason set is closed at exactly three values", () => {
+  assert.deepEqual(
+    [...ALL_JOB_DIAGNOSTIC_REASONS].sort(),
+    ["policy-denied", "spawn-error", "watcher/runtime-error"].sort()
+  );
+  assert.equal(ALL_JOB_DIAGNOSTIC_REASONS.length, 3);
+});
+
+test("isJobDiagnosticReason accepts exactly the three real reasons and rejects anything else, including a plausible-looking open-string value", () => {
+  for (const reason of ALL_JOB_DIAGNOSTIC_REASONS) {
+    assert.equal(isJobDiagnosticReason(reason), true);
+  }
+  assert.equal(isJobDiagnosticReason("unknown-error"), false);
+  assert.equal(isJobDiagnosticReason("timeout"), false);
+  assert.equal(isJobDiagnosticReason(""), false);
+  assert.equal(isJobDiagnosticReason(42), false);
+  assert.equal(isJobDiagnosticReason(undefined), false);
+});
+
+test("createFailedJob/markSpawnFailed both produce a diagnostic.reason from the closed set (spawn-error) - the only value this codebase's real code paths actually produce", () => {
+  const store = new JobStore();
+  const failed = store.createFailedJob({
+    argv: ["bad"],
+    cwd: "/tmp",
+    env: {},
+    isShell: false,
+    diagnosticMessage: "x",
+  });
+  assert.equal(isJobDiagnosticReason(failed.diagnostic?.reason), true);
+  assert.equal(failed.diagnostic?.reason, "spawn-error");
+
+  const spawnFailed = store.createJob({ argv: ["echo"], cwd: "/tmp", env: {}, isShell: false });
+  store.markSpawnFailed(spawnFailed.job_id, "EACCES");
+  const after = store.get(spawnFailed.job_id)!;
+  assert.equal(isJobDiagnosticReason(after.diagnostic?.reason), true);
+  assert.equal(after.diagnostic?.reason, "spawn-error");
+});
+
+// ---------------------------------------------------------------------------
 // Stream buffer byte accounting
 // ---------------------------------------------------------------------------
 
@@ -894,6 +957,10 @@ test("exceeding MAX_BUFFER_LINES evicts the oldest lines first and sets truncate
     snapshot.lines.some((l) => l.text === "line-0"),
     false
   );
+  // droppedCount (the bounded scalar output/tail disclose as `dropped` -
+  // see jobStore.ts's own docs) must equal exactly materialized minus
+  // currently-retained, never more or fewer.
+  assert.equal(snapshot.droppedCount, totalLines - snapshot.lines.length);
 });
 
 test("exceeding MAX_BUFFER_BYTES (even under the line cap) evicts the oldest lines first and sets truncated: true", () => {
@@ -914,6 +981,23 @@ test("exceeding MAX_BUFFER_BYTES (even under the line cap) evicts the oldest lin
   assert.equal(
     snapshot.lines[snapshot.lines.length - 1]!.text,
     `${bigLineText}-${linesNeeded - 1}`
+  );
+  assert.equal(snapshot.droppedCount, linesNeeded - snapshot.lines.length);
+});
+
+test("droppedCount increments by exactly 1 per evicted line, never reset by further materialization, and stays 0 until the first real eviction", () => {
+  const state = createStreamBufferState();
+  appendChunkToBuffer(state, Buffer.from("a\n"));
+  assert.equal(snapshotStreamBuffer(state).droppedCount, 0, "nothing evicted yet");
+  const totalLines = MAX_BUFFER_LINES + 3; // 3 more evictions past the first line already pushed
+  for (let i = 0; i < totalLines; i += 1) {
+    appendChunkToBuffer(state, Buffer.from(`line-${i}\n`));
+  }
+  const snapshot = snapshotStreamBuffer(state);
+  assert.equal(
+    snapshot.droppedCount,
+    totalLines + 1 - snapshot.lines.length,
+    "droppedCount must equal total materialized minus currently retained, across the whole life of the buffer"
   );
 });
 
@@ -954,6 +1038,11 @@ test("a pending (not-yet-terminated) partial counts toward the byte cap alongsid
     0,
     "the only materialized line (600,000 bytes ALONE, under cap) is fully evictable here - it is NOT the documented 'single entry alone exceeds cap' exception, which only protects a line that is itself over the cap"
   );
+  assert.equal(
+    afterPending.droppedCount,
+    1,
+    "exactly one line was evicted to fit pending's growth"
+  );
   const combinedResidentBytes =
     afterPending.lines.reduce((sum, l) => sum + Buffer.byteLength(l.text, "utf8"), 0) +
     state.pending.length;
@@ -993,6 +1082,11 @@ test("pending growth evicts only as many materialized lines as needed to fit the
     ["-2"],
     "only the SECOND materialized line (-1) needed evicting - the newest (-2) still fits alongside pending"
   );
+  assert.equal(
+    final.droppedCount,
+    2,
+    "line -0 (materializeLine's own eviction) plus line -1 (pending-growth eviction) - two lines evicted in total"
+  );
   const materializedBytes = final.lines.reduce(
     (sum, l) => sum + Buffer.byteLength(l.text, "utf8"),
     0
@@ -1008,10 +1102,108 @@ test("pending growth evicts only as many materialized lines as needed to fit the
   );
 });
 
-test("a buffer that never exceeds either cap is never marked truncated", () => {
+// ---------------------------------------------------------------------------
+// A lone oversized-split entry is not a license for `pending` to grow
+// unboundedly on top of it forever - a DEDICATED regression for the fix
+// that closed exactly this gap in evictToFitBudget's single-entry
+// exception (see that function's own docs).
+// ---------------------------------------------------------------------------
+
+test("REGRESSION: a lone oversized-split entry is evicted once a LATER, SEPARATE call grows pending on top of it, instead of letting pending grow unboundedly on top of it forever", () => {
+  const state = createStreamBufferState();
+
+  // Force a real oversized-split entry: one unterminated chunk past
+  // MAX_LINE_BYTES, no trailing newline yet. The cut itself necessarily
+  // leaves a small leftover in `pending` (a forced cut only ever removes
+  // MAX_LINE_BYTES bytes from a `working` buffer that was, by construction,
+  // strictly longer than that) - this is the natural byproduct of THIS SAME
+  // call materializing the entry, not later unbounded growth, so it must
+  // NOT by itself defeat the single-entry exception.
+  appendChunkToBuffer(state, Buffer.from("x".repeat(MAX_LINE_BYTES + 500)));
+  const afterOversized = snapshotStreamBuffer(state);
+  assert.equal(afterOversized.lines.length, 1, "the forced split must be retained");
+  assert.equal(afterOversized.lines[0]!.terminator, "oversized-split");
+  assert.equal(
+    afterOversized.droppedCount,
+    0,
+    "nothing evicted yet - this call is the one that just materialized the entry, the documented exception's protected instant"
+  );
+  assert.equal(
+    state.pending.length,
+    500,
+    "the same cut's own small leftover naturally lands in pending - this alone must not defeat the exception"
+  );
+
+  // A SECOND, entirely SEPARATE appendChunkToBuffer call: a newline-free
+  // chunk that stays pending (well under MAX_LINE_BYTES, so it never
+  // forces a split of its own - no line materializes in THIS call at all).
+  // Before the fix, evictToFitBudget's single-entry exception ignored
+  // `pending` entirely, so the old oversized entry was never evicted here -
+  // pending could keep growing on top of it, unboundedly, call after call.
+  appendChunkToBuffer(state, Buffer.from("p".repeat(900_000)));
+
+  const afterPending = snapshotStreamBuffer(state);
+  assert.equal(
+    afterPending.lines.length,
+    0,
+    "the old oversized entry must be evicted now that new pending bytes are arriving behind it"
+  );
+  assert.equal(
+    afterPending.droppedCount,
+    1,
+    "exactly one line (the old oversized entry) was evicted"
+  );
+  assert.equal(afterPending.truncated, true, "an honest eviction must never be a silent drop");
+
+  const residentBytes =
+    afterPending.lines.reduce((sum, l) => sum + Buffer.byteLength(l.text, "utf8"), 0) +
+    state.pending.length;
+  assert.ok(
+    residentBytes <= MAX_BUFFER_BYTES,
+    `combined resident bytes (${residentBytes}) must return within the ordinary MAX_BUFFER_BYTES bound (${MAX_BUFFER_BYTES}) once new data starts arriving - this is the exact defect the fix closes`
+  );
+  assert.equal(
+    state.pending.length,
+    500 + 900_000,
+    "pending itself is never evicted or truncated by this mechanism - only materialized lines are ever removed (the earlier 500-byte leftover plus this call's own new 900,000 bytes, none of it force-split since the combined total still stays under MAX_LINE_BYTES)"
+  );
+});
+
+test("(green control) a normal-sized line arriving at a near-full-of-ordinary-lines buffer still takes the ordinary evict-old-lines path, never the single-entry exception - proving the fix targets only the pathological lone-oversized-entry state", () => {
+  const state = createStreamBufferState();
+  const ordinaryLine = "z".repeat(300_000);
+  // Three ordinary 'newline' lines, comfortably under the cap combined -
+  // never anywhere near the "one lone oversized entry" state the fix targets.
+  appendChunkToBuffer(state, Buffer.from(`${ordinaryLine}-0\n`));
+  appendChunkToBuffer(state, Buffer.from(`${ordinaryLine}-1\n`));
+  appendChunkToBuffer(state, Buffer.from(`${ordinaryLine}-2\n`));
+  const beforeOverflow = snapshotStreamBuffer(state);
+  assert.equal(beforeOverflow.lines.length, 3);
+  assert.equal(beforeOverflow.droppedCount, 0);
+
+  // A fourth ordinary line tips the combined bytes over the cap.
+  appendChunkToBuffer(state, Buffer.from(`${ordinaryLine}-3\n`));
+  const afterOverflow = snapshotStreamBuffer(state);
+  assert.ok(
+    afterOverflow.lines.length < 4,
+    "an old ordinary line must have been evicted to stay under the byte cap"
+  );
+  assert.ok(
+    afterOverflow.lines.every((l) => l.terminator === "newline"),
+    "no spurious oversized-split continuation marker must appear on a normal-sized line"
+  );
+  assert.equal(afterOverflow.droppedCount, 4 - afterOverflow.lines.length);
+  assert.equal(afterOverflow.truncated, true);
+  // The newest line must survive - ordinary "retain newest, drop oldest".
+  assert.equal(afterOverflow.lines[afterOverflow.lines.length - 1]!.text, `${ordinaryLine}-3`);
+});
+
+test("a buffer that never exceeds either cap is never marked truncated, and droppedCount stays 0", () => {
   const state = createStreamBufferState();
   appendChunkToBuffer(state, Buffer.from("a\nb\nc\n"));
-  assert.equal(snapshotStreamBuffer(state).truncated, false);
+  const snapshot = snapshotStreamBuffer(state);
+  assert.equal(snapshot.truncated, false);
+  assert.equal(snapshot.droppedCount, 0);
 });
 
 // ---------------------------------------------------------------------------

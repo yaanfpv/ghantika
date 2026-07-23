@@ -8,26 +8,34 @@
  * `jobStore` singleton (`src/jobStore.ts`), read-only from this file's
  * perspective.
  *
- * The event-numbering scheme (real per-line `seq`, the single-stream EXACT
- * gap disclosure, and the "both" cross-stream merge policy) is IDENTICAL to
+ * The event-numbering scheme (real per-line `seq`, GLOBAL across a job's
+ * stdout and stderr, and the "both" real-order merge) is IDENTICAL to
  * `src/tools/output.ts`'s - see that file's header for the full reasoning,
- * including why `jobStore.ts` exposes a real monotonic `seq`. The
- * module-boundary guard forbids a
- * `tools/*.ts` file from importing a sibling `tools/*.ts` file, and the
- * frozen module list (also enforced by that guard) forbids adding a new
- * shared helper module - so the scheme is necessarily REIMPLEMENTED here
- * rather than imported, kept deliberately in lockstep with output.ts's
- * version.
+ * including the bounded drop-disclosure contract (`dropped`/
+ * `droppedBeforeCursor`, never an exact per-seq range). The module-
+ * boundary guard forbids a `tools/*.ts` file from importing a sibling
+ * `tools/*.ts` file, and the frozen module list (also enforced by that
+ * guard) forbids adding a new shared helper module - so the scheme is
+ * necessarily REIMPLEMENTED here rather than imported, kept deliberately
+ * in lockstep with output.ts's version.
  *
  * `tail`'s own addition on top of that shared scheme: it always reads
  * from the retained floor (`after_cursor` is implicitly 0 - there is no
  * cursor argument, by design, since "give me the last N" is a fixed-size
  * window request, not an incremental-since-last-read one) and returns
- * only the LAST `N` real events (a gap marker, when present, is NEVER
- * counted against `N`), showing the gap only when the
- * requested window is large enough to actually reach back to the floor
- * (i.e. `N >= total available real events`) - a window that stops short
- * of the floor is a normal, non-lossy trim, not a disclosure-worthy gap.
+ * only the LAST `N` real events. Unlike a positional gap marker (which the
+ * old exact-range design suppressed when a window didn't reach the
+ * retained floor, since a mere trim isn't a loss), this file's
+ * `dropped`/`droppedBeforeCursor` disclosure is a simple historical fact
+ * about the stream (has it EVER dropped any of its own lines, and where is
+ * its current floor) - it is disclosed whenever `dropped > 0`, regardless
+ * of whether this particular `lines` window happens to reach that floor.
+ *
+ * `truncated` covers two distinct causes, neither masking the other: this
+ * stream (or, in "both" mode, either stream) has genuinely dropped some of
+ * its own history forever (retention eviction), OR this call's own
+ * `lines` window was smaller than what's currently available, so more
+ * already-retained events exist beyond what this response returned.
  */
 import type { CallToolResult, Tool } from "@modelcontextprotocol/server";
 
@@ -41,7 +49,7 @@ import {
 export const name = "tail";
 
 export const description =
-  "Get the most recent output a background job has produced, for polling without re-reading everything already seen. Returns the last N real events (a leading {gap:[start,end]} marker, if present, does not count against N) of stdout, stderr, or both (merged, default) - the marker discloses that older history is no longer available under the byte/line retention cap.";
+  'Get the most recent output a background job has produced, for polling without re-reading everything already seen. Returns the last N real events of stdout, stderr, or both (merged in real line-materialization order, default). Once a selected stream has dropped its own old lines under the byte/line retention cap, the response discloses a bounded "dropped" count for that stream (how many of its own lines were ever dropped) plus "droppedBeforeCursor" (the boundary before which that happened) - never which specific lines were lost. For stream:"stdout"/"stderr" this is a scalar pair at the top level; for stream:"both" it is a nested object keyed by stream ({stdout?:{...}, stderr?:{...}}), since each stream\'s own loss is independent. Three distinct signals, never conflate them: "dropped" means this stream lost lines forever; "truncated" means this specific call\'s own response window (from lines being smaller than what is available, or from that same lifetime loss) does not contain everything currently available; "next_cursor" is simply where to resume paging - it carries no information about loss on its own.';
 
 const DEFAULT_TAIL_LINES = 100;
 
@@ -61,7 +69,7 @@ export const inputSchema: Tool["inputSchema"] = {
       type: "string",
       enum: ["stdout", "stderr", "both"],
       description:
-        'Which stream to read. Defaults to "both" (merged in a stable, deterministic - but not necessarily true-chronological - global order; see output\'s docs for the exact merge policy).',
+        'Which stream to read. Defaults to "both" (merged in real line-materialization order; see output\'s docs for the exact merge scheme).',
     },
   },
   required: ["job_id"],
@@ -79,11 +87,10 @@ export interface OutputEvent {
   readonly partial?: true;
 }
 
-export interface GapMarker {
-  readonly gap: readonly [number, number];
+export interface StreamDropInfo {
+  readonly dropped: number;
+  readonly droppedBeforeCursor: number;
 }
-
-export type OutputItem = OutputEvent | GapMarker;
 
 // ---------------------------------------------------------------------------
 // Handler
@@ -107,20 +114,65 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
     return toolError(`tail: unknown job_id "${jobId}"`);
   }
 
-  const view = readStreamView(jobId, stream);
-  const reachesFloor = n >= view.events.length;
-  const tailEvents = reachesFloor ? view.events : view.events.slice(view.events.length - n);
-  const showGap = view.gap !== undefined && reachesFloor;
+  const view = readStreamView(jobId, stream, n);
 
-  const items: OutputItem[] = showGap ? [view.gap!, ...tailEvents] : tailEvents;
-  const lastEvent = tailEvents[tailEvents.length - 1];
-  const nextCursor =
-    lastEvent !== undefined ? lastEvent.seq : view.gap !== undefined ? view.gap.gap[1] : view.head;
+  const items: OutputEvent[] = view.events;
+  const nextCursor = computeNextCursor(view.head);
 
   const body: Record<string, unknown> = { events: items, next_cursor: nextCursor };
-  if (view.truncated) body.truncated = true;
+  // `truncated` covers BOTH real causes a caller might not have everything
+  // this stream (or, in "both" mode, either stream) has ever produced - see
+  // this file's header for the two distinct causes.
+  if (view.truncated || view.windowClamped) body.truncated = true;
+
+  applyDropDisclosure(body, stream, view.perStreamDrop);
 
   return toolSuccess(body);
+}
+
+/**
+ * `next_cursor` is always this stream selection's own `head` - the true
+ * highest `seq` this call's selected stream(s) have EVER produced, never
+ * merely the last RETURNED event's own `seq`. `head` is by construction
+ * always `>=` every event this call could possibly return (a single
+ * stream's own `headSeq` bounds its own lines; "both"'s `head` is the max
+ * of the two, and each stream's own retained lines are bounded by its own
+ * `headSeq`) - so resubmitting `after_cursor: head` via `output()` can
+ * never re-fetch anything this call already disclosed, in EVERY case,
+ * including the documented "pending growth evicted even the newest
+ * completed line" edge case (where the true head can exceed every
+ * currently-retained line's own seq, real events or none at all).
+ * Exported for direct unit testing, same rationale as
+ * `buildSingleStreamEvents`.
+ */
+export function computeNextCursor(head: number): number {
+  return head;
+}
+
+/**
+ * Shapes the `dropped`/`droppedBeforeCursor` response fields - identical
+ * to `output.ts`'s own `applyDropDisclosure` (duplicated per this file's
+ * header), see that function's own docs for the full reasoning.
+ */
+function applyDropDisclosure(
+  body: Record<string, unknown>,
+  stream: StreamSelector,
+  perStreamDrop: Partial<Record<ManagedStream, StreamDropInfo>>
+): void {
+  if (stream === "both") {
+    const dropped: Partial<Record<ManagedStream, StreamDropInfo>> = {};
+    for (const side of ["stdout", "stderr"] as const) {
+      const info = perStreamDrop[side]!;
+      if (info.dropped > 0) dropped[side] = info;
+    }
+    if (Object.keys(dropped).length > 0) body.dropped = dropped;
+    return;
+  }
+  const info = perStreamDrop[stream]!;
+  if (info.dropped > 0) {
+    body.dropped = info.dropped;
+    body.droppedBeforeCursor = info.droppedBeforeCursor;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -160,12 +212,15 @@ function validateLines(raw: unknown): ValidationResult<number> {
 
 interface StreamView {
   readonly events: OutputEvent[];
-  readonly gap?: GapMarker;
   readonly head: number;
   readonly truncated: boolean;
+  /** True when this call's own `lines` window returned fewer events than are currently retained/available - a distinct cause from `truncated`'s retention-eviction meaning (see this file's header). */
+  readonly windowClamped: boolean;
+  /** Per-stream drop disclosure - populated only for the stream(s) actually selected (both entries for "both", one entry for a single-stream read). */
+  readonly perStreamDrop: Partial<Record<ManagedStream, StreamDropInfo>>;
 }
 
-function readStreamView(jobId: string, stream: StreamSelector): StreamView {
+function readStreamView(jobId: string, stream: StreamSelector, n: number): StreamView {
   if (stream === "both") {
     // `jobStore.has(jobId)` was already confirmed true by the caller, so
     // both snapshots are guaranteed defined (createJob/createFailedJob
@@ -173,12 +228,28 @@ function readStreamView(jobId: string, stream: StreamSelector): StreamView {
     // registration - see jobStore.ts).
     const stdoutSnapshot = jobStore.getStreamSnapshot(jobId, "stdout")!;
     const stderrSnapshot = jobStore.getStreamSnapshot(jobId, "stderr")!;
-    const { events, gap, head } = buildBothStreamsEvents(stdoutSnapshot, stderrSnapshot);
-    return { events, gap, head, truncated: stdoutSnapshot.truncated || stderrSnapshot.truncated };
+    const { events, head, reachesFloor, stdoutDrop, stderrDrop } = buildBothStreamsEvents(
+      stdoutSnapshot,
+      stderrSnapshot,
+      n
+    );
+    return {
+      events,
+      head,
+      truncated: stdoutSnapshot.truncated || stderrSnapshot.truncated,
+      windowClamped: !reachesFloor,
+      perStreamDrop: { stdout: stdoutDrop, stderr: stderrDrop },
+    };
   }
   const snapshot = jobStore.getStreamSnapshot(jobId, stream)!;
-  const { events, gap, head } = buildSingleStreamEvents(stream, snapshot);
-  return { events, gap, head, truncated: snapshot.truncated };
+  const { events, head, reachesFloor, drop } = buildSingleStreamEvents(stream, snapshot, n);
+  return {
+    events,
+    head,
+    truncated: snapshot.truncated,
+    windowClamped: !reachesFloor,
+    perStreamDrop: { [stream]: drop },
+  };
 }
 
 /** Same partial-terminator rule as output.ts - see that file's docs. */
@@ -197,109 +268,73 @@ function buildEvent(
     : { seq, stream, text };
 }
 
+/** Same bounded drop-disclosure derivation as output.ts's `computeDropInfo` - see that file's header. */
+function computeDropInfo(snapshot: StreamBufferSnapshot): StreamDropInfo {
+  const droppedBeforeCursor = snapshot.lines.length > 0 ? snapshot.lines[0]!.seq : snapshot.headSeq;
+  return { dropped: snapshot.droppedCount, droppedBeforeCursor };
+}
+
 /**
- * Single-stream event view, always read from the floor (`afterCursor`
- * fixed at 0 - `tail` has no cursor argument). Exported for direct unit
- * testing against synthetic `StreamBufferSnapshot` values, mirroring
- * output.ts's own exported helpers.
+ * Single-stream event view, always read from the floor and trimmed to the
+ * last `n` real events. Exported for direct unit testing against synthetic
+ * `StreamBufferSnapshot` values, mirroring output.ts's own exported
+ * helpers.
  */
 export function buildSingleStreamEvents(
   stream: ManagedStream,
-  snapshot: StreamBufferSnapshot
-): { events: OutputEvent[]; gap?: GapMarker; head: number } {
+  snapshot: StreamBufferSnapshot,
+  n: number
+): { events: OutputEvent[]; head: number; reachesFloor: boolean; drop: StreamDropInfo } {
   // Every retained line's `seq` is REAL and stable (see output.ts's own
   // header, which this file's scheme is kept in lockstep with) - `tail`
-  // always reads from the floor (afterCursor implicitly 0), so every
-  // currently-retained line is a real event, numbered by its own true seq.
-  const events = snapshot.lines.map((line) =>
+  // always reads from the floor, so every currently-retained line is a
+  // real event, numbered by its own true seq.
+  const allEvents = snapshot.lines.map((line) =>
     buildEvent(stream, line.seq, line.text, line.terminator)
   );
-  const head = snapshot.totalEverMaterialized;
-
-  if (!snapshot.truncated) {
-    return { events, head };
-  }
-
-  // EXACT dropped range, same algorithm as output.ts's `computeExactGap`
-  // with `afterCursor` fixed at 0 (so `gapStart` is always 1): everything
-  // with seq 1 through `oldestSurvivingSeq - 1` is gone forever.
-  // `oldestSurvivingSeq` is `undefined` when nothing is currently retained
-  // at all, in which case the dropped range runs through
-  // `totalEverMaterialized`.
-  const oldestSurvivingSeq = snapshot.lines.length > 0 ? snapshot.lines[0]!.seq : undefined;
-  const droppedThrough = (oldestSurvivingSeq ?? snapshot.totalEverMaterialized + 1) - 1;
-  if (droppedThrough < 1) return { events, head }; // defensive - truncated:true implies this is >= 1
-  return { events, gap: { gap: [1, droppedThrough] }, head };
+  const head = snapshot.headSeq;
+  const reachesFloor = n >= allEvents.length;
+  const events = reachesFloor ? allEvents : allEvents.slice(allEvents.length - n);
+  return { events, head, reachesFloor, drop: computeDropInfo(snapshot) };
 }
 
 /**
- * The real per-stream seq at (and below) which everything is gone forever
- * - `0` when nothing has ever been dropped. Identical computation to
- * output.ts's own `droppedThroughRealSeq` - kept in lockstep per this
- * file's header.
- */
-function droppedThroughRealSeq(snapshot: StreamBufferSnapshot): number {
-  const oldestSurvivingSeq = snapshot.lines.length > 0 ? snapshot.lines[0]!.seq : undefined;
-  return (oldestSurvivingSeq ?? snapshot.totalEverMaterialized + 1) - 1;
-}
-
-/**
- * A best-effort merged-position gap for "both", always from the floor
- * (`tail` has no cursor argument). Identical policy to output.ts's own
- * `computeBothStreamsGap` with `afterCursor` fixed at 0 - kept in lockstep
- * per this file's header.
- */
-function computeBothStreamsGap(
-  stdoutSnapshot: StreamBufferSnapshot,
-  stderrSnapshot: StreamBufferSnapshot
-): GapMarker | undefined {
-  const stdoutDroppedThrough = droppedThroughRealSeq(stdoutSnapshot);
-  const stderrDroppedThrough = droppedThroughRealSeq(stderrSnapshot);
-  const mergedDroppedThrough = Math.max(
-    stdoutDroppedThrough >= 1 ? 2 * stdoutDroppedThrough - 1 : 0,
-    stderrDroppedThrough >= 1 ? 2 * stderrDroppedThrough : 0
-  );
-  if (mergedDroppedThrough < 1) return undefined;
-  return { gap: [1, mergedDroppedThrough] };
-}
-
-/**
- * Merged "both" event view, always read from the floor. Exported for
- * direct unit testing, same rationale as `buildSingleStreamEvents`.
- *
- * Merged position is derived from each line's own REAL, stable per-stream
- * `seq`, never from its transient index into `snapshot.lines` - identical
- * scheme to output.ts's own `buildBothStreamsEvents` (see that file's
- * docs for the full reasoning, including why an index-based formula was a
- * real, not cosmetic, defect: a line's merged position would silently
- * change across calls as older lines were evicted out from under its
- * index, even though `tail` itself has no cursor for a caller to be
- * confused by - the numbering was never actually stable the way this
- * file's header already claims it is).
+ * Merged "both" event view, always read from the floor and trimmed to the
+ * last `n` real events (merged across both streams). Exported for direct
+ * unit testing, same rationale as `buildSingleStreamEvents`.
  */
 export function buildBothStreamsEvents(
   stdoutSnapshot: StreamBufferSnapshot,
-  stderrSnapshot: StreamBufferSnapshot
-): { events: OutputEvent[]; gap?: GapMarker; head: number } {
-  const stdoutEvents = stdoutSnapshot.lines.map((line) =>
-    buildEvent("stdout", 2 * line.seq - 1, line.text, line.terminator)
-  );
-  const stderrEvents = stderrSnapshot.lines.map((line) =>
-    buildEvent("stderr", 2 * line.seq, line.text, line.terminator)
-  );
-  const merged = [...stdoutEvents, ...stderrEvents].sort((a, b) => a.seq - b.seq);
+  stderrSnapshot: StreamBufferSnapshot,
+  n: number
+): {
+  events: OutputEvent[];
+  head: number;
+  reachesFloor: boolean;
+  stdoutDrop: StreamDropInfo;
+  stderrDrop: StreamDropInfo;
+} {
+  const head = Math.max(stdoutSnapshot.headSeq, stderrSnapshot.headSeq);
 
-  const stdoutHeadSeq = stdoutSnapshot.totalEverMaterialized;
-  const stderrHeadSeq = stderrSnapshot.totalEverMaterialized;
-  const head = Math.max(
-    stdoutHeadSeq > 0 ? 2 * stdoutHeadSeq - 1 : 0,
-    stderrHeadSeq > 0 ? 2 * stderrHeadSeq : 0
-  );
+  const allEvents = [
+    ...stdoutSnapshot.lines.map((line) =>
+      buildEvent("stdout", line.seq, line.text, line.terminator)
+    ),
+    ...stderrSnapshot.lines.map((line) =>
+      buildEvent("stderr", line.seq, line.text, line.terminator)
+    ),
+  ].sort((a, b) => a.seq - b.seq);
 
-  if (!stdoutSnapshot.truncated && !stderrSnapshot.truncated) {
-    return { events: merged, head };
-  }
-  return { events: merged, gap: computeBothStreamsGap(stdoutSnapshot, stderrSnapshot), head };
+  const reachesFloor = n >= allEvents.length;
+  const events = reachesFloor ? allEvents : allEvents.slice(allEvents.length - n);
+
+  return {
+    events,
+    head,
+    reachesFloor,
+    stdoutDrop: computeDropInfo(stdoutSnapshot),
+    stderrDrop: computeDropInfo(stderrSnapshot),
+  };
 }
 
 // ---------------------------------------------------------------------------

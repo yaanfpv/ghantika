@@ -66,9 +66,55 @@ export function isJobState(value: unknown): value is JobState {
   return typeof value === "string" && (ALL_JOB_STATES as readonly string[]).includes(value);
 }
 
-/** Why a job ended up `failed` (today, always `spawn-error` - see `src/tools/run.ts`). */
+/**
+ * The closed, three-value set of legal `JobDiagnostic.reason` values - the
+ * SAME real-runtime-array pattern `ALL_JOB_STATES`/`isJobState` above use to
+ * make a closed union something a test can actually observe, not just a
+ * compile-time-only guarantee. See `JobDiagnostic`'s own docs for what each
+ * value means and which are actually producible by this codebase's real
+ * code paths today.
+ */
+export const ALL_JOB_DIAGNOSTIC_REASONS = [
+  "spawn-error",
+  "policy-denied",
+  "watcher/runtime-error",
+] as const;
+
+export type JobDiagnosticReason = (typeof ALL_JOB_DIAGNOSTIC_REASONS)[number];
+
+/** Runtime type guard mirroring `ALL_JOB_DIAGNOSTIC_REASONS`. */
+export function isJobDiagnosticReason(value: unknown): value is JobDiagnosticReason {
+  return (
+    typeof value === "string" && (ALL_JOB_DIAGNOSTIC_REASONS as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * Why a job ended up `failed`. `reason` is a CLOSED three-value set, never
+ * an open string:
+ *
+ * - `spawn-error`: the ONLY value this codebase's real code paths produce
+ *   today - a cwd/executable pre-flight rejection (`createFailedJob`,
+ *   called from `src/tools/run.ts` before ever attempting a real spawn) or
+ *   a genuine async OS-level spawn failure (`markSpawnFailed`, called from
+ *   `src/process.ts`'s `spawnManaged` `onError` callback).
+ * - `policy-denied`: reserved for a future command allowlist/denylist
+ *   policy gate - this codebase has no such gate today, so nothing ever
+ *   produces this value yet. Declared now so the type is closed over its
+ *   full legal range from the start, rather than every future producer
+ *   needing to widen an already-shipped union.
+ * - `watcher/runtime-error`: reserved for a future background
+ *   watcher/supervisor failure class - this codebase has no such watcher
+ *   today (job state is driven directly by real `child_process` events,
+ *   never a separate polling watcher process), so nothing produces this
+ *   value yet either, for the same reason as `policy-denied` above.
+ *
+ * Deliberately NOT wiring a real producer for the latter two here: doing so
+ * would mean inventing a scenario this codebase doesn't actually have,
+ * which is worse than an honestly-reserved, closed, currently-unused value.
+ */
 export interface JobDiagnostic {
-  readonly reason: string;
+  readonly reason: JobDiagnosticReason;
   readonly message: string;
 }
 
@@ -120,8 +166,10 @@ export interface JobRecord {
  * - `*_lines`: how many stream entries have ever been MATERIALIZED on that
  *   stream (a real newline-terminated line, a forced `oversized-split`
  *   piece, or a final `stream-end` partial - see `StreamLineTerminator`) -
- *   i.e. the stream's own monotonic `StreamLineEntry.seq` counter, which by
- *   construction equals this count (see that field's docs). Survives
+ *   i.e. the stream's own `StreamBufferState.linesEverMaterialized` pure
+ *   per-stream COUNT (a genuinely SEPARATE number from `StreamLineEntry.seq`
+ *   now that `seq` is a per-JOB GLOBAL value shared across stdout and
+ *   stderr - see that field's own docs for why the two diverge). Survives
  *   eviction: a stream that has produced 20,000 lines and been trimmed down
  *   to the newest 10,000 still reports `20000` here, never the smaller
  *   currently-retained count (`getStreamSnapshot(...).lines.length`), which
@@ -288,6 +336,36 @@ const MAX_UTF8_BACKTRACK = 3;
 const OVERSIZED_LINE_MARKER = "…[line exceeds 1 MiB, continues]";
 
 /**
+ * A tiny mutable counter, shared BY REFERENCE between a single job's
+ * stdout and stderr `StreamBufferState`s (see `JobStore.createJob`/
+ * `createFailedJob`) so that `materializeLine` on EITHER stream draws its
+ * `seq` from the SAME source. This is what makes `StreamLineEntry.seq` a
+ * REAL per-JOB GLOBAL event sequence - one monotonic axis spanning both
+ * streams, ordered by real materialization time - rather than two
+ * independent per-stream counters that could each assign the same number
+ * to an unrelated stdout and stderr line. `createStreamBufferState`
+ * defaults to a fresh PRIVATE counter when none is supplied, so this file's
+ * own standalone buffer-layer tests (which drive a lone `StreamBufferState`
+ * with no sibling stream at all) keep their existing single-stream
+ * seq-starts-at-1 behavior unchanged.
+ */
+export interface JobSeqCounter {
+  next(): number;
+}
+
+/** Starts at 1 (matching the old per-stream `nextLineSeq`'s starting value) - never reset or reused. */
+export function createJobSeqCounter(): JobSeqCounter {
+  let nextValue = 1;
+  return {
+    next(): number {
+      const value = nextValue;
+      nextValue += 1;
+      return value;
+    },
+  };
+}
+
+/**
  * Why a `StreamLineEntry` ends where it does:
  * - `newline`: the original stream had a real `\n` (or `\r\n`) here - a
  *   genuinely complete line.
@@ -309,14 +387,24 @@ export interface StreamLineEntry {
   readonly text: string;
   readonly terminator: StreamLineTerminator;
   /**
-   * A REAL monotonic per-line sequence number: assigned once, at
-   * materialization time, from `StreamBufferState.nextLineSeq`, and NEVER
-   * reset or reused for the life of this job's stream - even across
-   * eviction. Because it survives eviction, `output.ts`/`tail.ts` can use
-   * this STABLE, GLOBALLY-MEANINGFUL value instead of the line's array
-   * position (which drifts once eviction starts), and can compute an
-   * EXACT dropped-range gap from it (see
-   * `StreamBufferState.nextLineSeq`'s own docs).
+   * A REAL monotonic sequence number, GLOBAL across this JOB's stdout and
+   * stderr COMBINED (never just this one stream) - assigned once, at
+   * materialization time, from the job's shared `JobSeqCounter` (see its
+   * own docs), and NEVER reset or reused for the life of this job, even
+   * across eviction. Because stdout and stderr draw from the SAME counter,
+   * a stdout line and a stderr line can never collide on the same `seq`
+   * value, and sorting any mix of the two streams' lines by `seq` alone
+   * always recovers their real, true materialization order - no synthetic
+   * interleave policy (odd/even parity or similar) is needed to merge them,
+   * and `output.ts`/`tail.ts`'s "both" mode uses exactly this real ordering
+   * (see those files' own headers).
+   *
+   * (Earlier architectural history: this field used to be assigned from a
+   * PER-STREAM-only counter, and before that didn't exist at all -
+   * `output.ts`/`tail.ts` had to approximate `seq` as the line's array
+   * INDEX, exact only until the first eviction, and disclose only a
+   * deliberately-narrow `{gap: [X, X]}` placeholder. A real, persistent,
+   * now-GLOBAL `seq` removes both limitations at once.)
    */
   readonly seq: number;
 }
@@ -325,14 +413,54 @@ export interface StreamBufferSnapshot {
   readonly lines: readonly StreamLineEntry[];
   readonly truncated: boolean;
   /**
-   * The stream's REAL total-ever-materialized line count at snapshot time
-   * (`StreamBufferState.nextLineSeq - 1`). Lets a consumer
-   * (`output.ts`/`tail.ts`) compute an EXACT dropped-range gap once
-   * truncation starts (`[1, oldestSurvivingSeq - 1]`) and a stable `head`
-   * cursor, without depending on array position, which drifts once
-   * eviction starts.
+   * The highest `seq` EVER assigned to a line on THIS stream specifically,
+   * persisting through eviction (0 if this stream has never materialized a
+   * line) - a consumer's per-stream `head`/next-cursor value for a
+   * single-stream (`stdout`-only or `stderr`-only) read. Because `seq` is
+   * now a per-JOB GLOBAL value (see `StreamLineEntry.seq`'s own docs), this
+   * is no longer the same number as "how many lines has this stream
+   * materialized" (a stream's own line COUNT and the highest GLOBAL seq
+   * value one of its lines happened to receive are now two genuinely
+   * different numbers, since the other stream's own activity advances the
+   * shared counter too) - see `JobStore.getOutputCounts`'s own docs for the
+   * separate, pure per-stream COUNT that answers that different question.
    */
-  readonly totalEverMaterialized: number;
+  readonly headSeq: number;
+  /**
+   * How many of THIS stream's own lines have EVER been evicted, over its
+   * whole life - a pure per-stream COUNT, never a claim about WHICH `seq`
+   * values were lost (see `JobStore`'s own file-header note on why v1
+   * deliberately stops at a bounded count rather than exact per-seq
+   * disclosure). 0 if this stream has never had a line evicted.
+   *
+   * (Architectural history: an earlier revision of this fix tracked the
+   * exact SET of this stream's own evicted `seq` values, as the fewest
+   * possible disjoint `[start, end]` runs, specifically to avoid a single
+   * scalar boundary expanding into a contiguous range that could wrongly
+   * claim a still-alive SIBLING stream's `seq` as this stream's own loss -
+   * a real bug once `seq` became a per-job GLOBAL value shared across
+   * stdout/stderr, since this stream's own evicted set can itself be
+   * non-contiguous whenever the sibling owns one of the intervening
+   * values. An exact per-seq range representation is unbounded because
+   * stdout and stderr share one sequence counter, so a stream's own
+   * retained-line seqs can interleave with the sibling's, and any bounded
+   * collapse of that range representation (a hard cap, a response-side cap)
+   * reintroduces the same fabrication risk, since a widened/coalesced range
+   * is itself a scalar-boundary-shaped claim again. Scrapped in favor of
+   * this much simpler, deliberately WEAKER contract: a count and a
+   * boundary, never a value. A count can never misname a seq, because it
+   * never names one at all - see `droppedBeforeCursor`'s own computation in
+   * `src/tools/output.ts`/`src/tools/tail.ts` for the paired boundary.)
+   *
+   * Incremented by exactly 1 in `evictOldestLine` (the ONE place either
+   * eviction loop in this file actually removes a line) every time it
+   * actually removes one of THIS stream's own lines - never reset or
+   * decremented, matching this file's other `*EverMaterialized`/
+   * `*EverReceived` per-stream counters in shape (a single unbounded
+   * NUMBER, cheap regardless of a job's lifetime, unlike the abandoned
+   * per-seq-range design's array).
+   */
+  readonly droppedCount: number;
 }
 
 /** Internal, mutable per-stream buffer state. Exported only so tests can drive it directly with synthetic byte sequences. */
@@ -345,18 +473,47 @@ export interface StreamBufferState {
   truncated: boolean;
   finalized: boolean;
   /**
-   * The NEXT `seq` value to assign - starts at 1, incremented by exactly 1
-   * every time a line is materialized (`materializeLine`), NEVER reset or
-   * decremented (not even by eviction). Two things fall out of this single
-   * counter, by construction:
-   *
-   * - It IS the source of each new `StreamLineEntry.seq` (assigned, then
-   *   incremented).
-   * - `nextLineSeq - 1` is exactly "how many lines has this stream EVER
-   *   materialized, total" - `JobStore.getOutputCounts`'s `*_lines` field
-   *   reads this directly, with no separate counter needed.
+   * The source of each new `StreamLineEntry.seq` (`materializeLine` calls
+   * `.next()`, once per materialized line) - shared BY REFERENCE with the
+   * sibling stream of the SAME job (see `JobSeqCounter`'s own docs), which
+   * is what makes `seq` a real per-job GLOBAL value rather than a
+   * per-stream-only one. `createStreamBufferState` defaults to a fresh
+   * PRIVATE counter when none is supplied, so a standalone
+   * `StreamBufferState` (this file's own buffer-layer tests) still behaves
+   * exactly as a lone per-stream counter would.
    */
-  nextLineSeq: number;
+  seqCounter: JobSeqCounter;
+  /**
+   * How many lines THIS stream specifically has EVER materialized, total -
+   * a pure per-stream COUNT, incremented by exactly 1 every time THIS
+   * stream materializes a line (`materializeLine`), NEVER reset or
+   * decremented (not even by eviction). Deliberately a SEPARATE counter
+   * from `seqCounter` now that `seq` is shared/global: this stream's own
+   * line count and the highest `seq` value one of its lines happened to
+   * receive are two different numbers once a sibling stream's activity can
+   * also advance the shared counter (see `StreamLineEntry.seq`'s own
+   * docs). `JobStore.getOutputCounts`'s `*_lines` field reads this
+   * directly.
+   */
+  linesEverMaterialized: number;
+  /**
+   * The highest `seq` EVER assigned to a line on THIS stream, persisting
+   * through eviction (0 if this stream has never materialized a line) -
+   * the source of `StreamBufferSnapshot.headSeq` (see its own docs).
+   */
+  highestSeqAssigned: number;
+  /**
+   * How many of THIS stream's own lines have EVER been evicted, over its
+   * whole life - the source of `StreamBufferSnapshot.droppedCount` (see its
+   * own docs for why a bounded count, never a per-seq range, is what v1
+   * discloses). Incremented by exactly 1 in `evictOldestLine` (the ONE
+   * place either eviction loop in this file actually removes a line) every
+   * time it actually removes one of THIS stream's own lines - never reset
+   * or decremented, matching this struct's other `*EverMaterialized`/
+   * `*EverReceived` counters in shape: a single unbounded NUMBER, cheap
+   * regardless of a job's lifetime.
+   */
+  droppedCount: number;
   /**
    * Total RAW bytes ever received on this stream from the child, summed
    * across every `appendChunkToBuffer` call by that call's chunk size -
@@ -370,14 +527,28 @@ export interface StreamBufferState {
   bytesEverReceived: number;
 }
 
-export function createStreamBufferState(): StreamBufferState {
+/**
+ * @param seqCounter - the seq source this stream's materialized lines draw
+ *   from. Omit for a STANDALONE buffer (this file's own buffer-layer tests
+ *   drive one in isolation, with no sibling stream) - a fresh private
+ *   counter is created, so a solo stream's `seq` still starts at 1 and
+ *   increments by exactly 1 per line, unaffected by this change. `JobStore`
+ *   (below) always supplies one SHARED counter across a job's stdout and
+ *   stderr, which is what makes `seq` genuinely global for a real job.
+ */
+export function createStreamBufferState(
+  seqCounter: JobSeqCounter = createJobSeqCounter()
+): StreamBufferState {
   return {
     pending: Buffer.alloc(0),
     lines: [],
     totalBytes: 0,
     truncated: false,
     finalized: false,
-    nextLineSeq: 1,
+    seqCounter,
+    linesEverMaterialized: 0,
+    highestSeqAssigned: 0,
+    droppedCount: 0,
     bytesEverReceived: 0,
   };
 }
@@ -412,13 +583,31 @@ export function findUtf8SafeCutPoint(buffer: Buffer, maxOffset: number): number 
   return cut;
 }
 
+/**
+ * The ONE place either eviction loop in this file (`materializeLine`'s own
+ * loop below, and `evictToFitBudget`'s separate pass) actually removes a
+ * line from `state.lines` - shared so `totalBytes`/`truncated` accounting
+ * and the `droppedCount` increment (see that field's own docs) can never
+ * drift apart between the two call sites by one of them forgetting a step.
+ * Returns the removed entry, or `undefined` if there was nothing to evict.
+ */
+function evictOldestLine(state: StreamBufferState): StreamLineEntry | undefined {
+  const removed = state.lines.shift();
+  if (!removed) return undefined;
+  state.totalBytes -= Buffer.byteLength(removed.text, "utf8");
+  state.truncated = true;
+  state.droppedCount += 1;
+  return removed;
+}
+
 function materializeLine(
   state: StreamBufferState,
   text: string,
   terminator: StreamLineTerminator
 ): void {
-  const seq = state.nextLineSeq;
-  state.nextLineSeq += 1;
+  const seq = state.seqCounter.next();
+  state.linesEverMaterialized += 1;
+  state.highestSeqAssigned = seq;
   state.lines.push({ text, terminator, seq });
   state.totalBytes += Buffer.byteLength(text, "utf8");
   // `> 1`, not `> 0`: "retain the newest data" must guarantee the single
@@ -437,10 +626,7 @@ function materializeLine(
     state.lines.length > 1 &&
     (state.lines.length > MAX_BUFFER_LINES || state.totalBytes > MAX_BUFFER_BYTES)
   ) {
-    const removed = state.lines.shift();
-    if (!removed) break;
-    state.totalBytes -= Buffer.byteLength(removed.text, "utf8");
-    state.truncated = true;
+    if (!evictOldestLine(state)) break;
   }
 }
 
@@ -475,29 +661,61 @@ function materializeLine(
  * pass still protects, matching `materializeLine`'s own documented
  * exception verbatim ("the single most-recent entry always survives, even
  * if IT ALONE exceeds the byte cap"): when exactly one materialized line
- * remains AND that line's OWN size (ignoring `pending` entirely) already
- * exceeds `MAX_BUFFER_BYTES` on its own (the oversized-split case) - that
- * line is never evicted by this pass, regardless of how large `pending`
- * additionally is, so the two forced-split regression tests in this file's
- * test suite (a lone oversized-split entry surviving its own creation, and
- * surviving a smaller trailing pending remainder afterward) are unaffected.
+ * remains, that line's OWN size (ignoring `pending` entirely) already
+ * exceeds `MAX_BUFFER_BYTES` on its own (the oversized-split case), AND
+ * THIS `appendChunkToBuffer` call is the one that just materialized it (see
+ * `materializedALineThisCall` below) - that line is never evicted by this
+ * pass, so the forced-split regression tests proving a lone oversized-split
+ * entry survives the very call that creates it are unaffected - EVEN THOUGH
+ * that same call's own cut can naturally leave a leftover in `pending` up
+ * to just under `MAX_LINE_BYTES` (almost another full line-cap's worth),
+ * so resident bytes (this one oversized entry plus that leftover) can
+ * genuinely peak near double `MAX_BUFFER_BYTES` for the DURATION of the
+ * call that creates the entry, before the next call's own eviction pass
+ * brings it back down.
+ * On any LATER, SEPARATE call where no new line materializes at all -
+ * genuinely new bytes simply growing `pending` on top of an entry that was
+ * already sitting there before this call began - the exception no longer
+ * applies and this pass falls through to evict the old entry like any
+ * other. So the exception protects a single oversized ENTRY only at the
+ * instant it is created, never a license for `pending` to then grow
+ * unboundedly on top of it forever across further, separate calls (a real
+ * prior bug: the old entry sat protected no matter how large `pending`
+ * grew afterward, since the exception ignored `pending` entirely, checking
+ * only `state.lines.length`/`state.totalBytes`).
  *
  * Net effect, proven by this file's tests: at the return of every
  * `appendChunkToBuffer` call, `sum(state.lines bytes) + state.pending.length
- * <= MAX_BUFFER_BYTES`, UNLESS `state.lines.length === 1` and that lone
- * entry's own bytes already exceed the cap (the documented exception).
+ * <= MAX_BUFFER_BYTES`, UNLESS `state.lines.length === 1`, that lone entry's
+ * own bytes already exceed the cap, AND this same call is the one that just
+ * materialized it (the documented exception, which holds only for the call
+ * that creates the oversized entry - never for a later call that merely
+ * grows `pending` on top of an already-existing one).
+ *
+ * @param materializedALineThisCall - whether `materializeLine` ran at least
+ *   once during the SAME `appendChunkToBuffer` call this pass is closing out
+ *   (see that call site for how this is tracked). This is the discriminator
+ *   the single-entry exception above needs - see this function's own docs
+ *   above for why `state.pending.length` alone can't serve the same role.
  */
-function evictToFitBudget(state: StreamBufferState): void {
+function evictToFitBudget(state: StreamBufferState, materializedALineThisCall: boolean): void {
   for (;;) {
     if (state.lines.length === 0) return;
     const overLineCount = state.lines.length > MAX_BUFFER_LINES;
     const overByteCount = state.totalBytes + state.pending.length > MAX_BUFFER_BYTES;
     if (!overLineCount && !overByteCount) return;
-    if (state.lines.length === 1 && state.totalBytes > MAX_BUFFER_BYTES) return; // the documented single-entry exception - see this function's own docs
-    const removed = state.lines.shift();
-    if (!removed) return;
-    state.totalBytes -= Buffer.byteLength(removed.text, "utf8");
-    state.truncated = true;
+    // The documented single-entry exception - see this function's own docs.
+    // Only holds for the call that just materialized this entry; a later,
+    // separate call that merely grows `pending` on top of an
+    // already-existing lone oversized entry falls through and evicts it.
+    if (
+      state.lines.length === 1 &&
+      state.totalBytes > MAX_BUFFER_BYTES &&
+      materializedALineThisCall
+    ) {
+      return;
+    }
+    if (!evictOldestLine(state)) return;
   }
 }
 
@@ -524,10 +742,16 @@ function evictToFitBudget(state: StreamBufferState): void {
  * call's raw `chunk.length`, counted once, up front, before any of the
  * above processing - see that field's own docs) and ends every call with
  * `evictToFitBudget` (see its own docs for why this must run at the end
- * of EVERY call here, not only inside `materializeLine`).
+ * of EVERY call here, not only inside `materializeLine`) - passed whether
+ * this call materialized at least one line, by comparing
+ * `state.linesEverMaterialized` before and after this call's own loop (see
+ * `evictToFitBudget`'s `materializedALineThisCall` param docs for why that
+ * distinction, not `state.pending.length` alone, is what its single-entry
+ * exception needs).
  */
 export function appendChunkToBuffer(state: StreamBufferState, chunk: Buffer): void {
   state.bytesEverReceived += chunk.length;
+  const linesMaterializedBeforeThisCall = state.linesEverMaterialized;
   const working = state.pending.length > 0 ? Buffer.concat([state.pending, chunk]) : chunk;
   state.pending = Buffer.alloc(0);
 
@@ -585,7 +809,8 @@ export function appendChunkToBuffer(state: StreamBufferState, chunk: Buffer): vo
   // unconditionally (even when nothing was materialized this call), since
   // pending-only growth across many newline-less calls is exactly the gap
   // being closed.
-  evictToFitBudget(state);
+  const materializedALineThisCall = state.linesEverMaterialized > linesMaterializedBeforeThisCall;
+  evictToFitBudget(state, materializedALineThisCall);
 }
 
 /**
@@ -608,7 +833,8 @@ export function snapshotStreamBuffer(state: StreamBufferState): StreamBufferSnap
   return {
     lines: [...state.lines],
     truncated: state.truncated,
-    totalEverMaterialized: state.nextLineSeq - 1,
+    headSeq: state.highestSeqAssigned,
+    droppedCount: state.droppedCount,
   };
 }
 
@@ -696,9 +922,13 @@ export class JobStore {
       is_shell: input.isShell,
     };
     this.jobs.set(record.job_id, record);
+    // ONE shared JobSeqCounter for this job's stdout and stderr - see its
+    // own docs for why sharing it is what makes StreamLineEntry.seq a real
+    // per-job GLOBAL event sequence.
+    const eventSeq = createJobSeqCounter();
     this.buffers.set(record.job_id, {
-      stdout: createStreamBufferState(),
-      stderr: createStreamBufferState(),
+      stdout: createStreamBufferState(eventSeq),
+      stderr: createStreamBufferState(eventSeq),
     });
     return record;
   }
@@ -726,9 +956,14 @@ export class JobStore {
       is_shell: input.isShell,
     };
     this.jobs.set(record.job_id, record);
+    // Same shared-counter construction as createJob above, even though a
+    // failed-to-spawn job will realistically never produce any output -
+    // keeping both constructors identical means there is no separate,
+    // easy-to-forget code path for the event-seq wiring.
+    const eventSeq = createJobSeqCounter();
     this.buffers.set(record.job_id, {
-      stdout: createStreamBufferState(),
-      stderr: createStreamBufferState(),
+      stdout: createStreamBufferState(eventSeq),
+      stderr: createStreamBufferState(eventSeq),
     });
     return record;
   }
@@ -790,13 +1025,53 @@ export class JobStore {
     record.ended_at = new Date().toISOString();
   }
 
-  /** `starting`/`running` -> `exited`. Never `killed` here - that state is reserved exclusively for a real `kill` tool to set. No-op once terminal. */
+  /**
+   * `starting`/`running` -> `exited` OR `killed`, from the OS's own
+   * real, unsolicited `child_process` `exit` event (`run.ts`'s `onExit`
+   * callback passes this call's two arguments straight through from Node's
+   * own event - see `process.spawnManaged`'s docs). SIGNAL-vs-EXIT: a
+   * signalled death (`signal !== null`) -> `killed` + the exact signal
+   * name, never `exited`; a normal exit (`signal === null`) -> `exited` +
+   * `exitCode`. This covers a death this codebase did NOT itself request
+   * through `kill` - an external signal (another process, a shell job
+   * control, a crash such as SIGSEGV/SIGABRT) still genuinely killed the
+   * job, and `killed` is the honest state for that, not `exited`.
+   *
+   * This never collides with a REQUESTED kill: `kill.ts`'s own handler
+   * calls `markKilled` SYNCHRONOUSLY, right when it sends a signal - before
+   * this method's own async `onExit` invocation can ever run - so by the
+   * time the job's natural `exit` event reaches here the job is already
+   * terminal and this call is a no-op (first write wins, the same
+   * terminal-state guard every `mark*` transition here uses). So this
+   * method only ever gets to CHOOSE killed-vs-exited for a death this
+   * codebase did not request through `kill` at all.
+   *
+   * Windows note (WINDOWS DISPOSITION, "not POSIX-assumed"): Node's
+   * `child_process` `exit` event never delivers a real POSIX `signal` value
+   * on Windows (Windows has no POSIX signal delivery mechanism) - a
+   * Windows child's exit is always reported through the numeric `code`
+   * alone, even one this codebase's own `kill.ts`/`server.ts` win32
+   * branches forcefully terminated via `taskkill` (those branches record
+   * `killed` themselves, synchronously, via `markKilled`, before this
+   * method ever runs - see above). So on Windows this method's `signal`
+   * branch is simply never reached in practice; every real Windows
+   * `onExit` call this method sees naturally falls into the `exited`+code
+   * branch, the REAL disposition Windows reports - never a POSIX-style
+   * signal this platform doesn't have.
+   *
+   * No-op once the job is already terminal, so a late/duplicate event can
+   * never overwrite a real result.
+   */
   markExited(jobId: string, exitCode: number | null, signal: NodeJS.Signals | null): void {
     const record = this.jobs.get(jobId);
     if (!record || isTerminalJobState(record.state)) return;
-    record.state = "exited";
-    record.exit_code = exitCode ?? undefined;
-    record.signal = signal ?? undefined;
+    if (signal !== null) {
+      record.state = "killed";
+      record.signal = signal;
+    } else {
+      record.state = "exited";
+      record.exit_code = exitCode ?? undefined;
+    }
     record.ended_at = new Date().toISOString();
   }
 
@@ -880,9 +1155,9 @@ export class JobStore {
     const buffers = this.buffers.get(jobId);
     if (!buffers) return ZERO_JOB_OUTPUT_COUNTS;
     return {
-      stdout_lines: buffers.stdout.nextLineSeq - 1,
+      stdout_lines: buffers.stdout.linesEverMaterialized,
       stdout_bytes: buffers.stdout.bytesEverReceived,
-      stderr_lines: buffers.stderr.nextLineSeq - 1,
+      stderr_lines: buffers.stderr.linesEverMaterialized,
       stderr_bytes: buffers.stderr.bytesEverReceived,
     };
   }
