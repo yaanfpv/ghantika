@@ -249,7 +249,7 @@ test("tail.ts: a stream's own drop disclosure reflects only its own droppedCount
 // single-stream byte cap (MAX_BUFFER_BYTES, 1 MiB) genuinely evicts a
 // stream's own oldest line each time a second ~600KB line lands.
 
-test("REGRESSION (row-41 equivalent): drop-count accuracy under a REAL multi-eviction, cross-stream-interleaved scenario - built through real JobStore eviction, never a hand-authored synthetic snapshot", () => {
+test("REGRESSION: drop-count accuracy under a REAL multi-eviction, cross-stream-interleaved scenario - built through real JobStore eviction, never a hand-authored synthetic snapshot", () => {
   const jobId = makeJobWithRawOutput();
   // seq 1 (stdout, alone, no eviction yet)
   jobStore.appendOutput(jobId, "stdout", bigStreamLine("a"));

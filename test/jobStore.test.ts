@@ -1102,6 +1102,102 @@ test("pending growth evicts only as many materialized lines as needed to fit the
   );
 });
 
+// ---------------------------------------------------------------------------
+// A lone oversized-split entry is not a license for `pending` to grow
+// unboundedly on top of it forever - a DEDICATED regression for the fix
+// that closed exactly this gap in evictToFitBudget's single-entry
+// exception (see that function's own docs).
+// ---------------------------------------------------------------------------
+
+test("REGRESSION: a lone oversized-split entry is evicted once a LATER, SEPARATE call grows pending on top of it, instead of letting pending grow unboundedly on top of it forever", () => {
+  const state = createStreamBufferState();
+
+  // Force a real oversized-split entry: one unterminated chunk past
+  // MAX_LINE_BYTES, no trailing newline yet. The cut itself necessarily
+  // leaves a small leftover in `pending` (a forced cut only ever removes
+  // MAX_LINE_BYTES bytes from a `working` buffer that was, by construction,
+  // strictly longer than that) - this is the natural byproduct of THIS SAME
+  // call materializing the entry, not later unbounded growth, so it must
+  // NOT by itself defeat the single-entry exception.
+  appendChunkToBuffer(state, Buffer.from("x".repeat(MAX_LINE_BYTES + 500)));
+  const afterOversized = snapshotStreamBuffer(state);
+  assert.equal(afterOversized.lines.length, 1, "the forced split must be retained");
+  assert.equal(afterOversized.lines[0]!.terminator, "oversized-split");
+  assert.equal(
+    afterOversized.droppedCount,
+    0,
+    "nothing evicted yet - this call is the one that just materialized the entry, the documented exception's protected instant"
+  );
+  assert.equal(
+    state.pending.length,
+    500,
+    "the same cut's own small leftover naturally lands in pending - this alone must not defeat the exception"
+  );
+
+  // A SECOND, entirely SEPARATE appendChunkToBuffer call: a newline-free
+  // chunk that stays pending (well under MAX_LINE_BYTES, so it never
+  // forces a split of its own - no line materializes in THIS call at all).
+  // Before the fix, evictToFitBudget's single-entry exception ignored
+  // `pending` entirely, so the old oversized entry was never evicted here -
+  // pending could keep growing on top of it, unboundedly, call after call.
+  appendChunkToBuffer(state, Buffer.from("p".repeat(900_000)));
+
+  const afterPending = snapshotStreamBuffer(state);
+  assert.equal(
+    afterPending.lines.length,
+    0,
+    "the old oversized entry must be evicted now that new pending bytes are arriving behind it"
+  );
+  assert.equal(
+    afterPending.droppedCount,
+    1,
+    "exactly one line (the old oversized entry) was evicted"
+  );
+  assert.equal(afterPending.truncated, true, "an honest eviction must never be a silent drop");
+
+  const residentBytes =
+    afterPending.lines.reduce((sum, l) => sum + Buffer.byteLength(l.text, "utf8"), 0) +
+    state.pending.length;
+  assert.ok(
+    residentBytes <= MAX_BUFFER_BYTES,
+    `combined resident bytes (${residentBytes}) must return within the ordinary MAX_BUFFER_BYTES bound (${MAX_BUFFER_BYTES}) once new data starts arriving - this is the exact defect the fix closes`
+  );
+  assert.equal(
+    state.pending.length,
+    500 + 900_000,
+    "pending itself is never evicted or truncated by this mechanism - only materialized lines are ever removed (the earlier 500-byte leftover plus this call's own new 900,000 bytes, none of it force-split since the combined total still stays under MAX_LINE_BYTES)"
+  );
+});
+
+test("(green control) a normal-sized line arriving at a near-full-of-ordinary-lines buffer still takes the ordinary evict-old-lines path, never the single-entry exception - proving the fix targets only the pathological lone-oversized-entry state", () => {
+  const state = createStreamBufferState();
+  const ordinaryLine = "z".repeat(300_000);
+  // Three ordinary 'newline' lines, comfortably under the cap combined -
+  // never anywhere near the "one lone oversized entry" state the fix targets.
+  appendChunkToBuffer(state, Buffer.from(`${ordinaryLine}-0\n`));
+  appendChunkToBuffer(state, Buffer.from(`${ordinaryLine}-1\n`));
+  appendChunkToBuffer(state, Buffer.from(`${ordinaryLine}-2\n`));
+  const beforeOverflow = snapshotStreamBuffer(state);
+  assert.equal(beforeOverflow.lines.length, 3);
+  assert.equal(beforeOverflow.droppedCount, 0);
+
+  // A fourth ordinary line tips the combined bytes over the cap.
+  appendChunkToBuffer(state, Buffer.from(`${ordinaryLine}-3\n`));
+  const afterOverflow = snapshotStreamBuffer(state);
+  assert.ok(
+    afterOverflow.lines.length < 4,
+    "an old ordinary line must have been evicted to stay under the byte cap"
+  );
+  assert.ok(
+    afterOverflow.lines.every((l) => l.terminator === "newline"),
+    "no spurious oversized-split continuation marker must appear on a normal-sized line"
+  );
+  assert.equal(afterOverflow.droppedCount, 4 - afterOverflow.lines.length);
+  assert.equal(afterOverflow.truncated, true);
+  // The newest line must survive - ordinary "retain newest, drop oldest".
+  assert.equal(afterOverflow.lines[afterOverflow.lines.length - 1]!.text, `${ordinaryLine}-3`);
+});
+
 test("a buffer that never exceeds either cap is never marked truncated, and droppedCount stays 0", () => {
   const state = createStreamBufferState();
   appendChunkToBuffer(state, Buffer.from("a\nb\nc\n"));

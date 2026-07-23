@@ -441,13 +441,15 @@ export interface StreamBufferSnapshot {
    * a real bug once `seq` became a per-job GLOBAL value shared across
    * stdout/stderr, since this stream's own evicted set can itself be
    * non-contiguous whenever the sibling owns one of the intervening
-   * values. That per-seq design kept generating fabrication findings of
-   * its own across several review rounds (a bounded/coalesced cap still
-   * had to widen old ranges, and a widened range is itself a scalar-
-   * boundary-shaped claim again) and was scrapped in favor of this much
-   * simpler, deliberately WEAKER contract: a count and a boundary, never a
-   * value. A count can never misname a seq, because it never names one at
-   * all - see `droppedBeforeCursor`'s own computation in
+   * values. An exact per-seq range representation is unbounded because
+   * stdout and stderr share one sequence counter, so a stream's own
+   * retained-line seqs can interleave with the sibling's, and any bounded
+   * collapse of that range representation (a hard cap, a response-side cap)
+   * reintroduces the same fabrication risk, since a widened/coalesced range
+   * is itself a scalar-boundary-shaped claim again. Scrapped in favor of
+   * this much simpler, deliberately WEAKER contract: a count and a
+   * boundary, never a value. A count can never misname a seq, because it
+   * never names one at all - see `droppedBeforeCursor`'s own computation in
    * `src/tools/output.ts`/`src/tools/tail.ts` for the paired boundary.)
    *
    * Incremented by exactly 1 in `evictOldestLine` (the ONE place either
@@ -659,25 +661,62 @@ function materializeLine(
  * pass still protects, matching `materializeLine`'s own documented
  * exception verbatim ("the single most-recent entry always survives, even
  * if IT ALONE exceeds the byte cap"): when exactly one materialized line
- * remains AND that line's OWN size (ignoring `pending` entirely) already
- * exceeds `MAX_BUFFER_BYTES` on its own (the oversized-split case) - that
- * line is never evicted by this pass, regardless of how large `pending`
- * additionally is, so the two forced-split regression tests in this file's
- * test suite (a lone oversized-split entry surviving its own creation, and
- * surviving a smaller trailing pending remainder afterward) are unaffected.
+ * remains, that line's OWN size (ignoring `pending` entirely) already
+ * exceeds `MAX_BUFFER_BYTES` on its own (the oversized-split case), AND
+ * THIS `appendChunkToBuffer` call is the one that just materialized it (see
+ * `materializedALineThisCall` below) - that line is never evicted by this
+ * pass, so the forced-split regression tests proving a lone oversized-split
+ * entry survives the very call that creates it (regardless of whatever
+ * small leftover that same cut naturally left in `pending`) are unaffected.
+ * On any LATER, SEPARATE call where no new line materializes at all -
+ * genuinely new bytes simply growing `pending` on top of an entry that was
+ * already sitting there before this call began - the exception no longer
+ * applies and this pass falls through to evict the old entry like any
+ * other. So the exception protects a single oversized ENTRY only at the
+ * instant it is created, never a license for `pending` to then grow
+ * unboundedly on top of it forever across further, separate calls (a real
+ * prior bug: the old entry sat protected no matter how large `pending`
+ * grew afterward, since the exception ignored `pending` entirely, checking
+ * only `state.lines.length`/`state.totalBytes`).
  *
  * Net effect, proven by this file's tests: at the return of every
  * `appendChunkToBuffer` call, `sum(state.lines bytes) + state.pending.length
- * <= MAX_BUFFER_BYTES`, UNLESS `state.lines.length === 1` and that lone
- * entry's own bytes already exceed the cap (the documented exception).
+ * <= MAX_BUFFER_BYTES`, UNLESS `state.lines.length === 1`, that lone entry's
+ * own bytes already exceed the cap, AND this same call is the one that just
+ * materialized it (the documented exception, which holds only for the call
+ * that creates the oversized entry - never for a later call that merely
+ * grows `pending` on top of an already-existing one).
+ *
+ * @param materializedALineThisCall - whether `materializeLine` ran at least
+ *   once during the SAME `appendChunkToBuffer` call this pass is closing out
+ *   (see that call site for how this is tracked). This is the discriminator
+ *   the single-entry exception above needs: `state.pending.length` alone
+ *   can't tell "the small natural leftover from the very cut that just
+ *   created this entry" apart from "brand new bytes arriving in a later,
+ *   separate call on top of an entry that already existed" - a forced split
+ *   always leaves at least one leftover byte in `pending` in the same call
+ *   it happens (the cut removes at most `MAX_LINE_BYTES` bytes from a
+ *   `working` buffer that was, by construction, strictly longer than that),
+ *   so gating on `pending.length === 0` alone would evict the entry
+ *   immediately in the very call that just created it.
  */
-function evictToFitBudget(state: StreamBufferState): void {
+function evictToFitBudget(state: StreamBufferState, materializedALineThisCall: boolean): void {
   for (;;) {
     if (state.lines.length === 0) return;
     const overLineCount = state.lines.length > MAX_BUFFER_LINES;
     const overByteCount = state.totalBytes + state.pending.length > MAX_BUFFER_BYTES;
     if (!overLineCount && !overByteCount) return;
-    if (state.lines.length === 1 && state.totalBytes > MAX_BUFFER_BYTES) return; // the documented single-entry exception - see this function's own docs
+    // The documented single-entry exception - see this function's own docs.
+    // Only holds for the call that just materialized this entry; a later,
+    // separate call that merely grows `pending` on top of an
+    // already-existing lone oversized entry falls through and evicts it.
+    if (
+      state.lines.length === 1 &&
+      state.totalBytes > MAX_BUFFER_BYTES &&
+      materializedALineThisCall
+    ) {
+      return;
+    }
     if (!evictOldestLine(state)) return;
   }
 }
@@ -705,10 +744,16 @@ function evictToFitBudget(state: StreamBufferState): void {
  * call's raw `chunk.length`, counted once, up front, before any of the
  * above processing - see that field's own docs) and ends every call with
  * `evictToFitBudget` (see its own docs for why this must run at the end
- * of EVERY call here, not only inside `materializeLine`).
+ * of EVERY call here, not only inside `materializeLine`) - passed whether
+ * this call materialized at least one line, by comparing
+ * `state.linesEverMaterialized` before and after this call's own loop (see
+ * `evictToFitBudget`'s `materializedALineThisCall` param docs for why that
+ * distinction, not `state.pending.length` alone, is what its single-entry
+ * exception needs).
  */
 export function appendChunkToBuffer(state: StreamBufferState, chunk: Buffer): void {
   state.bytesEverReceived += chunk.length;
+  const linesMaterializedBeforeThisCall = state.linesEverMaterialized;
   const working = state.pending.length > 0 ? Buffer.concat([state.pending, chunk]) : chunk;
   state.pending = Buffer.alloc(0);
 
@@ -766,7 +811,8 @@ export function appendChunkToBuffer(state: StreamBufferState, chunk: Buffer): vo
   // unconditionally (even when nothing was materialized this call), since
   // pending-only growth across many newline-less calls is exactly the gap
   // being closed.
-  evictToFitBudget(state);
+  const materializedALineThisCall = state.linesEverMaterialized > linesMaterializedBeforeThisCall;
+  evictToFitBudget(state, materializedALineThisCall);
 }
 
 /**

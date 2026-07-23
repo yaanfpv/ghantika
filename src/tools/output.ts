@@ -36,12 +36,14 @@
  * `droppedBeforeCursor` (that stream's own current retained floor - the
  * lowest `seq` still retained, or its `headSeq` if nothing survives). This
  * never names a seq value, so it can never misattribute a still-live
- * SIBLING stream's own event as this stream's loss - the exact fabrication
- * class every earlier per-seq-range design (a single scalar boundary, then
- * a bounded/coalesced set of exact `[start, end]` runs) kept reintroducing
- * across several review rounds, since a widened/coalesced range is itself
- * a scalar-boundary-shaped claim again. See `jobStore.ts`'s own
- * `StreamBufferSnapshot.droppedCount` docs for the fuller architectural
+ * SIBLING stream's own event as this stream's loss. An exact per-seq range
+ * representation is unbounded because stdout and stderr share one sequence
+ * counter, so a stream's own retained-line seqs can interleave with the
+ * sibling's, and any bounded collapse of that range representation (a
+ * single scalar boundary, or a bounded/coalesced set of exact `[start, end]`
+ * runs) reintroduces the same fabrication risk, since a widened/coalesced
+ * range is itself a scalar-boundary-shaped claim again. See `jobStore.ts`'s
+ * own `StreamBufferSnapshot.droppedCount` docs for the fuller architectural
  * history. Exact per-line gap-range disclosure is deferred to a follow-up
  * story.
  *
