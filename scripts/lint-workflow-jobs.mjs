@@ -3,15 +3,20 @@
  * Structural lints over .github/workflows/ci.yml that go beyond the
  * needs/if topology scripts/verify-workflow-topology.mjs checks:
  *
- *  - no job the "gate" aggregate depends on may set `continue-on-error:
- *    true` anywhere, since that would let a step (and therefore the job)
- *    report success on GitHub's dashboard while actually having failed -
- *    exactly the kind of pass-that-isn't-a-pass the gate job exists to
- *    rule out.
+ *  - no job the "gate" aggregate depends on, and no aggregate itself
+ *    (job level or step level), may set `continue-on-error` to anything
+ *    other than absent or the literal `false` - not just the literal
+ *    boolean `true`, but also a quoted string or a GitHub Actions
+ *    expression, either of which GitHub treats identically to the
+ *    boolean at runtime. Any of those would let a step (and therefore the
+ *    job) report success on GitHub's dashboard while actually having
+ *    failed - exactly the kind of pass-that-isn't-a-pass the gate job
+ *    exists to rule out, including on the aggregate itself, which is the
+ *    one required check branch protection actually points at.
  *  - the `test` job's matrix has to cover every combination of operating
  *    system and Node version this project claims to support, so a leg
- *    can't quietly go missing (e.g. nobody notices Windows + Node 24 was
- *    dropped from the matrix).
+ *    can't quietly go missing (e.g. nobody notices a leg silently drops
+ *    from the matrix).
  *  - the workflow's job list must never contain a job pretending to be
  *    secret scanning or Dependabot - those are GitHub repository settings
  *    (and, for Dependabot, a separate .github/dependabot.yml config file),
@@ -23,14 +28,41 @@ import { fileURLToPath } from "node:url";
 import { load as loadYaml } from "js-yaml";
 
 import { isMainModule } from "./lib/is-main.mjs";
+import { forEachDescendant, parseSourceFile, ts } from "./lib/ts-ast.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const THIS_FILE_PATH = fileURLToPath(import.meta.url);
 
 export const WORKFLOW_PATH = path.join(REPO_ROOT, ".github", "workflows", "ci.yml");
 export const AGGREGATE_JOB_ID = "gate";
 export const TEST_JOB_ID = "test";
-export const EXPECTED_OS = ["ubuntu-latest", "macos-latest", "windows-latest"];
+export const EXPECTED_OS = ["ubuntu-latest", "macos-latest"];
 export const EXPECTED_NODE = ["22", "24"];
+
+/**
+ * The independent, hard-coded closed set of "<os>::<node>" legs the real
+ * `test` job matrix must contain - written directly here as a literal
+ * array of string literals, never derived from `EXPECTED_OS`/
+ * `EXPECTED_NODE` above. This is the PRODUCTION location the underlying
+ * design specifies: a constant declared only in a test file protects
+ * just that test, while this file's own `main()` - which CI's `lint` job
+ * actually runs - would keep shipping the weaker, derived check. A
+ * coordinated edit that shrinks BOTH the real workflow matrix AND
+ * `EXPECTED_OS`/`EXPECTED_NODE` together leaves this list untouched, so
+ * `verifyIndependentMatrixLegs` below still catches it.
+ *
+ * See `verifyIndependentLegsIsLiteral` for the SEPARATE, mandatory
+ * guarantee that this declaration STAYS a literal - the entry a coordinated
+ * edit would need to touch to defeat this list is exactly the shape that
+ * function is built to catch.
+ */
+export const INDEPENDENT_EXPECTED_LEGS = [
+  "ubuntu-latest::22",
+  "ubuntu-latest::24",
+  "macos-latest::22",
+  "macos-latest::24",
+];
+
 export const FORBIDDEN_JOB_IDS = [
   "secret-scan",
   "secret_scan",
@@ -49,9 +81,32 @@ export function loadWorkflow(filePath = WORKFLOW_PATH) {
 }
 
 /**
+ * Whether a `continue-on-error` value should be treated as a violation.
+ * Only two values are safe: the field being absent, or the literal boolean
+ * `false`. Everything else is a violation - not just the literal boolean
+ * `true`, but also a quoted string like `"true"` (YAML accepts
+ * continue-on-error as a string and GitHub Actions treats it the same as
+ * the boolean at runtime) and, most importantly, a GitHub Actions
+ * expression such as `${{ matrix.allow_failure }}`. An expression's actual
+ * value can only be known at real runtime, from context this static check
+ * never has - so it cannot be waved through just because it isn't the
+ * literal boolean `true`. An expression that MIGHT resolve to true is
+ * exactly as dangerous as one that always does: it lets a step (and
+ * therefore the job) report success while having actually failed, on some
+ * runs and not others, which is worse than the always-true case because it
+ * would pass a naive `=== true` check forever.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isContinueOnErrorViolation(value) {
+  return value !== undefined && value !== false;
+}
+
+/**
  * Every job except the aggregate is a job the aggregate is meant to be
- * gating on, so `continue-on-error: true` is forbidden anywhere in it -
- * on the job itself or on any of its steps.
+ * gating on, so a truthy or expression-valued `continue-on-error` is
+ * forbidden anywhere in it - on the job itself or on any of its steps.
  *
  * @param {Record<string, any>} jobs
  * @param {string} [aggregateId]
@@ -61,8 +116,10 @@ export function findContinueOnError(jobs, aggregateId = AGGREGATE_JOB_ID) {
   const offenders = [];
   for (const [jobId, job] of Object.entries(jobs ?? {})) {
     if (jobId === aggregateId) continue;
-    const onJob = job?.["continue-on-error"] === true;
-    const onAnyStep = (job?.steps ?? []).some((step) => step?.["continue-on-error"] === true);
+    const onJob = isContinueOnErrorViolation(job?.["continue-on-error"]);
+    const onAnyStep = (job?.steps ?? []).some((step) =>
+      isContinueOnErrorViolation(step?.["continue-on-error"])
+    );
     if (onJob || onAnyStep) {
       offenders.push(jobId);
     }
@@ -71,8 +128,53 @@ export function findContinueOnError(jobs, aggregateId = AGGREGATE_JOB_ID) {
 }
 
 /**
+ * The gate aggregate's OWN `continue-on-error` usage - deliberately a
+ * SEPARATE check from `findContinueOnError` above, which excludes the
+ * aggregate by id on purpose (it is checking jobs the aggregate DEPENDS
+ * on, and the aggregate does not depend on itself). That exclusion left a
+ * real gap: nothing checked whether `gate` itself, or any of its own
+ * steps - including the one step that exits 1 when a required job did not
+ * literally succeed - carries a `continue-on-error` that would let GATE
+ * ITSELF report success while its own check failed. That is strictly
+ * worse than the excluded case, since `gate` is the one required check a
+ * branch-protection rule actually points at. Same
+ * `isContinueOnErrorViolation` predicate (only absent or literal `false`
+ * is safe), applied to the aggregate job and each of its own steps by
+ * index, so a violation names exactly where it was found.
+ *
+ * @param {Record<string, any>} jobs
+ * @param {string} [aggregateId]
+ * @returns {string[]} human-readable locations where the aggregate itself carries a forbidden continue-on-error
+ */
+export function findGateOwnContinueOnError(jobs, aggregateId = AGGREGATE_JOB_ID) {
+  const aggregate = jobs?.[aggregateId];
+  if (aggregate === undefined) return [];
+  const violations = [];
+  if (isContinueOnErrorViolation(aggregate["continue-on-error"])) {
+    violations.push(`"${aggregateId}" job level`);
+  }
+  (aggregate.steps ?? []).forEach((step, index) => {
+    if (isContinueOnErrorViolation(step?.["continue-on-error"])) {
+      violations.push(`"${aggregateId}".steps[${index}]`);
+    }
+  });
+  return violations;
+}
+
+/**
  * Cross-products a matrix's `os` and `node` axes, honoring `exclude`
  * entries, into a flat list of "<os>::<node>" leg keys.
+ *
+ * An `exclude` entry may omit either axis key entirely, and GitHub Actions
+ * treats an omitted key as "matches anything on that axis" - not "matches
+ * nothing". So `{ os: "macos-latest" }` (no `node` key) excludes every
+ * Node version for macos-latest, and `{ node: "24" }` (no `os` key)
+ * excludes node 24 across every OS. Both axes are checked the same way for
+ * this reason: `entry.os === undefined` already meant "any os" here, and
+ * `entry.node === undefined` gets the identical treatment for the node
+ * axis, rather than falling through to `String(undefined) === String(node)`
+ * (always false), which would silently keep a leg that a real
+ * single-axis exclude was supposed to drop.
  *
  * @param {{ os?: string[], node?: (string | number)[], exclude?: any[] }} [matrix]
  * @returns {string[]}
@@ -86,7 +188,8 @@ export function computeMatrixLegs(matrix) {
     for (const node of nodeList) {
       const excluded = excludes.some(
         (entry) =>
-          (entry.os === undefined || entry.os === os) && String(entry.node) === String(node)
+          (entry.os === undefined || entry.os === os) &&
+          (entry.node === undefined || String(entry.node) === String(node))
       );
       if (!excluded) {
         legs.push(`${os}::${node}`);
@@ -121,6 +224,147 @@ export function verifyMatrixCompleteness(
 }
 
 /**
+ * The actual invariant `EXPECTED_OS`/`EXPECTED_NODE` must hold is "a
+ * non-empty array of non-empty strings" - not merely "non-empty", which a
+ * bare string would also satisfy (a string has `.length > 0` too, and
+ * iterates as individual characters if ever spread or mapped over,
+ * silently producing garbage leg keys rather than an error). An array
+ * containing `null` or an empty string is equally unsafe: either composes
+ * into a leg key that names no real OS/Node value at all.
+ *
+ * @param {unknown} value
+ * @param {string} name
+ * @returns {string | null} a human-readable problem, or null if clean
+ */
+function describeExpectedAxisViolation(value, name) {
+  if (!Array.isArray(value)) {
+    const gotType =
+      typeof value === "string" ? `the string ${JSON.stringify(value)}` : typeof value;
+    return `${name} is not an array (got ${gotType}) - the matrix-completeness check requires an actual array, not merely something with a truthy .length`;
+  }
+  if (value.length === 0) {
+    return `${name} is empty - the matrix-completeness check would vacuously pass with no ${name === "EXPECTED_OS" ? "operating systems" : "Node versions"} required at all`;
+  }
+  const badIndex = value.findIndex((entry) => typeof entry !== "string" || entry.length === 0);
+  if (badIndex !== -1) {
+    return `${name} contains a non-string or empty-string element at index ${badIndex} (${JSON.stringify(value[badIndex])}) - every element must be a real, non-empty string`;
+  }
+  return null;
+}
+
+/**
+ * `verifyMatrixCompleteness` above only ever reports legs that are present
+ * in `expectedOs x expectedNode` but absent from the real matrix - it has
+ * no opinion at all about whether `expectedOs`/`expectedNode` themselves
+ * are genuinely a non-empty array of non-empty strings. A degenerate value
+ * for either (empty, not an array, or containing a null/empty-string
+ * element) makes the cross-product either empty or garbage, so the
+ * completeness loop above either iterates zero times (vacuously
+ * "complete" no matter what the real matrix contains) or compares against
+ * leg keys nothing real could ever match. Nothing else in this file's
+ * production `main()` path would catch that: it is a direct guard against
+ * the two module-level constants themselves being degenerate, not against
+ * a leg going missing from the matrix.
+ *
+ * @param {unknown} [expectedOs]
+ * @param {unknown} [expectedNode]
+ * @returns {string[]} human-readable problems; empty means clean
+ */
+export function verifyExpectedAxesNonEmpty(expectedOs = EXPECTED_OS, expectedNode = EXPECTED_NODE) {
+  const errors = [];
+  const osViolation = describeExpectedAxisViolation(expectedOs, "EXPECTED_OS");
+  if (osViolation) errors.push(osViolation);
+  const nodeViolation = describeExpectedAxisViolation(expectedNode, "EXPECTED_NODE");
+  if (nodeViolation) errors.push(nodeViolation);
+  return errors;
+}
+
+/**
+ * Checks the real matrix's legs against `INDEPENDENT_EXPECTED_LEGS`
+ * directly - never against `EXPECTED_OS`/`EXPECTED_NODE`, which is
+ * exactly the derivation `verifyMatrixCompleteness` above uses and which
+ * a coordinated edit could shrink in lockstep with the real matrix. This
+ * is the independent oracle that guarantees a coordinated edit like that
+ * is still caught.
+ *
+ * @param {any} job
+ * @returns {{ missing: string[], extra: string[] }}
+ */
+export function verifyIndependentMatrixLegs(job) {
+  const actualLegs = computeMatrixLegs(job?.strategy?.matrix);
+  const actualSet = new Set(actualLegs);
+  const missing = INDEPENDENT_EXPECTED_LEGS.filter((leg) => !actualSet.has(leg));
+  const extra = actualLegs.filter((leg) => !INDEPENDENT_EXPECTED_LEGS.includes(leg));
+  return { missing, extra };
+}
+
+/**
+ * THE MANDATORY META-GUARD: confirms
+ * `INDEPENDENT_EXPECTED_LEGS` above is STILL a genuine hard-coded literal
+ * - a plain array of string literals with no computed element - and not
+ * quietly weakened back into a derived product of `EXPECTED_OS` x
+ * `EXPECTED_NODE`. Proven necessary, not theoretical: a mutated
+ * declaration (`EXPECTED_OS.flatMap((os) => EXPECTED_NODE.map((node) =>
+ * \`${os}::${node}\`))`) still let the full guard-test suite pass,
+ * because nothing checked the declaration's own SHAPE. Every other check
+ * in this file only ever reads the exported VALUE of
+ * `INDEPENDENT_EXPECTED_LEGS`, which looks identical whether it came from
+ * a literal or a derivation that happens to currently agree with it - the
+ * escape is invisible from the value alone, which is why this reads the
+ * declaration's SOURCE instead.
+ *
+ * Parses THIS FILE'S OWN source text (via the same real TypeScript AST
+ * machinery `scripts/lib/ts-ast.mjs` already uses for the module-loader
+ * guards, not string matching) and walks it looking for the
+ * `INDEPENDENT_EXPECTED_LEGS` variable declaration. Passes only when its
+ * initializer is an `ArrayLiteralExpression` whose every element is a
+ * plain string literal (or no-substitution template) - fails closed on
+ * anything else: a call expression, a spread, an identifier reference
+ * (which would mean it now reads from somewhere else, e.g.
+ * `EXPECTED_OS`), a template with interpolation, or the declaration being
+ * missing entirely.
+ *
+ * @param {string} [sourceText] defaults to reading this file's own source from disk
+ * @returns {{ isLiteral: boolean, reason?: string }}
+ */
+export function verifyIndependentLegsIsLiteral(sourceText = readFileSync(THIS_FILE_PATH, "utf8")) {
+  const sourceFile = parseSourceFile(THIS_FILE_PATH, sourceText);
+  let declaration;
+  forEachDescendant(sourceFile, (node) => {
+    if (declaration !== undefined) return;
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.name.text === "INDEPENDENT_EXPECTED_LEGS"
+    ) {
+      declaration = node;
+    }
+  });
+
+  if (declaration === undefined) {
+    return { isLiteral: false, reason: "INDEPENDENT_EXPECTED_LEGS declaration not found at all" };
+  }
+  const initializer = declaration.initializer;
+  if (initializer === undefined || !ts.isArrayLiteralExpression(initializer)) {
+    return {
+      isLiteral: false,
+      reason: "INDEPENDENT_EXPECTED_LEGS is not initialized with a plain array literal",
+    };
+  }
+  for (const element of initializer.elements) {
+    const isPlainString =
+      ts.isStringLiteral(element) || ts.isNoSubstitutionTemplateLiteral(element);
+    if (!isPlainString) {
+      return {
+        isLiteral: false,
+        reason: `INDEPENDENT_EXPECTED_LEGS contains a non-literal element (kind ${ts.SyntaxKind[element.kind]}) - it is no longer a genuine hard-coded closed set`,
+      };
+    }
+  }
+  return { isLiteral: true };
+}
+
+/**
  * @param {Record<string, any>} jobs
  * @returns {string[]} forbidden job ids present in the workflow
  */
@@ -136,18 +380,61 @@ function main() {
   const continueOnErrorOffenders = findContinueOnError(jobs, AGGREGATE_JOB_ID);
   for (const jobId of continueOnErrorOffenders) {
     errors.push(
-      `job "${jobId}" sets continue-on-error: true, which would let it report success while actually failing`
+      `job "${jobId}" sets continue-on-error to something other than absent/false, which would let it report success while actually failing`
     );
+  }
+
+  const gateOwnOffenders = findGateOwnContinueOnError(jobs, AGGREGATE_JOB_ID);
+  for (const location of gateOwnOffenders) {
+    errors.push(
+      `${location} sets continue-on-error to something other than absent/false, which would let the aggregate itself report success while its own required-success check failed`
+    );
+  }
+
+  const expectedAxesErrors = verifyExpectedAxesNonEmpty();
+  for (const message of expectedAxesErrors) {
+    errors.push(message);
   }
 
   const testJob = jobs[TEST_JOB_ID];
   if (!testJob) {
     errors.push(`no "${TEST_JOB_ID}" job found in the workflow`);
   } else {
-    const missingLegs = verifyMatrixCompleteness(testJob);
-    for (const leg of missingLegs) {
-      errors.push(`"${TEST_JOB_ID}" matrix is missing the ${leg.replace("::", " / node ")} leg`);
+    // verifyMatrixCompleteness resolves its expectedOs/expectedNode
+    // parameters, via their own default values, to the SAME EXPECTED_OS/
+    // EXPECTED_NODE this file just validated above - so it must never run
+    // when expectedAxesErrors is non-empty. A degenerate axis (null, not
+    // an array, empty) is not merely "incomplete data" to that function:
+    // `for (const os of expectedOs)` throws an uncaught TypeError when
+    // expectedOs isn't iterable, which would crash main() before the
+    // diagnostic verifyExpectedAxesNonEmpty already built above ever
+    // reaches the console.error/exitCode reporting below - a misowned red
+    // (the crash, not the intended message, is what a caller would see),
+    // not a real kill of the named check. verifyIndependentMatrixLegs
+    // below is unaffected by this and always runs regardless: it reads
+    // INDEPENDENT_EXPECTED_LEGS, a separate literal never derived from
+    // EXPECTED_OS/EXPECTED_NODE.
+    if (expectedAxesErrors.length === 0) {
+      const missingLegs = verifyMatrixCompleteness(testJob);
+      for (const leg of missingLegs) {
+        errors.push(`"${TEST_JOB_ID}" matrix is missing the ${leg.replace("::", " / node ")} leg`);
+      }
     }
+
+    const independentResult = verifyIndependentMatrixLegs(testJob);
+    for (const leg of independentResult.missing) {
+      errors.push(`"${TEST_JOB_ID}" matrix is missing the independently-required leg ${leg}`);
+    }
+    for (const leg of independentResult.extra) {
+      errors.push(
+        `"${TEST_JOB_ID}" matrix contains ${leg}, which is not in the independent expected-legs list`
+      );
+    }
+  }
+
+  const literalCheck = verifyIndependentLegsIsLiteral();
+  if (!literalCheck.isLiteral) {
+    errors.push(`meta-guard failure: ${literalCheck.reason}`);
   }
 
   const forbiddenJobs = findForbiddenGovernanceJobs(jobs);
@@ -165,7 +452,7 @@ function main() {
     return;
   }
   console.log(
-    `${path.relative(REPO_ROOT, WORKFLOW_PATH)} is clean: no continue-on-error, full test matrix, no fake governance jobs`
+    `${path.relative(REPO_ROOT, WORKFLOW_PATH)} is clean: no forbidden continue-on-error (including on gate itself), complete test matrix against both the derived and independent oracles, no fake governance jobs`
   );
 }
 

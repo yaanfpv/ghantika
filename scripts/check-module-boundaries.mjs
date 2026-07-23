@@ -18,12 +18,20 @@
  *      extra file appearing anywhere in `src/` and the six tool handlers
  *      being collapsed into fewer files (or split into more).
  *   2. findSiblingToolImports - no file under `src/tools/` may load
- *      (however it does so - a static/dynamic import, or CommonJS
- *      `require`/`createRequire`) another file under `src/tools/`.
- *      Resolves each relative specifier to a real filesystem path (rather
- *      than a string-prefix guess) so "./sibling.js", the more roundabout
- *      "../tools/sibling.js", and a `require("./sibling.js")` equivalent
- *      are all caught the same way.
+ *      (however it does so - a static/dynamic import, `import.meta.resolve`,
+ *      or CommonJS `require`/`createRequire`) another file under
+ *      `src/tools/`, whether named directly or reached transitively
+ *      through a permitted re-export barrel. Two resolution layers: a fast
+ *      path of relative-specifier path arithmetic (unchanged from this
+ *      guard's original design, and still what most of this file's own
+ *      fixture-based tests exercise, since it works even when the
+ *      referenced file doesn't exist on disk), plus a real resolver
+ *      (`resolveModuleSpecifierRealPath` in scripts/lib/ts-ast.mjs) that
+ *      canonicalizes through Node's own CJS resolution + `realpathSync` -
+ *      catching an absolute path, a `file://` URL, a package/subpath-import
+ *      alias, an extensionless or directory-index specifier, and a symlink
+ *      whose real target sits inside `tools/` even when the symlink's OWN
+ *      path does not, none of which the fast path alone can see.
  *   3. findPersistentStateDeclarations - no file under `src/tools/`, and
  *      no OTHER core module either (`server.ts`/`registry.ts`/`process.ts`)
  *      may declare its own persistent buffer/state. Only `jobStore.ts`
@@ -43,7 +51,7 @@
  *      object literal (a plain mutable accumulator that starts empty and
  *      grows via `.push`/property writes later).
  */
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -55,6 +63,7 @@ import {
   isDynamicImportCall,
   isRequireCall,
   parseSourceFile,
+  resolveModuleSpecifierRealPath,
   ts,
 } from "./lib/ts-ast.mjs";
 
@@ -149,11 +158,21 @@ const UNRESOLVABLE_SIBLING_SPECIFIER_LABEL =
  * a name-only callee check would need to see past that alias to catch the
  * later `makeLoader(...)` call, which it structurally cannot do.
  *
- * @param {"named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access"} kind
+ * @param {"named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access" | "process-dangerous-property-access" | "unresolvable-process-access" | "reflect-reference" | "constructor-property-access" | "property-descriptor-access"} kind
  * @returns {string}
  */
 function createRequireImportBindingLabel(kind) {
   switch (kind) {
+    case "property-descriptor-access":
+      return "<reads Object.getOwnPropertyDescriptor(target, key) where key resolves to a banned identifier - constructor, one of the four bare globals off globalThis, or a dangerous process property - a descriptor read reaches the same value a direct property access would without ever writing the identifier as a property-access key, so it's forbidden at the point of the descriptor call itself, unconditional on whether .value/.get is later extracted>";
+    case "process-dangerous-property-access":
+      return "<references one of process's dangerous properties (getBuiltinModule, dlopen, or binding) - directly, or through one local alias hop - each a route to native/builtin-loading capability with no import/require syntax naming its target anywhere, forbidden outright at the point of reference the same as the four bare globals, regardless of what specifier it is later called with or how the reference is stored/aliased>";
+    case "unresolvable-process-access":
+      return "<accesses a computed property of process whose key can't be resolved statically - cannot verify it avoids .getBuiltinModule, failing closed>";
+    case "reflect-reference":
+      return "<references the global Reflect - forbidden outright at the point of reference, whether called, stored, passed, bound, or never used, unless the name resolves to a local shadow, the same reasoning and the same shadow exception as module: zero legitimate use, banned outright rather than trying to enumerate which of its methods could reach a forbidden primitive>";
+    case "constructor-property-access":
+      return "<reads a .constructor property - reachable off ANY value, not just an unshadowed global, so this is flagged unconditionally on the base expression, the same acquisition-site principle as the bare globals but applied to a universal property instead of a lexical name>";
     case "namespace":
       return '<imports the whole node:module namespace ("import * as ...") - exposes createRequire via property access, forbidden outright the same as importing createRequire by name, regardless of the local namespace alias chosen>';
     case "default":
@@ -183,12 +202,96 @@ function createRequireImportBindingLabel(kind) {
 }
 
 /**
+ * True when `path.relative(dirRealPath, candidateRealPath)` shows
+ * `candidateRealPath` sitting genuinely INSIDE `dirRealPath` - segment-
+ * aware, so a sibling directory that merely shares a string prefix (e.g.
+ * `tools-backup/` alongside `tools/`) is never mistaken for a subdirectory
+ * the way a naive `startsWith` string compare would be.
+ */
+function isRealPathInsideDir(candidateRealPath, dirRealPath) {
+  const rel = path.relative(dirRealPath, candidateRealPath);
+  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+/** `realpathSync`, falling back to the path as given when it doesn't exist on disk - most of this guard's own fixture-based tests never write the importing file itself to disk. */
+function realpathOrSelf(absPath) {
+  try {
+    return realpathSync(absPath);
+  } catch {
+    return absPath;
+  }
+}
+
+const MAX_TRANSITIVE_BARREL_HOPS = 8;
+
+/**
+ * Follows the module-specifier graph starting from `fileRealAbsPath` - a
+ * REAL file that resolved OUTSIDE `toolsDirRealAbsPath` (a permitted,
+ * directly-named import) - looking for a specifier that resolves,
+ * possibly several hops away, to a REAL file INSIDE `toolsDirRealAbsPath`.
+ * This is what closes a re-export BARREL (`export * from
+ * "./tools/sibling.js"`) or an ordinary import chain that transitively
+ * pulls a sibling in without the importING file ever naming it directly -
+ * a specifier check that only ever inspects the DIRECTLY-named target
+ * would see a barrel import as a legitimate non-sibling reference and
+ * never look further.
+ *
+ * Bounded (`MAX_TRANSITIVE_BARREL_HOPS`) and cycle-safe
+ * (`visitedRealPaths` accumulates every real path already followed, so a
+ * re-export graph that cycles back on itself terminates instead of
+ * looping forever), and deliberately never follows into `node_modules` -
+ * this guard's job is catching an internal barrel indirection, not
+ * scanning arbitrary vendored dependency trees. Genuinely different from
+ * every other check in this file: it reads files off disk the CALLER
+ * never asked about, since following a barrel means inspecting files
+ * beyond the one the caller already has the text of.
+ *
+ * @returns {string | undefined} the real path of the first sibling file
+ *   reached transitively, or `undefined` if none is reached within budget
+ */
+function findTransitiveSiblingThroughReExports(
+  fileRealAbsPath,
+  toolsDirRealAbsPath,
+  visitedRealPaths
+) {
+  if (visitedRealPaths.has(fileRealAbsPath)) return undefined;
+  visitedRealPaths.add(fileRealAbsPath);
+  if (visitedRealPaths.size > MAX_TRANSITIVE_BARREL_HOPS) return undefined;
+  if (fileRealAbsPath.split(path.sep).includes("node_modules")) return undefined;
+
+  let text;
+  try {
+    text = readFileSync(fileRealAbsPath, "utf8");
+  } catch {
+    return undefined; // not a real, readable file - nothing to follow
+  }
+
+  const barrelSourceFile = parseSourceFile(fileRealAbsPath, text);
+  for (const { text: specifier } of collectModuleSpecifiers(barrelSourceFile)) {
+    if (specifier === undefined) continue;
+    const resolvedReal = resolveModuleSpecifierRealPath(specifier, fileRealAbsPath);
+    if (resolvedReal === undefined) continue;
+    if (isRealPathInsideDir(resolvedReal, toolsDirRealAbsPath)) {
+      return resolvedReal;
+    }
+    const deeper = findTransitiveSiblingThroughReExports(
+      resolvedReal,
+      toolsDirRealAbsPath,
+      visitedRealPaths
+    );
+    if (deeper !== undefined) return deeper;
+  }
+  return undefined;
+}
+
+/**
  * Finds every module-loading construct in `sourceText` (the contents of a
  * file under `src/tools/`) whose RESOLVED TARGET is a DIFFERENT file that
- * is itself under `toolsDir` - and separately, every use of
- * `createRequire(...)`, which is forbidden outright. Real AST analysis:
- * walks every `ImportDeclaration`/`ExportDeclaration`/dynamic
- * `import()`/`require(...)` call in the file (see
+ * is itself under `toolsDir`, DIRECTLY or TRANSITIVELY through a permitted
+ * barrel - and separately, every use of `createRequire(...)`, which is
+ * forbidden outright. Real AST analysis: walks every
+ * `ImportDeclaration`/`ExportDeclaration`/dynamic `import()`/
+ * `import.meta.resolve(...)`/`require(...)` call in the file (see
  * scripts/lib/ts-ast.mjs's `collectModuleSpecifiers`), so a comment
  * sitting between `import`/`export`/`from`/`require` and the specifier -
  * or between `import(`/`require(` and its string-literal argument - can
@@ -196,19 +299,41 @@ function createRequireImportBindingLabel(kind) {
  * regex (a comment isn't an AST node at all).
  *
  * The mechanism used to load a module (ES `import`, dynamic `import()`,
- * CommonJS `require(...)`, a `require` obtained from `createRequire(...)`)
- * is deliberately irrelevant here - only the RESOLVED TARGET matters, so
- * every form collected by `collectModuleSpecifiers` is resolved the same
- * way and checked against the same rule.
+ * `import.meta.resolve`, CommonJS `require(...)`, a `require` obtained
+ * from `createRequire(...)`) is deliberately irrelevant here - only the
+ * RESOLVED TARGET matters, so every form collected by
+ * `collectModuleSpecifiers` is resolved the same way and checked against
+ * the same rule.
  *
- * Resolution is a real filesystem path computation (relative to the
- * importing file's own directory, stripping the NodeNext-style ".js"
- * extension back to ".ts"), not a string-prefix guess - so this catches a
- * sibling import however it's spelled, and never false-positives on
- * "../registry.js" or "../jobStore.js" (which resolve OUTSIDE tools/, and
- * are legitimate). Only RELATIVE specifiers (starting with ".") are ever
- * candidates - a bare package specifier (the SDK, a Node builtin) can
- * never resolve to a file under tools/.
+ * TWO resolution layers, run in order for every specifier:
+ *
+ *   1. A fast path of pure path arithmetic for a relative dot-specifier
+ *      (unchanged from this guard's original design): strips the
+ *      NodeNext-style `.js` extension back to `.ts` and checks whether
+ *      the COMPUTED path falls inside `toolsDir`. Works even when the
+ *      referenced file doesn't exist on disk at all - most of this
+ *      guard's own fixture-based tests exercise exactly this, writing
+ *      only the source TEXT under test, never a real sibling file.
+ *   2. A real resolver (`resolveModuleSpecifierRealPath`, scripts/lib/
+ *      ts-ast.mjs) for every specifier the fast path didn't already
+ *      flag: Node's own CJS resolution plus `realpathSync`, canonicalizing
+ *      an absolute path, a `file://` URL, a package/subpath-import alias,
+ *      an extensionless or directory-index specifier, or a symlink whose
+ *      REAL TARGET sits inside `toolsDir` even when the symlink's own
+ *      path does not - none of which the fast path can see, since it only
+ *      ever computes from the specifier's literal text against the
+ *      importing file's own directory, never touching the filesystem or
+ *      following an indirection. This layer only fires when the specifier
+ *      resolves to a REAL file (it is a real resolver, not string
+ *      matching) - a specifier naming a file that doesn't exist (most of
+ *      this guard's own fixtures) simply resolves to nothing here, and is
+ *      caught by the fast path instead when it's a relative dot specifier.
+ *      When the real resolver's target sits OUTSIDE `toolsDir`, it is
+ *      followed ONE step further (`findTransitiveSiblingThroughReExports`)
+ *      to catch a permitted barrel that itself re-exports a sibling.
+ *
+ * Never false-positives on "../registry.js" or "../jobStore.js" (both
+ * resolve OUTSIDE tools/, and are legitimate) under either layer.
  *
  * @param {string} sourceText
  * @param {string} importingFileAbsPath - absolute path of the file being scanned
@@ -219,6 +344,8 @@ export function findSiblingToolImports(sourceText, importingFileAbsPath, toolsDi
   const hits = [];
   const importingDir = path.dirname(importingFileAbsPath);
   const sourceFile = parseSourceFile(importingFileAbsPath, sourceText);
+  const importingFileReal = realpathOrSelf(importingFileAbsPath);
+  const toolsDirReal = realpathOrSelf(toolsDirAbsPath);
 
   for (const { node, text: specifier } of collectModuleSpecifiers(sourceFile)) {
     if (specifier === undefined) {
@@ -227,15 +354,49 @@ export function findSiblingToolImports(sourceText, importingFileAbsPath, toolsDi
       }
       continue;
     }
-    if (!specifier.startsWith(".")) continue;
-    const withoutJsExt = specifier.replace(/\.js$/, "");
-    const resolved = `${path.resolve(importingDir, withoutJsExt)}.ts`;
-    if (resolved === importingFileAbsPath) continue; // a file can't sibling-import itself
-    const relToTools = path.relative(toolsDirAbsPath, resolved);
-    const staysInsideTools =
-      relToTools !== "" && !relToTools.startsWith("..") && !path.isAbsolute(relToTools);
-    if (staysInsideTools) {
+
+    // Layer 1: the original fast path, pure text arithmetic on a relative
+    // dot-specifier - see this function's own doc comment for why it
+    // stays alongside the real resolver below.
+    if (specifier.startsWith(".")) {
+      const withoutJsExt = specifier.replace(/\.js$/, "");
+      const resolved = `${path.resolve(importingDir, withoutJsExt)}.ts`;
+      if (resolved !== importingFileAbsPath) {
+        const relToTools = path.relative(toolsDirAbsPath, resolved);
+        const staysInsideTools =
+          relToTools !== "" && !relToTools.startsWith("..") && !path.isAbsolute(relToTools);
+        if (staysInsideTools) {
+          hits.push(specifier);
+          continue;
+        }
+      }
+    }
+
+    // Layer 2: the real resolver - canonical resolution + realpath
+    // compare, catching every form layer 1 structurally cannot (see this
+    // function's own doc comment).
+    const resolvedReal = resolveModuleSpecifierRealPath(specifier, importingFileAbsPath);
+    if (resolvedReal === undefined) continue;
+    if (resolvedReal === importingFileReal) continue; // a file can't sibling-import itself
+
+    if (isRealPathInsideDir(resolvedReal, toolsDirReal)) {
       hits.push(specifier);
+      continue;
+    }
+
+    // The resolved target sits OUTSIDE tools/ - itself a legitimate,
+    // directly-named reference, but if THAT file transitively re-exports
+    // or imports something inside tools/, the importing file has pulled a
+    // sibling in through a permitted intermediate barrel.
+    const transitiveSibling = findTransitiveSiblingThroughReExports(
+      resolvedReal,
+      toolsDirReal,
+      new Set()
+    );
+    if (transitiveSibling !== undefined) {
+      hits.push(
+        `${specifier} -> transitively re-exports/imports sibling "${transitiveSibling}" through this permitted target`
+      );
     }
   }
 

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { test } from "node:test";
 
 // Real client, real in-process transport, real server - the end-to-end
@@ -266,40 +267,54 @@ test("isTerminalJobState is true for exited/killed/failed and false for starting
   assert.equal(isTerminalJobState("running"), false);
 });
 
-test("attachChild/getChildHandle: a real attached child's pid and an approximate spawnedAtMs are retrievable, never the raw ChildProcess itself", async () => {
-  const store = new JobStore();
-  const record = store.createJob({ argv: ["sleep", "1"], cwd: "/tmp", env: {}, isShell: false });
-  const beforeAttach = Date.now();
-  const child = spawnManaged(
-    {
-      argv: ["sleep", "1"],
-      cwd: process.cwd(),
-      env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
-    },
-    {
-      onSpawn: () => {},
-      onError: () => {},
-      onExit: () => {},
-      onStdoutChunk: () => {},
-      onStderrChunk: () => {},
-      onStdoutEnd: () => {},
-      onStderrEnd: () => {},
-    }
-  );
-  store.attachChild(record.job_id, child!);
-  const afterAttach = Date.now();
+test(
+  "attachChild/getChildHandle: a real attached child's pid and an approximate spawnedAtMs are retrievable, never the raw ChildProcess itself",
+  {
+    // Spawns the bare `sleep` binary and cleans up via a negative-pid
+    // process-group kill, neither of which has a Windows equivalent here -
+    // a test-harness gap, not a product scope decision. Windows is a
+    // supported platform; only this harness's real POSIX process-group
+    // primitives are not.
+    skip:
+      process.platform === "win32"
+        ? "spawns bare `sleep` and cleans up via a negative-pid process-group kill, both POSIX-only"
+        : false,
+  },
+  async () => {
+    const store = new JobStore();
+    const record = store.createJob({ argv: ["sleep", "1"], cwd: "/tmp", env: {}, isShell: false });
+    const beforeAttach = Date.now();
+    const child = spawnManaged(
+      {
+        argv: ["sleep", "1"],
+        cwd: process.cwd(),
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+      },
+      {
+        onSpawn: () => {},
+        onError: () => {},
+        onExit: () => {},
+        onStdoutChunk: () => {},
+        onStderrChunk: () => {},
+        onStdoutEnd: () => {},
+        onStderrEnd: () => {},
+      }
+    );
+    store.attachChild(record.job_id, child!);
+    const afterAttach = Date.now();
 
-  const handle = store.getChildHandle(record.job_id)!;
-  assert.equal(handle.pid, child!.pid);
-  assert.ok(handle.spawnedAtMs >= beforeAttach && handle.spawnedAtMs <= afterAttach);
-  assert.equal(
-    "child" in (handle as unknown as Record<string, unknown>),
-    false,
-    "getChildHandle must never expose the raw ChildProcess, only {pid, spawnedAtMs}"
-  );
+    const handle = store.getChildHandle(record.job_id)!;
+    assert.equal(handle.pid, child!.pid);
+    assert.ok(handle.spawnedAtMs >= beforeAttach && handle.spawnedAtMs <= afterAttach);
+    assert.equal(
+      "child" in (handle as unknown as Record<string, unknown>),
+      false,
+      "getChildHandle must never expose the raw ChildProcess, only {pid, spawnedAtMs}"
+    );
 
-  process.kill(-child!.pid!, "SIGKILL"); // cleanup
-});
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
 
 test("getChildHandle returns undefined for a job that never had a child attached (e.g. a job that started already-failed)", () => {
   const store = new JobStore();
@@ -1107,3 +1122,112 @@ test("end-to-end: a real `run` tools/call driven through a real Client/Server ro
   await client.close();
   await instance.shutdown("test cleanup");
 });
+
+/** A real `pgrep -g <pgid>` call - see test/kill.test.ts's identical helper for the full rationale. Returns the real pids found, `[]` when pgrep finds none. */
+function pgrepGroupMembers(pgid: number): number[] {
+  try {
+    const output = execFileSync("pgrep", ["-g", String(pgid)], { encoding: "utf8" });
+    return output
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .map(Number);
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException & { status?: number };
+    if (err.status === 1) return []; // pgrep's own "nothing matched" exit code - a real, expected zero-survivors result
+    throw error;
+  }
+}
+
+test(
+  "REGRESSION: shutdown reaping a job whose process group already exited naturally emits NO false kill error even when the signal-send deterministically reports EPERM, and a real external pgrep independently confirms zero survivors",
+  {
+    skip:
+      process.platform === "win32"
+        ? "exercises a real POSIX pgrep oracle, no win32 equivalent path here"
+        : false,
+  },
+  async (t) => {
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const instance = createServer(serverTransport);
+    await instance.server.connect(instance.transport);
+
+    const client = new Client({ name: "ghantika-eperm-race-regression-test", version: "0.0.0" });
+    await client.connect(clientTransport);
+
+    const callResult = (await client.callTool({
+      name: "run",
+      arguments: { command: ["true"], label: "eperm-race-regression-check" },
+    })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
+    assert.notEqual(callResult.isError, true);
+    const jobId = callResult.structuredContent?.job_id as string | undefined;
+    assert.equal(typeof jobId, "string");
+
+    const record = jobStore.get(jobId!);
+    assert.notEqual(record, undefined);
+    const childHandle = jobStore.getChildHandle(jobId!);
+    assert.notEqual(childHandle, undefined, "expected a real attached child pid for this job");
+    const pgid = childHandle!.pid;
+
+    // `true` exits almost immediately, but the OS fully reclaiming it from
+    // the process table (as opposed to a transient zombie entry) is a
+    // separate, real async step - observed empirically to take measurably
+    // longer on Linux CI than on macOS. Waits out that real gap here so
+    // the injected EPERM below lands against a group already confirmed
+    // gone by the SAME external oracle (`pgrep`) the production
+    // arbitration itself consults, rather than a fixed guess at timing.
+    const deadline = Date.now() + 2000;
+    while (pgrepGroupMembers(pgid).length > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    // Deterministically injects the EXACT race this regression guards,
+    // rather than relying on it happening to occur naturally: `["true"]`
+    // reliably exits before shutdown's per-job reap runs, so the group is
+    // already gone by construction, but the injected EPERM (instead of the
+    // ESRCH the old code already handled) is what actually distinguishes
+    // this test from one the prior, buggy code could also have passed.
+    // Everything else - the real MCP round trip, the real shutdown path,
+    // the real external pgrep survivor proof - stays fully end-to-end and
+    // unmocked.
+    const realKill = process.kill.bind(process);
+    t.mock.method(process, "kill", (target: number, signal?: string | number) => {
+      if (target === -pgid && signal === "SIGTERM") {
+        const err = new Error("kill EPERM") as NodeJS.ErrnoException;
+        err.code = "EPERM";
+        throw err;
+      }
+      return realKill(target, signal);
+    });
+
+    // Spies on the real console.error (calls through by default - `t.mock`
+    // records without replacing behavior) rather than silencing it: this
+    // test proves the FIX at the real, unmocked, end-to-end shutdown
+    // layer, with only the signal-send's reported errno controlled.
+    const errorSpy = t.mock.method(console, "error");
+
+    await client.close();
+    await instance.shutdown("test cleanup");
+
+    const falseErrorCalls = errorSpy.mock.calls.filter((call) =>
+      String(call.arguments[0]).includes(`error killing job ${jobId}'s process group`)
+    );
+    assert.deepEqual(
+      falseErrorCalls,
+      [],
+      `expected NO false kill-error diagnostic for a job whose group already exited naturally, even under an injected EPERM, got: ${JSON.stringify(
+        falseErrorCalls.map((c) => c.arguments.map(String))
+      )}`
+    );
+
+    // Independent, external-of-this-codebase's-own-bookkeeping proof the
+    // group really is gone - never trusting that the absence of a printed
+    // error means the same thing as an actually-reaped group.
+    const survivors = pgrepGroupMembers(pgid);
+    assert.deepEqual(
+      survivors,
+      [],
+      `expected zero real process-group survivors after shutdown, pgrep still saw: ${JSON.stringify(survivors)}`
+    );
+  }
+);

@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import {
   FROZEN_MODULES,
@@ -267,15 +268,14 @@ test("green control: a plain function that happens to be named require but is lo
 // ---------------------------------------------------------------------------
 // The guard's unit of analysis is the BINDING and its provenance, not the
 // ImportDeclaration node: any route that can deliver createRequire (or the
-// node:module namespace it lives on) is in scope, however it was obtained.
-// A prior version only inspected static ImportDeclaration nodes, so a
-// dynamic `await import("node:module")` destructured for createRequire ran
-// with zero violations and successfully loaded a sibling tools/*.ts file at
-// runtime - executable, not parser-only. Same entry routes as
+// node:module namespace it lives on) is in scope, however it was obtained -
+// including a dynamic `await import("node:module")` destructured for
+// createRequire, which is just as executable a route to a sibling
+// tools/*.ts file at runtime as a static import. Same entry routes as
 // no-tasks-import.test.ts, exercised here against the sibling-import guard.
 // ---------------------------------------------------------------------------
 
-test("a dynamic import of node:module, destructured for createRequire, is caught - the executable survivor that motivated this fix", () => {
+test("a dynamic import of node:module, destructured for createRequire, is caught", () => {
   const hits = siblingImportsFrom(
     'const { createRequire: weaveBridge } = await import("node:module");\n' +
       "const retrieveUnit = weaveBridge(import.meta.url);\n" +
@@ -491,30 +491,238 @@ test("green control: a catch clause's destructuring pattern has no initializer t
 });
 
 // ---------------------------------------------------------------------------
-// The guard resolves named lexical references; a value obtained through a
-// function object's own constructor property, a reflective string-key
-// lookup on globalThis, or a Node builtin-module API is not a named
-// reference and is not detected - see this function's own doc comment for
-// the full boundary. These three controls make that limit an executable
-// fact: each one is a real acquisition route, verified to execute on a
-// real Node runtime, and each is asserted here to produce NO detection so
-// the boundary is visible rather than silently assumed.
+// process.getBuiltinModule, the bare Reflect global, and the .constructor
+// property are all closed as of this file - see findCreateRequireImports's
+// own doc comment (scripts/lib/ts-ast.mjs) for the full acquisition-site
+// design and why banning the whole Reflect/.constructor surface (rather
+// than pattern-matching one demonstrated combination of them) is what
+// actually closes that specific class, plus why the broader reflective/
+// structural category is not claimed exhausted by doing so.
 // ---------------------------------------------------------------------------
 
-test("documented out of scope: obtaining the Function constructor via an ordinary function object's own .constructor property is not detected", () => {
+test("REGRESSION: obtaining the Function constructor via an ordinary function object's own .constructor property IS now detected", () => {
   const hits = siblingImportsFrom('const F = (() => 1).constructor;\nF("return 1");\n');
-  assert.deepEqual(hits, []);
+  assert.ok(
+    hits.some((hit) => hit.includes(".constructor")),
+    `expected a constructor-property-access violation, got: ${JSON.stringify(hits)}`
+  );
 });
 
-test('documented out of scope: obtaining the global eval via Reflect.get(globalThis, "eval") (a runtime string key, not an identifier reference) is not detected', () => {
+test('REGRESSION: obtaining the global eval via Reflect.get(globalThis, "eval") IS now detected - at the bare Reflect reference itself', () => {
   const hits = siblingImportsFrom('const e = Reflect.get(globalThis, "eval");\ne("1");\n');
+  assert.ok(
+    hits.some((hit) => hit.includes("references the global Reflect")),
+    `expected a reflect-reference violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("Reflect is flagged at the ACQUISITION site regardless of which method is used or how the reference is stored", () => {
+  const hits = siblingImportsFrom("const R = Reflect;\nR.construct(Object, []);\n");
+  assert.ok(
+    hits.some((hit) => hit.includes("references the global Reflect")),
+    `expected the aliased Reflect reference to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a LOCALLY SHADOWED Reflect (never the real global) is never flagged", () => {
+  const hits = siblingImportsFrom(
+    "function f(Reflect: { get: (t: unknown, k: string) => unknown }) {\n" +
+      '  return Reflect.get(globalThis, "eval");\n' +
+      "}\n"
+  );
   assert.deepEqual(hits, []);
 });
 
-test('documented out of scope: reaching createRequire via process.getBuiltinModule("node:module") (a Node builtin-module API, no import/require syntax) is not detected', () => {
+test(".constructor is flagged on ANY base, not just a known-dangerous one - a plain object literal's .constructor is just as flagged as a function's", () => {
+  const hits = siblingImportsFrom("const c = ({}).constructor;\n");
+  assert.ok(
+    hits.some((hit) => hit.includes(".constructor")),
+    `expected the plain-object .constructor access to be flagged too, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a class's OWN constructor method declaration is never confused with a .constructor property READ - defining a constructor is not an acquisition", () => {
+  const hits = siblingImportsFrom(
+    "class Foo {\n  constructor() {\n    this.ready = true;\n  }\n}\nnew Foo();\n"
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("green control: an object literal's own 'constructor' property KEY (defining, not reading) is never flagged", () => {
+  const hits = siblingImportsFrom('const obj = { constructor: () => "not a real class" };\n');
+  assert.deepEqual(hits, []);
+});
+
+// ---------------------------------------------------------------------------
+// globalThis/process ONE-HOP ALIAS - see the matching section in
+// test/no-tasks-import.test.ts for the full rationale, including the
+// REGRESSION this closes (a prior version only checked `symbol === undefined`
+// as the "genuinely unshadowed globalThis" signal, but the real checker
+// returns a truthy symbol with an EMPTY declarations array for that case, so
+// even a direct, non-aliased `globalThis.eval(...)` silently stopped being
+// detected). Mirrored here since this guard shares the exact same
+// resolution function.
+// ---------------------------------------------------------------------------
+
+test("REGRESSION: a direct, unshadowed globalThis.eval(...) reference (no alias, no local shadow) is detected", () => {
+  const hits = siblingImportsFrom("globalThis.eval('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the direct globalThis.eval access to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a local const aliasing globalThis, then accessed through the alias, is caught - const g = globalThis; g.eval(x)", () => {
+  const hits = siblingImportsFrom("const g = globalThis;\ng.eval('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the one-hop globalThis alias to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a local const aliasing process's BASE (not just its method), then accessed through the alias, is caught - const p = process; p.getBuiltinModule(...)", () => {
+  const hits = siblingImportsFrom("const p = process;\np.getBuiltinModule('node:module');\n");
+  assert.ok(
+    hits.some((h) => h.includes("getBuiltinModule")),
+    `expected the one-hop process BASE alias to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a BARE REASSIGNMENT (no initializer on the variable's own declaration) aliasing globalThis is caught the same as a declaration initializer - let g; g = globalThis; g.eval(x)", () => {
+  const hits = siblingImportsFrom("let g;\ng = globalThis;\ng.eval('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the bare-reassignment globalThis alias to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a bare reassignment aliasing process is caught the same way - let p; p = process; p.getBuiltinModule(...)", () => {
+  const hits = siblingImportsFrom("let p;\np = process;\np.getBuiltinModule('node:module');\n");
+  assert.ok(
+    hits.some((h) => h.includes("getBuiltinModule")),
+    `expected the bare-reassignment process alias to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: an unrelated bare reassignment (never process/globalThis) is never flagged", () => {
+  const hits = siblingImportsFrom("let x;\nx = 5;\nvoid x;\n");
+  assert.deepEqual(hits, []);
+});
+
+test("documented boundary: a TWO-HOP alias chain is not chased (const g = globalThis; const h = g; h.eval(x)) - tracked as OPEN-1 in test/loader-escape-matrix.test.ts; guard logic is unchanged, this stays green by design", () => {
+  const hits = siblingImportsFrom("const g = globalThis;\nconst h = g;\nh.eval('1');\n");
+  assert.deepEqual(hits, []);
+});
+
+// ---------------------------------------------------------------------------
+// Object.getOwnPropertyDescriptor - see the matching section in
+// test/no-tasks-import.test.ts for the full rationale. Mirrored here since
+// this guard shares the exact same acquisition-site detection function.
+// ---------------------------------------------------------------------------
+
+test('Object.getOwnPropertyDescriptor(globalThis, "eval")?.value reaches the real eval through a descriptor read, not a direct property access, and is caught', () => {
+  const hits = siblingImportsFrom(
+    "const e = Object.getOwnPropertyDescriptor(globalThis, 'eval')?.value;\ne('1');\n"
+  );
+  assert.ok(
+    hits.some((h) => h.includes("getOwnPropertyDescriptor")),
+    `expected a property-descriptor-access violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test('Object.getOwnPropertyDescriptor(Object.getPrototypeOf(fn), "constructor")?.value reaches .constructor through a descriptor read off an ARBITRARY target - caught unconditionally on the key, the same as a direct .constructor access', () => {
+  const hits = siblingImportsFrom(
+    "const fn = () => {};\n" +
+      "const F = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(fn), 'constructor')?.value;\n" +
+      "F('return 1');\n"
+  );
+  assert.ok(
+    hits.some((h) => h.includes("getOwnPropertyDescriptor")),
+    `expected a property-descriptor-access violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a descriptor key resolved through one local alias hop (const k = 'eval'; Object.getOwnPropertyDescriptor(globalThis, k)) is caught, not just a literal key", () => {
+  const hits = siblingImportsFrom(
+    "const k = 'eval';\nconst d = Object.getOwnPropertyDescriptor(globalThis, k);\n"
+  );
+  assert.ok(hits.some((h) => h.includes("getOwnPropertyDescriptor")));
+});
+
+test("green control: a LOCALLY SHADOWED Object is never flagged, even for a descriptor read against globalThis", () => {
+  const hits = siblingImportsFrom(
+    "const Object = { getOwnPropertyDescriptor: () => undefined };\n" +
+      "const d = Object.getOwnPropertyDescriptor(globalThis, 'eval');\n"
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("green control: a descriptor read for a harmless property on the real process global is never flagged - only the dangerous three properties are", () => {
+  const hits = siblingImportsFrom("const d = Object.getOwnPropertyDescriptor(process, 'env');\n");
+  assert.deepEqual(hits, []);
+});
+
+// ---------------------------------------------------------------------------
+// process.getBuiltinModule - REGRESSION: an executable fixture demonstrated
+// this route reaches createRequire via a supported Node builtin-module API
+// with no import/require syntax naming "node:module" anywhere - previously
+// undetected, now flagged at the property-access acquisition site the same
+// way the four bare globals are.
+// ---------------------------------------------------------------------------
+
+test('REGRESSION: process.getBuiltinModule("node:module").createRequire(...) IS now detected (prior out-of-scope behavior, now closed by an executable fixture)', () => {
   const hits = siblingImportsFrom(
     'const r = process.getBuiltinModule("node:module").createRequire(import.meta.url);\n' +
       'r("./status.js");\n'
+  );
+  assert.ok(
+    hits.some((hit) => hit.includes("getBuiltinModule")),
+    `expected a process.getBuiltinModule violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("process.getBuiltinModule is flagged at the ACQUISITION site regardless of invocation shape - stored, aliased, never immediately called", () => {
+  const hits = siblingImportsFrom(
+    "const acquire = process.getBuiltinModule;\nconst mod = acquire('node:module');\n"
+  );
+  assert.ok(
+    hits.some((hit) => hit.includes("getBuiltinModule")),
+    `expected the aliased acquisition to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test('process.getBuiltinModule via bracket notation ("computed" but statically foldable) is still detected', () => {
+  const hits = siblingImportsFrom('const m = process["getBuiltinModule"]("node:module");\n');
+  assert.ok(
+    hits.some((hit) => hit.includes("getBuiltinModule")),
+    `expected the bracket-notation access to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("fail-closed: a COMPUTED, non-statically-foldable property key on process is flagged - this guard cannot prove it does not reach .getBuiltinModule", () => {
+  const hits = siblingImportsFrom("const key = getKey();\nconst m = process[key]();\n");
+  assert.ok(
+    hits.some((hit) => hit.includes("computed property of process")),
+    `expected an unresolvable-process-access violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a LOCALLY SHADOWED process (never the real global) accessing .getBuiltinModule is never flagged", () => {
+  const hits = siblingImportsFrom(
+    "function f(process: { getBuiltinModule: (id: string) => unknown }) {\n" +
+      '  return process.getBuiltinModule("node:module");\n' +
+      "}\n"
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("green control: every OTHER property of the real process global stays completely unflagged - only .getBuiltinModule is dangerous", () => {
+  const hits = siblingImportsFrom(
+    "const a = process.env;\n" +
+      "const b = process.platform;\n" +
+      "const c = process.cwd();\n" +
+      "const d = process.argv;\n" +
+      'process.kill(1, "SIGTERM");\n'
   );
   assert.deepEqual(hits, []);
 });
@@ -543,6 +751,369 @@ test("a MIXED import clause still reds on its value specifier - a sibling type-o
     hits.some((h) => h.includes("imports createRequire")),
     `expected the value specifier to still be flagged despite the type-only sibling, got: ${JSON.stringify(hits)}`
   );
+});
+
+// ---------------------------------------------------------------------------
+// THE REAL RESOLVER - canonical resolution + realpath compare, catching an
+// absolute path, a file:// URL, a package/subpath-import alias, an
+// extensionless or directory-index specifier, and a symlink whose real
+// target sits inside tools/ even when the symlink's own path does not.
+// Each fixture here writes REAL files to a real scratch directory (unlike
+// most of this file's other tests, which exercise pure text against the
+// original fast-path arithmetic) - the real resolver only fires when a
+// specifier resolves to a real file on disk, so proving it catches
+// anything requires a real file to resolve to.
+// ---------------------------------------------------------------------------
+
+/** Builds a scratch src/-shaped tree: `tools/sibling.ts` and `tools/index.ts` always present, plus whatever `extraFiles`/`symlinks` the caller asks for. Returns the tree's root dir and its `tools/` subdirectory. */
+function buildResolverFixture(
+  extraFiles: Record<string, string> = {},
+  symlinks: Record<string, string> = {}
+): { dir: string; toolsDir: string } {
+  const dir = mkdtempSync(path.join(tmpdir(), "ghantika-resolver-"));
+  const toolsDir = path.join(dir, "tools");
+  mkdirSync(toolsDir, { recursive: true });
+  writeFileSync(path.join(toolsDir, "sibling.ts"), "export const marker = 1;\n");
+  writeFileSync(path.join(toolsDir, "index.ts"), "export const marker = 2;\n");
+  for (const [relPath, content] of Object.entries(extraFiles)) {
+    const abs = path.join(dir, relPath);
+    mkdirSync(path.dirname(abs), { recursive: true });
+    writeFileSync(abs, content);
+  }
+  for (const [relLinkPath, relTargetPath] of Object.entries(symlinks)) {
+    const linkAbs = path.join(dir, relLinkPath);
+    mkdirSync(path.dirname(linkAbs), { recursive: true });
+    symlinkSync(path.join(dir, relTargetPath), linkAbs);
+  }
+  return { dir, toolsDir };
+}
+
+test("a relative sibling specifier resolves and compares correctly through the real resolver, not just the fast path", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports('import { x } from "./sibling.js";\n', importing, toolsDir);
+    assert.ok(
+      hits.includes("./sibling.js"),
+      `expected the sibling hit, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// FOUR NON-LITERAL SPECIFIER SHAPES - a no-substitution template literal, an
+// interpolated template, a string concatenation, and a computed/variable
+// expression. An ordinary static `import` cannot syntactically take a
+// template/interpolated/concatenated/computed specifier at all (a parse
+// error, never a kill) - each fixture here uses a PERMITTED loader form
+// instead (a dynamic `import()`, whose argument is an ordinary expression
+// position) so the module-boundary specifier check is the only thing that
+// can produce the red, never an acquisition diagnostic from a banned
+// loader.
+// ---------------------------------------------------------------------------
+
+test("a no-substitution TEMPLATE LITERAL specifier, via a permitted dynamic import(), is read as a literal and caught the same as a plain string", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports("import(`./sibling.js`);\n", importing, toolsDir);
+    assert.ok(
+      hits.includes("./sibling.js"),
+      `expected the template-literal sibling hit, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an INTERPOLATED template specifier, via a permitted dynamic import(), fails CLOSED - a skip would be a fail", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports(
+      'const dir = "tools";\nimport(`../${dir}/sibling.js`);\n',
+      importing,
+      toolsDir
+    );
+    assert.ok(
+      hits.some((h) => h.includes("computed/non-literal")),
+      `expected the interpolated-template specifier to fail closed, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a string-CONCATENATION specifier, via a permitted dynamic import(), fails CLOSED", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports(
+      'import("../tools/" + "sibling.js");\n',
+      importing,
+      toolsDir
+    );
+    assert.ok(
+      hits.some((h) => h.includes("computed/non-literal")),
+      `expected the concatenated specifier to fail closed, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a COMPUTED/VARIABLE specifier, via a permitted dynamic import(), fails CLOSED", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports(
+      "const specifier = getSiblingPath();\nimport(specifier);\n",
+      importing,
+      toolsDir
+    );
+    assert.ok(
+      hits.some((h) => h.includes("computed/non-literal")),
+      `expected the computed specifier to fail closed, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("green control (non-literal-specifier harness): a dynamic import() of a legitimate, unrelated, statically-resolvable specifier is never flagged", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports('import("node:path");\n', importing, toolsDir);
+    assert.deepEqual(hits, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a specifier assembled at runtime so it is not statically resolvable (an array .join(...)) fails CLOSED, never silently skipped", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports(
+      'const parts = ["../", "tools/", "sibling.js"];\nimport(parts.join(""));\n',
+      importing,
+      toolsDir
+    );
+    assert.ok(
+      hits.some((h) => h.includes("computed/non-literal")),
+      `expected the assembled specifier to fail closed, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an ABSOLUTE PATH specifier pointing at a real sibling file is caught - the fast path skips non-dot specifiers entirely, only the real resolver sees this", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const absSpecifier = path.join(toolsDir, "sibling.js");
+    const hits = findSiblingToolImports(
+      `import { x } from "${absSpecifier}";\n`,
+      importing,
+      toolsDir
+    );
+    assert.ok(
+      hits.includes(absSpecifier),
+      `expected the absolute-path sibling hit, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an EXTENSIONLESS relative specifier resolving to a real sibling .ts file is caught", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports(
+      'import { x } from "../tools/sibling";\n',
+      importing,
+      toolsDir
+    );
+    assert.ok(
+      hits.includes("../tools/sibling"),
+      `expected the extensionless sibling hit, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a DIRECTORY-INDEX specifier (trailing slash, resolving to the real index.ts) is caught", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports('import { x } from "../tools/";\n', importing, toolsDir);
+    assert.ok(
+      hits.includes("../tools/"),
+      `expected the directory-index sibling hit, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a file:// URL specifier pointing at a real sibling file is caught - a prefix/suffix text test on the raw specifier would never see through the URL encoding", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const fileUrl = pathToFileURL(path.join(toolsDir, "sibling.js")).href;
+    const hits = findSiblingToolImports(`import { x } from "${fileUrl}";\n`, importing, toolsDir);
+    assert.ok(
+      hits.includes(fileUrl),
+      `expected the file:// URL sibling hit, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a SYMLINK located OUTSIDE tools/ whose real target sits INSIDE tools/ is caught - the fast path's pure path arithmetic on the symlink's own (outside-tools) path would miss this entirely, only realpath-following the resolved target catches it", () => {
+  const { dir, toolsDir } = buildResolverFixture(
+    {},
+    { "lib/sibling-alias.ts": "tools/sibling.ts" }
+  );
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports(
+      'import { x } from "../lib/sibling-alias.js";\n',
+      importing,
+      toolsDir
+    );
+    assert.ok(
+      hits.includes("../lib/sibling-alias.js"),
+      `expected the symlink-indirection sibling hit, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a PACKAGE/SUBPATH-IMPORT ALIAS (package.json\'s own "imports" field) resolving to a real sibling file is caught', () => {
+  const { dir, toolsDir } = buildResolverFixture({
+    "package.json": JSON.stringify({
+      name: "fixture",
+      imports: { "#sibling": "./tools/sibling.ts" },
+    }),
+  });
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports('import { x } from "#sibling";\n', importing, toolsDir);
+    assert.ok(
+      hits.includes("#sibling"),
+      `expected the package-alias sibling hit, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("import.meta.resolve(...) of a sibling, handed to a require obtained via process.getBuiltinModule, is caught by the SPECIFIER check itself - not merely by the separate, already-banned process.getBuiltinModule acquisition", () => {
+  const { dir, toolsDir } = buildResolverFixture();
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const source = [
+      'const resolvedUrl = import.meta.resolve("../tools/sibling.js");',
+      'const req = process.getBuiltinModule("node:module").createRequire(import.meta.url);',
+      "req(resolvedUrl);",
+      "",
+    ].join("\n");
+    const hits = findSiblingToolImports(source, importing, toolsDir);
+    // The kill criterion is the SPECIFIER hit specifically - a bare
+    // non-empty check would pass even if only the (also-real, separately
+    // owned) process.getBuiltinModule acquisition hit fired, which would
+    // prove nothing about whether this guard's specifier-resolution logic
+    // ever looked at import.meta.resolve's own argument at all.
+    assert.ok(
+      hits.includes("../tools/sibling.js"),
+      `expected the import.meta.resolve specifier itself to be flagged as a sibling reference, got: ${JSON.stringify(hits)}`
+    );
+    assert.ok(
+      hits.some((h) => h.includes("dangerous properties")),
+      `expected the process.getBuiltinModule acquisition to ALSO be flagged (both are real), got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a re-export BARREL (outside tools/) that itself re-exports a sibling is caught transitively - the importing file never names the sibling directly", () => {
+  const { dir, toolsDir } = buildResolverFixture({
+    "barrel.ts": 'export * from "./tools/sibling.js";\n',
+  });
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports('export * from "../barrel.js";\n', importing, toolsDir);
+    const transitiveHit = hits.find(
+      (h) => h.includes("../barrel.js") && h.includes("transitively") && h.includes("sibling.ts")
+    );
+    assert.ok(
+      transitiveHit,
+      `expected a transitive-barrel hit naming both the barrel and the sibling, got: ${JSON.stringify(hits)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("green control: a permitted barrel that does NOT reach any sibling is never flagged, even though it's followed transitively", () => {
+  const { dir, toolsDir } = buildResolverFixture({
+    "core-barrel.ts": "export const x = 1;\n",
+  });
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const hits = findSiblingToolImports(
+      'export * from "../core-barrel.js";\n',
+      importing,
+      toolsDir
+    );
+    assert.deepEqual(hits, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("green control: an absolute path, file:// URL, extensionless, or directory specifier pointing OUTSIDE tools/ is never flagged", () => {
+  const { dir, toolsDir } = buildResolverFixture({ "registry.ts": "export const marker = 3;\n" });
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const absSpecifier = path.join(dir, "registry.js");
+    const hits = findSiblingToolImports(
+      `import { x } from "${absSpecifier}";\n`,
+      importing,
+      toolsDir
+    );
+    assert.deepEqual(hits, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the real resolver's own compare uses path.relative-based containment on canonical realpaths, never a prefix/suffix string test - a sibling directory that merely shares a string prefix (tools-backup/) is never mistaken for tools/ itself", () => {
+  const { dir, toolsDir } = buildResolverFixture({
+    "tools-backup/sibling.ts": "export const marker = 99;\n",
+  });
+  try {
+    const importing = path.join(toolsDir, "run.ts");
+    const backupAbs = path.join(dir, "tools-backup", "sibling.js");
+    const hits = findSiblingToolImports(`import { x } from "${backupAbs}";\n`, importing, toolsDir);
+    assert.deepEqual(
+      hits,
+      [],
+      "a same-string-prefix sibling directory (tools-backup/) must never be mistaken for tools/ itself"
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // --- combined guard: state-declaration checks ---

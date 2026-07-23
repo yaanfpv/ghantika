@@ -196,14 +196,13 @@ test("green control: a file with neither require nor createRequire at all stays 
 // ---------------------------------------------------------------------------
 // The guard's unit of analysis is the BINDING and its provenance, not the
 // ImportDeclaration node: any route that can deliver createRequire (or the
-// node:module namespace it lives on) is in scope, however it was obtained.
-// A prior version of this guard only inspected static ImportDeclaration
-// nodes, so a dynamic `await import("node:module")` destructured for
-// createRequire ran with zero violations and successfully loaded the
-// forbidden Tasks subpath at runtime - executable, not parser-only. Each
-// row below is a distinct entry route, each independently caught, plus
-// green controls proving legitimate dynamic imports and an unrelated
-// property named "require" stay clean.
+// node:module namespace it lives on) is in scope, however it was obtained -
+// including a dynamic `await import("node:module")` destructured for
+// createRequire, which is just as executable a route to the forbidden
+// Tasks subpath at runtime as a static import. Each row below is a
+// distinct entry route, each independently caught, plus green controls
+// proving legitimate dynamic imports and an unrelated property named
+// "require" stay clean.
 // ---------------------------------------------------------------------------
 
 test("a dynamic import of node:module, destructured for createRequire, is caught - the executable survivor that motivated this fix", () => {
@@ -520,30 +519,441 @@ test("green control: createRequire imported from a package OTHER than node:modul
 });
 
 // ---------------------------------------------------------------------------
-// The guard resolves named lexical references; a value obtained through a
-// function object's own constructor property, a reflective string-key
-// lookup on globalThis, or a Node builtin-module API is not a named
-// reference and is not detected - see findCreateRequireImports's own doc
-// comment for the full boundary. These three controls make that limit an
-// executable fact: each is a real acquisition route, verified to execute
-// on a real Node runtime, and each is asserted here to produce NO detection
-// so the boundary is visible rather than silently assumed.
+// process.getBuiltinModule, the bare Reflect global, and the .constructor
+// property are all closed as of this file - see findCreateRequireImports's
+// own doc comment for the full acquisition-site design and why banning the
+// whole Reflect/.constructor surface (rather than pattern-matching one
+// demonstrated combination of them) is what actually closes that specific
+// class, plus why the broader reflective/structural category is not
+// claimed exhausted by doing so.
 // ---------------------------------------------------------------------------
 
-test("documented out of scope: obtaining the Function constructor via an ordinary function object's own .constructor property is not detected", () => {
+test("REGRESSION: obtaining the Function constructor via an ordinary function object's own .constructor property IS now detected", () => {
   const hits = findTasksImports('const F = (() => 1).constructor;\nF("return 1");\n');
-  assert.deepEqual(hits, []);
+  assert.ok(
+    hits.some((hit) => hit.includes(".constructor")),
+    `expected a constructor-property-access violation, got: ${JSON.stringify(hits)}`
+  );
 });
 
-test('documented out of scope: obtaining the global eval via Reflect.get(globalThis, "eval") (a runtime string key, not an identifier reference) is not detected', () => {
+test('REGRESSION: obtaining the global eval via Reflect.get(globalThis, "eval") IS now detected - at the bare Reflect reference itself', () => {
   const hits = findTasksImports('const e = Reflect.get(globalThis, "eval");\ne("1");\n');
+  assert.ok(
+    hits.some((hit) => hit.includes("references the global Reflect")),
+    `expected a reflect-reference violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("Reflect is flagged at the ACQUISITION site regardless of which method is used or how the reference is stored", () => {
+  const hits = findTasksImports("const R = Reflect;\nR.construct(Object, []);\n");
+  assert.ok(
+    hits.some((hit) => hit.includes("references the global Reflect")),
+    `expected the aliased Reflect reference to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a LOCALLY SHADOWED Reflect (never the real global) is never flagged", () => {
+  const hits = findTasksImports(
+    "function f(Reflect: { get: (t: unknown, k: string) => unknown }) {\n" +
+      '  return Reflect.get(globalThis, "eval");\n' +
+      "}\n"
+  );
   assert.deepEqual(hits, []);
 });
 
-test('documented out of scope: reaching createRequire via process.getBuiltinModule("node:module") (a Node builtin-module API, no import/require syntax) is not detected', () => {
+test(".constructor is flagged on ANY base, not just a known-dangerous one - a plain object literal's .constructor is just as flagged as a function's", () => {
+  const hits = findTasksImports("const c = ({}).constructor;\n");
+  assert.ok(
+    hits.some((hit) => hit.includes(".constructor")),
+    `expected the plain-object .constructor access to be flagged too, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a class's OWN constructor method declaration is never confused with a .constructor property READ - defining a constructor is not an acquisition", () => {
+  const hits = findTasksImports(
+    "class Foo {\n  constructor() {\n    this.ready = true;\n  }\n}\nnew Foo();\n"
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("green control: an object literal's own 'constructor' property KEY (defining, not reading) is never flagged", () => {
+  const hits = findTasksImports('const obj = { constructor: () => "not a real class" };\n');
+  assert.deepEqual(hits, []);
+});
+
+// ---------------------------------------------------------------------------
+// globalThis/process ONE-HOP ALIAS - a local binding that comes to hold the
+// real globalThis/process, either via its own declaration initializer or a
+// later bare reassignment, is exactly as real an acquisition route as the
+// bare name would have been. REGRESSION coverage: a prior version of the
+// resolution helper only recognized `symbol === undefined` as the signal
+// that a `globalThis` reference is genuinely unshadowed, but the real
+// checker returns a TRUTHY symbol with an EMPTY `.declarations` array for
+// that exact case - so the direct, non-aliased form (`globalThis.eval(...)`
+// with no local shadow anywhere) silently stopped being detected at all.
+// That regression is caught here alongside the new alias coverage, since
+// both routes share the same underlying resolution function.
+// ---------------------------------------------------------------------------
+
+test("REGRESSION: a direct, unshadowed globalThis.eval(...) reference (no alias, no local shadow) is detected", () => {
+  const hits = findTasksImports("globalThis.eval('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the direct globalThis.eval access to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("REGRESSION: a direct, unshadowed globalThis['eval'] (computed) reference is detected too", () => {
+  const hits = findTasksImports("globalThis['eval']('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the direct computed globalThis['eval'] access to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a local const aliasing globalThis, then accessed through the alias, is caught - const g = globalThis; g.eval(x)", () => {
+  const hits = findTasksImports("const g = globalThis;\ng.eval('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the one-hop globalThis alias to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a local const aliasing process's BASE (not just its method), then accessed through the alias, is caught - const p = process; p.getBuiltinModule(...)", () => {
+  const hits = findTasksImports("const p = process;\np.getBuiltinModule('node:module');\n");
+  assert.ok(
+    hits.some((h) => h.includes("getBuiltinModule")),
+    `expected the one-hop process BASE alias to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a BARE REASSIGNMENT (no initializer on the variable's own declaration) aliasing globalThis is caught the same as a declaration initializer - let g; g = globalThis; g.eval(x)", () => {
+  const hits = findTasksImports("let g;\ng = globalThis;\ng.eval('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the bare-reassignment globalThis alias to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a bare reassignment aliasing process is caught the same way - let p; p = process; p.getBuiltinModule(...)", () => {
+  const hits = findTasksImports("let p;\np = process;\np.getBuiltinModule('node:module');\n");
+  assert.ok(
+    hits.some((h) => h.includes("getBuiltinModule")),
+    `expected the bare-reassignment process alias to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a reassignment aliasing globalThis AFTER an unrelated initializer is still caught - let g = 5; g = globalThis; g.eval(x)", () => {
+  const hits = findTasksImports("let g = 5;\ng = globalThis;\ng.eval('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the reassignment to be flagged despite the harmless initial value, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a locally SHADOWED globalThis aliased through a const is never flagged, even though the alias-resolution machinery now checks reassignments too", () => {
+  const hits = findTasksImports(
+    "const globalThis = { eval: () => 1 };\nconst g = globalThis;\ng.eval('1');\n"
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("green control: an unrelated bare reassignment (never process/globalThis) is never flagged", () => {
+  const hits = findTasksImports("let x;\nx = 5;\nvoid x;\n");
+  assert.deepEqual(hits, []);
+});
+
+test("documented boundary: a TWO-HOP alias chain is not chased (const g = globalThis; const h = g; h.eval(x)) - tracked as OPEN-1 in test/loader-escape-matrix.test.ts; guard logic is unchanged, this stays green by design", () => {
+  const hits = findTasksImports("const g = globalThis;\nconst h = g;\nh.eval('1');\n");
+  assert.deepEqual(hits, []);
+});
+
+// ---------------------------------------------------------------------------
+// Object.getOwnPropertyDescriptor - a DESCRIPTOR READ reaches the same value
+// a direct property access would, without ever writing the target's key as
+// a real property-access AST node - an independent adversarial pass proved
+// both rows below guard-green and runtime-executing before this guard
+// recognized Object.getOwnPropertyDescriptor as an acquisition site at all.
+// ---------------------------------------------------------------------------
+
+test('Object.getOwnPropertyDescriptor(globalThis, "eval")?.value reaches the real eval through a descriptor read, not a direct property access, and is caught', () => {
+  const hits = findTasksImports(
+    "const e = Object.getOwnPropertyDescriptor(globalThis, 'eval')?.value;\ne('1');\n"
+  );
+  assert.ok(
+    hits.some((h) => h.includes("getOwnPropertyDescriptor")),
+    `expected a property-descriptor-access violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test('Object.getOwnPropertyDescriptor(Object.getPrototypeOf(fn), "constructor")?.value reaches .constructor through a descriptor read off an ARBITRARY target - caught unconditionally on the key, the same as a direct .constructor access', () => {
+  const hits = findTasksImports(
+    "const fn = () => {};\n" +
+      "const F = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(fn), 'constructor')?.value;\n" +
+      "F('return 1');\n"
+  );
+  assert.ok(
+    hits.some((h) => h.includes("getOwnPropertyDescriptor")),
+    `expected a property-descriptor-access violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test('a descriptor read via computed/bracket Object["getOwnPropertyDescriptor"] is caught too, not just the dotted spelling', () => {
+  const hits = findTasksImports(
+    "const d = Object['getOwnPropertyDescriptor'](globalThis, 'eval');\n"
+  );
+  assert.ok(hits.some((h) => h.includes("getOwnPropertyDescriptor")));
+});
+
+test("a descriptor read targeting process's own dangerous property is caught the same way", () => {
+  const hits = findTasksImports(
+    "const d = Object.getOwnPropertyDescriptor(process, 'getBuiltinModule');\n"
+  );
+  assert.ok(hits.some((h) => h.includes("getOwnPropertyDescriptor")));
+});
+
+test("a descriptor key resolved through one local alias hop (const k = 'eval'; Object.getOwnPropertyDescriptor(globalThis, k)) is caught, not just a literal key", () => {
+  const hits = findTasksImports(
+    "const k = 'eval';\nconst d = Object.getOwnPropertyDescriptor(globalThis, k);\n"
+  );
+  assert.ok(hits.some((h) => h.includes("getOwnPropertyDescriptor")));
+});
+
+test("fail-closed: a descriptor read off globalThis with a genuinely unresolvable key is flagged, cannot prove it avoids a forbidden name", () => {
+  const hits = findTasksImports(
+    "const key = getKey();\nconst d = Object.getOwnPropertyDescriptor(globalThis, key);\n"
+  );
+  assert.ok(
+    hits.some((h) => h.includes("getOwnPropertyDescriptor")),
+    `expected the unresolvable-key descriptor read to fail closed, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a LOCALLY SHADOWED Object is never flagged, even for a descriptor read against globalThis", () => {
+  const hits = findTasksImports(
+    "const Object = { getOwnPropertyDescriptor: () => undefined };\n" +
+      "const d = Object.getOwnPropertyDescriptor(globalThis, 'eval');\n"
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("green control: a descriptor read off an unrelated, harmless object with an unrelated key is never flagged", () => {
+  const hits = findTasksImports(
+    "const safe = {};\nconst d = Object.getOwnPropertyDescriptor(safe, 'eval');\n"
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("green control: a descriptor read for a harmless property on the real process global is never flagged - only the dangerous three properties are", () => {
+  const hits = findTasksImports("const d = Object.getOwnPropertyDescriptor(process, 'env');\n");
+  assert.deepEqual(hits, []);
+});
+
+// ---------------------------------------------------------------------------
+// process.getBuiltinModule - REGRESSION: an executable fixture demonstrated
+// this route reaches createRequire via a supported Node builtin-module API
+// with no import/require syntax naming "node:module" anywhere - previously
+// undetected, now flagged at the property-access acquisition site the same
+// way the four bare globals are.
+// ---------------------------------------------------------------------------
+
+test('REGRESSION: process.getBuiltinModule("node:module").createRequire(...) IS now detected (prior out-of-scope behavior, now closed by an executable fixture)', () => {
   const hits = findTasksImports(
     'const r = process.getBuiltinModule("node:module").createRequire(import.meta.url);\n' +
       'r("@modelcontextprotocol/sdk/experimental/tasks");\n'
+  );
+  assert.ok(
+    hits.some((hit) => hit.includes("getBuiltinModule")),
+    `expected a process.getBuiltinModule violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("process.getBuiltinModule is flagged at the ACQUISITION site regardless of invocation shape - stored, aliased, never immediately called", () => {
+  const hits = findTasksImports(
+    "const acquire = process.getBuiltinModule;\nconst mod = acquire('node:module');\n"
+  );
+  assert.ok(
+    hits.some((hit) => hit.includes("getBuiltinModule")),
+    `expected the aliased acquisition to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test('process.getBuiltinModule via bracket notation ("computed" but statically foldable) is still detected', () => {
+  const hits = findTasksImports('const m = process["getBuiltinModule"]("node:module");\n');
+  assert.ok(
+    hits.some((hit) => hit.includes("getBuiltinModule")),
+    `expected the bracket-notation access to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("process.getBuiltinModule via a folded string-concatenation key is still detected", () => {
+  const hits = findTasksImports('const m = process["getBuiltin" + "Module"]("node:module");\n');
+  assert.ok(
+    hits.some((hit) => hit.includes("getBuiltinModule")),
+    `expected the concatenated-key access to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("fail-closed: a COMPUTED, non-statically-foldable property key on process is flagged - this guard cannot prove it does not reach .getBuiltinModule", () => {
+  const hits = findTasksImports("const key = getKey();\nconst m = process[key]();\n");
+  assert.ok(
+    hits.some((hit) => hit.includes("computed property of process")),
+    `expected an unresolvable-process-access violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a LOCALLY SHADOWED process (never the real global) accessing .getBuiltinModule is never flagged", () => {
+  const hits = findTasksImports(
+    "function f(process: { getBuiltinModule: (id: string) => unknown }) {\n" +
+      '  return process.getBuiltinModule("node:module");\n' +
+      "}\n"
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("green control: every OTHER property of the real process global stays completely unflagged - only .getBuiltinModule is dangerous", () => {
+  const hits = findTasksImports(
+    "const a = process.env;\n" +
+      "const b = process.platform;\n" +
+      "const c = process.cwd();\n" +
+      "const d = process.argv;\n" +
+      'process.kill(1, "SIGTERM");\n'
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("green control: process.getBuiltinModule called with a DIFFERENT builtin (not node:module) is still flagged at the acquisition site - the property reference itself is the violation, independent of the argument", () => {
+  // This is deliberately NOT a green control in the usual sense: the
+  // acquisition-site design (see ts-ast.mjs's own header) flags the bare
+  // process.getBuiltinModule REFERENCE, unconditionally on what it is
+  // later called with - the same principle that makes `const r = require;
+  // r("anything")` a violation at `r`'s own definition, not at the call.
+  // A real green control for "process.getBuiltinModule genuinely unused"
+  // is the passing test suite everywhere this string never appears.
+  const hits = findTasksImports('const fsModule = process.getBuiltinModule("fs");\n');
+  assert.ok(
+    hits.some((hit) => hit.includes("getBuiltinModule")),
+    `expected the acquisition itself to be flagged regardless of argument, got: ${JSON.stringify(hits)}`
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Six further acquisition shapes, each an idiomatic variant of a route
+// already closed above rather than a new mechanism - permanent regression
+// coverage for each specific spelling, since the acquisition-site checks
+// above were verified against a battery of fixtures but these six shapes
+// were not yet represented as their own dedicated test.
+// ---------------------------------------------------------------------------
+
+test("a destructured getBuiltinModule reached DIRECTLY off process (no intermediate alias variable) is caught the same way an aliased base is - const { getBuiltinModule } = process", () => {
+  const hits = findTasksImports(
+    "const { getBuiltinModule } = process;\n" +
+      "const m = getBuiltinModule('node:module');\n" +
+      "m.createRequire(import.meta.url);\n"
+  );
+  assert.ok(
+    hits.some((h) => h.includes("getBuiltinModule")),
+    `expected the direct destructure off process to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: destructuring a HARMLESS property directly off process is never flagged", () => {
+  const hits = findTasksImports("const { env } = process;\nvoid env;\n");
+  assert.deepEqual(hits, []);
+});
+
+test("a variable-keyed .constructor access, resolved through one local alias hop, is caught the same way a literal bracketed key already is - const k = 'constructor'; obj[k]", () => {
+  const hits = findTasksImports(
+    "const k = 'constructor';\nconst F = (() => 1)[k];\nF('return 1');\n"
+  );
+  assert.ok(
+    hits.some((h) => h.includes(".constructor")),
+    `expected the alias-resolved computed .constructor key to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a variable-keyed property access whose alias resolves to an UNRELATED string is never mistaken for a .constructor access", () => {
+  const hits = findTasksImports("const k = 'toString';\nconst t = ({})[k];\nvoid t;\n");
+  assert.deepEqual(hits, []);
+});
+
+test("a .constructor binding destructured directly off a NON-GLOBAL source (an arrow function, not globalThis/process) is caught - the ban is on the key, unconditional on where it's destructured from", () => {
+  const hits = findTasksImports("const { constructor: F } = (() => {});\nF('return 1');\n");
+  assert.ok(
+    hits.some((h) => h.includes(".constructor")),
+    `expected the destructured .constructor off a non-global source to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: destructuring a HARMLESS key off a non-global source is never flagged", () => {
+  const hits = findTasksImports("const { toString: t } = (() => {});\nvoid t;\n");
+  assert.deepEqual(hits, []);
+});
+
+test("a non-null assertion sitting directly on the globalThis base does not defeat detection - globalThis!.eval(x)", () => {
+  const hits = findTasksImports("globalThis!.eval('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the non-null-asserted globalThis base to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("an 'as' cast sitting directly on the globalThis base does not defeat detection either - (globalThis as typeof globalThis).eval(x)", () => {
+  const hits = findTasksImports("(globalThis as typeof globalThis).eval('1');\n");
+  assert.ok(
+    hits.some((h) => h.includes("references the global eval")),
+    `expected the cast globalThis base to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a non-null assertion sitting directly on the process base is caught the same way - process!.getBuiltinModule(...)", () => {
+  const hits = findTasksImports("process!.getBuiltinModule('node:module');\n");
+  assert.ok(
+    hits.some((h) => h.includes("getBuiltinModule")),
+    `expected the non-null-asserted process base to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a cast or non-null assertion on an UNRELATED, harmless base is never flagged", () => {
+  const hits = findTasksImports(
+    "const safe = { run: () => 1 };\nconst x = (safe as typeof safe)!.run();\nvoid x;\n"
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("process.dlopen is caught - one of the two process properties beyond getBuiltinModule this guard also treats as dangerous", () => {
+  const hits = findTasksImports("process.dlopen({ exports: {} }, './native.node');\n");
+  assert.ok(
+    hits.some((h) => h.includes("process's dangerous properties")),
+    `expected a process.dlopen violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("process.binding is caught the same way - Node's internal native-binding loader", () => {
+  const hits = findTasksImports("const b = process.binding('fs');\nvoid b;\n");
+  assert.ok(
+    hits.some((h) => h.includes("process's dangerous properties")),
+    `expected a process.binding violation, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("an AMBIENT 'declare const Reflect' does not actually shadow at runtime - the guard treats the reference as the real global, not a local shadow", () => {
+  const hits = findTasksImports(
+    "declare const Reflect: { get: (t: unknown, k: string) => unknown };\n" +
+      "const e = Reflect.get(globalThis, 'eval');\n" +
+      "e('1');\n"
+  );
+  assert.ok(
+    hits.some((h) => h.includes("references the global Reflect")),
+    `expected the ambient-shadowed Reflect reference to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a REAL (non-ambient) local Reflect declaration still shadows correctly - only the ambient, erased form fails to shadow", () => {
+  const hits = findTasksImports(
+    "const Reflect = { get: (t: unknown, k: string) => undefined };\n" +
+      "const e = Reflect.get(globalThis, 'eval');\n" +
+      "void e;\n"
   );
   assert.deepEqual(hits, []);
 });

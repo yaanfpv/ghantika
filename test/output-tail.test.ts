@@ -253,12 +253,156 @@ test("'both' merge is prefix-stable - a stream's Nth retained line keeps the sam
   );
 });
 
-test("'both' with either stream truncated emits exactly one combined leading gap (flagged best-effort: true per-stream interior positioning needs a jobStore.ts counter - see output.ts's header)", () => {
-  const stdoutSnap = snapshot([{ text: "o1" }], true); // stdout truncated
-  const stderrSnap = snapshot([{ text: "e1" }], false); // stderr never truncated
+test("'both' with either stream truncated emits a best-effort combined leading gap, derived from each stream's real dropped-through seq (not a caller-cursor-relative placeholder)", () => {
+  // Realistic post-eviction shape: 5 stdout lines ever existed, only the
+  // newest (seq 5) survives - seq 1-4 are gone. stderr never truncated.
+  const stdoutSnap = snapshot([{ text: "o5", seq: 5 }], true, 5);
+  const stderrSnap = snapshot([{ text: "e1" }], false);
   const { events, gap } = outputTool.buildBothStreamsEvents(stdoutSnap, stderrSnap, 0);
-  assert.deepEqual(gap, { gap: [1, 1] });
-  assert.deepEqual(events.map((e) => e.text).sort(), ["e1", "o1"]);
+  // stdout's real dropped-through seq is 4; converted via the same parity
+  // formula real events use (2*seq-1), that's merged position 7.
+  assert.deepEqual(gap, { gap: [1, 7] });
+  assert.deepEqual(
+    events
+      .map((e) => [e.seq, e.stream, e.text] as const)
+      .sort((a, b) => (a[0] as number) - (b[0] as number)),
+    [
+      [2, "stderr", "e1"],
+      [9, "stdout", "o5"],
+    ]
+  );
+});
+
+test("'both': a cursor already past everything ever dropped on either stream gets no gap marker", () => {
+  const stdoutSnap = snapshot([{ text: "o5", seq: 5 }], true, 5); // dropped-through merged position 7
+  const stderrSnap = snapshot([{ text: "e1" }], false);
+  const atTheBoundary = outputTool.buildBothStreamsEvents(stdoutSnap, stderrSnap, 7);
+  assert.equal(atTheBoundary.gap, undefined);
+});
+
+// The core regression this fix closes: the OLD "both" truncated branch
+// recomputed the entire current window's numbering relative to the
+// CALLER's OWN after_cursor on every call, unfiltered - so re-submitting a
+// prior call's own next_cursor, with nothing new having arrived, returned
+// the SAME lines again with a climbing next_cursor, forever. A poller has
+// no way to detect "I'm caught up" under that scheme.
+test("REGRESSION: 'both' in truncated mode reaches an EMPTY page once the caller catches up, instead of replaying the same window forever", () => {
+  const stdoutSnap = snapshot(
+    [
+      { text: "o7", seq: 7 },
+      { text: "o8", seq: 8 },
+      { text: "o9", seq: 9 },
+    ],
+    true,
+    9
+  );
+  const stderrSnap = snapshot(
+    [
+      { text: "e5", seq: 5 },
+      { text: "e6", seq: 6 },
+    ],
+    true,
+    6
+  );
+
+  const first = outputTool.buildBothStreamsEvents(stdoutSnap, stderrSnap, 0);
+  assert.ok(first.events.length > 0, "a fresh read must return the currently-retained window");
+
+  // Simulate the caller submitting the first call's own next_cursor
+  // (=head) as the second call's after_cursor, with nothing new having
+  // materialized on either stream in between.
+  const second = outputTool.buildBothStreamsEvents(stdoutSnap, stderrSnap, first.head);
+  assert.deepEqual(
+    second.events,
+    [],
+    "a caller who has already read everything currently available must see an EMPTY page, not the same lines replayed"
+  );
+  assert.equal(
+    second.gap,
+    undefined,
+    "nothing new was dropped since the caller's own cursor either"
+  );
+  assert.equal(second.head, first.head, "head must not move when nothing new has materialized");
+});
+
+test("'both' merged seq for a SURVIVING line is stable across further eviction, not just across the other stream's growth", () => {
+  const before = outputTool.buildBothStreamsEvents(
+    snapshot(
+      [
+        { text: "o5", seq: 5 },
+        { text: "o6", seq: 6 },
+        { text: "o7", seq: 7 },
+        { text: "o8", seq: 8 },
+        { text: "o9", seq: 9 },
+      ],
+      true,
+      9
+    ),
+    snapshot([{ text: "e1", seq: 1 }]),
+    0
+  );
+  const o9Before = before.events.find((e) => e.text === "o9")!;
+
+  // MORE eviction has happened since - seq 5, 6, 7 are gone too now, only
+  // seq 8, 9 survive.
+  const after = outputTool.buildBothStreamsEvents(
+    snapshot(
+      [
+        { text: "o8", seq: 8 },
+        { text: "o9", seq: 9 },
+      ],
+      true,
+      9
+    ),
+    snapshot([{ text: "e1", seq: 1 }]),
+    0
+  );
+  const o9After = after.events.find((e) => e.text === "o9")!;
+
+  assert.equal(
+    o9Before.seq,
+    o9After.seq,
+    "a surviving line's merged seq must not change just because OLDER lines around it got evicted"
+  );
+});
+
+// tail.ts REIMPLEMENTS this same scheme independently (no sibling
+// tools/*.ts import permitted - see its own header), so its "both" merge
+// needs its own direct pure-function coverage, never assumed correct just
+// because output.ts's is - closing a real gap: before this fix, tail.ts's
+// own buildBothStreamsEvents had NO direct test at all, truncated or not.
+
+test("tail.ts: buildBothStreamsEvents untruncated matches output.ts's own parity split exactly", () => {
+  const stdoutSnap = snapshot([{ text: "o1" }, { text: "o2" }]);
+  const stderrSnap = snapshot([{ text: "e1" }]);
+  const { events, head, gap } = tailTool.buildBothStreamsEvents(stdoutSnap, stderrSnap);
+  assert.deepEqual(
+    events.map((e) => [e.seq, e.stream, e.text]),
+    [
+      [1, "stdout", "o1"],
+      [2, "stderr", "e1"],
+      [3, "stdout", "o2"],
+    ]
+  );
+  assert.equal(head, 3);
+  assert.equal(gap, undefined);
+});
+
+test("tail.ts: buildBothStreamsEvents merges via the same real-seq-derived parity split as output.ts, stable under truncation", () => {
+  const stdoutSnap = snapshot([{ text: "o5", seq: 5 }], true, 5);
+  const stderrSnap = snapshot([{ text: "e1" }], false);
+  const { events, gap, head } = tailTool.buildBothStreamsEvents(stdoutSnap, stderrSnap);
+  assert.deepEqual(gap, { gap: [1, 7] });
+  assert.deepEqual(
+    events
+      .map((e) => [e.seq, e.stream, e.text] as const)
+      .sort((a, b) => (a[0] as number) - (b[0] as number)),
+    [
+      [2, "stderr", "e1"],
+      [9, "stdout", "o5"],
+    ]
+  );
+  assert.equal(head, 9);
 });
 
 // --- partial-line flagging ---
@@ -611,6 +755,39 @@ test("tail: gap is shown only when the requested window reaches back to the reta
     fullEvents.some((e) => "gap" in e),
     true,
     "a tail window large enough to reach the floor of a truncated stream must show the gap"
+  );
+});
+
+// REGRESSION (handler-level, real jobStore overflow): the same defect the
+// pure-function tests above prove directly, now proven through the real
+// handler + real byte-accounting eviction, exactly the path an agent
+// polling output() actually drives.
+test("REGRESSION: output(stream: both) against a real overflowed job reaches an EMPTY page on re-submitted next_cursor, never replays the same lines", () => {
+  const jobId = makeJobWithRawOutput();
+  for (let i = 0; i < 10_050; i += 1) {
+    jobStore.appendOutput(jobId, "stdout", Buffer.from(`line-${i}\n`));
+  }
+  const first = structuredOf(outputTool.handler({ job_id: jobId, stream: "both" }));
+  assert.equal(first.truncated, true, "fixture must have genuinely overflowed MAX_BUFFER_LINES");
+  const firstEvents = (first.events as Array<Record<string, unknown>>).filter((e) => !("gap" in e));
+  assert.ok(firstEvents.length > 0, "a fresh read must return the currently-retained window");
+
+  const second = structuredOf(
+    outputTool.handler({
+      job_id: jobId,
+      stream: "both",
+      after_cursor: first.next_cursor as number,
+    })
+  );
+  assert.deepEqual(
+    second.events,
+    [],
+    "re-submitting the previous call's own next_cursor, with nothing new produced since, must return an EMPTY page - the exact defect this fix closes"
+  );
+  assert.equal(
+    second.next_cursor,
+    first.next_cursor,
+    "next_cursor must not keep climbing when nothing new has arrived"
   );
 });
 

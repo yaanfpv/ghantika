@@ -243,6 +243,69 @@ test("a bounded multi-hop re-alias chain (up to a documented hop limit) is still
   assert.ok(aliasHits.some((h) => h.includes('"c"')));
 });
 
+// ---------------------------------------------------------------------------
+// A bare REASSIGNMENT (`let p; p = process;`) is exactly as real an alias-
+// creation event as a declaration's own initializer - a variable declared
+// with NO initializer of its own previously escaped the alias check
+// entirely, since the check only ever inspected a VariableDeclaration's
+// initializer field. REGRESSION coverage for the fix (found by an
+// adversarial pass): the guard must catch the assignment itself, chase a
+// chain that goes through a reassignment, and stay green for an unrelated
+// reassignment.
+// ---------------------------------------------------------------------------
+
+test("REGRESSION: a bare reassignment to process (no initializer on the variable's own declaration) is caught, not just a declaration's own initializer", () => {
+  const hits = findStdoutWrites('let p;\np = process;\np.stdout.write("leak");\n');
+  const aliasHits = hits.filter((h) => h.includes("alias"));
+  assert.equal(
+    aliasHits.length,
+    1,
+    `expected the bare reassignment itself to be flagged, got: ${JSON.stringify(hits)}`
+  );
+  assert.match(aliasHits[0]!, /"p"/);
+});
+
+test("REGRESSION: a reassignment to process AFTER an unrelated initializer is caught too", () => {
+  const hits = findStdoutWrites('let p = 5;\np = process;\np.stdout.write("leak");\n');
+  assert.ok(
+    hits.some((h) => h.includes("alias") && h.includes('"p"')),
+    `expected the reassignment to be flagged despite the harmless initial value, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("REGRESSION: a re-alias chain that goes through a bare reassignment is still followed - each hop resolves transitively back to process", () => {
+  const source = ["let g;", "g = process;", "let h;", "h = g;", 'h.stdout.write("leak");', ""].join(
+    "\n"
+  );
+  const hits = findStdoutWrites(source);
+  const aliasHits = hits.filter((h) => h.includes("alias"));
+  assert.equal(
+    aliasHits.length,
+    2,
+    `expected both "g" and "h" to be flagged, got: ${JSON.stringify(hits)}`
+  );
+  assert.ok(aliasHits.some((h) => h.includes('"g"')));
+  assert.ok(aliasHits.some((h) => h.includes('"h"')));
+});
+
+test("green control: a bare reassignment to an unrelated value is never flagged", () => {
+  const hits = findStdoutWrites("let x;\nx = 5;\nvoid x;\n");
+  assert.deepEqual(hits, []);
+});
+
+test("green control: reassigning an already-real variable to another harmless value is never flagged", () => {
+  const hits = findStdoutWrites("let y = 1;\ny = 2;\nvoid y;\n");
+  assert.deepEqual(hits, []);
+});
+
+test("mutation control: the bare-reassignment fix reacts to the change - clean before, red after a process reassignment is introduced, clean again once reverted", () => {
+  const clean = "let p;\np = 5;\nvoid p;\n";
+  assert.deepEqual(findStdoutWrites(clean), []);
+  const withRegression = "let p;\np = process;\nvoid p;\n";
+  assert.equal(findStdoutWrites(withRegression).length, 1);
+  assert.deepEqual(findStdoutWrites(clean), []);
+});
+
 test("green control: a const/let/var bound to an UNRELATED value is never flagged as a process alias", () => {
   const source = [
     "const a = 1;",

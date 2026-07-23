@@ -3,7 +3,11 @@ import { test } from "node:test";
 
 import {
   AGGREGATE_JOB_ID,
+  collectControllingExpressionText,
+  hasLiteralSuccessCheck,
   loadWorkflow,
+  normalizeNeeds,
+  verifyIndependentRequiredJobs,
   verifyTopology,
 } from "../scripts/verify-workflow-topology.mjs";
 
@@ -80,7 +84,399 @@ test("mutation control: weakening the literal-success check for one job is caugh
   );
 });
 
+// A trailing `|| true` disjunction (`needs.build.result == 'success' ||
+// true`) makes the whole clause vacuously true regardless of build's
+// actual result. A plain adjacency check that only looks for an unbroken
+// "== 'success'" right after the "needs.build.result" marker misses the
+// disjunction entirely; the real check parses the expression and confirms
+// forcing build's result away from 'success' still makes the whole
+// expression unsatisfiable (see hasLiteralSuccessCheck's own doc comment).
+test("mutation control: a trailing || true disjunction after the literal-success check is caught", () => {
+  const workflow = loadWorkflow();
+  const mutated = structuredClone(workflow);
+  const step = mutated.jobs[AGGREGATE_JOB_ID].steps[0];
+  const original = step.env.ALL_SUCCEEDED;
+
+  step.env.ALL_SUCCEEDED = original.replace(
+    "needs.build.result == 'success' &&",
+    "needs.build.result == 'success' || true &&"
+  );
+  assert.notEqual(step.env.ALL_SUCCEEDED, original, "the mutation should have changed the text");
+
+  const topologyErrors = verifyTopology(mutated.jobs, AGGREGATE_JOB_ID);
+  assert.ok(
+    topologyErrors.some((error) => error.includes('"build"') && error.includes("never checks")),
+    `expected verifyTopology to flag the vacuously-true build clause, got: ${JSON.stringify(topologyErrors)}`
+  );
+  const independentErrors = verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID);
+  assert.ok(
+    independentErrors.some((error) => error.includes('"build"') && error.includes("never checks")),
+    `expected verifyIndependentRequiredJobs to flag the vacuously-true build clause, got: ${JSON.stringify(independentErrors)}`
+  );
+
+  // Revert and confirm clean again - the check reacts to the actual
+  // disjunction, it doesn't just always fail.
+  step.env.ALL_SUCCEEDED = original;
+  assert.deepEqual(verifyTopology(mutated.jobs, AGGREGATE_JOB_ID), []);
+  assert.deepEqual(verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID), []);
+});
+
+// A `||` disjunction can just as easily sit BEFORE the matched literal as
+// after it (`(true || needs.build.result == 'success')`). The clause is
+// exactly as vacuously true either way, since `true ||` needs nothing else
+// to hold; which side of the literal the `||` is written on - or how many
+// operands separate it, see the class battery further below - does not
+// change whether build's result is genuinely necessary for the whole
+// expression to be true.
+test("mutation control: a leading disjunction before the literal-success check is caught", () => {
+  const workflow = loadWorkflow();
+  const mutated = structuredClone(workflow);
+  const step = mutated.jobs[AGGREGATE_JOB_ID].steps[0];
+  const original = step.env.ALL_SUCCEEDED;
+
+  step.env.ALL_SUCCEEDED = original.replace(
+    "needs.build.result == 'success' &&",
+    "(true || needs.build.result == 'success') &&"
+  );
+  assert.notEqual(step.env.ALL_SUCCEEDED, original, "the mutation should have changed the text");
+
+  const topologyErrors = verifyTopology(mutated.jobs, AGGREGATE_JOB_ID);
+  assert.ok(
+    topologyErrors.some((error) => error.includes('"build"') && error.includes("never checks")),
+    `expected verifyTopology to flag the vacuously-true build clause, got: ${JSON.stringify(topologyErrors)}`
+  );
+  const independentErrors = verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID);
+  assert.ok(
+    independentErrors.some((error) => error.includes('"build"') && error.includes("never checks")),
+    `expected verifyIndependentRequiredJobs to flag the vacuously-true build clause, got: ${JSON.stringify(independentErrors)}`
+  );
+
+  // Revert and confirm clean again.
+  step.env.ALL_SUCCEEDED = original;
+  assert.deepEqual(verifyTopology(mutated.jobs, AGGREGATE_JOB_ID), []);
+  assert.deepEqual(verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID), []);
+});
+
+// Removing a job's clause from the REAL controlling expression (the env
+// value the gate step's run script actually reads) while leaving decoy
+// literal text "needs.build.result == 'success'" in some other, unused
+// location on the job - an env entry no run script ever reads - must not
+// substitute for the real clause it replaced. Restricting the search to
+// the job's controlling expression (collectControllingExpressionText),
+// not its entire flattened env/run/if text, is what closes this.
+test("mutation control: a decoy literal-success check in an unused env entry does not substitute for the real one", () => {
+  const workflow = loadWorkflow();
+  const mutated = structuredClone(workflow);
+  const step = mutated.jobs[AGGREGATE_JOB_ID].steps[0];
+  const original = step.env.ALL_SUCCEEDED;
+
+  // Remove build's clause from the real controlling expression...
+  step.env.ALL_SUCCEEDED = original.replace("needs.build.result == 'success' &&", "");
+  assert.notEqual(step.env.ALL_SUCCEEDED, original, "the mutation should have changed the text");
+  // ...then plant the decoy where nothing reads it: a second env entry on
+  // the same step that the step's own run script never references.
+  step.env.DECOY_UNUSED = "needs.build.result == 'success'";
+  assert.ok(
+    !step.run.includes("$DECOY_UNUSED") && !step.run.includes("${DECOY_UNUSED}"),
+    "test assumption: the decoy env entry must not be referenced by the step's run script"
+  );
+
+  const topologyErrors = verifyTopology(mutated.jobs, AGGREGATE_JOB_ID);
+  assert.ok(
+    topologyErrors.some((error) => error.includes('"build"') && error.includes("never checks")),
+    `expected verifyTopology to flag the removed build check despite the decoy, got: ${JSON.stringify(topologyErrors)}`
+  );
+  const independentErrors = verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID);
+  assert.ok(
+    independentErrors.some((error) => error.includes('"build"') && error.includes("never checks")),
+    `expected verifyIndependentRequiredJobs to flag the removed build check despite the decoy, got: ${JSON.stringify(independentErrors)}`
+  );
+
+  // Revert and confirm clean again.
+  step.env.ALL_SUCCEEDED = original;
+  delete step.env.DECOY_UNUSED;
+  assert.deepEqual(verifyTopology(mutated.jobs, AGGREGATE_JOB_ID), []);
+  assert.deepEqual(verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID), []);
+});
+
+// --- hasLiteralSuccessCheck: the non-adjacent-disjunction CLASS ---
+//
+// GitHub Actions binds `&&` tighter than `||` (same as JS), so a `||` can
+// govern a literal from any distance away, not merely from directly
+// beside it: `needs.build.result == 'success' && false || true` is
+// unconditionally true regardless of build's result, even with an extra
+// `&&` operand separating the literal from the disjunction that actually
+// controls it. No fixed adjacency distance can bound "how far away can
+// the disjunction be", so the production check parses the expression and
+// asks a semantic question instead: does forcing this job's result away
+// from 'success' make the WHOLE expression provably false, regardless of
+// every other unknown (see hasLiteralSuccessCheck / evaluateForcingJobFalse's
+// own doc comments)? The battery below exercises that CLASS directly
+// against hasLiteralSuccessCheck - not two rows for two specific strings,
+// but every combination of which side the disjunction is on and how many
+// extra operands sit between it and the literal.
+//
+// Every expression below is a real GitHub Actions boolean expression that
+// would let the `gate` job's required-success predicate pass regardless
+// of build's actual result - a bypass of the GATE PREDICATE itself. The
+// assertions confirm the opposite is true of the VERIFIER:
+// hasLiteralSuccessCheck correctly REJECTS every one of them (reports
+// build's check as not established), so none of these forms can slip
+// past the guard undetected.
+
+test("class battery: non-adjacent disjunctions on either side, at increasing operand distance, are all rejected by the verifier", () => {
+  const gatePredicateBypasses = [
+    // trailing, zero operands of distance (the original adjacent case)
+    "needs.build.result == 'success' || true",
+    // trailing, one extra && operand between the literal and the ||
+    "needs.build.result == 'success' && false || true",
+    // trailing, two extra && operands
+    "needs.build.result == 'success' && false && false || true",
+    // leading, zero operands of distance (the original adjacent case)
+    "true || needs.build.result == 'success'",
+    // leading, one extra && operand between the || and the literal
+    "true || false && needs.build.result == 'success'",
+    // leading, two extra && operands
+    "true || false && false && needs.build.result == 'success'",
+  ];
+  for (const expression of gatePredicateBypasses) {
+    assert.equal(
+      hasLiteralSuccessCheck(expression, "build"),
+      false,
+      `expected "${expression}" to be flagged as not establishing build's check`
+    );
+  }
+});
+
+test("class battery: legitimate AND-chains of any length still report the job's check as established (green controls)", () => {
+  const safe = [
+    "needs.build.result == 'success'",
+    "needs.build.result == 'success' && needs.lint.result == 'success'",
+    "needs.lint.result == 'success' && needs.build.result == 'success' && needs.test.result == 'success'",
+    "(needs.build.result == 'success') && needs.lint.result == 'success'",
+    "needs.build.result == 'success' && (needs.lint.result == 'success' && needs.test.result == 'success')",
+  ];
+  for (const expression of safe) {
+    assert.equal(
+      hasLiteralSuccessCheck(expression, "build"),
+      true,
+      `expected "${expression}" to establish build's check - a fix that overcorrects into flagging legitimate AND-chains is its own defect`
+    );
+  }
+});
+
+test("class battery: forcing applies to EVERY occurrence of the job's atom, not just the first match", () => {
+  // (X && X) || true reduces to "true" regardless of X, even though the
+  // FIRST occurrence, read in isolation, looks like a normal, safe
+  // AND-conjoined check. A first-match implementation that stopped at the
+  // first occurrence would miss that the second occurrence sits inside a
+  // structure the outer `|| true` makes irrelevant.
+  assert.equal(
+    hasLiteralSuccessCheck(
+      "needs.build.result == 'success' && needs.build.result == 'success' || true",
+      "build"
+    ),
+    false,
+    "both occurrences of build's atom must be forced together - a bypass reachable through either one must be caught"
+  );
+  // X || (X && false) reduces to exactly X, so this is genuinely safe -
+  // confirming multiple occurrences don't make the check overcorrect
+  // either, as long as every path back to true still requires X.
+  assert.equal(
+    hasLiteralSuccessCheck(
+      "needs.build.result == 'success' || (needs.build.result == 'success' && false)",
+      "build"
+    ),
+    true,
+    "X || (X && false) reduces to X - build's result is still genuinely necessary"
+  );
+});
+
+test("class battery: constructs outside the understood grammar are flagged, never silently accepted (fail closed)", () => {
+  const unsafe = [
+    // Negation: logically equivalent to a genuine success check, but this
+    // file does not understand `!` and must not guess that it does.
+    "!(needs.build.result != 'success')",
+    // A function call standing in for (or combined with) the check.
+    "success() || needs.build.result == 'success'",
+    "always() && needs.build.result == 'success' || true",
+    // A comparison operator, or a literal, outside the one shape this
+    // file understands (`== 'success'`/`== "success"` only).
+    "needs.build.result != 'failure'",
+    "needs.build.result == 'skipped'",
+    // Malformed/truncated fragments this file cannot parse at all.
+    "needs.build.result == 'success",
+    "(needs.build.result == 'success'",
+    "needs.build.result == 'success') && true",
+  ];
+  for (const expression of unsafe) {
+    assert.equal(
+      hasLiteralSuccessCheck(expression, "build"),
+      false,
+      `expected "${expression}" (outside the understood grammar) to be flagged, not silently accepted`
+    );
+  }
+});
+
+// The controlling step's own `if` being anything other than absent or
+// literally true - a computed, usually-false GitHub Actions expression,
+// say - must not still count as "running": a gate whose own
+// required-success step is silently skipped would report success
+// trivially, regardless of what actually failed - defeating the WHOLE
+// aggregate check in one move, not just one job's clause the way the
+// disjunction bypasses above each do. The gate's JOB-level `if: always()`
+// (required, untouched by this test) is a completely separate concern
+// from this STEP-level `if`; see stepIsUnconditionallyControlling's own
+// docs for why they need opposite treatment.
+test("mutation control: a conditional if on the controlling step itself is caught", () => {
+  const workflow = loadWorkflow();
+  const mutated = structuredClone(workflow);
+  const step = mutated.jobs[AGGREGATE_JOB_ID].steps[0];
+  assert.equal(step.if, undefined, "test assumption: the real controlling step has no if today");
+
+  step.if = "${{ github.run_number > 999999 }}";
+
+  const topologyErrors = verifyTopology(mutated.jobs, AGGREGATE_JOB_ID);
+  assert.ok(
+    topologyErrors.length > 0,
+    `expected verifyTopology to flag every job once the controlling step can't be trusted to run, got: ${JSON.stringify(topologyErrors)}`
+  );
+  const independentErrors = verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID);
+  assert.ok(
+    independentErrors.length > 0,
+    `expected verifyIndependentRequiredJobs to flag every job once the controlling step can't be trusted to run, got: ${JSON.stringify(independentErrors)}`
+  );
+
+  // Revert and confirm clean again. Also confirm the job-level if:
+  // always() (a completely separate concern) is untouched by this
+  // mutation and still exactly "always()".
+  delete step.if;
+  assert.deepEqual(verifyTopology(mutated.jobs, AGGREGATE_JOB_ID), []);
+  assert.deepEqual(verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID), []);
+  assert.equal(mutated.jobs[AGGREGATE_JOB_ID].if, "always()");
+});
+
 test("no job found under the given aggregate id is reported, not thrown", () => {
   const errors = verifyTopology({ build: {} }, "no-such-job");
   assert.deepEqual(errors, ['no "no-such-job" job found in the workflow']);
+});
+
+// --- Mandatory protection: paired-deletion independent required-job inventory ---
+//
+// verifyTopology derives "which jobs must gate depend on" from
+// Object.keys(jobs) on the SAME workflow file it is checking. So a
+// coordinated edit that deletes a job entirely - not just from gate.needs,
+// but the job definition itself, plus its needs entry, plus its clause in
+// gate's success-expression, all at once - removes that job from
+// consideration everywhere in the same motion, and verifyTopology has
+// nothing left to compare it against. The list below is read directly off
+// the real ci.yml's job set and hard-coded here, independent of the
+// workflow file - a coordinated deletion like that would ALSO have to
+// touch this file to keep the suite green.
+const INDEPENDENT_REQUIRED_JOB_IDS = [
+  "build",
+  "typecheck",
+  "lint",
+  "test",
+  "format",
+  "coverage",
+  "codeql",
+  "semgrep",
+  "zizmor",
+  "actionlint",
+  "changelog-presence",
+  "guards",
+  "sha-parity",
+  "install-repro",
+];
+
+test("independent inventory: gate.needs and gate's literal success-checks cover every hard-coded required job", () => {
+  const workflow = loadWorkflow();
+  const gate = workflow.jobs[AGGREGATE_JOB_ID];
+  const needs = normalizeNeeds(gate.needs);
+  // collectControllingExpressionText (imported from production, not
+  // reimplemented here) is what the shipped verify*/hasLiteralSuccessCheck
+  // pair actually searches: the job's CONTROLLING expression text only,
+  // not its entire flattened env/run/if text - see that function's own
+  // doc comment for why a wider search is unsafe.
+  const controllingText = collectControllingExpressionText(gate);
+  for (const jobId of INDEPENDENT_REQUIRED_JOB_IDS) {
+    assert.ok(
+      needs.includes(jobId),
+      `gate.needs is missing the independently-required job "${jobId}"`
+    );
+    // hasLiteralSuccessCheck (imported from production, not reimplemented
+    // here) parses the controlling expression and evaluates it with the
+    // SAME jobId's success comparison forced false, reporting the job's
+    // check as established only when that forced evaluation is provably
+    // false - not merely that both "needs.<id>.result" and "'success'"
+    // appear SOMEWHERE in the job text independently of each other. A
+    // weaker two-independent-substrings check
+    // (jobText.includes("needs.x.result") && jobText.includes("'success'"))
+    // would pass even when those two pieces belong to two DIFFERENT jobs'
+    // checks - exactly the kind of paired-shrink escape this independent
+    // inventory exists to close, so reusing the same non-vacuous mechanism
+    // here (not a hand-rolled weaker one) matters as much as the
+    // independent job-id list does. It also rejects a disjunction that
+    // governs the literal from any distance, not merely one sitting
+    // directly beside it, so a vacuously-true clause doesn't count either.
+    assert.ok(
+      hasLiteralSuccessCheck(controllingText, jobId),
+      `gate does not appear to literally check needs.${jobId}.result == 'success'`
+    );
+  }
+});
+
+// Proves the SHIPPED production check (the one "guards"/lint invokes, via
+// npm run verify:workflow-topology) actually agrees with this test file's
+// own independently-hardcoded list against the real workflow - so a drift
+// between the two hardcoded copies (this file's INDEPENDENT_REQUIRED_JOB_IDS
+// above and verify-workflow-topology.mjs's own) would show up as a real
+// test failure here, not silently diverge unnoticed.
+test("the shipped verifyIndependentRequiredJobs check is clean against the real workflow", () => {
+  const workflow = loadWorkflow();
+  assert.deepEqual(verifyIndependentRequiredJobs(workflow.jobs, AGGREGATE_JOB_ID), []);
+});
+
+// Mutation control: a coordinated deletion of a whole job - "coverage",
+// chosen because it has nothing to do with Windows/OS matrix work - is
+// removed from the job list itself, from gate.needs, and from gate's
+// success-expression all at once, in a test-local mutated copy.
+// verifyTopology alone (proven below as a sanity check) reports this clean,
+// because it derives its own expectations from the same mutated file. The
+// independent inventory above never reads the workflow file for its
+// expectations, so it still catches the deletion.
+test("mutation control (paired deletion): wholesale-deleting the coverage job is invisible to verifyTopology alone but caught by the independent inventory", () => {
+  const workflow = loadWorkflow();
+  const mutated = structuredClone(workflow);
+  delete mutated.jobs.coverage;
+  mutated.jobs[AGGREGATE_JOB_ID].needs = mutated.jobs[AGGREGATE_JOB_ID].needs.filter(
+    (id) => id !== "coverage"
+  );
+  mutated.jobs[AGGREGATE_JOB_ID].steps[0].env.ALL_SUCCEEDED = mutated.jobs[
+    AGGREGATE_JOB_ID
+  ].steps[0].env.ALL_SUCCEEDED.replace("needs.coverage.result == 'success' &&", "");
+
+  // Sanity check: proves the escape is real. verifyTopology, given only
+  // this mutated file, has nothing left in it to compare "coverage"
+  // against, so it reports clean.
+  assert.deepEqual(
+    verifyTopology(mutated.jobs, AGGREGATE_JOB_ID),
+    [],
+    "sanity check: verifyTopology alone does not notice a wholesale job deletion - this is the escape this protection exists to close"
+  );
+
+  // The independent inventory never derived its expectations from the
+  // workflow file, so the same mutated file still fails it - proven two
+  // ways: this file's own hardcoded list directly, and the shipped
+  // production function against the same mutated jobs.
+  const needs = normalizeNeeds(mutated.jobs[AGGREGATE_JOB_ID].needs);
+  const missing = INDEPENDENT_REQUIRED_JOB_IDS.filter((jobId) => !needs.includes(jobId));
+  assert.deepEqual(missing, ["coverage"]);
+
+  const productionErrors = verifyIndependentRequiredJobs(mutated.jobs, AGGREGATE_JOB_ID);
+  assert.ok(
+    productionErrors.some((error) => error.includes("coverage")),
+    `expected the shipped check to name "coverage", got: ${JSON.stringify(productionErrors)}`
+  );
 });
