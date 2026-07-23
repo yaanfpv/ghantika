@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { after, test } from "node:test";
 
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
@@ -11,6 +12,7 @@ import {
 } from "../dist/jobStore.js";
 import * as outputTool from "../dist/tools/output.js";
 import * as tailTool from "../dist/tools/tail.js";
+import * as runTool from "../dist/tools/run.js";
 
 // Explicit ".ts" extension - see test/e2e-server.test.ts's import comment
 // for why spawnServer.ts is imported this way.
@@ -22,15 +24,26 @@ import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/sp
 
 /**
  * A hand-built StreamBufferSnapshot - the exact shape jobStore.getStreamSnapshot
- * returns, now including the real per-line `seq` and `totalEverMaterialized`
- * (the seq architectural addition). Each line's `seq` defaults to
- * its 1-based array position (correct for an UNTRUNCATED fixture, where
- * nothing has ever been evicted so seq === position), but can be
+ * returns: real per-line `seq` (a per-JOB GLOBAL value - see jobStore.ts's
+ * `JobSeqCounter` docs), `headSeq` (the highest seq ever assigned to a line
+ * on THIS stream, persisting through eviction), and `droppedCount` (how
+ * many of THIS stream's own lines have ever been evicted - see
+ * `StreamBufferSnapshot.droppedCount`'s own docs in jobStore.ts for why v1
+ * discloses a bounded COUNT and a cursor boundary, never an exact per-seq
+ * range). Each line's `seq` defaults to its 1-based array position
+ * (correct for a SINGLE-stream, UNTRUNCATED fixture, where nothing has
+ * ever been evicted and no sibling stream shares the counter), but can be
  * overridden per-line to simulate a REALISTIC post-eviction scenario
- * (surviving lines' seq values starting well above 1). `totalEverMaterialized`
+ * (surviving lines' seq values starting well above 1) or a REALISTIC
+ * interleaved "both"-mode scenario (non-colliding seq values shared with a
+ * sibling stream's own snapshot - see the "both" fixtures below, which
+ * always pass explicit `seq` values for exactly this reason). `headSeq`
  * similarly defaults to the last line's own seq (again, correct only when
- * nothing has been evicted) and can be overridden to simulate "N lines
- * existed in total, only the newest few survived".
+ * nothing has been evicted and this stream owns the trailing edge of the
+ * counter) and can be overridden to simulate "seq N was the highest this
+ * stream ever produced, only the newest few lines survived". `droppedCount`
+ * defaults to 0 (nothing ever dropped) and can be overridden explicitly to
+ * simulate a stream that has genuinely evicted some of its own lines.
  */
 function snapshot(
   lines: Array<{
@@ -39,16 +52,16 @@ function snapshot(
     seq?: number;
   }>,
   truncated = false,
-  totalEverMaterialized?: number
+  headSeq?: number,
+  droppedCount = 0
 ) {
   const withSeq = lines.map((l, i) => ({
     text: l.text,
     terminator: l.terminator ?? ("newline" as const),
     seq: l.seq ?? i + 1,
   }));
-  const resolvedTotal =
-    totalEverMaterialized ?? (withSeq.length > 0 ? withSeq[withSeq.length - 1]!.seq : 0);
-  return { lines: withSeq, truncated, totalEverMaterialized: resolvedTotal };
+  const resolvedHead = headSeq ?? (withSeq.length > 0 ? withSeq[withSeq.length - 1]!.seq : 0);
+  return { lines: withSeq, truncated, headSeq: resolvedHead, droppedCount };
 }
 
 function structuredOf(result: {
@@ -63,21 +76,43 @@ function makeJobWithRawOutput(): string {
   return record.job_id;
 }
 
+/** Builds a genuine ~600KB single-line chunk (well under MAX_LINE_BYTES, but two together exceed MAX_BUFFER_BYTES) - real bytes, not a synthetic fixture. */
+function bigStreamLine(tag: string): Buffer {
+  return Buffer.from(tag.repeat(600_001) + "\n");
+}
+
+/** A real `pgrep -g <pgid>` call - see test/kill.test.ts's/test/jobStore.test.ts's identical helper for the full rationale. Returns the real pids found, `[]` when pgrep finds none (its own documented exit code 1). */
+function pgrepGroupMembers(pgid: number): number[] {
+  try {
+    const output = execFileSync("pgrep", ["-g", String(pgid)], { encoding: "utf8" });
+    return output
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .map(Number);
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException & { status?: number };
+    if (err.status === 1) return []; // pgrep's own "nothing matched" exit code - a real, expected zero-survivors result
+    throw error;
+  }
+}
+
 // =============================================================================
 // Tier 1: pure event-view construction (output.ts's buildSingleStreamEvents /
-// buildBothStreamsEvents) - fast, deterministic, exercises every cursor/gap/
-// merge computation precisely against hand-built and byte-accounting-layer-
-// built snapshots. tail.ts re-implements the identical scheme (no sibling
-// import permitted between tools/*.ts files - see both files' headers), so
-// each test in this tier is run against BOTH modules to keep them in
-// lockstep, except where tail's fixed after_cursor=0 makes the case N/A.
+// buildBothStreamsEvents) - fast, deterministic, exercises every cursor/drop-
+// disclosure/merge computation precisely against hand-built and byte-
+// accounting-layer-built snapshots. tail.ts re-implements the identical
+// scheme (no sibling import permitted between tools/*.ts files - see both
+// files' headers), so each test in this tier is run against BOTH modules to
+// keep them in lockstep, except where tail's fixed n-from-floor makes the
+// case N/A.
 // =============================================================================
 
-// --- untruncated (exact) mode ---
+// --- untruncated (nothing ever dropped) mode ---
 
-test("an untruncated stream numbers its events 1..N by position - exact and stable", () => {
+test("an untruncated stream numbers its events 1..N by position - exact and stable, and dropped stays 0", () => {
   const snap = snapshot([{ text: "a" }, { text: "b" }, { text: "c" }]);
-  const { events, head, gap } = outputTool.buildSingleStreamEvents("stdout", snap, 0);
+  const { events, head, drop } = outputTool.buildSingleStreamEvents("stdout", snap, 0);
   assert.deepEqual(
     events.map((e) => [e.seq, e.text]),
     [
@@ -87,7 +122,7 @@ test("an untruncated stream numbers its events 1..N by position - exact and stab
     ]
   );
   assert.equal(head, 3);
-  assert.equal(gap, undefined);
+  assert.deepEqual(drop, { dropped: 0, droppedBeforeCursor: 1 });
 });
 
 test("after_cursor filters an untruncated stream down to strictly-newer events only", () => {
@@ -107,11 +142,10 @@ test("after_cursor beyond the current head returns no events plus the current he
 });
 
 // (green control) a valid, in-range cursor must return exactly the
-// expected subsequent events, unaffected by any of the truncated-branch
-// machinery.
-test("(green control) a valid in-range cursor read stays exact and unaffected by truncated-branch logic", () => {
+// expected subsequent events, unaffected by anything drop-related.
+test("(green control) a valid in-range cursor read stays exact, with dropped staying 0", () => {
   const snap = snapshot([{ text: "a" }, { text: "b" }, { text: "c" }, { text: "d" }]);
-  const { events, head, gap } = outputTool.buildSingleStreamEvents("stdout", snap, 2);
+  const { events, head, drop } = outputTool.buildSingleStreamEvents("stdout", snap, 2);
   assert.deepEqual(
     events.map((e) => [e.seq, e.text]),
     [
@@ -120,23 +154,24 @@ test("(green control) a valid in-range cursor read stays exact and unaffected by
     ]
   );
   assert.equal(head, 4);
-  assert.equal(gap, undefined);
+  assert.equal(drop.dropped, 0);
 });
 
-// --- truncated (EXACT) mode - gap emission ---
+// --- truncated mode - bounded drop disclosure ---
 //
-// The seq architectural addition: `jobStore.ts` now exposes a
-// REAL monotonic per-line `seq` (never reused, survives eviction) plus a
-// real running `totalEverMaterialized` count, so the disclosed gap is now
-// the EXACT dropped range `[1, oldestSurvivingSeq - 1]`, narrowed to
-// whatever portion of it is still relevant to the caller's own
-// `after_cursor` - replacing the old width-1 "always disclose something"
-// placeholder these tests used to assert.
+// v1 deliberately never claims WHICH seq values were dropped (see
+// jobStore.ts's own `StreamBufferSnapshot.droppedCount` docs for why the
+// earlier exact-per-seq-range design was scrapped): a response only ever
+// carries a bounded COUNT (`dropped`) and a cursor boundary
+// (`droppedBeforeCursor`, this stream's own current retained floor). Both
+// are facts about the STREAM's whole life, never scoped or filtered by the
+// caller's own `after_cursor` - a deliberate simplification over the old
+// exact-range design, which suppressed a gap marker once the cursor moved
+// past it.
 
-test("a truncated stream discloses the EXACT dropped range, narrowed to what's still relevant past the caller's own cursor", () => {
-  // Realistic post-eviction shape: 9 lines have EVER existed on this
-  // stream, but only the newest 3 (seq 7, 8, 9) are still retained - seq
-  // 1 through 6 are gone forever.
+test("a truncated stream discloses dropped count and droppedBeforeCursor, independent of the caller's own cursor", () => {
+  // Realistic post-eviction shape: 6 lines were dropped, the newest 3
+  // (seq 7, 8, 9) are still retained.
   const snap = snapshot(
     [
       { text: "x", seq: 7 },
@@ -144,265 +179,236 @@ test("a truncated stream discloses the EXACT dropped range, narrowed to what's s
       { text: "z", seq: 9 },
     ],
     true,
-    9
+    9,
+    6
   );
-  const { events, gap, head } = outputTool.buildSingleStreamEvents("stdout", snap, 5);
-  // The caller's cursor (5) is already past seq 1-5 of the dropped range -
-  // only seq 6 is BOTH dropped AND still relevant to them, so the gap is
-  // exactly [6, 6], never the full [1, 6] the underlying stream actually
-  // lost (that's genuinely irrelevant to a caller who already read past 5).
-  assert.deepEqual(gap, { gap: [6, 6] });
+  const fresh = outputTool.buildSingleStreamEvents("stdout", snap, 0);
+  assert.deepEqual(fresh.drop, { dropped: 6, droppedBeforeCursor: 7 });
   assert.deepEqual(
-    events.map((e) => [e.seq, e.text]),
+    fresh.events.map((e) => [e.seq, e.text]),
     [
       [7, "x"],
       [8, "y"],
       [9, "z"],
     ]
   );
-  assert.equal(head, 9);
+  assert.equal(fresh.head, 9);
+
+  // A caller reading from far past the drop still sees the IDENTICAL drop
+  // disclosure - a fact about the stream, never filtered by cursor (unlike
+  // the earlier exact-range design, which stopped disclosing a gap once
+  // the caller's own cursor was already past it).
+  const pastCursor = outputTool.buildSingleStreamEvents("stdout", snap, 100);
+  assert.deepEqual(pastCursor.drop, { dropped: 6, droppedBeforeCursor: 7 });
 });
 
-test("truncated + omitted cursor (0) discloses the FULL exact dropped range - a fresh read is honestly missing everything that was ever evicted", () => {
-  // 5 lines ever existed, only the newest survives (seq 5); seq 1-4 are gone.
-  const snap = snapshot([{ text: "only-survivor", seq: 5 }], true, 5);
-  const { events, gap, head } = outputTool.buildSingleStreamEvents("stdout", snap, 0);
-  assert.deepEqual(gap, { gap: [1, 4] });
+test("a truncated stream with NO currently-retained lines reports droppedBeforeCursor through headSeq", () => {
+  // evictToFitBudget (jobStore.ts) can legitimately evict every
+  // materialized line - 12 lines ever existed, none survive.
+  const snap = snapshot([], true, 12, 12);
+  const { events, drop, head } = outputTool.buildSingleStreamEvents("stdout", snap, 3);
+  assert.deepEqual(events, []);
+  assert.deepEqual(drop, { dropped: 12, droppedBeforeCursor: 12 });
+  assert.equal(head, 12);
+});
+
+// --- no fabrication (structural) ---
+//
+// The proven real bug the earlier exact-range design kept reintroducing:
+// a single-stream disclosure that names a seq value belonging to a
+// still-retained SIBLING stream. Under the v1 bounded-count design this is
+// now impossible BY CONSTRUCTION - a count and a boundary never name a
+// seq at all - so these tests confirm each stream's own disclosure only
+// ever reflects its own droppedCount, never a sibling's activity.
+
+test("(no fabrication, structural) a stream's own drop disclosure reflects only its own droppedCount, never a sibling snapshot's", () => {
+  const stdoutSnap = snapshot([{ text: "o-3", seq: 3 }], true, 3, 1); // stdout's own 1 eviction
+  const stderrSnap = snapshot([{ text: "e-2", seq: 2 }], false, undefined, 0); // stderr never evicted
+  const stdoutView = outputTool.buildSingleStreamEvents("stdout", stdoutSnap, 0);
+  const stderrView = outputTool.buildSingleStreamEvents("stderr", stderrSnap, 0);
+  assert.deepEqual(stdoutView.drop, { dropped: 1, droppedBeforeCursor: 3 });
+  assert.deepEqual(stderrView.drop, { dropped: 0, droppedBeforeCursor: 2 });
+});
+
+test("tail.ts: a stream's own drop disclosure reflects only its own droppedCount, never a sibling snapshot's - same fix, tail's own reimplementation", () => {
+  const snap = snapshot([{ text: "o-3", seq: 3 }], true, 3, 1);
+  const { events, drop, head } = tailTool.buildSingleStreamEvents("stdout", snap, 100);
+  assert.deepEqual(drop, { dropped: 1, droppedBeforeCursor: 3 });
+  assert.deepEqual(
+    events.map((e) => e.seq),
+    [3]
+  );
+  assert.equal(head, 3);
+});
+
+// --- the DEEPER no-fabrication proof: real production eviction machinery,
+// never a hand-built snapshot, since the fabrication risk the earlier
+// per-seq-range design had lived in whether jobStore.ts's own tracking
+// produced the right SHAPE, not merely in how output.ts/tail.ts consumed
+// it. Every fixture below drives real ~600KB chunks so the SAME
+// single-stream byte cap (MAX_BUFFER_BYTES, 1 MiB) genuinely evicts a
+// stream's own oldest line each time a second ~600KB line lands.
+
+test("REGRESSION (row-41 equivalent): drop-count accuracy under a REAL multi-eviction, cross-stream-interleaved scenario - built through real JobStore eviction, never a hand-authored synthetic snapshot", () => {
+  const jobId = makeJobWithRawOutput();
+  // seq 1 (stdout, alone, no eviction yet)
+  jobStore.appendOutput(jobId, "stdout", bigStreamLine("a"));
+  // seq 2 (stderr, retained forever - never touched again)
+  jobStore.appendOutput(jobId, "stderr", Buffer.from("e2\n"));
+  // seq 3 (stdout) - stdout's own two lines together now exceed the 1 MiB
+  // cap, so stdout's OWN real eviction loop evicts its OWN oldest line
+  // (seq 1), retaining only seq 3. stdout's own droppedCount is now 1.
+  jobStore.appendOutput(jobId, "stdout", bigStreamLine("c"));
+  // seq 4 (stderr, also retained)
+  jobStore.appendOutput(jobId, "stderr", Buffer.from("e4\n"));
+  // seq 5 (stdout) - evicts stdout's own seq-3 line the same way, retaining
+  // only seq 5. stdout's own droppedCount is now 2 - never conflated with
+  // stderr's own untouched activity.
+  jobStore.appendOutput(jobId, "stdout", bigStreamLine("e"));
+
+  const stdoutSnapshot = jobStore.getStreamSnapshot(jobId, "stdout")!;
+  assert.equal(stdoutSnapshot.lines.length, 1, "only the newest stdout line (seq 5) survives");
+  assert.equal(stdoutSnapshot.lines[0]!.seq, 5);
+  assert.equal(stdoutSnapshot.truncated, true);
+  assert.equal(
+    stdoutSnapshot.droppedCount,
+    2,
+    "stdout must have evicted exactly its own two oldest lines (seq 1 and 3), never counting stderr's own untouched activity"
+  );
+  const stderrSnapshot = jobStore.getStreamSnapshot(jobId, "stderr")!;
+  assert.deepEqual(
+    stderrSnapshot.lines.map((l) => l.seq),
+    [2, 4],
+    "stderr's own seq 2 and 4 must both still be alive - never evicted by anything"
+  );
+  assert.equal(stderrSnapshot.droppedCount, 0, "stderr never had a line evicted");
+
+  const result = structuredOf(outputTool.handler({ job_id: jobId, stream: "stdout" }));
+  assert.equal(result.dropped, 2);
+  assert.equal(
+    result.droppedBeforeCursor,
+    5,
+    "the current retained floor is stdout's only surviving line, seq 5"
+  );
+  const events = result.events as Array<{ seq: number }>;
   assert.deepEqual(
     events.map((e) => e.seq),
     [5]
   );
-  assert.equal(head, 5);
-});
 
-test("a truncated stream with NO currently-retained lines still reports the exact dropped range through totalEverMaterialized, and a sane head (empty window edge case)", () => {
-  // evictToFitBudget (jobStore.ts) can legitimately evict every
-  // materialized line - 12 lines ever existed, none survive.
-  const snap = snapshot([], true, 12);
-  const { events, gap, head } = outputTool.buildSingleStreamEvents("stdout", snap, 3);
-  assert.deepEqual(events, []);
-  assert.deepEqual(gap, { gap: [4, 12] });
-  assert.equal(head, 12);
-});
-
-// A genuinely NEW capability the exact scheme provides that the old
-// always-disclose-something placeholder could not: a caller whose own
-// cursor is ALREADY past everything that was ever dropped gets NO gap
-// marker at all - there is truly nothing relevant left to disclose to them.
-test("a cursor already past everything ever dropped gets NO gap marker at all - nothing relevant remains to disclose", () => {
-  const snap = snapshot(
-    [
-      { text: "x", seq: 7 },
-      { text: "y", seq: 8 },
-      { text: "z", seq: 9 },
-    ],
-    true,
-    9
-  );
-  const atTheBoundary = outputTool.buildSingleStreamEvents("stdout", snap, 6); // seq 1-6 dropped; cursor is exactly at the last dropped seq
-  assert.equal(atTheBoundary.gap, undefined);
+  // No fabrication, end to end: reading "both" over the same span must
+  // still return stderr's genuinely-alive seq 2 and 4 - stdout's own drop
+  // disclosure cannot even NAME a seq, so this is impossible by
+  // construction, verified anyway as a real regression - and stderr must
+  // be OMITTED from the "dropped" object entirely, since it never lost
+  // anything.
+  const both = structuredOf(outputTool.handler({ job_id: jobId, stream: "both" }));
+  const bothEvents = both.events as Array<{ seq: number; stream: string }>;
   assert.deepEqual(
-    atTheBoundary.events.map((e) => e.seq),
-    [7, 8, 9]
-  );
-
-  const wellPast = outputTool.buildSingleStreamEvents("stdout", snap, 100); // cursor beyond even the retained window
-  assert.equal(wellPast.gap, undefined);
-  assert.deepEqual(wellPast.events, []);
-});
-
-// --- "both" merge order + interior-gap positioning ---
-
-test("'both' merges via a fixed, deterministic parity split (stdout odd, stderr even) when neither stream is truncated", () => {
-  const stdoutSnap = snapshot([{ text: "o1" }, { text: "o2" }]);
-  const stderrSnap = snapshot([{ text: "e1" }]);
-  const { events, head, gap } = outputTool.buildBothStreamsEvents(stdoutSnap, stderrSnap, 0);
-  assert.deepEqual(
-    events.map((e) => [e.seq, e.stream, e.text]),
+    bothEvents.map((e) => [e.seq, e.stream]),
     [
-      [1, "stdout", "o1"],
-      [2, "stderr", "e1"],
-      [3, "stdout", "o2"],
+      [2, "stderr"],
+      [4, "stderr"],
+      [5, "stdout"],
     ]
   );
-  assert.equal(head, 3);
-  assert.equal(gap, undefined);
+  assert.deepEqual(
+    both.dropped,
+    { stdout: { dropped: 2, droppedBeforeCursor: 5 } },
+    "stderr must be omitted entirely from the dropped object - it never lost anything"
+  );
 });
 
-test("'both' merge is prefix-stable - a stream's Nth retained line keeps the same merged seq regardless of how much the OTHER stream grows", () => {
-  const stderrSnap = snapshot([{ text: "e1" }]);
-  const before = outputTool.buildBothStreamsEvents(snapshot([{ text: "o1" }]), stderrSnap, 0);
-  const after = outputTool.buildBothStreamsEvents(
-    snapshot([{ text: "o1" }, { text: "o2" }, { text: "o3" }]),
+test("no-fabrication regression: cross-selector cursor reuse never skips a still-retained sibling event", () => {
+  const jobId = makeJobWithRawOutput();
+  jobStore.appendOutput(jobId, "stdout", bigStreamLine("a")); // seq 1
+  jobStore.appendOutput(jobId, "stderr", Buffer.from("e2\n")); // seq 2, retained forever
+  jobStore.appendOutput(jobId, "stdout", bigStreamLine("c")); // seq 3, evicts seq 1
+  jobStore.appendOutput(jobId, "stderr", Buffer.from("e4\n")); // seq 4, retained forever
+
+  const stdoutRead = structuredOf(outputTool.handler({ job_id: jobId, stream: "stdout" }));
+  assert.equal(
+    stdoutRead.next_cursor,
+    3,
+    "stdout's own true head is its only surviving event's seq"
+  );
+
+  // Re-reading from the floor with "both" must still surface stderr's
+  // seq 2 and seq 4 - they sit numerically inside the span stdout itself
+  // lost data in (seq 1..3), yet were never stdout's own to drop, and must
+  // never be silently skipped just because a caller previously read only
+  // stdout's own cursor.
+  const bothReplay = structuredOf(
+    outputTool.handler({ job_id: jobId, stream: "both", after_cursor: 0 })
+  );
+  const events = bothReplay.events as Array<{ seq: number; stream: string }>;
+  assert.ok(
+    events.some((e) => e.seq === 2 && e.stream === "stderr"),
+    "stderr's still-retained seq 2 must be returned, never swallowed by stdout's own drop"
+  );
+  assert.ok(
+    events.some((e) => e.seq === 4 && e.stream === "stderr"),
+    "stderr's still-retained seq 4 must be returned"
+  );
+});
+
+// --- "both" merge order + independent per-stream drop disclosure ---
+//
+// jobStore.ts assigns `seq` from ONE counter shared across a job's stdout
+// AND stderr (see JobSeqCounter's own docs), so a "both" fixture below
+// always hand-authors REALISTIC, non-colliding, interleaved `seq` values
+// across its stdout/stderr snapshot pair - exactly what a real job would
+// produce, never each stream independently defaulting to 1, 2, 3... (which
+// would fabricate an impossible collision under the real shared counter).
+
+test("'both' merges by REAL seq (never a synthetic parity split) - real interleaved arrival order, stable and exact", () => {
+  // Realistic interleave: stdout produced seq 1 and 3, stderr produced
+  // seq 2 and 4 - exactly the shape a shared per-job counter yields.
+  const stdoutSnap = snapshot([
+    { text: "o1", seq: 1 },
+    { text: "o2", seq: 3 },
+  ]);
+  const stderrSnap = snapshot([
+    { text: "e1", seq: 2 },
+    { text: "e2", seq: 4 },
+  ]);
+  const { events, head, stdoutDrop, stderrDrop } = outputTool.buildBothStreamsEvents(
+    stdoutSnap,
     stderrSnap,
     0
   );
-  const o1Before = before.events.find((e) => e.text === "o1")!;
-  const o1After = after.events.find((e) => e.text === "o1")!;
-  const e1Before = before.events.find((e) => e.text === "e1")!;
-  const e1After = after.events.find((e) => e.text === "e1")!;
-  assert.equal(
-    o1Before.seq,
-    o1After.seq,
-    "stdout's first line must keep the same merged seq as stdout grows"
-  );
-  assert.equal(
-    e1Before.seq,
-    e1After.seq,
-    "stderr's first line must keep the same merged seq as stdout grows"
-  );
-});
-
-test("'both' with either stream truncated emits a best-effort combined leading gap, derived from each stream's real dropped-through seq (not a caller-cursor-relative placeholder)", () => {
-  // Realistic post-eviction shape: 5 stdout lines ever existed, only the
-  // newest (seq 5) survives - seq 1-4 are gone. stderr never truncated.
-  const stdoutSnap = snapshot([{ text: "o5", seq: 5 }], true, 5);
-  const stderrSnap = snapshot([{ text: "e1" }], false);
-  const { events, gap } = outputTool.buildBothStreamsEvents(stdoutSnap, stderrSnap, 0);
-  // stdout's real dropped-through seq is 4; converted via the same parity
-  // formula real events use (2*seq-1), that's merged position 7.
-  assert.deepEqual(gap, { gap: [1, 7] });
-  assert.deepEqual(
-    events
-      .map((e) => [e.seq, e.stream, e.text] as const)
-      .sort((a, b) => (a[0] as number) - (b[0] as number)),
-    [
-      [2, "stderr", "e1"],
-      [9, "stdout", "o5"],
-    ]
-  );
-});
-
-test("'both': a cursor already past everything ever dropped on either stream gets no gap marker", () => {
-  const stdoutSnap = snapshot([{ text: "o5", seq: 5 }], true, 5); // dropped-through merged position 7
-  const stderrSnap = snapshot([{ text: "e1" }], false);
-  const atTheBoundary = outputTool.buildBothStreamsEvents(stdoutSnap, stderrSnap, 7);
-  assert.equal(atTheBoundary.gap, undefined);
-});
-
-// The core regression this fix closes: the OLD "both" truncated branch
-// recomputed the entire current window's numbering relative to the
-// CALLER's OWN after_cursor on every call, unfiltered - so re-submitting a
-// prior call's own next_cursor, with nothing new having arrived, returned
-// the SAME lines again with a climbing next_cursor, forever. A poller has
-// no way to detect "I'm caught up" under that scheme.
-test("REGRESSION: 'both' in truncated mode reaches an EMPTY page once the caller catches up, instead of replaying the same window forever", () => {
-  const stdoutSnap = snapshot(
-    [
-      { text: "o7", seq: 7 },
-      { text: "o8", seq: 8 },
-      { text: "o9", seq: 9 },
-    ],
-    true,
-    9
-  );
-  const stderrSnap = snapshot(
-    [
-      { text: "e5", seq: 5 },
-      { text: "e6", seq: 6 },
-    ],
-    true,
-    6
-  );
-
-  const first = outputTool.buildBothStreamsEvents(stdoutSnap, stderrSnap, 0);
-  assert.ok(first.events.length > 0, "a fresh read must return the currently-retained window");
-
-  // Simulate the caller submitting the first call's own next_cursor
-  // (=head) as the second call's after_cursor, with nothing new having
-  // materialized on either stream in between.
-  const second = outputTool.buildBothStreamsEvents(stdoutSnap, stderrSnap, first.head);
-  assert.deepEqual(
-    second.events,
-    [],
-    "a caller who has already read everything currently available must see an EMPTY page, not the same lines replayed"
-  );
-  assert.equal(
-    second.gap,
-    undefined,
-    "nothing new was dropped since the caller's own cursor either"
-  );
-  assert.equal(second.head, first.head, "head must not move when nothing new has materialized");
-});
-
-test("'both' merged seq for a SURVIVING line is stable across further eviction, not just across the other stream's growth", () => {
-  const before = outputTool.buildBothStreamsEvents(
-    snapshot(
-      [
-        { text: "o5", seq: 5 },
-        { text: "o6", seq: 6 },
-        { text: "o7", seq: 7 },
-        { text: "o8", seq: 8 },
-        { text: "o9", seq: 9 },
-      ],
-      true,
-      9
-    ),
-    snapshot([{ text: "e1", seq: 1 }]),
-    0
-  );
-  const o9Before = before.events.find((e) => e.text === "o9")!;
-
-  // MORE eviction has happened since - seq 5, 6, 7 are gone too now, only
-  // seq 8, 9 survive.
-  const after = outputTool.buildBothStreamsEvents(
-    snapshot(
-      [
-        { text: "o8", seq: 8 },
-        { text: "o9", seq: 9 },
-      ],
-      true,
-      9
-    ),
-    snapshot([{ text: "e1", seq: 1 }]),
-    0
-  );
-  const o9After = after.events.find((e) => e.text === "o9")!;
-
-  assert.equal(
-    o9Before.seq,
-    o9After.seq,
-    "a surviving line's merged seq must not change just because OLDER lines around it got evicted"
-  );
-});
-
-// tail.ts REIMPLEMENTS this same scheme independently (no sibling
-// tools/*.ts import permitted - see its own header), so its "both" merge
-// needs its own direct pure-function coverage, never assumed correct just
-// because output.ts's is - closing a real gap: before this fix, tail.ts's
-// own buildBothStreamsEvents had NO direct test at all, truncated or not.
-
-test("tail.ts: buildBothStreamsEvents untruncated matches output.ts's own parity split exactly", () => {
-  const stdoutSnap = snapshot([{ text: "o1" }, { text: "o2" }]);
-  const stderrSnap = snapshot([{ text: "e1" }]);
-  const { events, head, gap } = tailTool.buildBothStreamsEvents(stdoutSnap, stderrSnap);
   assert.deepEqual(
     events.map((e) => [e.seq, e.stream, e.text]),
     [
       [1, "stdout", "o1"],
       [2, "stderr", "e1"],
       [3, "stdout", "o2"],
+      [4, "stderr", "e2"],
     ]
   );
-  assert.equal(head, 3);
-  assert.equal(gap, undefined);
+  assert.equal(head, 4);
+  assert.equal(stdoutDrop.dropped, 0);
+  assert.equal(stderrDrop.dropped, 0);
 });
 
-test("tail.ts: buildBothStreamsEvents merges via the same real-seq-derived parity split as output.ts, stable under truncation", () => {
-  const stdoutSnap = snapshot([{ text: "o5", seq: 5 }], true, 5);
-  const stderrSnap = snapshot([{ text: "e1" }], false);
-  const { events, gap, head } = tailTool.buildBothStreamsEvents(stdoutSnap, stderrSnap);
-  assert.deepEqual(gap, { gap: [1, 7] });
+test("'both': each stream's own dropped/droppedBeforeCursor stays fully independent, never a merged/shared boundary", () => {
+  const stdoutSnap = snapshot([{ text: "o-3", seq: 3 }], true, 3, 1);
+  const stderrSnap = snapshot([{ text: "e-4", seq: 4 }], true, 4, 2); // a DIFFERENT dropped count
+  const { events, head, stdoutDrop, stderrDrop } = outputTool.buildBothStreamsEvents(
+    stdoutSnap,
+    stderrSnap,
+    0
+  );
+  assert.deepEqual(stdoutDrop, { dropped: 1, droppedBeforeCursor: 3 });
+  assert.deepEqual(stderrDrop, { dropped: 2, droppedBeforeCursor: 4 });
   assert.deepEqual(
-    events
-      .map((e) => [e.seq, e.stream, e.text] as const)
-      .sort((a, b) => (a[0] as number) - (b[0] as number)),
+    events.map((e) => [e.seq, e.stream, e.text]),
     [
-      [2, "stderr", "e1"],
-      [9, "stdout", "o5"],
+      [3, "stdout", "o-3"],
+      [4, "stderr", "e-4"],
     ]
   );
-  assert.equal(head, 9);
+  assert.equal(head, 4);
 });
 
 // --- partial-line flagging ---
@@ -427,30 +433,32 @@ test("(green control) a genuinely complete newline-terminated line never carries
 
 // --- realistic fixtures via the byte-accounting layer itself (mirrors jobStore.test.ts's construction style) ---
 
-test("realistic fixture: a genuine byte-cap overflow (built via appendChunkToBuffer, not hand-authored) produces truncated: true, and output.ts discloses the EXACT gap - a real, provable dropped count, not a fabricated placeholder", () => {
+test("realistic fixture: a genuine byte-cap overflow (built via appendChunkToBuffer, not hand-authored) produces truncated: true, and output.ts discloses the EXACT drop count - a real, provable dropped count, not a fabricated placeholder", () => {
   const state = createStreamBufferState();
   for (let i = 0; i < 50; i += 1) {
     appendChunkToBuffer(state, Buffer.from(`z`.repeat(30_000) + `-${i}\n`));
   }
   const snap = snapshotStreamBuffer(state);
   assert.equal(snap.truncated, true, "fixture must have genuinely overflowed the byte cap");
-  const { events, gap } = outputTool.buildSingleStreamEvents("stdout", snap, 0);
+  const { events, drop } = outputTool.buildSingleStreamEvents("stdout", snap, 0);
   assert.ok(events.length > 0 && events.length < 50, "some lines must have been evicted");
   const droppedCount = 50 - events.length;
-  // The gap's width must be EXACTLY the real number of dropped lines
-  // (verifiable independently from the retained-event count itself) - the
-  // old scheme could only ever disclose a fixed width-1 placeholder here.
-  assert.deepEqual(gap, { gap: [1, droppedCount] });
+  // A solo stream (no sibling sharing the counter) always evicts its own
+  // strictly contiguous prefix - the disclosed count must be EXACTLY the
+  // real number of dropped lines (verifiable independently from the
+  // retained-event count itself).
+  assert.equal(drop.dropped, droppedCount);
+  assert.equal(drop.droppedBeforeCursor, events[0]!.seq);
   // The newest line must still be the real newest.
   assert.ok(events[events.length - 1]!.text.endsWith("-49"));
 });
 
-// Eviction across MULTIPLE separate
-// overflow events (not just the very first one) must still produce a
-// correct EXACT gap - proving the running totalEverMaterialized/seq
-// counters keep accumulating correctly across many append calls, not just
-// surviving a single overflow burst.
-test("realistic fixture: eviction across MULTIPLE separate overflow events still produces a correct exact gap, reflecting the CUMULATIVE drop, not just the first round's", () => {
+// Eviction across MULTIPLE separate overflow events (not just the very
+// first one) must still produce a correct CUMULATIVE drop count, proving
+// the running headSeq/linesEverMaterialized/droppedCount counters keep
+// accumulating correctly across many append calls, not just surviving a
+// single overflow burst.
+test("realistic fixture: eviction across MULTIPLE separate overflow events still produces a correct CUMULATIVE drop count, not just the first round's", () => {
   const state = createStreamBufferState();
   const bigLine = (i: number): Buffer => Buffer.from(`z`.repeat(30_000) + `-${i}\n`);
 
@@ -460,8 +468,7 @@ test("realistic fixture: eviction across MULTIPLE separate overflow events still
   }
   const afterRound1 = snapshotStreamBuffer(state);
   assert.equal(afterRound1.truncated, true);
-  const gapAfterRound1 = outputTool.buildSingleStreamEvents("stdout", afterRound1, 0).gap!;
-  const droppedAfterRound1 = gapAfterRound1.gap[1];
+  const dropAfterRound1 = outputTool.buildSingleStreamEvents("stdout", afterRound1, 0).drop;
 
   // Round 2: 50 MORE lines (seq 51..100), forcing further eviction of
   // everything round 1 had retained too.
@@ -470,40 +477,36 @@ test("realistic fixture: eviction across MULTIPLE separate overflow events still
   }
   const afterRound2 = snapshotStreamBuffer(state);
   assert.equal(afterRound2.truncated, true);
-  const { events, gap } = outputTool.buildSingleStreamEvents("stdout", afterRound2, 0);
+  const { events, drop } = outputTool.buildSingleStreamEvents("stdout", afterRound2, 0);
 
-  assert.ok(gap !== undefined);
-  const droppedAfterRound2 = gap!.gap[1];
   // The cumulative drop after round 2 must be strictly larger than after
   // round 1 alone (every one of round 1's survivors got evicted too, PLUS
-  // whatever additional round-2 lines didn't fit) - proving this is a
-  // real running total, not a value that resets or double-counts.
+  // whatever additional round-2 lines didn't fit) - proving this is a real
+  // running total, not a value that resets or double-counts.
   assert.ok(
-    droppedAfterRound2 > droppedAfterRound1,
-    `expected cumulative drop (${droppedAfterRound2}) to exceed round 1's drop (${droppedAfterRound1})`
+    drop.dropped > dropAfterRound1.dropped,
+    `expected cumulative drop (${drop.dropped}) to exceed round 1's drop (${dropAfterRound1.dropped})`
   );
   // Exact, independently-verifiable identity: total ever materialized (100)
-  // = dropped-through-seq + currently-retained count.
-  assert.equal(droppedAfterRound2 + events.length, 100);
+  // = dropped + currently-retained.
+  assert.equal(drop.dropped + events.length, 100);
   // The retained window's own oldest survivor's seq must be exactly one
-  // past the disclosed gap - internally consistent, no off-by-one.
-  assert.equal(events[0]!.seq, droppedAfterRound2 + 1);
+  // past the disclosed drop count - internally consistent, no off-by-one.
+  assert.equal(events[0]!.seq, drop.dropped + 1);
+  assert.equal(drop.droppedBeforeCursor, events[0]!.seq);
   assert.ok(
     events[events.length - 1]!.text.endsWith("-99"),
     "the newest line must always be the true newest"
   );
 });
 
-// --- tail.ts's OWN exact-gap computation, tested directly at the pure-
-// function level (not just via the handler-level tests further down) -
-// tail.ts REIMPLEMENTS this scheme independently (no sibling tools/*.ts
+// --- tail.ts's OWN drop-disclosure computation, tested directly at the
+// pure-function level (not just via the handler-level tests further down)
+// - tail.ts REIMPLEMENTS this scheme independently (no sibling tools/*.ts
 // import permitted - see its own header), so it needs its own dedicated
-// coverage, never assumed correct just because output.ts's is. Closes a
-// real gap: a mutant in tail.ts's exact-gap block was NOT caught by any
-// test before these were added (every existing tail-related test only
-// checked gap PRESENCE, never its actual VALUE).
+// coverage, never assumed correct just because output.ts's is.
 
-test("tail.ts: buildSingleStreamEvents discloses the EXACT dropped range through totalEverMaterialized (afterCursor fixed at 0)", () => {
+test("tail.ts: buildSingleStreamEvents discloses dropped/droppedBeforeCursor through headSeq when the window (n) reaches the retained floor", () => {
   const snap = snapshot(
     [
       { text: "x", seq: 7 },
@@ -511,13 +514,14 @@ test("tail.ts: buildSingleStreamEvents discloses the EXACT dropped range through
       { text: "z", seq: 9 },
     ],
     true,
-    9
+    9,
+    6
   );
-  const { events, gap, head } = tailTool.buildSingleStreamEvents("stdout", snap);
+  const { events, drop, head } = tailTool.buildSingleStreamEvents("stdout", snap, 100);
   assert.deepEqual(
-    gap,
-    { gap: [1, 6] },
-    "seq 1-6 are gone forever; tail always reads from the floor, so the full range is disclosed"
+    drop,
+    { dropped: 6, droppedBeforeCursor: 7 },
+    "seq 1-6 are gone forever; the current retained floor is seq 7"
   );
   assert.deepEqual(
     events.map((e) => [e.seq, e.text]),
@@ -530,11 +534,32 @@ test("tail.ts: buildSingleStreamEvents discloses the EXACT dropped range through
   assert.equal(head, 9);
 });
 
-test("tail.ts: buildSingleStreamEvents with NO currently-retained lines still reports the exact dropped range through totalEverMaterialized", () => {
-  const snap = snapshot([], true, 12);
-  const { events, gap, head } = tailTool.buildSingleStreamEvents("stdout", snap);
+test("tail.ts: dropped/droppedBeforeCursor are disclosed even when the requested window does NOT reach the retained floor - a stream-level fact, never gated on this call's own window size (a deliberate difference from the old gap-suppression design)", () => {
+  const snap = snapshot(
+    [
+      { text: "x", seq: 7 },
+      { text: "y", seq: 8 },
+      { text: "z", seq: 9 },
+    ],
+    true,
+    9,
+    6
+  );
+  const { events, drop, head, reachesFloor } = tailTool.buildSingleStreamEvents("stdout", snap, 2);
+  assert.equal(reachesFloor, false, "n=2 requests fewer events than are currently retained (3)");
+  assert.deepEqual(drop, { dropped: 6, droppedBeforeCursor: 7 });
+  assert.deepEqual(
+    events.map((e) => e.text),
+    ["y", "z"]
+  );
+  assert.equal(head, 9);
+});
+
+test("tail.ts: buildSingleStreamEvents with NO currently-retained lines still reports droppedBeforeCursor through headSeq", () => {
+  const snap = snapshot([], true, 12, 12);
+  const { events, drop, head } = tailTool.buildSingleStreamEvents("stdout", snap, 100);
   assert.deepEqual(events, []);
-  assert.deepEqual(gap, { gap: [1, 12] });
+  assert.deepEqual(drop, { dropped: 12, droppedBeforeCursor: 12 });
   assert.equal(head, 12);
 });
 
@@ -545,17 +570,63 @@ test("tail.ts: buildSingleStreamEvents against a REAL byte-cap overflow (via app
   }
   const snap = snapshotStreamBuffer(state);
   assert.equal(snap.truncated, true);
-  const { events, gap } = tailTool.buildSingleStreamEvents("stdout", snap);
+  const { events, drop } = tailTool.buildSingleStreamEvents("stdout", snap, 100_000);
   assert.ok(events.length > 0 && events.length < 50);
   const droppedCount = 50 - events.length;
-  assert.deepEqual(gap, { gap: [1, droppedCount] });
+  assert.equal(drop.dropped, droppedCount);
   assert.ok(events[events.length - 1]!.text.endsWith("-49"));
+});
+
+// --- tail.ts's OWN "both" real-seq merge + independent per-stream drop
+// disclosure, at the pure-function level - mirrors output.ts's own
+// coverage above, since tail.ts reimplements the scheme independently (no
+// sibling import permitted - see its own header).
+
+test("tail.ts: buildBothStreamsEvents returns the last N events in REAL global seq order across both streams, never a synthetic parity split", () => {
+  const stdoutSnap = snapshot([
+    { text: "o1", seq: 1 },
+    { text: "o2", seq: 3 },
+  ]);
+  const stderrSnap = snapshot([
+    { text: "e1", seq: 2 },
+    { text: "e2", seq: 4 },
+  ]);
+  const { events, head, reachesFloor, stdoutDrop, stderrDrop } = tailTool.buildBothStreamsEvents(
+    stdoutSnap,
+    stderrSnap,
+    2
+  );
+  assert.deepEqual(
+    events.map((e) => [e.seq, e.stream, e.text]),
+    [
+      [3, "stdout", "o2"],
+      [4, "stderr", "e2"],
+    ]
+  );
+  assert.equal(reachesFloor, false, "n=2 of 4 total events does not reach the floor");
+  assert.equal(stdoutDrop.dropped, 0);
+  assert.equal(stderrDrop.dropped, 0);
+  assert.equal(head, 4);
+});
+
+test("tail.ts: buildBothStreamsEvents discloses each stream's own drop info independently, regardless of window size", () => {
+  const stdoutSnap = snapshot([{ text: "o-3", seq: 3 }], true, 3, 1);
+  const stderrSnap = snapshot([{ text: "e-4", seq: 4 }], true, 4, 5);
+  const { stdoutDrop, stderrDrop, reachesFloor } = tailTool.buildBothStreamsEvents(
+    stdoutSnap,
+    stderrSnap,
+    1 // does not reach the floor (2 total events)
+  );
+  assert.equal(reachesFloor, false);
+  assert.deepEqual(stdoutDrop, { dropped: 1, droppedBeforeCursor: 3 });
+  assert.deepEqual(stderrDrop, { dropped: 5, droppedBeforeCursor: 4 });
 });
 
 // =============================================================================
 // Tier 2: handler-level integration - the shared jobStore singleton, real
-// not-found/validation behavior, tail's N-selection and gap-suppression-
-// when-not-reaching-the-floor logic.
+// not-found/validation behavior, drop-disclosure field shaping (zero-drop
+// omission, single-stream vs "both" shape), and truncated's two distinct
+// causes (retention eviction and limit/lines clamping).
 // =============================================================================
 
 // --- unknown job_id ---
@@ -642,6 +713,92 @@ test("output: limit caps the number of events returned per call and next_cursor 
   );
 });
 
+// --- zero-drop field omission ---
+
+test("(green control) output: dropped/droppedBeforeCursor/truncated are all omitted entirely when nothing was ever evicted and no limit clamped this call", () => {
+  const jobId = makeJobWithRawOutput();
+  jobStore.appendOutput(jobId, "stdout", Buffer.from("a\nb\nc\n"));
+  const result = structuredOf(outputTool.handler({ job_id: jobId, stream: "stdout" }));
+  assert.equal("truncated" in result, false);
+  assert.equal("dropped" in result, false);
+  assert.equal("droppedBeforeCursor" in result, false);
+});
+
+test("(green control) 'both': dropped is omitted entirely when neither stream has ever evicted anything", () => {
+  const jobId = makeJobWithRawOutput();
+  jobStore.appendOutput(jobId, "stdout", Buffer.from("o\n"));
+  jobStore.appendOutput(jobId, "stderr", Buffer.from("e\n"));
+  const result = structuredOf(outputTool.handler({ job_id: jobId, stream: "both" }));
+  assert.equal("dropped" in result, false);
+});
+
+// --- truncated's two distinct causes (retention eviction vs limit/lines clamping) ---
+
+test("output: truncated stays true from the retention-eviction cause even once the caller's own cursor has fully caught up (no items pending this call)", () => {
+  const jobId = makeJobWithRawOutput();
+  for (let i = 0; i < 10_050; i += 1) {
+    jobStore.appendOutput(jobId, "stdout", Buffer.from(`line-${i}\n`));
+  }
+  const first = structuredOf(outputTool.handler({ job_id: jobId, stream: "stdout" }));
+  assert.equal(first.truncated, true, "fixture must have genuinely overflowed MAX_BUFFER_LINES");
+  const caughtUp = structuredOf(
+    outputTool.handler({
+      job_id: jobId,
+      stream: "stdout",
+      after_cursor: first.next_cursor as number,
+    })
+  );
+  assert.deepEqual(caughtUp.events, []);
+  assert.equal(
+    caughtUp.truncated,
+    true,
+    "truncated must stay true - this stream genuinely lost history forever, regardless of whether THIS call has anything new to disclose"
+  );
+});
+
+test("output: `limit` alone sets truncated:true even on a stream that has never evicted anything - the limit-clamping cause, distinct from retention eviction", () => {
+  const jobId = makeJobWithRawOutput();
+  jobStore.appendOutput(jobId, "stdout", Buffer.from("a\nb\nc\n"));
+  const result = structuredOf(outputTool.handler({ job_id: jobId, stream: "stdout", limit: 2 }));
+  assert.equal((result.events as unknown[]).length, 2);
+  assert.equal(
+    result.truncated,
+    true,
+    "2 of 3 available events were returned - one remains, so truncated must be true even though nothing was ever evicted"
+  );
+  assert.equal(
+    result.dropped,
+    undefined,
+    "no retention eviction ever happened - dropped/droppedBeforeCursor must stay absent"
+  );
+});
+
+test("output: dropped/droppedBeforeCursor stay identical across every paginated page of the same truncated stream - never affected by `limit`", () => {
+  const jobId = makeJobWithRawOutput();
+  for (let i = 0; i < 10_050; i += 1) {
+    jobStore.appendOutput(jobId, "stdout", Buffer.from(`line-${i}\n`));
+  }
+  const unlimited = structuredOf(outputTool.handler({ job_id: jobId, stream: "stdout" }));
+  assert.equal(typeof unlimited.dropped, "number");
+  let cursor = 0;
+  for (let step = 0; step < 5; step += 1) {
+    const page = structuredOf(
+      outputTool.handler({ job_id: jobId, stream: "stdout", after_cursor: cursor, limit: 1 })
+    );
+    assert.equal(
+      page.dropped,
+      unlimited.dropped,
+      `step ${step}: dropped must be identical regardless of pagination`
+    );
+    assert.equal(
+      page.droppedBeforeCursor,
+      unlimited.droppedBeforeCursor,
+      `step ${step}: droppedBeforeCursor must be identical regardless of pagination`
+    );
+    cursor = page.next_cursor as number;
+  }
+});
+
 // --- tail() ---
 
 test("tail: 'lines' must be a positive integer - N<=0 and non-integer values are typed validation errors", () => {
@@ -711,50 +868,111 @@ test("tail keeps the partial final line if a mutant filters partial-flagged entr
   assert.equal(partialEvent!.partial, true);
 });
 
-// A gap doesn't consume a tail-N slot.
-test("a leading gap marker does NOT consume one of tail's N real-event slots", () => {
+test("tail's returned events are always exactly min(N, available) real events - nothing but real OutputEvent objects ever appears in the array", () => {
   const jobId = makeJobWithRawOutput();
-  // Force a real overflow via the real byte-accounting layer, through the
-  // SAME jobStore singleton output/tail read from.
   for (let i = 0; i < 10_050; i += 1) {
     jobStore.appendOutput(jobId, "stdout", Buffer.from(`line-${i}\n`));
   }
-  const snapBefore = jobStore.getStreamSnapshot(jobId, "stdout")!;
-  assert.equal(
-    snapBefore.truncated,
-    true,
-    "fixture must have genuinely overflowed MAX_BUFFER_LINES"
-  );
-
   const result = structuredOf(tailTool.handler({ job_id: jobId, stream: "stdout", lines: 5 }));
-  const events = result.events as Array<{ text?: string; gap?: [number, number] }>;
-  const realEvents = events.filter((e) => !("gap" in e));
-  assert.equal(
-    realEvents.length,
-    5,
-    "exactly N=5 REAL events, whether or not a gap marker is also present"
-  );
+  const events = result.events as Array<Record<string, unknown>>;
+  assert.equal(events.length, 5, "exactly N=5 real events, no non-event items of any kind");
+  for (const event of events) {
+    assert.equal(typeof event.seq, "number");
+    assert.equal(typeof event.stream, "string");
+    assert.equal(typeof event.text, "string");
+  }
 });
 
-test("tail: gap is shown only when the requested window reaches back to the retained floor - a normal in-window trim is not a disclosed gap", () => {
+test("tail: `lines` alone sets truncated:true when the requested window is smaller than what's currently retained - distinct from retention eviction", () => {
+  const jobId = makeJobWithRawOutput();
+  jobStore.appendOutput(jobId, "stdout", Buffer.from("a\nb\nc\n"));
+  const result = structuredOf(tailTool.handler({ job_id: jobId, stream: "stdout", lines: 2 }));
+  assert.deepEqual(
+    (result.events as Array<{ text: string }>).map((e) => e.text),
+    ["b", "c"]
+  );
+  assert.equal(result.truncated, true);
+  assert.equal(result.dropped, undefined, "nothing was ever evicted - only the window was smaller");
+});
+
+test("tail: truncated stays true from the retention-eviction cause even when the window reaches the retained floor and returns everything currently available", () => {
+  const jobId = makeJobWithRawOutput();
+  for (let i = 0; i < 10_050; i += 1) {
+    jobStore.appendOutput(jobId, "stdout", Buffer.from(`line-${i}\n`));
+  }
+  const result = structuredOf(
+    tailTool.handler({ job_id: jobId, stream: "stdout", lines: 100_000 })
+  );
+  assert.equal(result.truncated, true);
+});
+
+test("tail: dropped/droppedBeforeCursor are disclosed even when the requested window does NOT reach the retained floor - a stream-level fact, not gated on this call's own window size", () => {
   const jobId = makeJobWithRawOutput();
   for (let i = 0; i < 10_050; i += 1) {
     jobStore.appendOutput(jobId, "stdout", Buffer.from(`line-${i}\n`));
   }
   const small = structuredOf(tailTool.handler({ job_id: jobId, stream: "stdout", lines: 3 }));
-  const smallEvents = small.events as Array<Record<string, unknown>>;
-  assert.equal(
-    smallEvents.some((e) => "gap" in e),
-    false,
-    "a small tail window that doesn't reach the floor must not show a gap"
-  );
+  assert.equal(typeof small.dropped, "number");
+  assert.ok((small.dropped as number) > 0);
+  assert.equal(typeof small.droppedBeforeCursor, "number");
+});
 
-  const full = structuredOf(tailTool.handler({ job_id: jobId, stream: "stdout", lines: 100_000 }));
-  const fullEvents = full.events as Array<Record<string, unknown>>;
+test("(green control) tail: truncated/dropped are all omitted when nothing was ever evicted and the window reaches/exceeds what's available", () => {
+  const jobId = makeJobWithRawOutput();
+  jobStore.appendOutput(jobId, "stdout", Buffer.from("a\nb\n"));
+  const result = structuredOf(tailTool.handler({ job_id: jobId, stream: "stdout", lines: 10 }));
+  assert.equal("truncated" in result, false);
+  assert.equal("dropped" in result, false);
+});
+
+// REGRESSION (handler-level, real jobStore byte-accounting, not
+// hand-authored): next_cursor must still correctly cover the "most-recent-
+// line-evicted-by-pending-growth" edge case even with no gap markers left
+// to reason about - it must equal the stream's own true head so a
+// resubmitted after_cursor via output() never tries to re-fetch a line
+// that is genuinely gone.
+test("REGRESSION: tail's next_cursor equals the stream's true head when a stream has been evicted down to zero retained lines (pending-growth eviction)", () => {
+  const jobId = makeJobWithRawOutput();
+  // stderr materializes ONE line first - this job's own seq counter is
+  // fresh, so it becomes seq 1 - and is never touched again, surviving
+  // untouched.
+  jobStore.appendOutput(jobId, "stderr", Buffer.from("e1\n"));
+  // stdout materializes ONE genuine, complete ~600KB line - seq 2 - well
+  // under the 1 MiB cap alone, so nothing evicts yet.
+  jobStore.appendOutput(jobId, "stdout", Buffer.from("x".repeat(600_001) + "\n"));
+  // A further ~600KB chunk with NO trailing newline stays pending -
+  // jobStore.ts's own documented "pending growth can evict even the
+  // newest completed line" edge case (evictToFitBudget) now kicks in:
+  // totalBytes + pending exceeds the 1 MiB cap, so stdout's only
+  // materialized line (seq 2) is evicted to make room, even though it is
+  // stdout's own newest (and only) line - stdout ends with ZERO retained
+  // lines, headSeq 2.
+  jobStore.appendOutput(jobId, "stdout", Buffer.from("y".repeat(600_000)));
+
+  const stdoutSnap = jobStore.getStreamSnapshot(jobId, "stdout")!;
   assert.equal(
-    fullEvents.some((e) => "gap" in e),
-    true,
-    "a tail window large enough to reach the floor of a truncated stream must show the gap"
+    stdoutSnap.lines.length,
+    0,
+    "fixture must have genuinely evicted stdout's only materialized line"
+  );
+  assert.equal(stdoutSnap.truncated, true);
+  assert.equal(stdoutSnap.headSeq, 2);
+  assert.equal(stdoutSnap.droppedCount, 1);
+
+  const result = structuredOf(tailTool.handler({ job_id: jobId, stream: "both", lines: 100 }));
+  const events = result.events as Array<{ seq: number; text: string }>;
+  // stderr's seq 1 is the only real, retained event.
+  assert.deepEqual(
+    events.map((e) => [e.seq, e.text]),
+    [[1, "e1"]]
+  );
+  // next_cursor must cover the true head (2), never just the last real
+  // event's own seq (1) - a client resubmitting after_cursor:1 must never
+  // be told to re-fetch a line that is genuinely gone.
+  assert.equal(
+    result.next_cursor,
+    2,
+    "next_cursor must equal the stream's true head, not just the last retained event's seq"
   );
 });
 
@@ -769,7 +987,7 @@ test("REGRESSION: output(stream: both) against a real overflowed job reaches an 
   }
   const first = structuredOf(outputTool.handler({ job_id: jobId, stream: "both" }));
   assert.equal(first.truncated, true, "fixture must have genuinely overflowed MAX_BUFFER_LINES");
-  const firstEvents = (first.events as Array<Record<string, unknown>>).filter((e) => !("gap" in e));
+  const firstEvents = first.events as Array<Record<string, unknown>>;
   assert.ok(firstEvents.length > 0, "a fresh read must return the currently-retained window");
 
   const second = structuredOf(
@@ -818,9 +1036,151 @@ test("output()/tail() after a job's stream is finalized (post-terminal) still re
 });
 
 // =============================================================================
+// Tier 2.5: real concurrent-write stress, IN-PROCESS - a real spawned child
+// process, real jobStore singleton, direct handler calls (no wire needed
+// for this specific proof, which is about output()/tail()'s own
+// non-blocking-snapshot correctness under real concurrent writes, not
+// about the wire protocol - that is covered separately in Tier 3). This
+// REBUILDS the earlier "non-blocking snapshot consistency" stress test,
+// which only ever asserted response SHAPE (never a torn/corrupted event)
+// without ever proving the reads genuinely raced a LIVE process, and
+// without any per-call SLA or seq-integrity check within a response.
+// =============================================================================
+
+test(
+  "non-blocking snapshot consistency, HARDENED: real PGID-alive assertions bracketing both output() and tail(), a per-call deadline, and full seq-integrity checks within every response - never a torn/corrupted/out-of-order event",
+  {
+    skip:
+      process.platform === "win32"
+        ? "exercises a real POSIX pgrep oracle, no win32 equivalent path here"
+        : false,
+  },
+  async () => {
+    const runResult = runTool.handler({
+      command: [
+        "node",
+        "-e",
+        "let i = 0; const t = setInterval(() => { if (i >= 4000) { clearInterval(t); return; } console.log('payload-' + 'x'.repeat(40) + '-' + i); i++; }, 0)",
+      ],
+    });
+    assert.notEqual(runResult.isError, true);
+    const jobId = (runResult.structuredContent as Record<string, unknown>).job_id as string;
+    const handle = jobStore.getChildHandle(jobId);
+    assert.notEqual(handle, undefined, "expected a real attached child for this in-process job");
+    const pgid = handle!.pid;
+
+    try {
+      // Bracket #1: confirm the writer is a REAL, alive process group
+      // before ever trusting that the reads below are genuinely concurrent
+      // with it, not silently racing an already-dead job.
+      assert.ok(
+        pgrepGroupMembers(pgid).length > 0,
+        "the writer's process group must be alive before the concurrent-read loop starts"
+      );
+
+      const CALL_DEADLINE_MS = 500;
+      function timedCall<T>(label: string, fn: () => T): T {
+        const startedAt = Date.now();
+        const result = fn();
+        const elapsed = Date.now() - startedAt;
+        assert.ok(
+          elapsed < CALL_DEADLINE_MS,
+          `${label} must resolve well under ${CALL_DEADLINE_MS}ms on its own (a per-call deadline, not just the aggregate loop budget) - took ${elapsed}ms`
+        );
+        return result;
+      }
+
+      const lineShape = /^payload-x{40}-\d+$/;
+      let sawAtLeastOneEvent = false;
+      let sawAliveMidLoop = false;
+      const startedAt = Date.now();
+      // Hammer output()/tail() repeatedly WHILE the child is very likely
+      // still writing - every single response must be internally
+      // well-formed, and at least one read (bracket #2) must observe the
+      // writer's process group still alive, proving genuine concurrency.
+      // The handler calls themselves are synchronous, but the real child's
+      // stdout `data` events are delivered asynchronously by the event
+      // loop - a tight synchronous `while` loop with no `await` inside it
+      // never yields, which starves the event loop and means the child's
+      // output is NEVER actually read during the loop (proven empirically:
+      // without the yield below, this test always observes zero events).
+      // Yielding via `setImmediate` each iteration is what makes the reads
+      // genuinely concurrent with the writer's real, async I/O.
+      while (Date.now() - startedAt < 1500) {
+        const outputResult = timedCall("output()", () =>
+          outputTool.handler({ job_id: jobId, stream: "stdout" })
+        );
+        const tailResult = timedCall("tail()", () =>
+          tailTool.handler({ job_id: jobId, stream: "stdout", lines: 25 })
+        );
+        if (pgrepGroupMembers(pgid).length > 0) sawAliveMidLoop = true;
+
+        for (const result of [outputResult, tailResult]) {
+          assert.notEqual(
+            result.isError,
+            true,
+            "a snapshot read must never itself error under concurrent writes"
+          );
+          const events = (result.structuredContent?.events ?? []) as Array<{
+            seq?: number;
+            stream?: string;
+            text?: string;
+            partial?: boolean;
+          }>;
+          let previousSeq = -Infinity;
+          for (const event of events) {
+            sawAtLeastOneEvent = true;
+            assert.equal(typeof event.seq, "number", "every event must carry an integer seq");
+            assert.ok(Number.isInteger(event.seq), `seq must be an integer, got ${event.seq}`);
+            assert.ok(
+              event.seq! > previousSeq,
+              `seqs must be strictly ascending and unique within one response - got ${event.seq} after ${previousSeq}`
+            );
+            previousSeq = event.seq!;
+            assert.equal(
+              event.stream,
+              "stdout",
+              "this read only ever selected stdout - no cross-stream leakage"
+            );
+            const text = event.text!;
+            // A torn/corrupted event would fail to match the exact
+            // repeated payload shape (e.g. half-old-content-half-new-
+            // content spliced together) UNLESS it's honestly flagged
+            // partial (a genuine still-open line, never a lie).
+            if (!lineShape.test(text)) {
+              assert.equal(
+                event.partial,
+                true,
+                `a malformed-looking line must be explicitly flagged partial, got: ${JSON.stringify(text)}`
+              );
+            }
+          }
+        }
+        // Yield to the event loop so the real child's async stdout `data`
+        // events actually get a chance to fire between reads.
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.ok(
+        sawAtLeastOneEvent,
+        "the stress loop must have actually observed real output at least once"
+      );
+      assert.ok(
+        sawAliveMidLoop,
+        "the writer's process group must have been observed alive at least once DURING the read loop - proving genuine concurrency, not reads against an already-finished job"
+      );
+    } finally {
+      try {
+        process.kill(-pgid, "SIGKILL"); // cleanup - a no-op (ESRCH) if it already exited naturally
+      } catch {
+        // already exited naturally - fine
+      }
+    }
+  }
+);
+
+// =============================================================================
 // Tier 3: real end-to-end proof - a real spawned dist/index.js process, real
-// JSON-RPC over its real stdin/stdout. This is the single most important
-// verification.
+// JSON-RPC over its real stdin/stdout.
 // =============================================================================
 
 const spawned: SpawnedServer[] = [];
@@ -958,7 +1318,7 @@ test("e2e: a real spawned job with a genuinely partial final line (no trailing n
   server.child.kill("SIGKILL");
 });
 
-test("e2e: a real spawned job that overflows the retention cap - truncated: true and a real disclosed gap, read over the real wire", async () => {
+test("e2e: a real spawned job that overflows the retention cap - truncated: true and a bounded drop-count disclosure, read over the real wire", async () => {
   const server = tracked();
   await completeHandshake(server);
   // A real fast child that synchronously prints 10,050 lines - guaranteed
@@ -978,9 +1338,8 @@ test("e2e: a real spawned job that overflows the retention cap - truncated: true
   for (;;) {
     body = await callTool(server, 921, "output", { job_id: jobId, stream: "stdout" });
     structured = body.result?.structuredContent;
-    const events = (structured?.events ?? []) as Array<{ text: string; gap?: unknown }>;
-    const realEvents = events.filter((e) => !("gap" in e));
-    const last = realEvents[realEvents.length - 1];
+    const events = (structured?.events ?? []) as Array<{ text: string }>;
+    const last = events[events.length - 1];
     if (structured?.truncated === true && last?.text === "overflow-line-10049") break;
     if (Date.now() > deadline)
       throw new Error("timed out waiting for the real overflow child to finish");
@@ -988,91 +1347,24 @@ test("e2e: a real spawned job that overflows the retention cap - truncated: true
   }
 
   assert.equal(structured!.truncated, true);
-  const events = structured!.events as Array<Record<string, unknown>>;
+  assert.equal(typeof structured!.dropped, "number");
+  assert.ok((structured!.dropped as number) > 0, "some lines must have been genuinely dropped");
+  assert.equal(typeof structured!.droppedBeforeCursor, "number");
+  const events = structured!.events as Array<{ text: string }>;
+  assert.ok(events.length < 10050, "eviction must have genuinely dropped some lines");
   assert.equal(
-    "gap" in events[0]!,
-    true,
-    "a truncated stream's response must lead with an explicit gap marker, never a silent hole"
-  );
-  const gapValue = events[0]!.gap as [number, number];
-  assert.ok(
-    Array.isArray(gapValue) && gapValue.length === 2 && gapValue[0]! <= gapValue[1]!,
-    "the gap must be a valid [start, end] range"
-  );
-  const realEvents = events.filter((e) => !("gap" in e)) as Array<{ text: string }>;
-  assert.ok(realEvents.length < 10050, "eviction must have genuinely dropped some lines");
-  assert.equal(
-    realEvents[realEvents.length - 1]!.text,
+    events[events.length - 1]!.text,
     "overflow-line-10049",
     "the newest line must always survive eviction"
   );
   assert.equal(
-    realEvents.some((e) => e.text === "overflow-line-0"),
+    events.some((e) => e.text === "overflow-line-0"),
     false,
     "the oldest lines must have been genuinely evicted"
   );
-  server.child.kill("SIGKILL");
-});
-
-// The concurrent-write stress test.
-test("non-blocking snapshot consistency - repeated output()/tail() calls against a real fast-writing job never observe a torn/corrupted event", async () => {
-  const server = tracked();
-  await completeHandshake(server);
-  const runBody = await callTool(server, 930, "run", {
-    command: [
-      "node",
-      "-e",
-      "let i = 0; const t = setInterval(() => { if (i >= 4000) { clearInterval(t); return; } console.log('payload-' + 'x'.repeat(40) + '-' + i); i++; }, 0)",
-    ],
-  });
-  const jobId = runBody.result?.structuredContent?.job_id as string;
-
-  let requestId = 931;
-  const lineShape = /^payload-x{40}-\d+$/;
-  let sawAtLeastOneEvent = false;
-  const startedAt = Date.now();
-  // Hammer output()/tail() repeatedly WHILE the child is very likely still
-  // writing (the setInterval-based writer keeps yielding, so real chunk
-  // delivery genuinely interleaves with these reads on the same event
-  // loop) - every single response must be internally well-formed.
-  while (Date.now() - startedAt < 1500) {
-    const [outputBody, tailBody] = await Promise.all([
-      callTool(server, requestId++, "output", { job_id: jobId, stream: "stdout" }),
-      callTool(server, requestId++, "tail", { job_id: jobId, stream: "stdout", lines: 25 }),
-    ]);
-    for (const body of [outputBody, tailBody]) {
-      assert.equal(
-        body.error,
-        undefined,
-        "a snapshot read must never itself error under concurrent writes"
-      );
-      const events = (body.result?.structuredContent?.events ?? []) as Array<{
-        text?: string;
-        partial?: boolean;
-        gap?: unknown;
-      }>;
-      for (const event of events) {
-        if ("gap" in event) continue;
-        sawAtLeastOneEvent = true;
-        const text = event.text!;
-        // A torn/corrupted event would fail to match the exact repeated
-        // payload shape (e.g. half-old-content-half-new-content spliced
-        // together) UNLESS it's honestly flagged partial (a genuine
-        // still-open line, never a lie).
-        if (!lineShape.test(text)) {
-          assert.equal(
-            event.partial,
-            true,
-            `a malformed-looking line must be explicitly flagged partial, got: ${JSON.stringify(text)}`
-          );
-        }
-      }
-    }
-  }
-  assert.ok(
-    sawAtLeastOneEvent,
-    "the stress loop must have actually observed real output at least once"
-  );
+  // Independently-verifiable identity, proven over the real wire: total
+  // lines produced (10,050) = dropped + currently-retained.
+  assert.equal((structured!.dropped as number) + events.length, 10050);
   server.child.kill("SIGKILL");
 });
 
