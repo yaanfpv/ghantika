@@ -100,6 +100,63 @@ export async function callToolsConcurrently(
   }>,
   timeoutMs = 15_000
 ): Promise<Map<number, ToolCallBody>> {
+  const timed = await callToolsConcurrentlyTimed(server, calls, timeoutMs, "callToolsConcurrently");
+  return new Map([...timed].map(([id, result]) => [id, result.body]));
+}
+
+export interface TimedToolCallResult {
+  readonly body: ToolCallBody;
+  /**
+   * Milliseconds from just before this BATCH's requests are written to the
+   * wire (the shared `start` taken before the send loop, not after it)
+   * until THIS specific response was read back off it - i.e. the moment
+   * the CLIENT's own `nextLine()` read loop dequeued/consumed this line,
+   * not an independent wire-arrival timestamp (`RawStdoutLine`/the
+   * underlying line-reading mechanism carries no such timestamp of its
+   * own - see `spawnServer.ts`). Lets a caller prove, with a real
+   * timestamp rather than an ordering assumption, that one call's
+   * response was genuinely available for the client to consume while
+   * another (slower) call in the SAME batch was still unresolved on the
+   * server - e.g. a fast read's response already read back while a slow
+   * escalating `kill()` elsewhere in the same batch has not yet responded,
+   * which is exactly the property "these two things happened
+   * concurrently" needs and "both were sent in the same tick" alone does
+   * not prove. A dequeue-time ordering is still a valid (if conservative)
+   * proof that one response was available for consumption before another -
+   * every RELATIVE comparison this file makes between two calls in the
+   * same batch relies only on that, never on absolute wire-arrival time.
+   * The shared baseline being "just before the writes" rather than "just
+   * after" doesn't affect any such comparison either - both elapsedMs
+   * values share the same offset, so which one is smaller is unchanged
+   * either way.
+   */
+  readonly elapsedMs: number;
+}
+
+/**
+ * Same pipelining/id-matching contract as `callToolsConcurrently` (see its
+ * own docs - this function backs it), but returns each response's own
+ * read/dequeue time (see `TimedToolCallResult.elapsedMs`'s own docs for
+ * why that, not wire-arrival time, is the honest description) alongside
+ * its body instead of discarding it. Used directly by
+ * `callToolsConcurrently`'s callers that don't need timing, and by
+ * test/integration.test.ts's resistant-leader-escalation test, which
+ * needs concrete, timestamped proof that real activity against other live
+ * jobs was answered WHILE a slow, escalating `kill()` in the SAME batch
+ * was still in flight - not merely that every request was written to the
+ * wire around the same time.
+ */
+export async function callToolsConcurrentlyTimed(
+  server: SpawnedServer,
+  calls: ReadonlyArray<{
+    readonly id: number;
+    readonly toolName: string;
+    readonly args: Record<string, unknown>;
+  }>,
+  timeoutMs = 15_000,
+  callerName = "callToolsConcurrentlyTimed"
+): Promise<Map<number, TimedToolCallResult>> {
+  const start = Date.now();
   for (const call of calls) {
     server.send({
       jsonrpc: "2.0",
@@ -109,24 +166,23 @@ export async function callToolsConcurrently(
     });
   }
   const expected = new Set(calls.map((call) => call.id));
-  const results = new Map<number, ToolCallBody>();
-  const start = Date.now();
+  const results = new Map<number, TimedToolCallResult>();
   while (results.size < expected.size) {
     const remaining = timeoutMs - (Date.now() - start);
     if (remaining <= 0) {
       throw new Error(
-        `callToolsConcurrently: timed out waiting for ${expected.size - results.size} of ${expected.size} responses (got ids: ${[...results.keys()].join(",")})`
+        `${callerName}: timed out waiting for ${expected.size - results.size} of ${expected.size} responses (got ids: ${[...results.keys()].join(",")})`
       );
     }
     const line = await server.nextLine(remaining);
     assert.equal(
       line.parseError,
       undefined,
-      `callToolsConcurrently: a stdout line failed to parse as JSON - framing corruption: ${JSON.stringify(line.raw)}`
+      `${callerName}: a stdout line failed to parse as JSON - framing corruption: ${JSON.stringify(line.raw)}`
     );
     const id = (line.parsed as { id?: unknown })?.id;
     if (typeof id === "number" && expected.has(id)) {
-      results.set(id, line.parsed as ToolCallBody);
+      results.set(id, { body: line.parsed as ToolCallBody, elapsedMs: Date.now() - start });
     }
   }
   return results;
@@ -234,6 +290,29 @@ export function parsesAsPgid(content: string): boolean {
   return Number.isInteger(pgid) && pgid > 0;
 }
 
+/**
+ * The same "wait for the WHOLE number, never a truncated read" reasoning
+ * `parsesAsPgid` documents above, generalized to a marker holding several
+ * pids appended one per line (used for identifying a set of specific
+ * descendant/keep-alive pids by their own `$!`, distinct from the group's
+ * own pgid - see `NoisyLiveJobOptions.descendantPidsMarkerPath` below).
+ * Requires the content to already end in `\n` (the same truncated-final-
+ * append guard `parsesAsPgid` uses) and requires EXACTLY `count` non-empty
+ * lines, never `>= count` - reading a marker mid-append, before its last
+ * expected line has landed at all, must never be mistaken for "done."
+ */
+export function parsesAsPidList(content: string, count: number): boolean {
+  if (!content.endsWith("\n")) return false;
+  const lines = content.split("\n").filter((line) => line.trim().length > 0);
+  if (lines.length !== count) return false;
+  return lines.every((line) => {
+    const text = line.trim();
+    if (!/^\d+$/.test(text)) return false;
+    const pid = Number(text);
+    return Number.isInteger(pid) && pid > 0;
+  });
+}
+
 /** True once `content` is a complete JSON object, so a partial write is never parsed. */
 export function parsesAsJsonObject(content: string): boolean {
   try {
@@ -326,6 +405,91 @@ export function noiseToken(jobIndex: number): string {
   return `GHANTIKA-NOISE-JOB-${jobIndex}`;
 }
 
+export interface NoisyLiveJobOptions {
+  /**
+   * When true, the job's own LEADER (the shell process itself, tracked as
+   * the job's pid) traps and ignores SIGTERM (`trap '' TERM`, the same
+   * fixture shape test/process.test.ts's own "a SIGTERM-resistant process
+   * is escalated to SIGKILL" test already establishes at the
+   * `killProcessGroupPosix` layer - reused here at the real MCP-tool/wire
+   * layer). A plain SIGTERM to the whole process group therefore cannot
+   * terminate the leader on its own: `isProcessGroupAlive` (src/process.ts)
+   * still reads the group as alive after the leader survives, which is
+   * exactly what forces `killProcessGroupPosix`'s real
+   * grace-period-then-SIGKILL escalation to actually fire, rather than
+   * merely being reachable in principle.
+   *
+   * This resistance is genuinely LEADER-ONLY, not group-wide - the
+   * `DESCENDANTS_PER_JOB` descendants stay plainly killable by a plain
+   * SIGTERM, exactly like any other job's descendants. That takes two
+   * things working together, both verified empirically (a naive version
+   * of either one alone reintroduces a real bug, not just a style
+   * difference):
+   *
+   * 1. The trap is only ever set in the LEADER shell, and only AFTER the
+   *    `DESCENDANTS_PER_JOB` descendants have already been forked (see
+   *    `buildNoisyLiveJobShellCommand`'s own statement order below). An
+   *    ignored (or any) signal disposition is inherited by a forked child
+   *    in every POSIX shell, so a descendant forked BEFORE the trap runs
+   *    still has the shell's default (terminable) disposition at the
+   *    moment it's created, and nothing forked afterward can retroactively
+   *    change that for a process that already exists. Getting the order
+   *    backwards - trapping first, forking after - was the actual bug: a
+   *    plain group SIGTERM then did nothing to any of the group's members,
+   *    descendants included, confirmed by reproducing it directly against
+   *    a real spawned process group before this fix (see this file's git
+   *    history).
+   * 2. The trailing `wait` no longer blocks on the `DESCENDANTS_PER_JOB`
+   *    descendants alone. Once they're genuinely killable (per point 1),
+   *    they die the instant a real SIGTERM reaches the group - and a bare
+   *    `wait` only blocks until ITS OWN backgrounded children exit, so it
+   *    would unblock right then, letting the leader's script reach its end
+   *    and the leader process exit ON ITS OWN, moments after a plain
+   *    SIGTERM - never resisting anything for the real ~5s grace period an
+   *    escalation proof depends on. A resistant job therefore also forks
+   *    one extra background job, `sleep 300 &`, strictly AFTER the trap -
+   *    it inherits the leader's OWN ignored disposition (same reasoning as
+   *    point 1, in reverse), so only a real SIGKILL ends it, and `wait`
+   *    (waiting on every backgrounded job, this one included) stays
+   *    genuinely blocked - and so does the leader - through the whole
+   *    grace period, decoupled from whatever happens to the
+   *    `DESCENDANTS_PER_JOB` descendants. Confirmed empirically:
+   *    reordering alone (without this) still self-exited the whole leader
+   *    within ~1s of a plain SIGTERM, never reaching escalation at all.
+   */
+  readonly sigtermResistant?: boolean;
+
+  /**
+   * When set, ALSO captures each of the `DESCENDANTS_PER_JOB` descendants'
+   * OWN pid (via `$!`, read synchronously right after backgrounding each
+   * one - `$!` is POSIX-specified as "the pid of the most recently
+   * executed background command", so it must be captured before the next
+   * `&` fork overwrites it) and appends it to this marker path, one pid
+   * per line, in fork order. This is distinct from `pgidMarkerPath` above,
+   * which only ever names the group's LEADER (the group's pgid); this is
+   * how a caller identifies exactly which real pids the descendants
+   * THEMSELVES are, so it can assert something specific about them later
+   * (e.g. "these exact pids, and no others, are gone").
+   *
+   * Purely additive: when omitted, the produced command line is BYTE-FOR-
+   * BYTE identical to what every existing caller already gets - no new
+   * statement, no new marker file, nothing for a non-resistant caller (or
+   * any caller not asking for this) to be affected by.
+   */
+  readonly descendantPidsMarkerPath?: string;
+
+  /**
+   * `sigtermResistant`-only: the same `$!`-capture mechanism as
+   * `descendantPidsMarkerPath` above, but for the keep-alive anchor job
+   * (`sleep 300 &`) instead of the `DESCENDANTS_PER_JOB` descendants -
+   * lets a caller identify EXACTLY which surviving pid is the anchor,
+   * distinct from the leader's own pgid, rather than inferring it from a
+   * bare surviving-member count. Ignored when `sigtermResistant` isn't
+   * set (there is no anchor job to capture a pid for).
+   */
+  readonly anchorPidMarkerPath?: string;
+}
+
 /**
  * Builds the real shell command line for one noisy, multi-descendant live
  * job. `pgidMarkerPath` receives the shell leader's own pid (== the
@@ -336,20 +500,52 @@ export function noiseToken(jobIndex: number): string {
  * completed, so a test can barrier on "this job has genuinely produced its
  * NOISE_BYTES" rather than guessing at timing.
  *
- * Shape: write the pgid marker -> fork `DESCENDANTS_PER_JOB` real
- * background `sleep 60` descendants -> write >= NOISE_BYTES of real stdout
- * noise (via `yes | head -c`, a real, fast, deterministically-sized
+ * Shape for a plain (non-resistant) job, UNCHANGED from every existing
+ * call site: write the pgid marker -> fork `DESCENDANTS_PER_JOB` real
+ * background `sleep 60` descendants -> write >= NOISE_BYTES of real
+ * stdout noise (via `yes | head -c`, a real, fast, deterministically-sized
  * generator) -> write a smaller amount of real stderr noise -> write the
  * noise-done marker -> `wait` on the backgrounded descendants, which is
  * what keeps the whole tree (leader + descendants) alive until the caller
  * kills it or the server shuts down.
+ *
+ * Shape for a `sigtermResistant` job - see `NoisyLiveJobOptions.
+ * sigtermResistant`'s own docs for why each reordering/addition below is
+ * load-bearing, not stylistic: fork the `DESCENDANTS_PER_JOB` descendants
+ * and write the pgid marker FIRST -> `trap '' TERM` in the leader -> fork
+ * one extra background keep-alive job (`sleep 300 &`) -> the same
+ * stdout/stderr noise and done-marker as the plain shape -> the same
+ * trailing `wait`, now blocking on 1 + `DESCENDANTS_PER_JOB` backgrounded
+ * jobs instead of `DESCENDANTS_PER_JOB`.
+ *
+ * `descendantPidsMarkerPath`/`anchorPidMarkerPath` (see
+ * `NoisyLiveJobOptions`' own docs) each add one `echo $! >> marker`
+ * statement per captured pid, immediately after that pid's own background
+ * fork - additive only, and OMITTED entirely (byte-for-byte identical
+ * output to before) when the corresponding option isn't set.
  */
 export function buildNoisyLiveJobShellCommand(
   jobIndex: number,
   pgidMarkerPath: string,
-  noiseDonePath: string
+  noiseDonePath: string,
+  options?: NoisyLiveJobOptions
 ): string {
   const token = noiseToken(jobIndex);
+  const resistant = options?.sigtermResistant === true;
+  const descendantPidsMarkerPath = options?.descendantPidsMarkerPath;
+  const anchorPidMarkerPath = options?.anchorPidMarkerPath;
+
+  // Each descendant fork, on its own: with no marker requested, a bare
+  // `sleep 60 &` (ends in `&`, already a statement separator - see below);
+  // with a marker requested, the fork PLUS an immediate, synchronous
+  // `echo $! >> marker` reading back that exact fork's own pid before the
+  // next one can overwrite `$!` - this second form ends in an ordinary
+  // (non-backgrounded) statement, so it needs a REAL `;` to separate it
+  // from whatever statement follows, unlike the bare `&`-terminated form.
+  const descendantForkStatement =
+    descendantPidsMarkerPath === undefined
+      ? "sleep 60 &"
+      : `sleep 60 & echo $! >> '${descendantPidsMarkerPath}'`;
   // Each descendant fork ends in `&` (backgrounds it) - `&` is ALREADY a
   // statement separator, exactly like `;`, so joining `DESCENDANTS_PER_JOB`
   // of them with spaces and then continuing straight into the next
@@ -359,18 +555,64 @@ export function buildNoisyLiveJobShellCommand(
   // against both `sh` and `bash`), since a trailing `&` immediately
   // followed by `;` has nothing between them for the semicolon to
   // terminate. `descendantForksPrefix` therefore ends in a trailing space,
-  // not a trailing `;`.
-  const descendantForksPrefix = `${Array.from({ length: DESCENDANTS_PER_JOB }, () => "sleep 60 &").join(" ")} `;
+  // not a trailing `;`, UNLESS a marker was requested (see
+  // `descendantForkStatement` above), in which case each fork's own
+  // trailing `echo` statement is a real, separate statement and the joiner
+  // switches to a genuine `; ` (with a matching trailing `; `).
+  const descendantForksPrefix =
+    descendantPidsMarkerPath === undefined
+      ? `${Array.from({ length: DESCENDANTS_PER_JOB }, () => descendantForkStatement).join(" ")} `
+      : `${Array.from({ length: DESCENDANTS_PER_JOB }, () => descendantForkStatement).join("; ")}; `;
+  const noiseLine = `yes '${token}-0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF' | head -c ${NOISE_BYTES}`;
+  const stderrNoiseLine = `yes '${token}-STDERR-NOISE-abcdef0123456789' | head -c 16384 1>&2`;
+  const doneMarkerLine = `echo done > '${noiseDonePath}'`;
+
+  if (!resistant) {
+    // Unchanged from every existing (non-resistant) caller's original
+    // shape (`descendantPidsMarkerPath` is honored the same way here too,
+    // though no existing caller passes it on a non-resistant job today).
+    return [
+      `echo $$ > '${pgidMarkerPath}'`,
+      // The descendant forks are prepended directly onto this statement
+      // (see `descendantForksPrefix`'s own docs above), not joined via `; `.
+      `${descendantForksPrefix}${noiseLine}`,
+      stderrNoiseLine,
+      doneMarkerLine,
+      "wait",
+    ].join("; ");
+  }
+
+  // Resistant shape - see NoisyLiveJobOptions.sigtermResistant's own docs
+  // for why both the reorder and the keep-alive fork below are each
+  // individually load-bearing (verified empirically, not just reasoned
+  // about): descendants forked before the trap keeps them genuinely
+  // killable (leader-only resistance); the keep-alive fork after the trap
+  // keeps the leader's own `wait` - and so the leader itself - genuinely
+  // alive through the real grace period regardless of what happens to
+  // those descendants.
+  //
+  // The anchor fork mirrors `descendantForkStatement` above: a bare
+  // `sleep 300 &` when no marker is requested (unchanged, `&`-terminated),
+  // or the fork plus its own immediate `echo $! >> marker` (a real
+  // statement, needing a genuine `;` before whatever follows) when one is.
+  const anchorForkStatement =
+    anchorPidMarkerPath === undefined
+      ? "sleep 300 &"
+      : `sleep 300 & echo $! >> '${anchorPidMarkerPath}'`;
   return [
-    `echo $$ > '${pgidMarkerPath}'`,
-    // `yes '<token>-<padding>'` repeats a fixed-length line forever; `head -c NOISE_BYTES`
-    // cuts it at EXACTLY NOISE_BYTES real bytes (mid-line at the boundary -
-    // a real, honest "partial final line", not engineered away). The
-    // descendant forks are prepended directly onto this statement (see
-    // `descendantForksPrefix`'s own docs above), not joined via `; `.
-    `${descendantForksPrefix}yes '${token}-0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF' | head -c ${NOISE_BYTES}`,
-    `yes '${token}-STDERR-NOISE-abcdef0123456789' | head -c 16384 1>&2`,
-    `echo done > '${noiseDonePath}'`,
+    `${descendantForksPrefix}echo $$ > '${pgidMarkerPath}'`,
+    `trap '' TERM`,
+    // `sleep 300 &`'s own trailing `&` must not be followed by `; ` (the
+    // exact syntax error `descendantForksPrefix`'s own docs warn about),
+    // so the next statement is appended directly here with a plain space,
+    // the same shape `descendantForksPrefix` itself already uses - UNLESS
+    // an anchor marker was requested, in which case the anchor line ends
+    // in a real statement and needs a genuine `; ` before `noiseLine`.
+    anchorPidMarkerPath === undefined
+      ? `sleep 300 & ${noiseLine}`
+      : `${anchorForkStatement}; ${noiseLine}`,
+    stderrNoiseLine,
+    doneMarkerLine,
     "wait",
   ].join("; ");
 }
@@ -481,7 +723,14 @@ export async function startNoisyJobs(
   return { jobIds, pgids, dir };
 }
 
-async function waitForAllNoiseMaterialized(
+/**
+ * Exported (not just `startNoisyJobs`'s own private setup step) so a test
+ * building its OWN mixed job set - e.g. one resistant leader alongside
+ * ordinary noisy jobs, a shape `startNoisyJobs`'s own "every job is
+ * identical" contract doesn't cover - can still barrier on the same real
+ * "genuinely produced NOISE_BYTES" condition without re-deriving it.
+ */
+export async function waitForAllNoiseMaterialized(
   server: SpawnedServer,
   jobIds: readonly string[],
   nextId: () => number,
