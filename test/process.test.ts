@@ -10,6 +10,7 @@ import { test } from "node:test";
 import {
   MANAGED_CHILD_STDIO,
   POSIX_DEFAULT_PATH,
+  WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES,
   buildChildEnv,
   resolveCaseInsensitivePathKey,
   resolveCwd,
@@ -44,6 +45,16 @@ import {
 const POSIX_PROCESS_GROUP_SKIP =
   process.platform === "win32"
     ? "exercises a real POSIX process-group primitive (ps/pgrep/negative-pid kill) with no win32 equivalent path here"
+    : false;
+
+// On Windows, libuv force-injects any of WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES
+// the spawning process itself has set, regardless of env.mode - so replace
+// mode cannot guarantee an exact, closed env set there the way it can on
+// POSIX. See the Windows-only counterpart test below for the real contract
+// on that platform.
+const POSIX_ENV_REPLACE_EXACT_SKIP =
+  process.platform === "win32"
+    ? "on Windows, libuv force-injects any of WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES the spawning process has set, regardless of env.mode - replace mode cannot guarantee an exact, closed env set there"
     : false;
 
 // A structural guarantee: a real child's stdout must never
@@ -210,6 +221,51 @@ test("buildChildEnv replace mode uses ONLY the caller's vars, no base at all", (
   assert.equal("HOME" in env, false);
 });
 
+test("the Windows discriminator: buildChildEnv's own CONSTRUCTED merge vs replace envs differ on the platform's base-env keys, at the seam BEFORE anything downstream (libuv, on Windows) can rewrite the block", () => {
+  // On real Windows CI, libuv force-injects a small fixed set of names
+  // (see WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES) into a spawned child
+  // regardless of env.mode, AFTER this function has already returned - and
+  // ghantika's own Windows merge base (PATH, SystemRoot, USERPROFILE) is a
+  // subset of that same libuv-forced set. So an end-to-end observer of the
+  // REAL spawned child can be fooled: if replace ever silently fell through
+  // to merge on Windows, the child's final env could look the same either
+  // way, because libuv would force those same names in regardless. THIS
+  // seam - buildChildEnv's own return value, before libuv ever runs - still
+  // shows the distinction unambiguously, on every platform including
+  // Windows, because it observes what ghantika itself constructs, not what
+  // libuv does afterward.
+  const vars = { ONLY_VAR: "only-value" };
+  const mergeEnv = buildChildEnv("merge", vars);
+  const replaceEnv = buildChildEnv("replace", vars);
+
+  const baseKeyCandidates =
+    process.platform === "win32" ? ["PATH", "SystemRoot", "USERPROFILE"] : ["PATH", "HOME"];
+  const realBaseKeys = baseKeyCandidates.filter((key) => process.env[key] !== undefined);
+  assert.ok(
+    realBaseKeys.length > 0,
+    "sanity check: this host must actually have at least one base-env key set, or the comparison below proves nothing"
+  );
+
+  for (const key of realBaseKeys) {
+    assert.ok(
+      key in mergeEnv,
+      `merge mode must include this host's own base-env key "${key}" - if this fails, the sanity check above is lying`
+    );
+  }
+  for (const key of realBaseKeys) {
+    assert.equal(
+      key in replaceEnv,
+      false,
+      `replace mode must NOT include base-env key "${key}" at this seam - if replace silently degraded to merge, this key would appear here and this assertion would go red, independent of whatever libuv does to the child afterward`
+    );
+  }
+  assert.deepEqual(
+    replaceEnv,
+    vars,
+    "replace mode's constructed env must be exactly the caller's vars, nothing else, at this seam"
+  );
+});
+
 test("buildChildEnv replace mode with no vars produces a genuinely empty environment object", () => {
   const env = buildChildEnv("replace", {});
   assert.deepEqual(env, {});
@@ -217,6 +273,49 @@ test("buildChildEnv replace mode with no vars produces a genuinely empty environ
 
 test("POSIX_DEFAULT_PATH matches the documented Node.js fallback (/usr/bin:/bin)", () => {
   assert.equal(POSIX_DEFAULT_PATH, "/usr/bin:/bin");
+});
+
+// ---------------------------------------------------------------------------
+// README accuracy: env.mode "replace" on Windows (same pattern as
+// test/npm-ci-guard.test.js's own README content check - read the real
+// shipped file, assert on its real text, not a copy of it kept in this
+// test).
+// ---------------------------------------------------------------------------
+
+const README_TEXT = fs.readFileSync(new URL("../README.md", import.meta.url), "utf8");
+
+test("README's env argument row states the Windows caveat for replace mode, not an unconditional cross-platform claim", () => {
+  assert.ok(
+    README_TEXT.includes("not quite the whole story on Windows"),
+    'README.md\'s env argument row should flag that "replace passes vars alone with no base at all" is not the whole story on Windows'
+  );
+});
+
+test("README's Platform notes document replace mode's real Windows behavior - keeps a caller-supplied name, fills in a missing one only if the machine has it set - not an unconditional injection claim", () => {
+  assert.ok(
+    README_TEXT.includes(
+      "if you already supplied one of these names yourself, your value is kept exactly as given"
+    ),
+    "README.md's Platform notes should state that a caller-supplied required name survives unchanged"
+  );
+  assert.ok(
+    README_TEXT.includes("fill-in-if-missing, keep-if-supplied"),
+    "README.md's Platform notes should state the real, conditional (not unconditional) precedence rule"
+  );
+  for (const name of ["HOMEDRIVE", "SYSTEMROOT", "USERPROFILE", "WINDIR"]) {
+    assert.ok(
+      README_TEXT.includes(`\`${name}\``),
+      `README.md's Platform notes should name "${name}" as one of libuv's required variables`
+    );
+  }
+});
+
+test("README no longer states the old, inaccurate cross-platform claim that replace mode passes vars alone with no base at all on every platform", () => {
+  assert.equal(
+    README_TEXT.includes("no base at all. |"),
+    false,
+    'the env-argument table row must not end at "no base at all." with no Windows caveat - that was the pre-fix claim, true only on POSIX'
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -585,38 +684,88 @@ test("spawnManaged: stdout/stderr end events fire for a real completed process",
   assert.equal(Buffer.concat(rec.stderr).toString("utf8").trim(), "e");
 });
 
-test("spawnManaged: a command run with env replace mode sees ONLY the vars we gave it (real child, real echo of its own env)", async () => {
-  const rec = recorder();
-  const env = buildChildEnv("replace", {
-    MY_ONLY_VAR: "only-value",
-    PATH: process.env.PATH ?? POSIX_DEFAULT_PATH,
-  });
-  spawnManaged(
-    { argv: ["node", "-e", "console.log(JSON.stringify(process.env))"], cwd: process.cwd(), env },
-    callbacksFor(rec)
-  );
-  await waitFor(() => rec.exits.length > 0);
-  const childEnv = JSON.parse(Buffer.concat(rec.stdout).toString("utf8")) as Record<string, string>;
-  // macOS itself injects __CF_USER_TEXT_ENCODING into every process at
-  // launch (a CoreFoundation/dyld-level default, verified empirically -
-  // not something child_process's `env` option can suppress), so it's
-  // stripped before comparing rather than asserted on: this test's own
-  // point is that OUR base/inherited vars are absent, not that the OS
-  // injects nothing of its own.
-  delete childEnv.__CF_USER_TEXT_ENCODING;
-  // c8 injects NODE_V8_COVERAGE into every child it instruments - a real
-  // measurement artifact of running under coverage, not something replace
-  // mode itself adds. Subtracted only when the parent actually has it set,
-  // so an uninstrumented run still asserts on the whole object, and a real
-  // leak of this var outside coverage instrumentation still reds.
-  if (process.env.NODE_V8_COVERAGE !== undefined) {
-    delete childEnv.NODE_V8_COVERAGE;
+test(
+  "spawnManaged (POSIX): a command run with env replace mode sees ONLY the vars we gave it - no libuv env injection here (real child, real echo of its own env)",
+  { skip: POSIX_ENV_REPLACE_EXACT_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("replace", {
+      MY_ONLY_VAR: "only-value",
+      PATH: process.env.PATH ?? POSIX_DEFAULT_PATH,
+    });
+    spawnManaged(
+      { argv: ["node", "-e", "console.log(JSON.stringify(process.env))"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.exits.length > 0);
+    const childEnv = JSON.parse(Buffer.concat(rec.stdout).toString("utf8")) as Record<
+      string,
+      string
+    >;
+    // macOS itself injects __CF_USER_TEXT_ENCODING into every process at
+    // launch (a CoreFoundation/dyld-level default, verified empirically -
+    // not something child_process's `env` option can suppress), so it's
+    // stripped before comparing rather than asserted on: this test's own
+    // point is that OUR base/inherited vars are absent, not that the OS
+    // injects nothing of its own.
+    delete childEnv.__CF_USER_TEXT_ENCODING;
+    // c8 injects NODE_V8_COVERAGE into every child it instruments - a real
+    // measurement artifact of running under coverage, not something replace
+    // mode itself adds. Subtracted only when the parent actually has it set,
+    // so an uninstrumented run still asserts on the whole object, and a real
+    // leak of this var outside coverage instrumentation still reds.
+    if (process.env.NODE_V8_COVERAGE !== undefined) {
+      delete childEnv.NODE_V8_COVERAGE;
+    }
+    assert.deepEqual(childEnv, {
+      MY_ONLY_VAR: "only-value",
+      PATH: process.env.PATH ?? POSIX_DEFAULT_PATH,
+    });
   }
-  assert.deepEqual(childEnv, {
-    MY_ONLY_VAR: "only-value",
-    PATH: process.env.PATH ?? POSIX_DEFAULT_PATH,
-  });
-});
+);
+
+test(
+  "spawnManaged (Windows): a command run with env replace mode sees our vars PLUS whatever libuv force-injects, never fewer, never a name outside that fixed set",
+  {
+    skip:
+      process.platform === "win32"
+        ? false
+        : "exercises the win32-only libuv env-injection contract",
+  },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("replace", {
+      MY_ONLY_VAR: "only-value",
+      PATH: process.env.PATH ?? POSIX_DEFAULT_PATH,
+    });
+    spawnManaged(
+      { argv: ["node", "-e", "console.log(JSON.stringify(process.env))"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.exits.length > 0);
+    const childEnv = JSON.parse(Buffer.concat(rec.stdout).toString("utf8")) as Record<
+      string,
+      string
+    >;
+    // The real guarantee replace mode gives on Windows: our vars are
+    // present, and nothing outside {our vars} union {libuv's fixed
+    // injected set} ever appears. NOT that all 11 libuv names are
+    // present - libuv only injects the ones the spawning process itself
+    // has set, which varies by runner.
+    const allowedNames = new Set(["MY_ONLY_VAR", "PATH", ...WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES]);
+    for (const name of Object.keys(childEnv)) {
+      assert.ok(
+        allowedNames.has(name),
+        `unexpected env var "${name}" outside our vars and libuv's fixed injected set`
+      );
+    }
+    // Strengthening: assert our vars actually SURVIVED, not merely that
+    // they are permitted - a regression that dropped MY_ONLY_VAR or PATH
+    // entirely would otherwise still pass the loop above.
+    assert.equal(childEnv.MY_ONLY_VAR, "only-value");
+    assert.equal(childEnv.PATH, process.env.PATH ?? POSIX_DEFAULT_PATH);
+  }
+);
 
 // ---------------------------------------------------------------------------
 // kill: process-tree containment and termination
