@@ -19,15 +19,20 @@ import {
   JOBS,
   NOISE_BYTES,
   type SpawnedServer,
+  buildNoisyLiveJobShellCommand,
   callTool,
   callToolsConcurrently,
+  callToolsConcurrentlyTimed,
   completeHandshake,
   makeTempDir,
   noiseToken,
+  parsesAsPgid,
+  parsesAsPidList,
   pgrepGroupMembers,
   requireStructuredContent,
   spawnServer,
   startNoisyJobs,
+  waitForAllNoiseMaterialized,
   waitForFile,
   waitForPgrepGroupMembers,
 } from "./harness.ts";
@@ -71,6 +76,48 @@ let idCounter = 10_000;
 function nextId(): number {
   idCounter += 1;
   return idCounter;
+}
+
+/**
+ * Runs `body`, and regardless of whether it resolves normally or throws,
+ * reaps every one of `pgids` via a real, direct
+ * `process.kill(-pgid, "SIGKILL")` (the SAME mechanism src/process.ts's own
+ * `killProcessGroupPosix` uses internally to signal a whole POSIX process
+ * group) before returning or rethrowing. `ESRCH` ("no such process") is
+ * swallowed - the group is already gone, the expected outcome on a passing
+ * run - but any OTHER signal-send failure is logged (never thrown): this
+ * cleanup must never itself mask a real failure already propagating out of
+ * `body`.
+ *
+ * Exists because a test that builds real, managed process-group trees (via
+ * `startNoisyJobs`/`buildNoisyLiveJobShellCommand`) can throw partway
+ * through its own assertions - well before it ever gets to killing those
+ * jobs itself - and this file's shared `after()` hook only ever kills the
+ * MCP server's OWN top-level child process, never the real job process
+ * groups the server spawned on that test's behalf. Without this, a mid-
+ * test assertion failure orphans real, live processes on the host. Used by
+ * both the resistant-leader-escalation test below and its own guard test
+ * (further down this file), which deliberately drives `body` into throwing
+ * to prove this reap still runs.
+ */
+async function withProcessGroupReap<T>(
+  pgids: readonly number[],
+  body: () => Promise<T>
+): Promise<T> {
+  try {
+    return await body();
+  } finally {
+    for (const pgid of pgids) {
+      try {
+        process.kill(-pgid, "SIGKILL");
+      } catch (error) {
+        const err = error as NodeJS.ErrnoException;
+        if (err.code !== "ESRCH") {
+          console.error(`[test cleanup] failed to reap process group ${pgid}: ${err.message}`);
+        }
+      }
+    }
+  }
 }
 
 // =============================================================================
@@ -349,6 +396,680 @@ test("output()/tail() buffers remain readable after a real kill() (not just afte
 });
 
 test(
+  "cross-tool: a SIGTERM-resistant job's WHOLE process tree is escalated to real SIGKILL after the real ~5s grace period (confirmed genuinely leader-only mid-escalation: its own descendants, forked before the trap, are already gone from the plain SIGTERM while the leader and its keep-alive job are still alive), and status() independently reflects exactly that signal - proven over the real wire, with real status/output reads and real kill() calls on 3 ordinary jobs provably landing while the escalation is still in flight, and a real external pgrep lineage check",
+  { skip: PGREP_ORACLE_SKIP },
+  async () => {
+    const server = tracked();
+    await completeHandshake(server);
+
+    // One resistant leader among JOBS=4 concurrent noisy jobs - the SAME
+    // load shape startNoisyJobs builds elsewhere in this file, but this
+    // test needs one job's own LEADER to trap SIGTERM, a shape
+    // startNoisyJobs's own "every job is identical" contract doesn't cover,
+    // so the setup is built directly here from the same underlying
+    // primitives (buildNoisyLiveJobShellCommand, waitForFile/parsesAsPgid,
+    // waitForPgrepGroupMembers, waitForAllNoiseMaterialized) rather than
+    // through that wrapper.
+    const resistantIndex = 0;
+    const normalIndexes = [1, 2, 3];
+    const dir = makeTempDir();
+    const pgidMarkers = Array.from({ length: JOBS }, (_unused, i) =>
+      path.join(dir, `job-${i}-pgid.txt`)
+    );
+    const noiseDoneMarkers = Array.from({ length: JOBS }, (_unused, i) =>
+      path.join(dir, `job-${i}-noise-done.txt`)
+    );
+    // The resistant leader's own descendants' pids, and its keep-alive
+    // anchor's own pid - distinct from `pgidMarkers` above (which only
+    // ever names each job's LEADER/pgid) - so the mid-escalation proof
+    // below can assert something concrete about these SPECIFIC pids,
+    // rather than merely a surviving-member count. See
+    // `NoisyLiveJobOptions.descendantPidsMarkerPath`/`anchorPidMarkerPath`
+    // in test/harness.ts for the capture mechanism itself.
+    const resistantDescendantPidsMarker = path.join(dir, "resistant-descendant-pids.txt");
+    const resistantAnchorPidMarker = path.join(dir, "resistant-anchor-pid.txt");
+
+    const runCalls = Array.from({ length: JOBS }, (_unused, i) => ({
+      id: nextId(),
+      toolName: "run",
+      args: {
+        command: buildNoisyLiveJobShellCommand(i, pgidMarkers[i]!, noiseDoneMarkers[i]!, {
+          sigtermResistant: i === resistantIndex,
+          ...(i === resistantIndex
+            ? {
+                descendantPidsMarkerPath: resistantDescendantPidsMarker,
+                anchorPidMarkerPath: resistantAnchorPidMarker,
+              }
+            : {}),
+        }),
+        shell: true,
+        label: i === resistantIndex ? "sigterm-resistant-leader" : `noisy-job-${i}`,
+      },
+    }));
+    const runResponses = await callToolsConcurrently(server, runCalls);
+    const jobIds = runCalls.map(
+      (call) =>
+        requireStructuredContent(runResponses.get(call.id)!, `run() for job ${call.args.label}`)
+          .job_id as string
+    );
+
+    // Barrier 1: all 4 real process groups alive with their full descendant
+    // trees. For the resistant leader specifically, its `DESCENDANTS_PER_JOB`
+    // descendants are forked and its own pgid marker is written BEFORE
+    // `trap '' TERM` ever runs (see buildNoisyLiveJobShellCommand's own
+    // docs for why that order is what makes the resistance genuinely
+    // leader-only) - a parsed pgid here confirms the tree exists, not that
+    // the trap is live yet. That's confirmed instead by Barrier 2 below -
+    // specifically its own noise-done marker wait: the marker is written
+    // well after the trap statement runs, so by the time this test ever
+    // calls kill(), the trap is unconditionally already live.
+    const pgidTexts = await Promise.all(
+      pgidMarkers.map((markerPath) =>
+        waitForFile(markerPath, { timeoutMs: 15_000, until: parsesAsPgid })
+      )
+    );
+    const pgids = pgidTexts.map((pgidText, i) => {
+      const pgid = Number(pgidText.trim());
+      assert.ok(
+        Number.isInteger(pgid) && pgid > 0,
+        `expected a real numeric pgid from ${pgidMarkers[i]}`
+      );
+      return pgid;
+    });
+    await withProcessGroupReap(pgids, async () => {
+      await Promise.all(
+        pgids.map(async (pgid, i) => {
+          const members = await waitForPgrepGroupMembers(
+            pgid,
+            (m) => m.length >= 1 + DESCENDANTS_PER_JOB,
+            5000
+          );
+          assert.ok(
+            members.length >= 1 + DESCENDANTS_PER_JOB,
+            `job ${i} (pgid ${pgid}): expected >= ${1 + DESCENDANTS_PER_JOB} real process-group members before the proof, pgrep saw: ${JSON.stringify(members)}`
+          );
+        })
+      );
+
+      // Barrier 1b: the resistant leader's own descendant pids and anchor pid
+      // are readable. Both markers are written strictly BEFORE the noise-done
+      // marker Barrier 2's own marker wait waits on below (descendants+pgid
+      // first, then the trap, then the anchor fork, then noise - see
+      // buildNoisyLiveJobShellCommand's own statement order), so by the time
+      // Barrier 2 completes these are unconditionally already on disk too;
+      // waited on explicitly here anyway, with the same "never trust mere
+      // existence, wait for the WHOLE value" discipline every other marker in
+      // this file uses (see `parsesAsPidList`'s own docs).
+      const resistantDescendantPidsText = await waitForFile(resistantDescendantPidsMarker, {
+        timeoutMs: 15_000,
+        until: (content) => parsesAsPidList(content, DESCENDANTS_PER_JOB),
+      });
+      const resistantDescendantPids = resistantDescendantPidsText
+        .trim()
+        .split("\n")
+        .map((line) => Number(line.trim()));
+      const resistantAnchorPidText = await waitForFile(resistantAnchorPidMarker, {
+        timeoutMs: 15_000,
+        until: (content) => parsesAsPidList(content, 1),
+      });
+      const resistantAnchorPid = Number(resistantAnchorPidText.trim());
+
+      // Barrier 2: all 4 have genuinely produced their NOISE_BYTES of real
+      // stdout AND every one of the noise-done marker files actually holds
+      // "done" on disk - the resistant leader included, since its trap
+      // changes nothing about how it writes its own noise. These are two
+      // real, distinct checks, both load-bearing: the stdout-byte poll
+      // (via a live status() read) proves the byte-accounted buffer layer
+      // genuinely materialized NOISE_BYTES of real output; the marker wait
+      // (via a real filesystem read - never mere existence, see
+      // `waitForFile`'s own docs) proves the shell script actually reached
+      // its own done-marker statement. For the resistant leader
+      // specifically, that statement is written strictly AFTER
+      // `trap '' TERM` runs (see buildNoisyLiveJobShellCommand's own
+      // statement order), so the marker wait is what actually confirms the
+      // trap is live before this test ever calls kill() below - the
+      // stdout-byte poll alone proves nothing about the trap, since the
+      // trap changes nothing about how the leader writes its own noise.
+      await waitForAllNoiseMaterialized(server, jobIds, nextId);
+      await Promise.all(
+        noiseDoneMarkers.map((markerPath) =>
+          waitForFile(markerPath, {
+            timeoutMs: 15_000,
+            until: (content) => content.trim() === "done",
+          })
+        )
+      );
+
+      const resistantJobId = jobIds[resistantIndex]!;
+      const resistantPgid = pgids[resistantIndex]!;
+
+      // ---------------------------------------------------------------------
+      // THE CORE PROOF: kill() the SIGTERM-resistant leader with NO explicit
+      // "signal" argument - src/tools/kill.ts's real DEFAULT path - which
+      // sends SIGTERM to the whole process group, then genuinely waits the
+      // real POSIX_KILL_GRACE_PERIOD_MS (5000ms, this codebase's own real
+      // production constant - never shortened here, unlike this file's other,
+      // process.ts-layer unit tests, which inject a short graceMs; this is
+      // the real value a real client actually waits through), then escalates
+      // to SIGKILL only because the group is still alive - the leader's own
+      // `trap '' TERM` makes it survive plain SIGTERM on its own, exactly the
+      // regression test/process.test.ts's own "a SIGTERM-resistant process is
+      // escalated to SIGKILL" test already proves at the process.ts layer,
+      // now proven through the REAL kill TOOL, over the REAL MCP wire.
+      //
+      // "Under real concurrent load" is proven here as a CONCRETE, timestamped
+      // fact, not an ordering assumption: the resistant leader's kill() and
+      // real, live activity against the 3 ordinary jobs (a status()/output()
+      // read apiece, then their own kill() call) are all dispatched as ONE
+      // pipelined batch - every request written to the wire before the
+      // client's own first READ of any response in this batch - via
+      // `callToolsConcurrentlyTimed`, which records, for each response, the
+      // elapsed time from that shared dispatch instant until the client's
+      // own read loop dequeues that specific line. The resistant kill's
+      // response is asserted to land only after the real ~5s grace period
+      // (below); every ordinary job's own kill() response is asserted to
+      // have landed well BEFORE that
+      // (a real margin, well inside the grace period - see the elapsedMs <
+      // 4000 assertion further below), and every ordinary job's status/output
+      // read is asserted to have landed BEFORE it too, with no equivalent
+      // margin - i.e., the server genuinely answered real status/output reads
+      // AND real kill() calls on the other jobs WHILE the resistant leader's
+      // own escalation was still unresolved, not merely "requested in the
+      // same tick." (This
+      // does NOT claim a kill-then-read round-trip on those jobs - one
+      // representative ordinary job's (`normalIndexes[0]`) own post-kill
+      // state is confirmed separately, see `statusAfterNormalKillBody`
+      // further below, as its own distinct, later round-trip.)
+      // ---------------------------------------------------------------------
+      const resistantKillId = nextId();
+      const ordinaryReadCalls = normalIndexes.flatMap((i) => [
+        { id: nextId(), toolName: "status", args: { job_id: jobIds[i]! } },
+        { id: nextId(), toolName: "output", args: { job_id: jobIds[i]!, stream: "stdout" } },
+      ]);
+      const ordinaryKillCalls = normalIndexes.map((i) => ({
+        id: nextId(),
+        toolName: "kill",
+        args: { job_id: jobIds[i]! },
+      }));
+      // Send order matters here (not just batch membership): the resistant
+      // kill is listed first so it's dispatched immediately, and each
+      // ordinary job's own read calls are listed before that SAME job's kill
+      // call, so the server sees (and can answer) the read before it ever
+      // sees the request that would change that job's state.
+      const overlapCalls = [
+        { id: resistantKillId, toolName: "kill", args: { job_id: resistantJobId } },
+        ...ordinaryReadCalls,
+        ...ordinaryKillCalls,
+      ];
+      // Dispatched as a PROMISE, not yet awaited: `callToolsConcurrentlyTimed`
+      // writes every request in `overlapCalls` to the wire synchronously,
+      // before its own first `await` (see its own docs), so by the time this
+      // line returns, the resistant kill() has already been sent - the
+      // mid-escalation sample below can safely time itself from right here.
+      const overlapResponsesPromise = callToolsConcurrentlyTimed(
+        server,
+        overlapCalls,
+        12_000,
+        "resistant-escalation-under-concurrent-load"
+      );
+      // Attached immediately, not just at the `await` further below: if a
+      // mid-escalation assertion throws before this test ever reaches
+      // `await overlapResponsesPromise`, the promise above is still
+      // in-flight and its underlying `nextLine()` calls will eventually
+      // settle (resolve or reject) with nothing else listening, which Node
+      // reports as an unhandled rejection AFTER this test has already
+      // ended - a second, unrelated failure layered on top of the real one.
+      // A no-op `.catch` here is a SEPARATE listener from the `await`
+      // further below (attaching one doesn't detach or replace the other -
+      // both observe the same eventual settlement), so it only ever
+      // silences that specific delayed, ownerless rejection; the primary
+      // `await overlapResponsesPromise` path further down still throws
+      // normally and still fails the test the normal way when it rejects.
+      overlapResponsesPromise.catch(() => {});
+
+      // -----------------------------------------------------------------------
+      // LEADER-ONLY RESISTANCE PROOF: by this point the client has written
+      // every request in the batch above to the wire (see
+      // callToolsConcurrentlyTimed's own docs), but nothing here is assumed
+      // about how quickly the SEPARATE server process actually reads its
+      // stdin, parses the JSON-RPC request, dispatches to the kill handler,
+      // and sends the real group SIGTERM - that is genuinely async, subject
+      // to OS/event-loop scheduling in a different process, and this test
+      // never treats it as instantaneous or synchronous with the dispatch
+      // above. Instead of assuming a causal timeline, this polls the REAL
+      // external process group repeatedly (never this codebase's own
+      // bookkeeping, via `waitForPgrepGroupMembers`) until it directly
+      // observes the one discriminating fact this proof needs - every one of
+      // the resistant leader's original descendants gone - or a deadline
+      // elapses. The deadline is chosen to stay well clear of the real ~5s
+      // SIGKILL boundary the resistant kill's own response is asserted to
+      // wait past (>= 4900ms, below), so a genuine, non-mutant run has ample
+      // room to resolve the poll well before the deadline, while a
+      // still-in-flight (or genuinely broken) escalation never gets mistaken
+      // for a completed one.
+      //
+      // Confirmed empirically (see this file's git history/PR for the
+      // transcript) against BOTH the real fixture and a deliberately
+      // reintroduced version of the original bug (the trap moved back to
+      // BEFORE the descendant forks):
+      //
+      // - Correct code: the poll resolves quickly (well under 1s observed) -
+      //   the DESCENDANTS_PER_JOB descendants, forked before the trap ever
+      //   ran, die from the plain group SIGTERM within milliseconds, and at
+      //   that point the group holds EXACTLY the leader and its keep-alive
+      //   anchor.
+      // - The original bug (trap set before the forks): every descendant
+      //   inherits the SAME ignored disposition as the leader, so the poll's
+      //   condition is never satisfied and it runs out the full deadline
+      //   with descendants still present - the assertions below then fail
+      //   immediately with the same diagnostics they always produced, which
+      //   is what makes this a real, discriminating check of "leader-only,"
+      //   not merely "the group eventually reaches SIGKILL" (the
+      //   escalation-timing assertions further below hold in both cases and
+      //   cannot tell them apart on their own).
+      // -----------------------------------------------------------------------
+      const midEscalationDeadlineMs = 4000;
+      const midEscalationPollStart = Date.now();
+      const midEscalationMembers = await waitForPgrepGroupMembers(
+        resistantPgid,
+        (members) => resistantDescendantPids.every((pid) => !members.includes(pid)),
+        midEscalationDeadlineMs
+      );
+      const midEscalationElapsedMs = Date.now() - midEscalationPollStart;
+      assert.ok(
+        midEscalationMembers.includes(resistantPgid),
+        `leader-only resistance proof: the resistant leader's own pid (${resistantPgid}) must still be alive ${midEscalationElapsedMs}ms into its escalation (well before the real ~5s grace period elapses), pgrep saw: ${JSON.stringify(midEscalationMembers)}`
+      );
+      assert.ok(
+        midEscalationMembers.includes(resistantAnchorPid),
+        `leader-only resistance proof: the keep-alive anchor job's own pid (${resistantAnchorPid}) must still be alive ${midEscalationElapsedMs}ms into the escalation (it inherited the leader's OWN ignored disposition, forked after the trap), pgrep saw: ${JSON.stringify(midEscalationMembers)}`
+      );
+      for (const descendantPid of resistantDescendantPids) {
+        assert.equal(
+          midEscalationMembers.includes(descendantPid),
+          false,
+          `leader-only resistance proof: descendant pid ${descendantPid} (forked BEFORE the trap ran, so it never inherited the leader's ignored disposition) must already be dead from the plain group SIGTERM (polled for up to ${midEscalationDeadlineMs}ms, observed after ${midEscalationElapsedMs}ms). Surviving here would mean resistance leaked to the whole group, not just the leader - the exact regression this assertion exists to catch. pgrep saw: ${JSON.stringify(midEscalationMembers)}`
+        );
+      }
+      assert.deepEqual(
+        [...midEscalationMembers].sort((a, b) => a - b),
+        [resistantPgid, resistantAnchorPid].sort((a, b) => a - b),
+        `leader-only resistance proof: ${midEscalationElapsedMs}ms into the escalation (polled for up to ${midEscalationDeadlineMs}ms) the resistant leader's process group must contain EXACTLY the leader plus its keep-alive anchor job (2 members) - no surviving descendants, nothing else. pgrep saw: ${JSON.stringify(midEscalationMembers)}`
+      );
+
+      const overlapResponses = await overlapResponsesPromise;
+
+      const resistantKillResult = overlapResponses.get(resistantKillId)!;
+      const resistantKillStructured = requireStructuredContent(
+        resistantKillResult.body,
+        "kill(resistant leader)"
+      );
+      assert.equal(resistantKillStructured.state, "killed");
+      assert.equal(
+        resistantKillStructured.signal,
+        "SIGKILL",
+        'a SIGTERM-resistant leader must be recorded as "SIGKILL" once real escalation actually happens, never "SIGTERM" (the signal that was merely SENT first, not the one that actually finished the job - see jobStore.ts\'s own updateKillSignal docs)'
+      );
+      const killElapsedMs = resistantKillResult.elapsedMs;
+      assert.ok(
+        killElapsedMs >= 4900,
+        `escalation must genuinely wait out the real ~5s grace period before sending SIGKILL, kill() only took ${killElapsedMs}ms`
+      );
+
+      // The ordinary jobs' reads: each must show a job that's still
+      // genuinely alive and readable, AND the client must have read its
+      // response (dequeued it off the wire) before the resistant kill's
+      // own response - a real, timestamped ordering, though not a padded
+      // margin (unlike the ordinary kills' own elapsedMs < 4000 bound
+      // further below, a read here is only ever asserted to land before
+      // killElapsedMs, with no independent floor of its own) - not an
+      // assumption about send order.
+      for (const call of ordinaryReadCalls) {
+        const result = overlapResponses.get(call.id)!;
+        assert.ok(
+          result.elapsedMs < killElapsedMs,
+          `ordinary job's ${call.toolName}(${call.args.job_id}) must complete while the resistant leader's escalation is still in flight - it took ${result.elapsedMs}ms, the resistant kill took ${killElapsedMs}ms`
+        );
+        if (call.toolName === "status") {
+          const structured = requireStructuredContent(
+            result.body,
+            `status(${call.args.job_id}) during the resistant leader's in-flight escalation`
+          );
+          assert.equal(structured.job_id, call.args.job_id);
+          assert.equal(
+            structured.state,
+            "running",
+            "an ordinary job read while the resistant leader's escalation is genuinely in flight must still be genuinely running - real concurrent load, not an already-dead job"
+          );
+        } else {
+          const structured = requireStructuredContent(
+            result.body,
+            `output(${call.args.job_id}) during the resistant leader's in-flight escalation`
+          );
+          const events = structured.events as Array<{ text: string }>;
+          assert.ok(
+            events.length > 0,
+            "output() on a still-live ordinary job, read while the resistant leader's escalation is in flight, must return real events"
+          );
+        }
+      }
+
+      // The ordinary jobs' own kill()s: each dies from the default SIGTERM
+      // alone, well inside the grace period, no escalation needed (matching
+      // every other whole-tree kill in this file) - AND, per the same
+      // timestamped proof, the client genuinely read each one's own
+      // response before the resistant leader's, i.e. this real state
+      // change on other jobs happened while the resistant escalation was
+      // still unresolved.
+      for (const call of ordinaryKillCalls) {
+        const result = overlapResponses.get(call.id)!;
+        const structured = requireStructuredContent(result.body, `kill(${call.args.job_id})`);
+        assert.equal(structured.state, "killed");
+        assert.equal(
+          structured.signal,
+          "SIGTERM",
+          "a plain (non-resistant) job must die from SIGTERM alone, with no escalation"
+        );
+        assert.ok(
+          result.elapsedMs < 4000,
+          `plain jobs must die well within the 5s grace period, took ${result.elapsedMs}ms`
+        );
+        assert.ok(
+          result.elapsedMs < killElapsedMs,
+          `an ordinary job's own kill() must complete while the resistant leader's escalation is still in flight - it took ${result.elapsedMs}ms, the resistant kill took ${killElapsedMs}ms`
+        );
+      }
+
+      // Cross-tool DURABILITY proof (this test's own "and status() afterward
+      // reports... for one representative ordinary job and the resistant
+      // leader") - distinct from, and NOT part of, the concurrent-overlap
+      // proof above: status(), a SEPARATE tool call sent only after the
+      // whole overlap batch has already resolved, independently confirms
+      // the SAME states/signals that batch's own kill() calls reported for
+      // these two jobs, proving each of those two disposition changes is
+      // durably recorded in JobStore - readable again on a totally
+      // separate, later round trip - not merely reflected in a kill()
+      // call's own one-off return value. (The other two ordinary jobs'
+      // post-kill states rest on their own in-batch kill() results and the
+      // external pgrep zero-survivor check further below, not a later
+      // status() round-trip - this durability check does not claim to
+      // cover them.)
+      const statusAfterNormalKillBody = await callTool(server, nextId(), "status", {
+        job_id: jobIds[normalIndexes[0]!]!,
+      });
+      const statusAfterNormalKillStructured = requireStructuredContent(
+        statusAfterNormalKillBody,
+        "status() after a plain kill(), a separate round trip"
+      );
+      assert.equal(statusAfterNormalKillStructured.state, "killed");
+      assert.equal(statusAfterNormalKillStructured.signal, "SIGTERM");
+      const statusAfterEscalationBody = await callTool(server, nextId(), "status", {
+        job_id: resistantJobId,
+      });
+      const statusAfterEscalationStructured = requireStructuredContent(
+        statusAfterEscalationBody,
+        "status() after the real escalated kill()"
+      );
+      assert.equal(statusAfterEscalationStructured.job_id, resistantJobId);
+      assert.equal(statusAfterEscalationStructured.state, "killed");
+      assert.equal(statusAfterEscalationStructured.signal, "SIGKILL");
+      assert.equal(typeof statusAfterEscalationStructured.ended_at, "string");
+      assert.equal(
+        "exit_code" in statusAfterEscalationStructured,
+        false,
+        "a killed job must never carry exit_code, even after real SIGKILL escalation"
+      );
+
+      // Bullet 3: the resistant leader's output buffer stays readable after
+      // termination - output()/tail() must still return its real 64KiB-class
+      // noise, never error, even though the job that produced it is now dead
+      // (and was killed by escalation, not a plain single signal).
+      const outputAfterKillBody = await callTool(server, nextId(), "output", {
+        job_id: resistantJobId,
+        stream: "stdout",
+      });
+      const outputAfterKillStructured = requireStructuredContent(
+        outputAfterKillBody,
+        "output() after the real escalated kill()"
+      );
+      const outputEvents = outputAfterKillStructured.events as Array<{ text: string }>;
+      assert.ok(
+        outputEvents.length > 0,
+        "output() must still return the resistant leader's real noise after it was killed"
+      );
+      assert.ok(outputEvents.some((event) => event.text.includes(noiseToken(resistantIndex))));
+
+      const tailAfterKillBody = await callTool(server, nextId(), "tail", {
+        job_id: resistantJobId,
+        stream: "stdout",
+        lines: 20,
+      });
+      const tailAfterKillStructured = requireStructuredContent(
+        tailAfterKillBody,
+        "tail() after the real escalated kill()"
+      );
+      const tailEvents = tailAfterKillStructured.events as Array<{ text: string }>;
+      assert.ok(
+        tailEvents.length > 0,
+        "tail() must still return the resistant leader's real noise after it was killed"
+      );
+
+      // Bullet 4: the WHOLE tree - the resistant leader itself PLUS its
+      // DESCENDANTS_PER_JOB descendants - is genuinely gone, confirmed by a
+      // real, external `pgrep -g <pgid>` call, never this codebase's own
+      // bookkeeping. This is the escalation case specifically: the leader
+      // survived plain SIGTERM on its own, so this is what proves SIGKILL
+      // really did reach and terminate every group member (leader included),
+      // not merely the descendants that would have died from SIGTERM anyway.
+      const afterResistantMembers = await waitForPgrepGroupMembers(
+        resistantPgid,
+        (m) => m.length === 0,
+        5000
+      );
+      assert.deepEqual(
+        afterResistantMembers,
+        [],
+        `the SIGTERM-resistant leader's whole tree must be zero-survivor after real SIGKILL escalation, pgrep still saw: ${JSON.stringify(afterResistantMembers)}`
+      );
+
+      // And the 3 ordinary jobs' trees too, the same real external check.
+      const afterNormalMembers = await Promise.all(
+        normalIndexes.map((i) => waitForPgrepGroupMembers(pgids[i]!, (m) => m.length === 0, 5000))
+      );
+      afterNormalMembers.forEach((members, idx) => {
+        assert.deepEqual(
+          members,
+          [],
+          `job ${normalIndexes[idx]}'s tree must be zero-survivor too, pgrep saw: ${JSON.stringify(members)}`
+        );
+      });
+
+      server.child.kill("SIGKILL");
+    });
+    // `withProcessGroupReap` (see its own docs above `nextId`) unconditionally
+    // reaps all 4 of this test's own real process-group pgids (the resistant
+    // leader's own group plus the 3 ordinary jobs' groups) whether the
+    // callback above completed normally or threw - this test is the one
+    // place in this file where an assertion can throw BEFORE the mid-batch
+    // kill() calls are ever awaited (every mid-escalation assertion runs
+    // before `overlapResponsesPromise` is awaited), and this file's shared
+    // `after()` hook only ever kills the MCP server's OWN top-level child
+    // process, never the real job process GROUPS the server itself spawned.
+    // This reap is additional to, and does not replace, the assertions
+    // above that every tree is ALREADY a zero-survivor by the time a
+    // passing run reaches that point; it only does real work when
+    // something above threw first (proven directly by this file's own
+    // guard test further down, which deliberately reintroduces the
+    // original leader-only-resistance bug to drive exactly that path).
+  }
+);
+
+test(
+  "guard: withProcessGroupReap's teardown reaps a resistant leader's real process group even when the mid-escalation assertion throws, and leaves no unhandled rejection behind",
+  { skip: PGREP_ORACLE_SKIP },
+  async () => {
+    const server = tracked();
+    await completeHandshake(server);
+
+    const dir = makeTempDir();
+    const pgidMarker = path.join(dir, "guard-buggy-pgid.txt");
+    const noiseDoneMarker = path.join(dir, "guard-buggy-noise-done.txt");
+    const descendantPidsMarker = path.join(dir, "guard-buggy-descendant-pids.txt");
+    const token = "GHANTIKA-GUARD-BUGGY-RESISTANT";
+
+    // Deliberately REINTRODUCES the original leader-only-resistance bug
+    // `NoisyLiveJobOptions.sigtermResistant`'s own docs (test/harness.ts)
+    // describe: the trap is set BEFORE any descendant is forked, so every
+    // descendant inherits the leader's own ignored disposition instead of
+    // staying plainly killable by a plain group SIGTERM. Inlined here
+    // (rather than via buildNoisyLiveJobShellCommand, which only ever
+    // produces the CORRECT ordering) specifically so this guard test can
+    // drive the exact mid-escalation-assertion-throws failure path
+    // `withProcessGroupReap`'s own teardown exists for, without depending
+    // on that teardown to prove anything about itself. No keep-alive
+    // anchor job is needed here (unlike the real resistant fixture above):
+    // with the trap set first, EVERY descendant also inherits the ignored
+    // disposition, so the leader's own `wait` (blocking on those same
+    // descendants) stays genuinely blocked on its own - the anchor's job
+    // in the correctly-ordered fixture is only needed there because the
+    // descendants stay killable and would otherwise let `wait` return.
+    const descendantForkStatements = Array.from(
+      { length: DESCENDANTS_PER_JOB },
+      () => `sleep 60 & echo $! >> '${descendantPidsMarker}'`
+    ).join("; ");
+    const buggyResistantCommand = [
+      `echo $$ > '${pgidMarker}'`,
+      `trap '' TERM`,
+      descendantForkStatements,
+      `yes '${token}' | head -c 4096`,
+      `echo done > '${noiseDoneMarker}'`,
+      "wait",
+    ].join("; ");
+
+    const runBody = await callTool(server, nextId(), "run", {
+      command: buggyResistantCommand,
+      shell: true,
+      label: "guard-buggy-resistant-leader",
+    });
+    const jobId = requireStructuredContent(runBody, "run() for the guard's buggy resistant leader")
+      .job_id as string;
+
+    const pgidText = await waitForFile(pgidMarker, { timeoutMs: 15_000, until: parsesAsPgid });
+    const pgid = Number(pgidText.trim());
+    assert.ok(
+      Number.isInteger(pgid) && pgid > 0,
+      `guard: expected a real numeric pgid from ${pgidMarker}`
+    );
+
+    const descendantPidsText = await waitForFile(descendantPidsMarker, {
+      timeoutMs: 15_000,
+      until: (content) => parsesAsPidList(content, DESCENDANTS_PER_JOB),
+    });
+    const descendantPids = descendantPidsText
+      .trim()
+      .split("\n")
+      .map((line) => Number(line.trim()));
+
+    // Both barriers the real escalation test above uses: the real process
+    // group alive with its full descendant tree, and the shell has
+    // genuinely reached its own done-marker statement (which, per the
+    // reintroduced bug's own ordering, runs after the trap too - so this
+    // also confirms the trap is live before this guard ever calls kill()).
+    await waitForPgrepGroupMembers(pgid, (m) => m.length >= 1 + DESCENDANTS_PER_JOB, 15_000);
+    await waitForFile(noiseDoneMarker, {
+      timeoutMs: 15_000,
+      until: (content) => content.trim() === "done",
+    });
+
+    // Dispatched as a promise, deliberately not awaited before the
+    // mid-escalation check below - the exact shape the real escalation
+    // test's own `overlapResponsesPromise` uses. The immediate no-op
+    // `.catch` mirrors that same fix: if the mid-escalation assertion
+    // below throws before this test ever reads this promise's result, a
+    // delayed settlement here must never surface as a separate unhandled
+    // rejection.
+    const guardKillId = nextId();
+    const killPromise = callToolsConcurrentlyTimed(
+      server,
+      [{ id: guardKillId, toolName: "kill", args: { job_id: jobId } }],
+      12_000,
+      "guard-buggy-kill"
+    );
+    killPromise.catch(() => {});
+
+    // THE ACTUAL PROOF: run the exact mid-escalation shape the real
+    // escalation test uses, wrapped in the same `withProcessGroupReap`
+    // teardown, against the deliberately reintroduced bug - this
+    // assertion is EXPECTED to throw, since every descendant inherited the
+    // leader's own ignored disposition and none of them die from the
+    // plain group SIGTERM within any real window. 1500ms is ample: the
+    // real (correctly-ordered) fixture's own docs report this same
+    // condition resolving in well under 1s when the code is correct, so a
+    // bug that never resolves it at all is unambiguous well before this
+    // deadline elapses.
+    let caughtError: unknown;
+    try {
+      await withProcessGroupReap([pgid], async () => {
+        const members = await waitForPgrepGroupMembers(
+          pgid,
+          (m) => descendantPids.every((pid) => !m.includes(pid)),
+          1500
+        );
+        assert.ok(
+          descendantPids.every((pid) => !members.includes(pid)),
+          `guard: with the deliberately reintroduced leader-only-resistance bug, every descendant pid should ALREADY be dead from the plain group SIGTERM - if this assertion doesn't fail, the guard fixture itself failed to reproduce the original bug and this guard test proves nothing about the teardown. pgrep saw: ${JSON.stringify(members)}`
+        );
+      });
+    } catch (error) {
+      caughtError = error;
+    }
+    assert.ok(
+      caughtError,
+      "guard: expected the mid-escalation assertion above to throw against the deliberately reintroduced bug - see that assertion's own message if this fails"
+    );
+
+    // (a) THE REAL EXTERNAL PROOF: despite the assertion above throwing,
+    // `withProcessGroupReap`'s own `finally` must already have reaped this
+    // pgid via a real `process.kill(-pgid, "SIGKILL")` by the time we get
+    // here - a real, external `pgrep -g <pgid>` call, never this
+    // codebase's own bookkeeping.
+    const afterMembers = await waitForPgrepGroupMembers(pgid, (m) => m.length === 0, 3000);
+    assert.deepEqual(
+      afterMembers,
+      [],
+      `guard: expected ZERO surviving members of the resistant leader's process group after the mid-escalation assertion threw and withProcessGroupReap's own finally ran, pgrep still saw: ${JSON.stringify(afterMembers)}`
+    );
+
+    // (b) no unhandled rejection escapes: give the event loop a real,
+    // bounded grace window and watch for one directly. `killPromise`
+    // above was never awaited by this test (mirroring the real failure
+    // shape), so without its own `.catch` guard, a late settlement here
+    // would otherwise surface as a process-level unhandledRejection after
+    // this test has already made its assertions - node:test's own run
+    // would report that as a failure in its own right (see
+    // scripts/run-tests.mjs's own docs on why this project treats an
+    // unhandled rejection as a named failure, never something to force
+    // past). Reaching the end of this bounded window with nothing
+    // observed here, on top of this whole suite run reporting clean, is
+    // the concrete evidence.
+    let unhandled: unknown;
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandled = reason;
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    process.off("unhandledRejection", onUnhandledRejection);
+    assert.equal(
+      unhandled,
+      undefined,
+      `guard: expected no unhandled rejection to surface after the mid-escalation failure path, got: ${String(unhandled)}`
+    );
+
+    server.child.kill("SIGKILL");
+  }
+);
+
+test(
   "whole-tree reap under the FULL 4x3 concurrent load - a real external pgrep confirms ZERO survivors across ALL 4 jobs' full descendant trees after killing them",
   { skip: PGREP_ORACLE_SKIP },
   async () => {
@@ -458,10 +1179,13 @@ test(
 // =============================================================================
 // The Windows terminal-mapping nuance.
 //
-// The win32 code path in src/tools/kill.ts (and src/server.ts's shutdown
-// reap) runs only on the suite's Windows legs. This file's own assertions
-// have to hold on every leg, so they are written to prove what the code
-// does without depending on a real Windows kill happening underneath them.
+// There is currently no Windows CI signal at all (see this file's
+// PGREP_ORACLE_SKIP and CHANGELOG.md's own entry on Windows's removal from
+// the test matrix) - the win32 code path in src/tools/kill.ts (and
+// src/server.ts's shutdown reap) never actually executes on a real
+// Windows host anywhere this suite runs. So the assertions below are
+// written to prove what the code does without depending on a real Windows
+// kill happening underneath them at all.
 //
 // The WRONG version of this test would assert something like
 // "status()-after-kill always shows state:'killed' with SOME signal
@@ -564,14 +1288,17 @@ test('Windows mapping, structural: src/tools/kill.ts\'s real win32 branch passes
   // `killProcessTreeWindows(handle.pid, signal)` or
   // `markKilled(jobId, signal)`) - Windows has no graceful phase, so it is
   // ignored entirely (src/tools/kill.ts's own inputSchema description:
-  // "Ignored on Windows, which has no graceful phase"). Checked as "no
-  // `(...signal...)` call-argument shape", not a bare substring search for
-  // "signal" - this branch's own real comment legitimately DISCUSSES the
-  // caller-supplied signal in prose ("regardless of any caller-supplied
-  // `signal`"), and a bare substring check would wrongly flag that
-  // comment as if it were a code reference.
+  // "Ignored on Windows, which has no graceful phase"). Checked by
+  // stripping this branch's own `//` line comments first, then doing a
+  // bare word-boundary search for the identifier `signal` in what
+  // remains: the win32 branch's code, with `//` comments stripped, must
+  // not contain the word `signal` at all. This branch's own real comment
+  // legitimately DISCUSSES the caller-supplied signal in prose
+  // ("regardless of any caller-supplied `signal`"), and without
+  // stripping comments first, a substring check would wrongly flag that
+  // prose as if it were a code reference.
   assert.equal(
-    /\bsignal\b(?!`)/.test(win32Branch.replace(/\/\/.*$/gm, "")),
+    /\bsignal\b/.test(win32Branch.replace(/\/\/.*$/gm, "")),
     false,
     'the win32 branch\'s CODE (comments stripped) must never reference the caller-supplied "signal" identifier at all - it is unconditionally ignored on Windows'
   );
