@@ -1,15 +1,19 @@
+#!/usr/bin/env node
 /**
  * Package entry point. Starts the ghantika MCP server over stdio when run
- * directly (`node dist/index.js`), but does nothing on import - so a test
+ * directly (as the `ghantika` command, or `node dist/index.js`), but does
+ * nothing on import - so a test
  * that imports `./server.js` or `./registry.js` directly to exercise them
  * in-process never accidentally boots a real server as a side effect of
  * loading this file.
  *
  * `src/index.ts` is the package's public entry point (declared in
- * `package.json`'s `"main"`/`"types"`), not one of the frozen internal
- * modules (`server.ts`/`registry.ts`/`jobStore.ts`/
+ * `package.json`'s `"main"`/`"types"`/`"bin"`), not one of the frozen
+ * internal modules (`server.ts`/`registry.ts`/`jobStore.ts`/
  * `process.ts`/`tools/*.ts`) - it is deliberately just a thin
- * main-guarded wrapper around `runServer`.
+ * main-guarded wrapper around `runServer`. The shebang above is what lets
+ * npm's installed `ghantika` executable (from `"bin"`) run this file
+ * directly without a `node` prefix.
  */
 import { realpathSync } from "node:fs";
 import path from "node:path";

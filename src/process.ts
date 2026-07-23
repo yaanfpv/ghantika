@@ -10,8 +10,8 @@
  * (kept decoupled/independently testable, matching the existing
  * `test/process.test.ts` pattern of importing this module alone).
  *
- * The one piece of this that was already load-bearing before this module's
- * spawn logic was filled in (stdio purity) is `MANAGED_CHILD_STDIO`, unchanged here.
+ * The one piece of this load-bearing on stdio purity is
+ * `MANAGED_CHILD_STDIO`, defined below.
  */
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
@@ -159,14 +159,16 @@ function effectiveWindowsServerPath(): string | undefined {
  * any host, regardless of which OS actually runs the assertion
  * (guarding against a "Windows env-key casing collision" regression) -
  * `effectivePathForLookup` below gates USE of this behind
- * `process.platform === "win32"`, so that internal branch itself only
- * ever runs as live code on this repo's own development machines
- * (macOS); it DOES run for real, unmocked, on this repo's CI (ci.yml's
- * `test` job matrix includes a `windows-latest` leg, where
- * `process.platform` genuinely is `"win32"`). The underlying
- * case-insensitive-key-resolution ALGORITHM this codebase implements is
- * not itself platform-specific, and is what this function isolates for
- * direct verification independent of `process.platform`.
+ * `process.platform === "win32"`, so that internal branch never runs as
+ * live code during local development on a non-Windows machine. There is
+ * currently no Windows leg in this repo's CI matrix at all (temporarily
+ * removed; see CHANGELOG), so that win32-gated call site is not exercised
+ * against a real Windows host anywhere right now. This function's own
+ * ALGORITHM stays directly verified independent of that: the case-
+ * insensitive-key-resolution logic is not itself platform-specific, and
+ * this file's own test suite exercises it against real PATH/Path/path
+ * casing-collision fixtures on whatever host the suite runs on - which is
+ * exactly what "exported as its own small, pure function" above is for.
  */
 export function resolveCaseInsensitivePathKey(
   env: Readonly<Record<string, string>>
@@ -292,10 +294,12 @@ function effectivePathForLookup(env: Readonly<Record<string, string>>): string {
  * On Windows, a bare command with no extension is tried against each
  * extension in `PATHEXT` (in addition to the bare name), matching
  * `cmd.exe`/`CreateProcess`'s own resolution. Everything below the
- * platform check is a best-effort reading of that documented behavior, so
- * it is the suite's Windows legs that exercise it against a real
- * `CreateProcess`; a macOS or Linux run returns at the first line and
- * never reaches any of it.
+ * platform check is a best-effort reading of that documented behavior. A
+ * macOS or Linux run returns at the first line and never reaches any of
+ * it, and, with no Windows leg in this repo's CI matrix at all right now
+ * (temporarily removed; see CHANGELOG), nothing exercises the rest of
+ * this function against a real `CreateProcess` anywhere either - the
+ * branch below is currently verified only by reading, not by execution.
  */
 function windowsExtensionCandidates(command: string): string[] {
   if (process.platform !== "win32") return [command];
@@ -339,9 +343,9 @@ export interface ManagedChildCallbacks {
  * `detached` set, "the child will be a group leader"). There is no window
  * in which the child exists but is NOT yet its own group leader, and no
  * later Node API to join/re-parent a process into a group after the fact -
- * so "assigned at spawn time, never late, never allowing breakaway" holds
- * by construction, not by a runtime check this file could get wrong
- * later. Once the child is its own
+ * so the property holds by construction (assigned at spawn time, never
+ * late, never allowing breakaway), not by a runtime check this file could
+ * get wrong later. Once the child is its own
  * group leader, its pid IS the group's pgid - every kill primitive below
  * relies on exactly that identity, so it never has to track a separate
  * pgid value alongside the pid.
@@ -387,6 +391,7 @@ export function spawnManaged(
   let child: ChildProcess;
   try {
     if (options.shellCommand !== undefined) {
+      // nosemgrep: javascript.lang.security.audit.spawn-shell-true.spawn-shell-true -- running a caller-supplied shell command via a real shell is this tool's documented, intentional purpose (`run`'s `shell: true` opt-in), not an oversight.
       child = spawn(options.shellCommand, {
         cwd: options.cwd,
         env: options.env,
@@ -557,7 +562,35 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
-export type SignalResult = { readonly ok: true } | { readonly ok: false; readonly message: string };
+/**
+ * True if process GROUP `-pid` still has ANY member alive - the same
+ * real, zero-side-effect `kill(target, 0)` probe `isProcessAlive` uses,
+ * but targeting the whole group via a NEGATIVE pid (see
+ * `signalProcessGroupPosix`'s own docs for the identical POSIX negative-
+ * pid semantics: `kill(2)` with a negative target signals every process
+ * in that group, and returns ESRCH only once none remain).
+ *
+ * `isProcessAlive(pid)` alone is NOT sufficient to confirm a process
+ * GROUP is dead: it checks only the one pid named. A group's LEADER can
+ * exit (from a plain, untrapped SIGTERM, for example) while a descendant
+ * - a different pid, in the same group, that ignores or is slower to
+ * respond to the same signal - is still running. `isProcessAlive` on the
+ * leader's own pid alone reads that as "dead" even though the group
+ * patently is not.
+ */
+export function isProcessGroupAlive(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    return err.code !== "ESRCH";
+  }
+}
+
+export type SignalResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly message: string; readonly code: string | undefined };
 
 /**
  * Signals pid's WHOLE process GROUP (`-pid`, the negative form - see
@@ -575,26 +608,31 @@ export function signalProcessGroupPosix(pid: number, signal: string): SignalResu
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
     if (err.code === "ESRCH") return { ok: true }; // the group is already gone - nothing left to signal, not a failure
-    return { ok: false, message: err.message };
+    return { ok: false, message: err.message, code: err.code };
   }
 }
 
 /**
- * Polls `isProcessAlive` until either `pid` is confirmed gone or
- * `timeoutMs` elapses - the real wait loop behind the grace
- * period ("a real grace period, not a token delay"). `pollIntervalMs`
- * defaults small so death is detected promptly rather than only at the
- * next coarse tick, and is itself capped to never overshoot the deadline.
+ * Polls `isAlive(pid)` until it reports false (confirmed gone) or
+ * `timeoutMs` elapses - the real wait loop behind the grace period.
+ * `pollIntervalMs` defaults small so death is detected promptly rather
+ * than only at the next coarse tick, and is itself capped to never
+ * overshoot the deadline. Defaults `isAlive` to `isProcessAlive` (a
+ * single pid); pass `isProcessGroupAlive` to wait for a whole process
+ * GROUP to be gone instead - `killProcessGroupPosix` does exactly this,
+ * since a group-level kill must confirm the group is genuinely gone, not
+ * merely that its leader exited (see `isProcessGroupAlive`'s own docs).
  */
 export function waitForProcessDeath(
   pid: number,
   timeoutMs: number,
-  pollIntervalMs = 50
+  pollIntervalMs = 50,
+  isAlive: (pid: number) => boolean = isProcessAlive
 ): Promise<boolean> {
   return new Promise((resolve) => {
     const deadline = Date.now() + timeoutMs;
     const tick = (): void => {
-      if (!isProcessAlive(pid)) {
+      if (!isAlive(pid)) {
         resolve(true);
         return;
       }
@@ -635,12 +673,11 @@ export interface PosixKillCallbacks {
    * both are triggered by the identical signal, but the natural event can
    * only ever fire asynchronously (on a later turn of the event loop),
    * while a synchronous same-tick write can't be preempted by it. Without
-   * this hook (an earlier version of this function had none), the caller
-   * had no choice but to `await` the WHOLE phase-split-plus-wait sequence
-   * before writing anything, and during that real wait the job's own
-   * `exit` event reliably won the race instead - a job this codebase
-   * itself deliberately killed was ending up recorded as `exited`, not
-   * `killed`.
+   * this hook, the caller would have to `await` the whole
+   * phase-split-plus-wait sequence before writing anything, and during
+   * that wait the job's own `exit` event would reliably win the race
+   * instead - a job this codebase itself deliberately killed would end up
+   * recorded as `exited`, not `killed`.
    */
   readonly onSignaled?: (signal: "SIGTERM" | "SIGKILL") => void;
 }
@@ -659,6 +696,43 @@ export interface PosixKillCallbacks {
 const SIGKILL_CONFIRMATION_TIMEOUT_MS = 1000;
 
 /**
+ * An INDEPENDENT-of-`kill()` survivor check for a whole process group,
+ * used ONLY to arbitrate the ONE specific signal-send failure this file
+ * has actually observed being ambiguous: `EPERM`. `signalProcessGroupPosix`
+ * already treats `ESRCH` as success (the group is gone, nothing left to
+ * signal); `EPERM` was observed empirically on macOS for the EXACT SAME
+ * already-gone race that would otherwise report `ESRCH`, most likely
+ * because the OS is mid-reclaiming the group's pid at the moment of the
+ * call. A SECOND `kill(pid, 0)` probe (`isProcessGroupAlive`) cannot
+ * arbitrate this: it is subject to the identical kernel-level ambiguity,
+ * and was verified empirically to reproduce the same false `EPERM` in the
+ * same race, making it a no-op as a disambiguator. `pgrep -g <pgid>` reads
+ * the real process table through an entirely different mechanism, so it
+ * is not fooled the same way - the same external, independent-of-our-own-
+ * bookkeeping oracle this repo's own tests already trust for exactly this
+ * purpose (see `pgrepGroupMembers` in test/kill.test.ts and
+ * test/shutdown.test.ts), promoted here because a production decision now
+ * needs the same disambiguation a test already relied on. Deliberately
+ * NOT consulted for any other errno: an unanticipated failure shape is
+ * surfaced unconditionally rather than run through an oracle built to
+ * arbitrate one specific, verified ambiguity. POSIX-only, matching every
+ * other function in this section.
+ */
+export function hasLiveProcessGroupMembersPosix(pid: number): boolean {
+  try {
+    const output = execFileSync("pgrep", ["-g", String(pid)], { encoding: "utf8" });
+    return output
+      .split("\n")
+      .map((line) => line.trim())
+      .some((line) => line.length > 0);
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException & { status?: number };
+    if (err.status === 1) return false; // pgrep's own "nothing matched" exit code - a real, expected zero-survivors result
+    throw error;
+  }
+}
+
+/**
  * The real POSIX phase split: SIGTERM to the whole group, THEN
  * a real wait of `graceMs`, THEN SIGKILL to the whole group only if it's
  * still alive - never the reverse, never simultaneous, never skipped. The
@@ -667,25 +741,76 @@ const SIGKILL_CONFIRMATION_TIMEOUT_MS = 1000;
  * means "done," not merely "the final signal was sent." `callbacks.onSignaled`
  * fires synchronously after each real signal send - see its own docs for
  * why that matters (the kill/exit race).
+ *
+ * Both waits check the WHOLE GROUP (`isProcessGroupAlive`), never just
+ * the leader's own single pid. A group's leader can exit from a plain,
+ * untrapped SIGTERM while a descendant - a different pid, in the same
+ * group, that ignores or is slower to respond to the same signal - keeps
+ * running; checking only the leader's pid would read that as "the group
+ * died from SIGTERM alone" and return `escalated: false` while a real
+ * process in the group it was asked to terminate stayed alive.
+ *
+ * A signal SEND itself can fail for a benign reason distinct from every
+ * other failure this function reports: the whole group can exit in the
+ * narrow window between a caller's own liveness/identity check and this
+ * function's signal call - a short-lived child (an ordinary `true`, say)
+ * finishing on its own right then. A signal failure is therefore not
+ * trusted at face value - `hasLiveProcessGroupMembersPosix` (see its own
+ * docs for why a second `kill(pid, 0)` probe cannot do this job) is
+ * checked before deciding whether the failure is real: if the group is
+ * confirmed gone despite the failed send, the call still achieved its
+ * actual goal (a dead group) and is treated as success, exactly as if
+ * `ESRCH` had been returned; only a failed send where the group is
+ * CONFIRMED still alive is a genuine failure worth throwing over.
+ * `callbacks.onSignaled` still fires in the benign-race case -
+ * `jobStore.markKilled`'s own terminal-state guard (first write wins)
+ * makes this safe even if the job's natural `exit` event already claimed
+ * the terminal state a moment earlier.
  */
+/**
+ * The ONE owning arbitration point for a failed signal-send, shared by
+ * BOTH the SIGTERM and the SIGKILL call sites below - a single function,
+ * not two copies of the same condition, so a mutation to this logic can
+ * only ever have one owner to be tested against, never a second,
+ * accidentally-untested copy. Only `EPERM` is the known already-gone-race
+ * errno (verified empirically); any OTHER non-ESRCH failure (EINVAL, or
+ * anything unanticipated) is surfaced unconditionally, fail-closed,
+ * without ever consulting the survivor oracle - `hasLiveProcessGroupMembersPosix`
+ * exists to arbitrate the ONE specific ambiguity this file has actually
+ * observed, not as a blanket "maybe it's fine" check for any failure shape.
+ * Throws when the failure is real; returns normally when it is the benign
+ * already-gone race.
+ */
+export function throwUnlessBenignAlreadyGoneRace(
+  pid: number,
+  signal: string,
+  result: SignalResult
+): void {
+  if (result.ok) return;
+  if (result.code !== "EPERM" || hasLiveProcessGroupMembersPosix(pid)) {
+    throw new Error(`kill: failed to send ${signal} to process group ${pid}: ${result.message}`);
+  }
+}
+
 export async function killProcessGroupPosix(
   pid: number,
   graceMs: number = POSIX_KILL_GRACE_PERIOD_MS,
   callbacks?: PosixKillCallbacks
 ): Promise<PosixKillResult> {
   const termResult = signalProcessGroupPosix(pid, "SIGTERM");
-  if (!termResult.ok)
-    throw new Error(`kill: failed to send SIGTERM to process group ${pid}: ${termResult.message}`);
+  throwUnlessBenignAlreadyGoneRace(pid, "SIGTERM", termResult);
   callbacks?.onSignaled?.("SIGTERM");
+  if (!termResult.ok) return { finalSignal: "SIGTERM", escalated: false };
 
-  const diedFromTerm = await waitForProcessDeath(pid, graceMs);
+  const diedFromTerm = await waitForProcessDeath(pid, graceMs, 50, isProcessGroupAlive);
   if (diedFromTerm) return { finalSignal: "SIGTERM", escalated: false };
 
   const killResult = signalProcessGroupPosix(pid, "SIGKILL");
-  if (!killResult.ok)
-    throw new Error(`kill: failed to send SIGKILL to process group ${pid}: ${killResult.message}`);
+  throwUnlessBenignAlreadyGoneRace(pid, "SIGKILL", killResult);
   callbacks?.onSignaled?.("SIGKILL");
-  await waitForProcessDeath(pid, SIGKILL_CONFIRMATION_TIMEOUT_MS);
+  if (!killResult.ok) return { finalSignal: "SIGKILL", escalated: true };
+
+  await waitForProcessDeath(pid, SIGKILL_CONFIRMATION_TIMEOUT_MS, 50, isProcessGroupAlive);
   return { finalSignal: "SIGKILL", escalated: true };
 }
 
@@ -711,10 +836,9 @@ export interface WindowsKillResult {
  * repo's `package.json`) is a lean command-runner with a single existing
  * dependency (the MCP SDK itself).
  *
- * Per this codebase's own explicit escape hatch ("implement POSIX properly
- * and add a Windows implementation that is HONEST about its actual
- * behavior... flag this tradeoff explicitly rather than overclaiming"),
- * this is that honest fallback: `taskkill /pid <pid> /t /f`, which walks
+ * This codebase implements POSIX properly and, on Windows, is honest
+ * about what its fallback actually does rather than overclaiming a
+ * guarantee it can't provide: `taskkill /pid <pid> /t /f`, which walks
  * the LIVE parent-pid tree Windows itself maintains at the MOMENT of the
  * kill and force-terminates every process it finds there. That is real,
  * and it does successfully reap a normal, non-adversarial process tree.
@@ -738,10 +862,14 @@ export interface WindowsKillResult {
  *     at all (see `killProcessTreeWindows` itself: no `await`, no
  *     `setTimeout`, nothing SIGTERM-shaped).
  *
- * A real `taskkill` only exists on Windows, so it is the suite's Windows
- * legs that run this against the actual utility. Everywhere else the call
- * fails with ENOENT and lands in the catch below, which exercises the
- * error-swallowing path but proves nothing about a real Windows kill.
+ * A real `taskkill` only exists on Windows, and with no Windows leg in
+ * this repo's CI matrix at all right now (temporarily removed; see
+ * CHANGELOG), nothing exercises this against the actual utility anywhere
+ * currently - this function's test degrades to shape-only coverage: it
+ * can still be checked for structure and logic, not against a real
+ * Windows kill. Everywhere the suite DOES run, the call fails with ENOENT
+ * and lands in the catch below, which exercises the error-swallowing path
+ * but proves nothing about a real Windows kill either.
  */
 export function killProcessTreeWindows(pid: number): WindowsKillResult {
   try {

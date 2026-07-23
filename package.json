@@ -18,19 +18,23 @@
   },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "ghantika": "dist/index.js"
+  },
   "files": [
     "dist",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
+    "prepack": "npm run build",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "npm run build && node --test 'test/**/*.test.ts' 'test/**/*.test.js'",
+    "test": "npm run build && node scripts/run-tests.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "coverage": "c8 --reporter=text --reporter=json-summary node --test",
+    "coverage": "npm run build && c8 --reporter=text --reporter=json-summary node scripts/run-tests.mjs",
     "guard:npm-ci": "node scripts/check-npm-ci-usage.mjs",
     "guard:sdk-pin": "node scripts/check-sdk-exact-pin.mjs",
     "guard:module-boundaries": "node scripts/check-module-boundaries.mjs",
@@ -44,18 +48,18 @@
     "report:coverage-delta": "node scripts/report-coverage-delta.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/server": "2.0.0-beta.4"
+    "@modelcontextprotocol/server": "2.0.0-beta.5"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
-    "@modelcontextprotocol/client": "2.0.0-beta.4",
-    "@types/node": "22.20.1",
+    "@modelcontextprotocol/client": "2.0.0-beta.5",
+    "@types/node": "26.1.1",
     "c8": "12.0.0",
     "eslint": "10.7.0",
     "globals": "17.7.0",
     "js-yaml": "5.2.1",
     "prettier": "3.9.5",
     "typescript": "5.9.3",
-    "typescript-eslint": "8.64.0"
+    "typescript-eslint": "8.65.0"
   }
 }

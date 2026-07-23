@@ -8,23 +8,13 @@
  * module-scope `let`/`var`) - every read routes through the `jobStore`
  * singleton (`src/jobStore.ts`), read-only from this file's perspective.
  *
- * ## `seq` is now REAL data, not a per-call approximation
+ * ## `seq` is real data, not a per-call approximation
  *
- * `jobStore.getStreamSnapshot` used to return only `{lines:
- * StreamLineEntry[], truncated: boolean}`, with no seq/id field on a
- * `StreamLineEntry` and no running total anywhere - `output`/`tail` had no
- * choice but to APPROXIMATE `seq` as array position (exact only until the
- * first eviction) and disclose only a deliberately-narrow, honest
- * `{gap: [X, X]}` marker once truncation started, since the true dropped
- * count wasn't recoverable from the snapshot at all. That was a real
- * structural limit at the time: the running counter needed for a real seq
- * value had to live in `jobStore.ts`, and this file couldn't yet touch that
- * module, so the approximation was an explicit, flagged limitation until
- * that ownership boundary shifted.
- *
- * `jobStore.ts` now exposes that real running counter directly (see its
- * `StreamLineEntry.seq` and `StreamBufferSnapshot.totalEverMaterialized`
- * docs), so this file now consumes REAL data instead of approximating:
+ * `jobStore.getStreamSnapshot` returns each line's real, stable
+ * `StreamLineEntry.seq` (assigned once, at materialization time, never
+ * reused - see that field's own docs in `jobStore.ts`) plus the stream's
+ * real `totalEverMaterialized` count. This file consumes that real data
+ * directly:
  *
  * - **Single-stream reads (`stream: "stdout"`/`"stderr"`):** every event's
  *   `seq` is the line's own REAL, stable `StreamLineEntry.seq` - exact
@@ -35,17 +25,15 @@
  *   `[1, oldestSurvivingSeq - 1]` (see `computeExactGap`), narrowed to
  *   whatever portion of that range is still relevant to THIS caller's own
  *   `after_cursor` (a cursor already past everything ever dropped gets no
- *   gap marker at all - a real improvement over the old ALWAYS-disclose-
- *   something behavior, since there is genuinely nothing to disclose to
+ *   gap marker at all, since there is genuinely nothing to disclose to
  *   that caller).
- * - **`stream: "both"`:** UNCHANGED - see the next section. The real
- *   per-line `seq` this section describes is a per-STREAM value; "both"'s
- *   own merged numbering is a deliberately separate, arbitrary interleave
- *   axis (below), and mixing two streams' independent real seq spaces into
- *   one shared axis with no way to know their true interleave order would
- *   be exactly the kind of fabrication this whole rework is trying to
- *   avoid - so "both" keeps its existing synthetic parity numbering and
- *   existing best-effort (not exact) gap disclosure.
+ * - **`stream: "both"`:** see the next section. The real per-line `seq`
+ *   this section describes is a per-STREAM value; "both"'s own merged
+ *   numbering is a deliberately separate, arbitrary interleave axis
+ *   (below), and mixing two streams' independent real seq spaces into one
+ *   shared axis with no way to know their true interleave order would be
+ *   a fabrication - so "both" keeps its own synthetic parity numbering
+ *   and its own best-effort (not exact) gap disclosure.
  *
  * ## Cross-stream ("both") merge order - a disclosed policy, not a truth
  * claim
@@ -63,9 +51,9 @@
  * how much the OTHER stream grows), so merged numbering doesn't shift
  * around under the caller while both streams are un-truncated. Once either
  * stream has been truncated, "both" still discloses only a single leading
- * width-1 `{gap: [X, X]}` marker (the SAME best-effort shape single-stream
- * reads used before) - a real per-stream exact count exists for EACH
- * stream independently now, but there is no sound way to
+ * width-1 `{gap: [X, X]}` marker (the same best-effort shape single-stream
+ * reads use) - a real per-stream exact count exists for EACH stream, but
+ * there is no sound way to
  * express "N stdout lines and M stderr lines were dropped, in this unknown
  * relative order" as one exact range in the single shared merged-position
  * axis "both" uses, so this deliberately does not attempt to.
@@ -289,8 +277,7 @@ export function buildSingleStreamEvents(
   // the stream has ever been truncated, so there is no more untruncated-
   // vs-truncated code-path split for the EVENTS themselves. `head` is the
   // stream's true newest-ever-materialized seq (0 if nothing yet) -
-  // exact and eviction-independent, unlike the old `windowSize`-derived
-  // value.
+  // exact and eviction-independent.
   const events = snapshot.lines
     .filter((line) => line.seq > afterCursor)
     .map((line) => buildEvent(stream, line.seq, line.text, line.terminator));
@@ -323,9 +310,8 @@ export function buildSingleStreamEvents(
  *
  * The result is narrowed to what is still relevant to THIS caller's own
  * `afterCursor`: a cursor already at or past the last-ever-dropped seq
- * gets `undefined` (no gap to disclose - nothing beyond their cursor was
- * ever lost), rather than the old scheme's unconditional "always show
- * something" placeholder.
+ * gets `undefined` - no gap to disclose, since nothing beyond their
+ * cursor was ever lost.
  */
 function computeExactGap(
   afterCursor: number,
@@ -340,56 +326,97 @@ function computeExactGap(
 }
 
 /**
+ * The real per-stream seq at (and below) which everything is gone forever
+ * - `0` when nothing has ever been dropped. Same computation
+ * `computeExactGap` does internally for a single stream, extracted so
+ * `buildBothStreamsEvents`'s gap logic (below) can apply it to both
+ * streams independently.
+ */
+function droppedThroughRealSeq(snapshot: StreamBufferSnapshot): number {
+  const oldestSurvivingSeq = snapshot.lines.length > 0 ? snapshot.lines[0]!.seq : undefined;
+  return (oldestSurvivingSeq ?? snapshot.totalEverMaterialized + 1) - 1;
+}
+
+/**
+ * A best-effort merged-position gap for "both": each stream's own real
+ * dropped-through seq converts to a merged position via the SAME parity
+ * formula `buildBothStreamsEvents` uses for real events (stdout's real seq
+ * S -> merged 2S-1, stderr's real seq S -> merged 2S), and this discloses
+ * the HIGHER of the two converted boundaries - a genuine, honest upper
+ * bound on "something dropped could be at or before this merged position",
+ * not a claim about true interleave order (see this file's header for why
+ * an exact per-stream-interleaved range isn't sound to express here).
+ * Returns `undefined` when nothing relevant to THIS caller's own
+ * `afterCursor` was ever dropped on either stream.
+ */
+function computeBothStreamsGap(
+  afterCursor: number,
+  stdoutSnapshot: StreamBufferSnapshot,
+  stderrSnapshot: StreamBufferSnapshot
+): GapMarker | undefined {
+  const stdoutDroppedThrough = droppedThroughRealSeq(stdoutSnapshot);
+  const stderrDroppedThrough = droppedThroughRealSeq(stderrSnapshot);
+  const mergedDroppedThrough = Math.max(
+    stdoutDroppedThrough >= 1 ? 2 * stdoutDroppedThrough - 1 : 0,
+    stderrDroppedThrough >= 1 ? 2 * stderrDroppedThrough : 0
+  );
+  if (mergedDroppedThrough < 1) return undefined; // nothing has ever been dropped on either stream
+  const gapStart = Math.max(afterCursor + 1, 1);
+  if (gapStart > mergedDroppedThrough) return undefined; // this caller's cursor is already past everything ever dropped
+  return { gap: [gapStart, mergedDroppedThrough] };
+}
+
+/**
  * Merged "both" event view - see this file's header for the parity-split
  * merge policy and its prefix-stability property. Exported for direct
  * unit testing, same rationale as `buildSingleStreamEvents`.
+ *
+ * Merged position is derived from each line's own REAL, stable per-stream
+ * `seq` (see this file's header), never from its transient index into
+ * `snapshot.lines` - stdout's real seq S lands at merged position 2S-1,
+ * stderr's real seq S at merged position 2S. A line's real seq never
+ * changes once assigned, so its merged position never changes either -
+ * stable across eviction, unlike an index-based formula, whose result for
+ * a given line shifts every time an OLDER line gets evicted out from under
+ * it. That instability was a real defect, not a cosmetic one: once a
+ * stream had ever been truncated, the old index-based "both" branch
+ * recomputed the entire current window's numbering relative to the
+ * CALLER's OWN `after_cursor` on every call and returned it unfiltered -
+ * so a caller re-submitting the previous call's own `next_cursor` got the
+ * SAME lines back, renumbered, with a `next_cursor` that kept climbing,
+ * forever. Deriving merged position from real seq instead makes the exact
+ * same `seq > afterCursor` filter this file already uses for
+ * single-stream reads correct here too, in every case, truncated or not -
+ * so this function no longer needs a separate untruncated/truncated
+ * branch for the events themselves, only for whether a gap is disclosed.
  */
 export function buildBothStreamsEvents(
   stdoutSnapshot: StreamBufferSnapshot,
   stderrSnapshot: StreamBufferSnapshot,
   afterCursor: number
 ): { events: OutputEvent[]; gap?: GapMarker; head: number } {
-  const stdoutCount = stdoutSnapshot.lines.length;
-  const stderrCount = stderrSnapshot.lines.length;
-  const anyTruncated = stdoutSnapshot.truncated || stderrSnapshot.truncated;
+  const stdoutEvents = stdoutSnapshot.lines.map((line) =>
+    buildEvent("stdout", 2 * line.seq - 1, line.text, line.terminator)
+  );
+  const stderrEvents = stderrSnapshot.lines.map((line) =>
+    buildEvent("stderr", 2 * line.seq, line.text, line.terminator)
+  );
+  const merged = [...stdoutEvents, ...stderrEvents]
+    .filter((event) => event.seq > afterCursor)
+    .sort((a, b) => a.seq - b.seq);
 
-  if (!anyTruncated) {
-    // Fixed parity split: stdout's i-th line -> odd position 2i+1,
-    // stderr's i-th line -> even position 2i+2. Depends ONLY on each
-    // stream's own index, never on the other stream's length - so
-    // existing positions never shift as either stream grows
-    // (prefix-stable), and natural seq-filtering (`seq > afterCursor`)
-    // correctly produces an empty result for a cursor at or beyond head,
-    // with no separate "beyond head" special case needed.
-    const stdoutEvents = stdoutSnapshot.lines.map((line, i) =>
-      buildEvent("stdout", 2 * i + 1, line.text, line.terminator)
-    );
-    const stderrEvents = stderrSnapshot.lines.map((line, i) =>
-      buildEvent("stderr", 2 * i + 2, line.text, line.terminator)
-    );
-    const merged = [...stdoutEvents, ...stderrEvents].sort((a, b) => a.seq - b.seq);
-    const head = Math.max(
-      stdoutCount > 0 ? 2 * (stdoutCount - 1) + 1 : 0,
-      stderrCount > 0 ? 2 * (stderrCount - 1) + 2 : 0
-    );
-    return { events: merged.filter((event) => event.seq > afterCursor), head };
+  const stdoutHeadSeq = stdoutSnapshot.totalEverMaterialized;
+  const stderrHeadSeq = stderrSnapshot.totalEverMaterialized;
+  const head = Math.max(
+    stdoutHeadSeq > 0 ? 2 * stdoutHeadSeq - 1 : 0,
+    stderrHeadSeq > 0 ? 2 * stderrHeadSeq : 0
+  );
+
+  if (!stdoutSnapshot.truncated && !stderrSnapshot.truncated) {
+    return { events: merged, head };
   }
-
-  // BEST-EFFORT mode, same shape as the single-stream case: one width-1
-  // gap, then the full current window of BOTH streams, parity-merged and
-  // renumbered starting right after the gap.
-  const gapStart = afterCursor + 1;
-  const eventsStartSeq = afterCursor + 2;
-  const stdoutEvents = stdoutSnapshot.lines.map((line, i) =>
-    buildEvent("stdout", eventsStartSeq + 2 * i, line.text, line.terminator)
-  );
-  const stderrEvents = stderrSnapshot.lines.map((line, i) =>
-    buildEvent("stderr", eventsStartSeq + 2 * i + 1, line.text, line.terminator)
-  );
-  const merged = [...stdoutEvents, ...stderrEvents].sort((a, b) => a.seq - b.seq);
-  const lastEvent = merged[merged.length - 1];
-  const head = lastEvent !== undefined ? lastEvent.seq : afterCursor + 1;
-  return { events: merged, gap: { gap: [gapStart, gapStart] }, head };
+  const gap = computeBothStreamsGap(afterCursor, stdoutSnapshot, stderrSnapshot);
+  return { events: merged, gap, head };
 }
 
 // ---------------------------------------------------------------------------

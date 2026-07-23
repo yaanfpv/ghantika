@@ -74,7 +74,7 @@ import {
 export const name = "kill";
 
 export const description =
-  'Terminate a running background job and its whole process tree. POSIX: SIGTERM to the process group, a real 5-second grace period, then SIGKILL if it\'s still alive - or pass "signal" to skip the grace period and send exactly that one signal instead; the process-group signal is atomic. Windows: an immediate, forceful whole-tree kill via taskkill /t /f, with no graceful phase - real and recursive, but not atomic (a narrow race window exists); a real Windows Job Object for atomic containment is a tracked future enhancement. Idempotent: killing an already-terminal job is a no-op, not an error.';
+  'Terminate a running background job and its whole process tree. POSIX: SIGTERM to the process group, a real 5-second grace period, then SIGKILL if it\'s still alive - this is also what happens if "signal" is explicitly set to "SIGTERM", since that IS the default; pass a DIFFERENT "signal" to skip the grace period and send exactly that one signal instead, once. The process-group signal is atomic. Windows: an immediate, forceful whole-tree kill via taskkill /t /f, with no graceful phase - real and recursive, but not atomic (a narrow race window exists); a real Windows Job Object for atomic containment is a tracked future enhancement. Idempotent: killing an already-terminal job is a no-op, not an error.';
 
 export const inputSchema: Tool["inputSchema"] = {
   type: "object",
@@ -87,7 +87,7 @@ export const inputSchema: Tool["inputSchema"] = {
     signal: {
       type: "string",
       description:
-        'POSIX signal name to send, e.g. "SIGTERM" or "SIGKILL". Omitted (the default): SIGTERM to the process group, a real 5-second grace period, then SIGKILL if still alive. Provided: that exact signal is sent once, with no automatic escalation. Ignored on Windows, which has no graceful phase.',
+        'POSIX signal name to send, e.g. "SIGTERM" or "SIGKILL". Omitted, or explicitly "SIGTERM" (the default either way): SIGTERM to the process group, a real 5-second grace period, then SIGKILL if still alive. Any OTHER signal: that exact signal is sent once, with no automatic escalation. Ignored on Windows, which has no graceful phase.',
     },
   },
   required: ["job_id"],
@@ -200,8 +200,8 @@ export async function handler(args: Record<string, unknown> | undefined): Promis
   // `updateKillSignal` if escalation to SIGKILL later happens) is what
   // deterministically wins the race against this SAME job's own natural
   // `exit` event. Awaiting the whole phase-split-plus-wait sequence
-  // FIRST and only then calling `markKilled` (an earlier version of this
-  // handler did exactly that) loses that race almost every time: the real
+  // FIRST and only then calling `markKilled` would lose that race almost
+  // every time: the real
   // async wait inside `killProcessGroupPosix` gives the job's own `exit`
   // event - triggered by the very same signal - a real window to fire and
   // claim the terminal slot first, misreporting a job THIS CODE
