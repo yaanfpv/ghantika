@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +15,13 @@ import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/sp
 // observes a job's real filesystem side effects (see its own docs for why
 // it waits on content rather than on the file existing).
 import { parsesAsJsonObject, waitForFile } from "./harness.ts";
+// Imports the BUILT output, not src/ directly - see test/registry.test.ts's
+// import comment for why (same reason test/process.test.ts and
+// test/kill.test.ts already import straight from dist/ alongside their own
+// real-spawn assertions). This is the sourced, named list of variable NAMES
+// libuv itself force-injects into a Windows child regardless of env.mode -
+// see its own doc comment in src/process.ts for the full citation.
+import { WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES } from "../dist/process.js";
 
 /**
  * The real end-to-end proof: a real spawned `dist/index.js` process, real
@@ -861,22 +869,40 @@ test("shell: true actually runs a real shell command line, pipes and all", async
   server.child.kill("SIGKILL");
 });
 
-test("env.mode replace gives the child ONLY the caller's vars (proven via the child echoing its own real process.env to a file)", async () => {
-  const server = tracked();
-  await completeHandshake(server);
-  const dir = makeTempDir();
-  const marker = path.join(dir, "child-env.json");
+// ---------------------------------------------------------------------------
+// env.mode "replace": real, per-platform truth, not an assumption copied
+// from POSIX. See WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES's own doc comment in
+// src/process.ts for the full, sourced explanation of WHY Windows needs its
+// own separate, exact assertion here rather than sharing POSIX's.
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs a real child (`process.execPath`, invoked directly - not a bare
+ * "node" - sidesteps a PATH-search dependency entirely, since this whole
+ * section's point is env CONTENT, not executable resolution) that dumps
+ * its own real `process.env` to `marker` as JSON, waits for the complete
+ * write, and returns it parsed - stripped of the two known artifacts this
+ * suite already has to account for whenever it inspects a real child's
+ * real env, neither of which `env.mode` itself adds: macOS's own
+ * `__CF_USER_TEXT_ENCODING` (a CoreFoundation/dyld-level default, verified
+ * empirically - not something `child_process`'s `env` option can
+ * suppress) and c8's own `NODE_V8_COVERAGE` (a real coverage-
+ * instrumentation artifact, subtracted only when the parent actually has
+ * it set, so an uninstrumented run still asserts on the whole object and a
+ * genuine leak of this var outside coverage instrumentation still reds).
+ */
+async function runAndCaptureRealChildEnv(
+  server: SpawnedServer,
+  id: number,
+  marker: string,
+  env: { mode: "merge" | "replace"; vars: Record<string, string> }
+): Promise<Record<string, string>> {
   server.send({
     jsonrpc: "2.0",
-    id: 27,
+    id,
     method: "tools/call",
     params: {
       name: "run",
-      // Absolute path to node, not a bare "node" - replace mode gives NO
-      // base env at all (by design), so there is no PATH to
-      // search unless the caller supplies one; using process.execPath
-      // sidesteps that PATH-search dependency entirely (the point of THIS
-      // test is env content, not executable resolution).
       arguments: {
         command: [
           process.execPath,
@@ -884,7 +910,7 @@ test("env.mode replace gives the child ONLY the caller's vars (proven via the ch
           "require('fs').writeFileSync(process.argv[1], JSON.stringify(process.env))",
           marker,
         ],
-        env: { mode: "replace", vars: { ONLY_VAR: "only-value" } },
+        env,
       },
     },
   });
@@ -892,25 +918,660 @@ test("env.mode replace gives the child ONLY the caller's vars (proven via the ch
   const body = line.parsed as RunResponseBody;
   assert.equal(body.error, undefined);
   assert.notEqual(body.result?.isError, true);
-
   // Waiting for a complete JSON object, so a half-written one is never
   // handed to JSON.parse as a confusing syntax error.
   const content = await waitForFile(marker, { until: parsesAsJsonObject });
   const childEnv = JSON.parse(content) as Record<string, string>;
-  // macOS injects __CF_USER_TEXT_ENCODING into every process at launch
-  // (a CoreFoundation/dyld-level default, verified empirically) - stripped
-  // before comparing, since this test's point is that OUR base/inherited
-  // vars are absent, not that the OS injects nothing of its own.
   delete childEnv.__CF_USER_TEXT_ENCODING;
-  // c8 injects NODE_V8_COVERAGE into every child it instruments - a real
-  // measurement artifact of running under coverage, not something replace
-  // mode itself adds. Subtracted only when the parent actually has it set,
-  // so an uninstrumented run still asserts on the whole object, and a real
-  // leak of this var outside coverage instrumentation still reds.
   if (process.env.NODE_V8_COVERAGE !== undefined) {
     delete childEnv.NODE_V8_COVERAGE;
   }
-  assert.deepEqual(childEnv, { ONLY_VAR: "only-value" });
+  return childEnv;
+}
+
+/**
+ * Builds a case-insensitive lookup over `env`'s own keys, upper-cased. A
+ * plain JS object is case-SENSITIVE by construction, but Windows env keys
+ * are not (see WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES's own docs, and
+ * `resolveCaseInsensitivePathKey` in src/process.ts for the same fact
+ * applied to production code): a key THIS codebase contributes (e.g.
+ * `computeMinimalBaseEnv`'s `SystemRoot`, mixed case) and a key libuv
+ * force-injects (its own `required_vars` table spells the same variable
+ * `SYSTEMROOT`, all caps) name the identical variable as far as Windows
+ * itself is concerned, even though they are different strings to a raw JS
+ * `in`/`[]` lookup. Every assertion below that needs to ask "does the
+ * child have variable X" goes through this, not a raw object index,
+ * specifically so a real difference in case-spelling between this
+ * codebase's own vars and libuv's own spelling can never produce a false
+ * pass or a false fail here.
+ */
+function caseInsensitiveEnvLookup(env: Readonly<Record<string, string>>): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const [key, value] of Object.entries(env)) {
+    map.set(key.toUpperCase(), value);
+  }
+  return map;
+}
+
+/**
+ * Plants `count` random, unique, high-entropy env vars directly onto the
+ * TEST's own `process.env` and returns them. `spawnServer()` spawns the
+ * real ghantika server with no explicit `env` option of its own (see its
+ * own source), so it inherits THIS process's `process.env` exactly the way
+ * any real caller of ghantika inherits whatever launched it - planting a
+ * canary here really does put it on the SERVER's own live environment, not
+ * a simulation of one. Values that must never reach a `replace`-mode
+ * child, however this codebase's env handling is implemented - proves the
+ * child's env is exactly and only what's necessary, never an open-ended
+ * "well, something extra sometimes leaks."
+ *
+ * MUST be called BEFORE the server is spawned (before `tracked()`), never
+ * after. `spawn()` reads `process.env` synchronously at call time, so a
+ * canary planted after the server is already spawned never reaches the
+ * server's own environment at all - the assertion that it "never leaks"
+ * would then pass whether or not the underlying bug exists.
+ */
+function plantServerEnvCanaries(count: number, label: string): Record<string, string> {
+  const canaries: Record<string, string> = {};
+  for (let i = 0; i < count; i++) {
+    const key = `GHANTIKA_E2E_CANARY_${label}_${i}_${randomUUID().replace(/-/g, "").toUpperCase()}`;
+    canaries[key] = `must-never-leak-${randomUUID()}`;
+  }
+  for (const [key, value] of Object.entries(canaries)) process.env[key] = value;
+  return canaries;
+}
+
+function clearServerEnvCanaries(canaries: Record<string, string>): void {
+  for (const key of Object.keys(canaries)) delete process.env[key];
+}
+
+test(
+  "env.mode 'replace' on POSIX gives the child ONLY the caller's vars, no base at all, and none of the SERVER's own random canary vars leak in either (real spawn, real echo of the child's own process.env)",
+  {
+    skip:
+      process.platform === "win32"
+        ? "POSIX-only assertion - see the Windows-only test below for that platform's own real, empirically-checked behavior (they are deliberately NOT the same assertion - the two platforms genuinely differ here)"
+        : false,
+  },
+  async () => {
+    const canaries = plantServerEnvCanaries(3, "POSIX");
+    const server = tracked();
+    try {
+      await completeHandshake(server);
+      const dir = makeTempDir();
+      const marker = path.join(dir, "child-env-posix-replace.json");
+      const childEnv = await runAndCaptureRealChildEnv(server, 27, marker, {
+        mode: "replace",
+        vars: { ONLY_VAR: "only-value" },
+      });
+      assert.deepEqual(
+        childEnv,
+        { ONLY_VAR: "only-value" },
+        "POSIX replace mode's real, observed child env must be EXACTLY the caller's vars - nothing else, ever"
+      );
+      // Deliberately redundant with the deepEqual above, on its own: a
+      // single assertion carrying an entire property's safety net is a
+      // single point of failure - if that assertion is ever weakened (e.g.
+      // to checking only that ONLY_VAR is present, without checking that
+      // NOTHING else is), a real leak would still pass unnoticed unless
+      // something else independently checks for stray keys. This does.
+      const strayKeys = Object.keys(childEnv).filter((key) => key !== "ONLY_VAR");
+      assert.deepEqual(
+        strayKeys,
+        [],
+        `POSIX replace-mode child had unexpected key(s) beyond the caller's own vars: ${strayKeys.join(", ")}`
+      );
+      for (const key of Object.keys(canaries)) {
+        assert.equal(
+          key in childEnv,
+          false,
+          `canary "${key}" (planted directly on the SERVER's own live env) must never reach a replace-mode child`
+        );
+      }
+    } finally {
+      clearServerEnvCanaries(canaries);
+    }
+    server.child.kill("SIGKILL");
+  }
+);
+
+/**
+ * This test file's OWN independently-authored copy of libuv's required-vars
+ * list, deliberately NOT derived from the imported
+ * `WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES` (production's constant, under test
+ * below). The duplication is not a smell - it IS the oracle: if the
+ * Windows test below derived its own expected/allowed sets from the same
+ * production constant it's supposed to be checking, a bogus name added to
+ * that constant would silently widen this test's own allow-list right
+ * along with it, and the test would stay green regardless of whether
+ * production's claim is still accurate. This independent copy, plus the
+ * parity test right after it, is what actually catches that: if the two
+ * ever diverge, the parity test reds, and only a real, matching update on
+ * both sides makes it pass again.
+ */
+const INDEPENDENTLY_AUTHORED_WINDOWS_REQUIRED_ENV_VAR_NAMES: readonly string[] = [
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "LOGONSERVER",
+  "PATH",
+  "SYSTEMDRIVE",
+  "SYSTEMROOT",
+  "TEMP",
+  "USERDOMAIN",
+  "USERNAME",
+  "USERPROFILE",
+  "WINDIR",
+];
+
+// A divergence here means one side changed without the other, and every
+// Windows assertion below that trusts the production constant is no
+// longer verifying what it claims to.
+test("production's WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES matches this test file's own independently-authored copy", () => {
+  assert.deepEqual(
+    [...WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES].sort(),
+    [...INDEPENDENTLY_AUTHORED_WINDOWS_REQUIRED_ENV_VAR_NAMES].sort(),
+    "production's list and this test's own independent copy have diverged - update whichever one is now wrong, never just make this assertion match"
+  );
+});
+
+/**
+ * Runs on every platform, unlike the two platform-gated e2e tests above and
+ * below it - it checks a structural relationship between the two contracts
+ * themselves, not a real spawned child, so it needs no Windows host to run
+ * for real anywhere.
+ *
+ * The POSIX contract for a replace-mode child is "the caller's vars, and
+ * nothing else" - an allowed set of exactly `{ONLY_VAR}` in these tests.
+ * The Windows contract is strictly looser: "the caller's vars, plus
+ * whichever of libuv's documented required names the server had set" - an
+ * allowed set of `{ONLY_VAR}` union the eleven required names. If either
+ * platform's real e2e assertion were ever collapsed onto the other's claim
+ * - the POSIX test widened to also tolerate libuv's names, or the Windows
+ * test narrowed to reject them - the two would stop being genuinely
+ * different contracts, and this specific regression could survive on
+ * whichever platform the person making the change happens to be able to
+ * run at all (this project's own development machine is macOS, so a
+ * silent Windows-side narrowing is exactly the kind of change that would
+ * never show up as a local red).
+ */
+test("the Windows replace-mode allowance is a strict superset of the POSIX one, not the same claim by two names", () => {
+  const posixAllowedUpper = new Set(["ONLY_VAR"]);
+  const windowsAllowedUpper = new Set([
+    "ONLY_VAR",
+    ...WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES.map((name) => name.toUpperCase()),
+  ]);
+
+  assert.ok(
+    WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES.length > 0,
+    "libuv's required-names list must be non-empty, or there is no real difference between the two platforms' contracts to assert here"
+  );
+  for (const name of posixAllowedUpper) {
+    assert.ok(
+      windowsAllowedUpper.has(name),
+      `everything POSIX allows ("${name}") must still be allowed on Windows too - Windows only adds to the allowance, it never removes from it`
+    );
+  }
+  assert.ok(
+    windowsAllowedUpper.size > posixAllowedUpper.size,
+    "Windows's allowed set must be strictly larger than POSIX's - if the two ever became equal in size, either Windows narrowed to match POSIX or POSIX widened to match Windows, and the platform-specific e2e tests above would no longer be checking genuinely different contracts"
+  );
+});
+
+type ObservedWindowsRequiredEnvEntry = {
+  name: string;
+  serverHadItSet: boolean;
+  childReceivedIt: boolean;
+};
+
+type ObservedWindowsRequiredEnvPayload = {
+  platform: string;
+  observedRequiredNames: ObservedWindowsRequiredEnvEntry[];
+};
+
+/**
+ * Builds AND emits the observed Windows required-env map through an
+ * injectable sink (defaulting to `console.log` for real use), and RETURNS
+ * the exact same payload it emits - so a caller reads its own downstream
+ * assertions from this function's return value rather than a separately
+ * built variable. Deleting the call to this function therefore breaks the
+ * caller by reference (the variable goes out of scope), not merely a
+ * silent side effect nothing depends on.
+ *
+ * `requiredNames` is an INJECTED argument, not read from a module-level
+ * import inside this function - deliberately, so which list actually
+ * drives the output is a property of the call, testable by injecting a
+ * value that could not have come from anywhere else. The real Windows
+ * caller passes this test file's own independent list; the unconditional
+ * unit test below injects a distinctive sentinel list matching neither
+ * that list nor production's constant, and asserts the sentinel names
+ * come back unchanged - if this function ever read a hardcoded or
+ * globally-imported list instead of its argument, the sentinel would
+ * never appear and that assertion reds.
+ *
+ * The injectable sink is what makes the emission itself testable without a
+ * real Windows spawn or a real CI log to grep afterward: the same
+ * unconditional unit test calls this with a mock sink and proves, in-
+ * process and on every platform, that the sink is called exactly once,
+ * with this test file's OWN independently-hardcoded copy of the marker
+ * (not one shared with this function - sharing the literal would let a
+ * rename move both sides at once and the test would never notice, the
+ * same reasoning as `INDEPENDENTLY_AUTHORED_WINDOWS_REQUIRED_ENV_VAR_NAMES`
+ * above), carrying a single-line JSON payload that round-trips back to
+ * this exact object.
+ *
+ * What this map does NOT do: discover the required-name set on its own.
+ * It only ever reports presence/absence for the eleven names it is handed
+ * - it can never notice a twelfth name libuv might also force-inject that
+ * isn't already on this list (the Windows e2e test's own separate
+ * stray-keys check bounds THAT direction, by rejecting anything on the
+ * real child outside {the caller's vars} union {this list} - so an
+ * unlisted twelfth name would still be caught there, just not by this map
+ * itself). A genuinely independent check - capturing the real child's
+ * entire environment first, with no pre-selected list at all, then asking
+ * what's actually in it - needs a real Windows host to run against, which
+ * this project doesn't have (see WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES's own
+ * docs on where its eleven names come from instead). Recorded here as a
+ * known, disclosed gap rather than left implicit.
+ */
+function buildAndEmitObservedWindowsRequiredEnvMap(
+  requiredNames: readonly string[],
+  serverByUpper: Map<string, string>,
+  childByUpper: Map<string, string>,
+  sink: (line: string) => void = console.log
+): ObservedWindowsRequiredEnvPayload {
+  const observedRequiredNames: ObservedWindowsRequiredEnvEntry[] = requiredNames.map((name) => ({
+    name,
+    serverHadItSet: serverByUpper.has(name.toUpperCase()),
+    childReceivedIt: childByUpper.has(name.toUpperCase()),
+  }));
+  const payload: ObservedWindowsRequiredEnvPayload = {
+    platform: process.platform,
+    observedRequiredNames,
+  };
+  sink(`GHANTIKA_OBSERVED_WINDOWS_REQUIRED_ENV_MAP ${JSON.stringify(payload)}`);
+  return payload;
+}
+
+test("buildAndEmitObservedWindowsRequiredEnvMap emits exactly one line, through its own marker, carrying a payload that round-trips - proven with a mock sink, on every platform, so this never needs a real Windows spawn or a real CI log to verify", () => {
+  // This test's OWN hardcoded copy of the marker - deliberately NOT
+  // imported or referenced from inside the function under test, so a
+  // rename inside the function shows up here as a mismatch instead of
+  // moving invisibly with both sides.
+  const EXPECTED_MARKER = "GHANTIKA_OBSERVED_WINDOWS_REQUIRED_ENV_MAP";
+
+  const capturedLines: string[] = [];
+  const mockSink = (line: string) => {
+    capturedLines.push(line);
+  };
+
+  // Deliberately mixed input - some required names present on the
+  // "server", one of those NOT received by the "child", most entirely
+  // absent - proves the two boolean fields are independently derived from
+  // their own inputs, not the same check reported under two names, and
+  // that the real Windows CI run's own all-true/true result is a property
+  // of that one machine, not of this logic.
+  const serverByUpper = new Map<string, string>([
+    ["PATH", "C:\\server-path"],
+    ["SYSTEMROOT", "C:\\Windows"],
+    ["TEMP", "C:\\Temp"],
+  ]);
+  const childByUpper = new Map<string, string>([
+    ["PATH", "C:\\server-path"],
+    ["SYSTEMROOT", "C:\\Windows"],
+    // TEMP deliberately omitted from the child.
+  ]);
+
+  const returned = buildAndEmitObservedWindowsRequiredEnvMap(
+    INDEPENDENTLY_AUTHORED_WINDOWS_REQUIRED_ENV_VAR_NAMES,
+    serverByUpper,
+    childByUpper,
+    mockSink
+  );
+
+  assert.equal(
+    capturedLines.length,
+    1,
+    "the sink must be called exactly once - deleting the call inside the function, or calling it conditionally, changes this count"
+  );
+
+  const [line] = capturedLines;
+  assert.ok(
+    line !== undefined && line.startsWith(`${EXPECTED_MARKER} `),
+    `the emitted line must start with this test's own independently-hardcoded marker "${EXPECTED_MARKER}" - it did not, meaning the marker inside the function has drifted from what a reader greps for`
+  );
+
+  // The single-physical-line property is the entire reason this exists
+  // (see the function's own doc comment on why a multi-line emission is
+  // not safe under a concurrent test runner) - and it is not otherwise
+  // verified anywhere else. A trailing (or embedded) newline appended to
+  // an otherwise-correct line would still pass every check above
+  // (capturedLines.length is still 1, the marker prefix still matches,
+  // and JSON.parse tolerates trailing whitespace including a newline) -
+  // so this checks the property directly, not by inference from the
+  // other assertions.
+  assert.ok(
+    !line!.includes("\n") && !line!.includes("\r"),
+    "the emitted line must not contain any newline or carriage-return character anywhere in it - an embedded or trailing newline defeats the single-physical-line guarantee this function exists to provide, since a concurrent test file's own output could then land inside it exactly as it did before this was fixed"
+  );
+
+  const jsonText = line!.slice(EXPECTED_MARKER.length + 1);
+  const parsed = JSON.parse(jsonText) as ObservedWindowsRequiredEnvPayload;
+
+  assert.deepEqual(
+    parsed,
+    returned,
+    "the parsed emitted line must deep-equal the function's own return value - if they diverge, the emission and the payload a caller's downstream assertions read are no longer the same data"
+  );
+
+  // A payload-level mutant that adds an unrelated key to the object BEFORE
+  // it is either emitted or returned (rather than only to the emitted
+  // serialization) would pass the deepEqual above unchanged - both sides
+  // would carry the same extra key and still equal each other. These two
+  // checks are what actually catch that: an exhaustive top-level key set,
+  // and an exhaustive per-row key set for every one of the eleven entries,
+  // not a sample of three.
+  assert.deepEqual(
+    Object.keys(parsed).sort(),
+    ["observedRequiredNames", "platform"].sort(),
+    "the payload must have exactly these two top-level keys, no more - an extra key present on both the emitted and returned copies would not otherwise be caught, since they would still deep-equal each other"
+  );
+
+  assert.equal(parsed.platform, process.platform);
+  assert.deepEqual(
+    parsed.observedRequiredNames.map((entry) => entry.name),
+    [...INDEPENDENTLY_AUTHORED_WINDOWS_REQUIRED_ENV_VAR_NAMES],
+    "the emitted map must cover exactly this test file's own independent eleven-name list, in order - no omission, no extra, and not silently rebuilt from production's constant"
+  );
+
+  const byName = new Map(parsed.observedRequiredNames.map((entry) => [entry.name, entry]));
+  assert.deepEqual(byName.get("PATH"), {
+    name: "PATH",
+    serverHadItSet: true,
+    childReceivedIt: true,
+  });
+  assert.deepEqual(byName.get("TEMP"), {
+    name: "TEMP",
+    serverHadItSet: true,
+    childReceivedIt: false,
+  });
+  assert.deepEqual(byName.get("HOMEDRIVE"), {
+    name: "HOMEDRIVE",
+    serverHadItSet: false,
+    childReceivedIt: false,
+  });
+
+  for (const entry of parsed.observedRequiredNames) {
+    assert.deepEqual(
+      Object.keys(entry).sort(),
+      ["childReceivedIt", "name", "serverHadItSet"].sort(),
+      `"${entry.name}" entry must have exactly these three keys, no more, checked on every row - not just the three sampled above`
+    );
+    assert.equal(
+      typeof entry.serverHadItSet,
+      "boolean",
+      `"${entry.name}" serverHadItSet must be boolean`
+    );
+    assert.equal(
+      typeof entry.childReceivedIt,
+      "boolean",
+      `"${entry.name}" childReceivedIt must be boolean`
+    );
+  }
+});
+
+test("buildAndEmitObservedWindowsRequiredEnvMap genuinely uses the requiredNames it's given, not a hardcoded or globally-imported list - proven by injecting a distinctive sentinel list matching neither the test-owned independent list nor production's constant", () => {
+  // If this function ever stopped reading its own `requiredNames`
+  // argument and read a module-level list instead (either this test
+  // file's independent copy or production's constant), the output below
+  // would come back as one of THOSE elevn real names, never these three
+  // sentinels - because neither list contains them. Injecting the
+  // argument, rather than relying on the two real lists happening to
+  // differ (they don't, currently - see the parity test above), is what
+  // makes this observable regardless of whether the two real lists ever
+  // diverge.
+  const sentinelNames = [
+    "GHANTIKA_SENTINEL_ALPHA",
+    "GHANTIKA_SENTINEL_BETA",
+    "GHANTIKA_SENTINEL_GAMMA",
+  ];
+  const returned = buildAndEmitObservedWindowsRequiredEnvMap(
+    sentinelNames,
+    new Map(),
+    new Map(),
+    () => {}
+  );
+  assert.deepEqual(
+    returned.observedRequiredNames.map((entry) => entry.name),
+    sentinelNames,
+    "the function must use exactly the injected requiredNames argument, in order - these sentinel names match neither the test-owned independent list nor production's constant, so their presence proves the argument (not some other list) drove the output"
+  );
+});
+
+test(
+  "env.mode 'replace' on Windows: the child receives EXACTLY the caller's vars plus whichever of libuv's own documented forced set the SERVER itself has set - nothing else, matched case-insensitively - and none of the SERVER's own random canary vars leak in (real spawn, real echo of the child's own process.env, checked against WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES)",
+  {
+    skip:
+      process.platform !== "win32"
+        ? "Windows-only assertion - libuv's required-vars force-injection (see WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES's docs in src/process.ts) is a win32-only libuv code path with no POSIX equivalent (verified against libuv's own POSIX spawn source, which adds nothing of its own)"
+        : false,
+  },
+  async () => {
+    const canaries = plantServerEnvCanaries(3, "WIN");
+    const server = tracked();
+    try {
+      await completeHandshake(server);
+      const dir = makeTempDir();
+      const marker = path.join(dir, "child-env-windows-replace.json");
+      // Deliberately omits PATH/SystemRoot/USERPROFILE, and every other
+      // libuv-required name, from the caller's own vars - the entire point
+      // of this test is observing exactly what Windows adds on its own
+      // when the caller supplies none of it.
+      const childEnv = await runAndCaptureRealChildEnv(server, 27, marker, {
+        mode: "replace",
+        vars: { ONLY_VAR: "only-value" },
+      });
+
+      const childByUpper = caseInsensitiveEnvLookup(childEnv);
+      const serverByUpper = caseInsensitiveEnvLookup(process.env as Record<string, string>);
+
+      // buildAndEmitObservedWindowsRequiredEnvMap's OWN doc comment covers
+      // why this exists and how it's proven non-vacuous (own unconditional
+      // unit test below, exercised with a mock sink on every platform).
+      // Its RETURN VALUE, not a separately-built local, is what the
+      // assertions right below read - deleting this call doesn't leave a
+      // silent gap, it breaks `observedPayload` going out of scope and the
+      // file fails to compile.
+      const observedPayload = buildAndEmitObservedWindowsRequiredEnvMap(
+        INDEPENDENTLY_AUTHORED_WINDOWS_REQUIRED_ENV_VAR_NAMES,
+        serverByUpper,
+        childByUpper
+      );
+
+      assert.deepEqual(
+        observedPayload.observedRequiredNames.map((entry) => entry.name),
+        [...INDEPENDENTLY_AUTHORED_WINDOWS_REQUIRED_ENV_VAR_NAMES],
+        "the persisted map must cover exactly the eleven names on this test's own independent list, in order - no omission, no extra, and not silently rebuilt from production's constant"
+      );
+      for (const entry of observedPayload.observedRequiredNames) {
+        assert.equal(
+          typeof entry.serverHadItSet,
+          "boolean",
+          `"${entry.name}" entry's serverHadItSet must be a real boolean, not missing or the wrong type`
+        );
+        assert.equal(
+          typeof entry.childReceivedIt,
+          "boolean",
+          `"${entry.name}" entry's childReceivedIt must be a real boolean, not missing or the wrong type`
+        );
+      }
+
+      assert.equal(
+        childEnv.ONLY_VAR,
+        "only-value",
+        "the caller's own var must be present, byte-for-byte"
+      );
+
+      // For every libuv-required name the SERVER itself actually has set,
+      // the child must ALSO have it (case-insensitively), with the SAME
+      // value - libuv sources an injected value via GetEnvironmentVariableW
+      // on the spawning process (this ghantika server), never a fixed
+      // OS-wide default (see the constant's own docs). Read off the
+      // PERSISTED map above, not recomputed independently from
+      // `serverByUpper` - so a bug in how that map decides `serverHadItSet`
+      // (a hardcoded guess standing in for the real, live check) surfaces
+      // here too, instead of this assertion quietly using its own separate,
+      // correct computation while the persisted record is wrong.
+      const expectedInjectedNames = observedPayload.observedRequiredNames
+        .filter((entry) => entry.serverHadItSet)
+        .map((entry) => entry.name);
+      for (const name of expectedInjectedNames) {
+        const upper = name.toUpperCase();
+        assert.ok(
+          childByUpper.has(upper),
+          `the server itself has "${name}" set, so libuv must force-inject it into the child too - it did not`
+        );
+        assert.equal(
+          childByUpper.get(upper),
+          serverByUpper.get(upper),
+          `injected "${name}"'s value must match the SERVER's own real value - it did not`
+        );
+      }
+
+      // Nothing else: every key the child actually has must be either the
+      // caller's own ONLY_VAR or one of libuv's documented required names -
+      // never a stray, unexplained extra. This is what makes the claim
+      // "exactly this documented set" rather than "approximately the right
+      // vars" - a NAMED, FINITE, checked list, not an open-ended "Windows
+      // does whatever it wants" excuse. Derived from this test's OWN
+      // independent list (see above), so a bogus addition to production's
+      // constant can never silently widen this allow-list.
+      const allowedUpperNames = new Set([
+        "ONLY_VAR",
+        ...INDEPENDENTLY_AUTHORED_WINDOWS_REQUIRED_ENV_VAR_NAMES.map((name) => name.toUpperCase()),
+      ]);
+      const strayKeys = Object.keys(childEnv).filter(
+        (key) => !allowedUpperNames.has(key.toUpperCase())
+      );
+      assert.deepEqual(
+        strayKeys,
+        [],
+        `a replace-mode Windows child had key(s) outside {the caller's vars} union {libuv's documented required set}: ${strayKeys.join(", ")}`
+      );
+
+      // The canary check, explicit and direct - also already implied by
+      // the stray-keys check above (a random canary's name can never
+      // collide with the fixed required-vars list), kept as its own
+      // assertion so the intent reads unambiguously.
+      for (const key of Object.keys(canaries)) {
+        assert.equal(
+          childByUpper.has(key.toUpperCase()),
+          false,
+          `canary "${key}" (planted directly on the SERVER's own live env) must never reach a replace-mode child`
+        );
+      }
+    } finally {
+      clearServerEnvCanaries(canaries);
+    }
+    server.child.kill("SIGKILL");
+  }
+);
+
+test(
+  "env.mode 'replace' on Windows: when the caller explicitly supplies one of libuv's own required names (PATH), the caller's value wins - libuv's make_program_env() only fills in a required name that's MISSING from the input block, it never overrides one the caller already gave (real spawn, real echo of the child's own process.env)",
+  {
+    skip:
+      process.platform !== "win32"
+        ? "Windows-only assertion - this specific caller-supplied-vs-libuv-filled precedence only exists on the win32 code path; on POSIX, replace mode never adds or overrides anything of its own regardless of what the caller supplies"
+        : false,
+  },
+  async () => {
+    const server = tracked();
+    await completeHandshake(server);
+    const dir = makeTempDir();
+    const marker = path.join(dir, "child-env-windows-replace-caller-supplied-path.json");
+    const callerSuppliedPath = `C:\\ghantika-test-caller-supplied-path-${randomUUID()}`;
+    const childEnv = await runAndCaptureRealChildEnv(server, 27, marker, {
+      mode: "replace",
+      vars: { PATH: callerSuppliedPath, ONLY_VAR: "only-value" },
+    });
+    const childByUpper = caseInsensitiveEnvLookup(childEnv);
+    assert.equal(
+      childByUpper.get("PATH"),
+      callerSuppliedPath,
+      "libuv must preserve the caller's own PATH value, not override it with the spawning process's own PATH - it only fills in a required name that's MISSING from the input block, per make_program_env()'s own logic"
+    );
+    server.child.kill("SIGKILL");
+  }
+);
+
+test(
+  "negative control (POSIX): if env.mode 'replace' silently fell back to merge mode's own minimal base, HOME would leak into a replace-mode child that never asked for it - proving the assertion above would actually catch that regression, not pass regardless of it",
+  {
+    skip:
+      process.platform === "win32"
+        ? "POSIX-only: this specific merge-vs-replace comparison is not a valid discriminator on Windows - libuv force-injects Windows' own base-overlapping names (PATH, a SystemRoot-equivalent, USERPROFILE) regardless of ghantika's own env.mode, so merge and replace legitimately produce overlapping key sets there; the Windows empirical test above (the exact-match assertion against WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES) is that platform's own real proof instead"
+        : false,
+  },
+  async () => {
+    const server = tracked();
+    await completeHandshake(server);
+    const dir = makeTempDir();
+
+    // Same empty vars, both modes, same real spawn mechanism, same real
+    // server connection - the ONLY variable between these two calls is
+    // env.mode itself.
+    const mergeEnv = await runAndCaptureRealChildEnv(
+      server,
+      43,
+      path.join(dir, "child-env-merge-control.json"),
+      { mode: "merge", vars: {} }
+    );
+    const replaceEnv = await runAndCaptureRealChildEnv(
+      server,
+      44,
+      path.join(dir, "child-env-replace-control.json"),
+      { mode: "replace", vars: {} }
+    );
+
+    assert.ok(
+      "HOME" in mergeEnv,
+      "sanity check: merge mode's own minimal base really does add HOME when the caller doesn't - if this fails, the comparison below proves nothing"
+    );
+    assert.equal(
+      "HOME" in replaceEnv,
+      false,
+      "replace mode must NOT have HOME - if replace's implementation silently reused merge mode's own minimal-base code path (the exact regression this test exists to catch), HOME would appear here too, and this assertion would go red"
+    );
+    server.child.kill("SIGKILL");
+  }
+);
+
+test("negative control: if env.mode 'replace' silently included the server's FULL parent environment (a far worse bug than merely falling back to merge mode's own minimal base), a random canary planted directly on the server's own env would leak straight into the child - proving that bug class is caught too, on either platform", async () => {
+  const canaries = plantServerEnvCanaries(1, "FULLLEAK");
+  const server = tracked();
+  const canaryKey = Object.keys(canaries)[0]!;
+  const canaryValue = canaries[canaryKey]!;
+  try {
+    await completeHandshake(server);
+    const dir = makeTempDir();
+    const marker = path.join(dir, "child-env-full-leak-control.json");
+    const childEnv = await runAndCaptureRealChildEnv(server, 45, marker, {
+      mode: "replace",
+      vars: { ONLY_VAR: "only-value" },
+    });
+    assert.equal(
+      canaryKey in childEnv,
+      false,
+      "a replace-mode child must never receive the server's own arbitrary env var - if replace secretly passed through the server's FULL process.env, this canary would appear here and this assertion would go red"
+    );
+    assert.equal(
+      JSON.stringify(childEnv).includes(canaryValue),
+      false,
+      "the canary's VALUE must never leak into the child env either, under any key"
+    );
+  } finally {
+    clearServerEnvCanaries(canaries);
+  }
   server.child.kill("SIGKILL");
 });
 
