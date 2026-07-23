@@ -319,7 +319,7 @@ test("REGRESSION: drop-count accuracy under a REAL multi-eviction, cross-stream-
   );
 });
 
-test("no-fabrication regression: cross-selector cursor reuse never skips a still-retained sibling event", () => {
+test("no-fabrication regression: a fresh 'both' read from the floor never omits a sibling's still-retained event, even when the other stream separately evicted data spanning the same seq range", () => {
   const jobId = makeJobWithRawOutput();
   jobStore.appendOutput(jobId, "stdout", bigStreamLine("a")); // seq 1
   jobStore.appendOutput(jobId, "stderr", Buffer.from("e2\n")); // seq 2, retained forever
@@ -333,11 +333,12 @@ test("no-fabrication regression: cross-selector cursor reuse never skips a still
     "stdout's own true head is its only surviving event's seq"
   );
 
-  // Re-reading from the floor with "both" must still surface stderr's
-  // seq 2 and seq 4 - they sit numerically inside the span stdout itself
-  // lost data in (seq 1..3), yet were never stdout's own to drop, and must
-  // never be silently skipped just because a caller previously read only
-  // stdout's own cursor.
+  // A FRESH "both" read starting from the floor (after_cursor:0, NOT a
+  // reused stdout cursor - a single-stream cursor is scoped to that stream's
+  // own selection and is not safe to replay against "both", see this
+  // file's/output.ts's own docs on cursor scope) must still surface
+  // stderr's seq 2 and seq 4 - they sit numerically inside the span stdout
+  // itself lost data in (seq 1..3), yet were never stdout's own to drop.
   const bothReplay = structuredOf(
     outputTool.handler({ job_id: jobId, stream: "both", after_cursor: 0 })
   );
@@ -349,6 +350,45 @@ test("no-fabrication regression: cross-selector cursor reuse never skips a still
   assert.ok(
     events.some((e) => e.seq === 4 && e.stream === "stderr"),
     "stderr's still-retained seq 4 must be returned"
+  );
+});
+
+test("cursor scope regression: reusing a single-stream cursor with a DIFFERENT stream selection can skip a still-retained sibling event - the documented reason cross-selector reuse is unsupported", () => {
+  const jobId = makeJobWithRawOutput();
+  jobStore.appendOutput(jobId, "stdout", Buffer.from("o1\n")); // seq 1
+  jobStore.appendOutput(jobId, "stderr", Buffer.from("e2\n")); // seq 2, retained
+  jobStore.appendOutput(jobId, "stdout", Buffer.from("o3\n")); // seq 3
+
+  const stdoutRead = structuredOf(outputTool.handler({ job_id: jobId, stream: "stdout" }));
+  assert.equal(stdoutRead.next_cursor, 3, "stdout's own next_cursor is its own last seq");
+
+  // Reusing STDOUT's own next_cursor (3) with a DIFFERENT selector ("both")
+  // silently skips stderr's still-retained seq 2, since a single-stream
+  // cursor carries no information about what a sibling stream has or
+  // hasn't disclosed - this is exactly why cursor reuse is scoped to the
+  // SAME stream selection that produced it (see output.ts's own docs).
+  const crossSelectorReplay = structuredOf(
+    outputTool.handler({
+      job_id: jobId,
+      stream: "both",
+      after_cursor: stdoutRead.next_cursor as number,
+    })
+  );
+  const events = crossSelectorReplay.events as Array<{ seq: number; stream: string }>;
+  assert.equal(
+    events.length,
+    0,
+    "reusing a stdout-only cursor with 'both' skips stderr's still-retained seq 2 entirely - documented, unsupported behavior, not a bug"
+  );
+
+  // The honest, supported way to switch selections: start fresh.
+  const freshBothRead = structuredOf(
+    outputTool.handler({ job_id: jobId, stream: "both", after_cursor: 0 })
+  );
+  const freshEvents = freshBothRead.events as Array<{ seq: number; stream: string }>;
+  assert.ok(
+    freshEvents.some((e) => e.seq === 2 && e.stream === "stderr"),
+    "starting fresh (after_cursor:0) when switching selections correctly surfaces stderr's seq 2"
   );
 });
 

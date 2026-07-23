@@ -66,7 +66,7 @@ import {
 export const name = "output";
 
 export const description =
-  'Get a background job\'s accumulated stdout/stderr output, paginated by a monotonic cursor. Pass after_cursor (from a prior call\'s next_cursor) to fetch only new events since your last read. stream selects stdout, stderr, or both (merged in real line-materialization order, default). Once a selected stream has dropped its own old lines under its byte/line cap, the response discloses a bounded "dropped" count for that stream (how many of its own lines were ever dropped) plus "droppedBeforeCursor" (the boundary before which that happened) - never which specific lines were lost. For stream:"stdout"/"stderr" this is a scalar pair at the top level; for stream:"both" it is a nested object keyed by stream ({stdout?:{...}, stderr?:{...}}), since each stream\'s own loss is independent. Three distinct signals, never conflate them: "dropped" means this stream lost lines forever; "truncated" means this specific call\'s own response window (from limit, or from the same lifetime loss) does not contain everything currently available; "next_cursor" is simply where to resume paging - it carries no information about loss on its own.';
+  'Get a background job\'s accumulated stdout/stderr output, paginated by a monotonic cursor. Pass after_cursor (from a PRIOR CALL WITH THE SAME stream SELECTION\'s own next_cursor) to fetch only new events since your last read of that same selection - a cursor is scoped to the exact stream value that produced it, and reusing it with a DIFFERENT stream value can skip an already-retained event on the other stream (start from 0/omit after_cursor instead when switching selections). stream selects stdout, stderr, or both (merged in real line-materialization order, default). Once a selected stream has dropped its own old lines under its byte/line cap, the response discloses a bounded "dropped" count for that stream (how many of its own lines were ever dropped) plus "droppedBeforeCursor" (the boundary before which that happened) - never which specific lines were lost. For stream:"stdout"/"stderr" this is a scalar pair at the top level; for stream:"both" it is a nested object keyed by stream ({stdout?:{...}, stderr?:{...}}), since each stream\'s own loss is independent. Three distinct signals, never conflate them: "dropped" means this stream lost lines forever; "truncated" means this specific call\'s own response window (from limit, or from the same lifetime loss) does not contain everything currently available; "next_cursor" is simply where to resume paging with the SAME stream selection - it carries no information about loss on its own.';
 
 const DEFAULT_LIMIT: number | undefined = undefined;
 
@@ -87,7 +87,7 @@ export const inputSchema: Tool["inputSchema"] = {
     after_cursor: {
       type: "number",
       description:
-        "Only return events after this cursor (from a prior call's next_cursor). Omit or 0 to read from the earliest still-retained event. Must be a non-negative integer.",
+        "Only return events after this cursor (from a PRIOR CALL WITH THE SAME stream selection's own next_cursor - a cursor is scoped to the exact selection that produced it, and reusing it with a different stream value can skip an already-retained event on the other stream). Omit or 0 to read from the earliest still-retained event, or when switching stream selections. Must be a non-negative integer.",
     },
     limit: {
       type: "number",
@@ -144,8 +144,11 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
   const view = readStreamView(jobId, stream, afterCursor);
 
   // `limit` bounds how many events this one response discloses. A follow-up
-  // call with `after_cursor: nextCursor` is guaranteed to pick up exactly
-  // where this page left off, never skipping or re-showing anything.
+  // call with `after_cursor: nextCursor` AND THE SAME `stream` SELECTION is
+  // guaranteed to pick up exactly where this page left off, never skipping
+  // or re-showing anything - a cursor only proves what its own selection
+  // disclosed, so reusing it with a DIFFERENT selection can skip an
+  // already-retained event on the other stream (see this file's header).
   let items: OutputEvent[] = view.events;
   let nextCursor = view.head;
   let limitClamped = false;

@@ -666,8 +666,13 @@ function materializeLine(
  * THIS `appendChunkToBuffer` call is the one that just materialized it (see
  * `materializedALineThisCall` below) - that line is never evicted by this
  * pass, so the forced-split regression tests proving a lone oversized-split
- * entry survives the very call that creates it (regardless of whatever
- * small leftover that same cut naturally left in `pending`) are unaffected.
+ * entry survives the very call that creates it are unaffected - EVEN THOUGH
+ * that same call's own cut can naturally leave a leftover in `pending` up
+ * to just under `MAX_LINE_BYTES` (almost another full line-cap's worth),
+ * so resident bytes (this one oversized entry plus that leftover) can
+ * genuinely peak near double `MAX_BUFFER_BYTES` for the DURATION of the
+ * call that creates the entry, before the next call's own eviction pass
+ * brings it back down.
  * On any LATER, SEPARATE call where no new line materializes at all -
  * genuinely new bytes simply growing `pending` on top of an entry that was
  * already sitting there before this call began - the exception no longer
@@ -690,15 +695,8 @@ function materializeLine(
  * @param materializedALineThisCall - whether `materializeLine` ran at least
  *   once during the SAME `appendChunkToBuffer` call this pass is closing out
  *   (see that call site for how this is tracked). This is the discriminator
- *   the single-entry exception above needs: `state.pending.length` alone
- *   can't tell "the small natural leftover from the very cut that just
- *   created this entry" apart from "brand new bytes arriving in a later,
- *   separate call on top of an entry that already existed" - a forced split
- *   always leaves at least one leftover byte in `pending` in the same call
- *   it happens (the cut removes at most `MAX_LINE_BYTES` bytes from a
- *   `working` buffer that was, by construction, strictly longer than that),
- *   so gating on `pending.length === 0` alone would evict the entry
- *   immediately in the very call that just created it.
+ *   the single-entry exception above needs - see this function's own docs
+ *   above for why `state.pending.length` alone can't serve the same role.
  */
 function evictToFitBudget(state: StreamBufferState, materializedALineThisCall: boolean): void {
   for (;;) {
