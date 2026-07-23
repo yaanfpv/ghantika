@@ -20,6 +20,11 @@ import * as runTool from "../dist/tools/run.js";
 import * as statusTool from "../dist/tools/status.js";
 import * as tailTool from "../dist/tools/tail.js";
 
+// See test/e2e-server.test.ts's import comment for why this is ".ts", not
+// ".js" - the shared marker-file poll waits for CONTENT, never for mere
+// existence, so a follow-up read never races the write.
+import { waitForFile } from "./harness.ts";
+
 /**
  * A schema-invalid tool call always returns a tool-execution error result
  * (`isError: true`, never a thrown JSON-RPC error) - the only difference
@@ -150,17 +155,10 @@ test('run() with a relative PATH entry (".") and a matching cwd actually spawns 
 
   // Confirm it genuinely ran, not just that run() avoided an immediate
   // false-negative diagnostic - a real, deterministic side effect proves
-  // the child actually executed.
-  const deadline = Date.now() + 3000;
-  while (!fs.existsSync(marker) && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  assert.equal(
-    fs.existsSync(marker),
-    true,
-    "the fixture executable must have actually run and written its marker file"
-  );
-  assert.equal(fs.readFileSync(marker, "utf8").trim(), "ran");
+  // the child actually executed. waitForFile polls for the marker to hold
+  // its expected content, not merely to exist, so this can't read the file
+  // in the gap between the shell's redirect opening it and "ran" landing.
+  await waitForFile(marker, { timeoutMs: 3000, until: (content) => content.trim() === "ran" });
 });
 
 test("run: a label over 64 characters is a schema validation error (isError: true)", () => {
