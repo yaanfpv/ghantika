@@ -11,8 +11,9 @@
  */
 import ts from "typescript";
 import { createRequire } from "node:module";
-import { realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import path from "node:path";
 
 /**
  * Parses `sourceText` (the contents of `fileName`) into a real TypeScript
@@ -96,8 +97,14 @@ function isImportMetaResolveCall(node) {
  * the node's shape from a bare `Identifier` to an `AsExpression`/
  * `NonNullExpression`, which every base-expression check in this file
  * requires before it will even look at symbol resolution.
+ *
+ * Exported: any caller resolving "what value does this expression actually
+ * read at runtime" off a base it does not otherwise control (a namespace
+ * member access, an awaited dynamic-import result) needs the identical
+ * unwrap, not a re-implementation that could quietly diverge from this
+ * one's coverage.
  */
-function unwrapTransparentWrapper(node) {
+export function unwrapTransparentWrapper(node) {
   let current = node;
   for (;;) {
     if (ts.isParenthesizedExpression(current)) {
@@ -342,6 +349,77 @@ export function resolveModuleSpecifierRealPath(rawSpecifier, fromAbsFilePath) {
 }
 
 /**
+ * Resolves `rawSpecifier` (as written, relative to `fromAbsFilePath`) to the
+ * REAL npm package that owns it - its `name`/`version` (read off the
+ * nearest ancestor `package.json` of the specifier's real resolved file)
+ * and that package directory's own real path (`root`) - by building on
+ * `resolveModuleSpecifierRealPath`'s real, Node-resolver-based file
+ * resolution and then walking UP from the resolved file to the nearest
+ * ancestor `package.json` that itself declares a `name`.
+ *
+ * This is PACKAGE-IDENTITY resolution, not naive realpath-equality on the
+ * resolved FILE: two different entry files of the exact same installed
+ * package version (`dist/index.cjs` vs `dist/index.mjs`, or a `file://` URL
+ * naming either) resolve to DIFFERENT real file paths but the SAME real
+ * package directory - walking up to the nearest `package.json` collapses
+ * that difference, so a caller comparing package identity (this function's
+ * `{ name, version, root }`) correctly treats all of them as the one
+ * package, where a caller naively comparing the raw resolved FILE paths
+ * would wrongly split them into different roots. Two genuinely different
+ * packages that happen to expose an identically-named entry-file basename
+ * never collide here, since each still walks up to its OWN `package.json`.
+ *
+ * Returns `undefined` when the specifier does not resolve to any real file
+ * at all (an external, not-installed package is the overwhelmingly common
+ * case for an unrelated import - this is not a violation by itself, the
+ * caller decides), or when no ancestor `package.json` names a package
+ * (should not happen for anything actually reachable through a real
+ * `node_modules` tree or a repo's own root, both of which carry one).
+ *
+ * @param {string} rawSpecifier
+ * @param {string} fromAbsFilePath
+ * @returns {{ name: string, version: string | undefined, root: string } | undefined}
+ */
+export function resolvePackageIdentity(rawSpecifier, fromAbsFilePath) {
+  const realFilePath = resolveModuleSpecifierRealPath(rawSpecifier, fromAbsFilePath);
+  if (realFilePath === undefined) return undefined;
+  return findOwningPackageIdentity(path.dirname(realFilePath));
+}
+
+/**
+ * Walks up from `startDir` looking for the nearest ancestor directory
+ * containing a `package.json` that itself declares a string `name` - the
+ * owning package's manifest. A `package.json` with no (or a malformed/
+ * unparsable) `name` field is skipped in favor of the next ancestor up,
+ * matching Node's own package-boundary walk (a build tool's intermediate
+ * `package.json` with no `name` is not a package boundary).
+ */
+function findOwningPackageIdentity(startDir) {
+  let dir = startDir;
+  for (;;) {
+    const pkgJsonPath = path.join(dir, "package.json");
+    if (existsSync(pkgJsonPath)) {
+      let pkg;
+      try {
+        pkg = JSON.parse(readFileSync(pkgJsonPath, "utf8"));
+      } catch {
+        pkg = undefined;
+      }
+      if (pkg !== undefined && typeof pkg.name === "string") {
+        return {
+          name: pkg.name,
+          version: typeof pkg.version === "string" ? pkg.version : undefined,
+          root: realpathSync(dir),
+        };
+      }
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
+/**
  * The `node:module` builtin's specifier text, and the unprefixed `"module"`
  * form Node/TS also accept for the same builtin - verified empirically:
  * `import { createRequire } from "module"` resolves identically to the
@@ -495,8 +573,16 @@ const CONSTRUCTOR_PROPERTY_NAME = "constructor";
  * specifier name as a local declaration, which is all this file's
  * scope-resolution check ever needs; it does not need the import's TARGET
  * to resolve.
+ *
+ * Exported so a caller needing REAL scope/symbol resolution for its own
+ * purpose (e.g. proving a later `ns.Member` access resolves to the SAME
+ * `import * as ns` binding a specifier check already approved, in both
+ * value position - a `PropertyAccessExpression` - and type position - a
+ * `QualifiedName` inside a type - which resolve to the identical `ts.Symbol`
+ * per TypeScript's own namespace-import binding, verified empirically) can
+ * build one instead of re-implementing this in-memory-program machinery.
  */
-function createScopeCheckedProgram(fileName, sourceText) {
+export function createScopeCheckedProgram(fileName, sourceText) {
   const options = {
     target: ts.ScriptTarget.Latest,
     module: ts.ModuleKind.ESNext,
@@ -939,8 +1025,12 @@ function hasEnclosingLocalDeclaration(node, name) {
  * a computed `["foo"]`/`["re" + "quire"]` key foldable to a literal string.
  * `undefined` for a key that can't be statically resolved (a variable, an
  * interpolated template).
+ *
+ * Exported alongside `resolvedAccessKeyText` (the one-hop-alias-extended
+ * form) for any caller needing this file's own static-key-resolution
+ * primitive rather than a re-implementation.
  */
-function accessKeyText(node) {
+export function accessKeyText(node) {
   if (ts.isPropertyAccessExpression(node)) return node.name.text;
   if (ts.isElementAccessExpression(node)) return foldConstantString(node.argumentExpression);
   return undefined;
@@ -986,7 +1076,7 @@ function resolveOneHopStringExpression(node, checker, checkedSourceFile) {
  * `resolveOneHopStringExpression`'s own doc comment for the shared
  * mechanism this builds on.
  */
-function resolvedAccessKeyText(node, checker, checkedSourceFile) {
+export function resolvedAccessKeyText(node, checker, checkedSourceFile) {
   const direct = accessKeyText(node);
   if (direct !== undefined) return direct;
   if (!ts.isElementAccessExpression(node)) return undefined;
@@ -1787,8 +1877,12 @@ function staticPropertyKeyText(key) {
  * doesn't (`{ eval }`, shorthand - `undefined` here only if `.name` is
  * itself a nested pattern, out of scope). `undefined` for a computed key
  * that can't be statically resolved.
+ *
+ * Exported: a literal-root dynamic-import destructure (`const { X } = await
+ * import(root)`) needs the identical source-key reading this file already
+ * uses for a `globalThis`/`process` destructure acquisition.
  */
-function bindingElementSourceKeyText(element) {
+export function bindingElementSourceKeyText(element) {
   if (element.propertyName !== undefined) return staticPropertyKeyText(element.propertyName);
   return ts.isIdentifier(element.name) ? element.name.text : undefined;
 }

@@ -35,9 +35,12 @@ import { checkStdioPurity, findStdoutWrites } from "../scripts/check-stdio-purit
  * side-effect import, a const-bound empty array literal, a comment
  * splitting `import` from `(` in a dynamic import, a computed
  * `process["stdout"]` access); a violation reached INDIRECTLY (an
- * `Array()` call in place of an empty literal, a sibling/Tasks load via
- * `require`/`createRequire` instead of ES import syntax, a stdout write
- * through a `globalThis.process` alias, a stdout-writing `console` method
+ * `Array()` call in place of an empty literal, a sibling load via
+ * `require()` instead of ES import syntax (plus the `createRequire` import
+ * itself flagged independent of what it's later used to load - a neutral,
+ * non-Tasks placeholder target, since the guard's own createRequire ban is
+ * unconditional on load target), a stdout write through a
+ * `globalThis.process` alias, a stdout-writing `console` method
  * other than `log`); and a loader whose IMPORT BINDING is renamed, so no
  * call site is spelled `require` or `createRequire` at all. Where a class
  * has more members than the one example, the siblings are covered too
@@ -63,7 +66,7 @@ function buildScratchSrc(files: Record<string, string>): string {
 const DISGUISED_SYNTAX_COMBINED_MUTANT = [
   'import "./status.js";', // bare sibling side-effect import
   "const outputBuffer: string[] = [];", // module-scope mutable state (not a Map/Set)
-  'import/* comment */("@modelcontextprotocol/sdk/experimental/tasks");', // Tasks import with a comment splitting import( from the string
+  'const { GetTaskRequest } = await import/* comment */("@modelcontextprotocol/server");', // Tasks-symbol destructure with a comment splitting import( from the string
   'process["stdout"].write("leak");', // computed stdout access
   "",
 ].join("\n");
@@ -89,8 +92,8 @@ test("a file combining four regex-invisible escape forms is caught, every form a
 
     const tasksViolations = checkNoTasksImport(dir);
     assert.ok(
-      tasksViolations.some((v) => v.specifier.includes("experimental")),
-      `expected a Tasks-extension import violation, got: ${JSON.stringify(tasksViolations)}`
+      tasksViolations.some((v) => v.specifier.includes('"GetTaskRequest"')),
+      `expected a Tasks-symbol violation, got: ${JSON.stringify(tasksViolations)}`
     );
 
     const stdioViolations = checkStdioPurity(dir);
@@ -162,21 +165,19 @@ test("module-boundaries: a const-bound EMPTY array literal at module scope - fin
 });
 
 test("no-tasks-import: a comment splitting `import` from `(` in a dynamic import - findTasksImports goes red on the mutant text, clean on the original", () => {
-  const before = findTasksImports(
-    'import { Server } from "@modelcontextprotocol/sdk/server/index.js";\n'
-  );
+  const before = findTasksImports('import { Server } from "@modelcontextprotocol/server";\n');
   assert.deepEqual(before, [], "clean before the mutation");
   const after = findTasksImports(
-    'import/* comment */("@modelcontextprotocol/sdk/experimental/tasks");\n'
+    'const { GetTaskRequest } = await import/* comment */("@modelcontextprotocol/server");\n'
   );
   assert.deepEqual(
     after,
-    ["@modelcontextprotocol/sdk/experimental/tasks"],
-    "red after the mutation - the comment-split dynamic import form"
+    [
+      'destructures/accesses Tasks symbol "GetTaskRequest" from a literal-root dynamic import of "@modelcontextprotocol/server"',
+    ],
+    "red after the mutation - the comment-split dynamic import destructure form"
   );
-  const restored = findTasksImports(
-    'import { Server } from "@modelcontextprotocol/sdk/server/index.js";\n'
-  );
+  const restored = findTasksImports('import { Server } from "@modelcontextprotocol/server";\n');
   assert.deepEqual(restored, [], "clean again once restored");
 });
 
@@ -202,12 +203,14 @@ test("additional form (no-tasks-import): a no-substitution TEMPLATE LITERAL used
   const before = findTasksImports("const x = 1;\n");
   assert.deepEqual(before, [], "clean before the mutation");
   const after = findTasksImports(
-    "const mod = await import(`@modelcontextprotocol/sdk/experimental/tasks`);\n"
+    "const { GetTaskRequest } = await import(`@modelcontextprotocol/server`);\n"
   );
   assert.deepEqual(
     after,
-    ["@modelcontextprotocol/sdk/experimental/tasks"],
-    "red after the mutation - the template-literal dynamic import form"
+    [
+      'destructures/accesses Tasks symbol "GetTaskRequest" from a literal-root dynamic import of "@modelcontextprotocol/server"',
+    ],
+    "red after the mutation - the template-literal dynamic import destructure form"
   );
   const restored = findTasksImports("const x = 1;\n");
   assert.deepEqual(restored, [], "clean again once restored");
@@ -317,9 +320,10 @@ test("mutation control: the transient-access carve-out is genuinely narrow - a M
 // ---------------------------------------------------------------------------
 // Combined mutant: a DIFFERENT file whose four violations are each reached
 // INDIRECTLY rather than written out directly - `Array()` in place of an
-// empty literal, a sibling/Tasks load via require()/createRequire() instead
-// of ES import syntax, a stdout write through a globalThis.process alias,
-// and a stdout-writing console method other than log.
+// empty literal, a sibling load via require() instead of ES import syntax
+// (plus the createRequire import itself flagged independent of load
+// target), a stdout write through a globalThis.process alias, and a
+// stdout-writing console method other than log.
 // ---------------------------------------------------------------------------
 
 const INDIRECT_REACH_COMBINED_MUTANT = [
@@ -496,11 +500,11 @@ const ALIASED_LOADER_COMBINED_MUTANT = [
   'import { createRequire as makeLoader } from "node:module";',
   "const loadModule = makeLoader(import.meta.url);",
   'loadModule("./status.js");', // sibling load, reached only through the ALIASED loader
-  'loadModule("@modelcontextprotocol/sdk/experimental/tasks");', // Tasks load, reached only through the ALIASED loader
+  'loadModule("some-other-package/loaded-path");', // an arbitrary load, reached only through the ALIASED loader
   "",
 ].join("\n");
 
-test("an aliased createRequire import reaching BOTH a sibling tools/*.ts file AND the forbidden Tasks specifier through the same aliased loader is caught by both guards at once on a real scratch fixture tree", () => {
+test("an aliased createRequire import reaching BOTH a sibling tools/*.ts file AND an arbitrary load target through the same aliased loader is caught by both guards at once on a real scratch fixture tree", () => {
   const dir = buildScratchSrc({ "tools/mutant3.ts": ALIASED_LOADER_COMBINED_MUTANT });
   try {
     const moduleBoundaryViolations = checkModuleBoundaries(dir);
@@ -567,15 +571,13 @@ test("an aliased createRequire reaching a sibling module, alias pair grabLoader/
   }
 });
 
-test("an aliased createRequire reaching the Tasks specifier, alias pair grabLoader/spawn (the same pair as the sibling-target row above, proving the SAME aliased binding is caught independent of which target it's later used to load): findTasksImports goes red specifically, clean on the original", () => {
-  const before = findTasksImports(
-    'import { Server } from "@modelcontextprotocol/sdk/server/index.js";\n'
-  );
+test("an aliased createRequire reaching an arbitrary load target, alias pair grabLoader/spawn (the same pair as the sibling-target row above, proving the SAME aliased binding is caught independent of which target it's later used to load): findTasksImports goes red specifically, clean on the original", () => {
+  const before = findTasksImports('import { Server } from "@modelcontextprotocol/server";\n');
   assert.deepEqual(before, [], "clean before the mutation");
   const mutantSource = [
     'import { createRequire as grabLoader } from "node:module";',
     "const spawn = grabLoader(import.meta.url);",
-    'spawn("@modelcontextprotocol/sdk/experimental/tasks");',
+    'spawn("some-other-package/loaded-path");',
     "",
   ].join("\n");
   const after = findTasksImports(mutantSource);
@@ -583,9 +585,7 @@ test("an aliased createRequire reaching the Tasks specifier, alias pair grabLoad
     after.some((h) => h.includes("imports createRequire")),
     `red after the mutation - the aliased-import form must be caught by findTasksImports specifically, got: ${JSON.stringify(after)}`
   );
-  const restored = findTasksImports(
-    'import { Server } from "@modelcontextprotocol/sdk/server/index.js";\n'
-  );
+  const restored = findTasksImports('import { Server } from "@modelcontextprotocol/server";\n');
   assert.deepEqual(restored, [], "clean again once restored");
 });
 
@@ -609,13 +609,13 @@ test("a THIRD independent alias pair (cjsBridge/fetchModule - proving the fix is
     const tasksMutant = [
       'import { createRequire as cjsBridge } from "node:module";',
       "const fetchModule = cjsBridge(import.meta.url);",
-      'fetchModule("@modelcontextprotocol/sdk/experimental/tasks");',
+      'fetchModule("some-other-package/loaded-path");',
       "",
     ].join("\n");
     const tasksHits = findTasksImports(tasksMutant);
     assert.ok(
       tasksHits.some((h) => h.includes("imports createRequire")),
-      `expected the third alias pair to be caught on the Tasks target, got: ${JSON.stringify(tasksHits)}`
+      `expected the third alias pair to be caught by the no-tasks-import guard's createRequire ban (independent of the neutral, non-Tasks load target), got: ${JSON.stringify(tasksHits)}`
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -643,11 +643,11 @@ test('a namespace import (import * as ns from "node:module") reaching a sibling 
   }
 });
 
-test('a default import of node:module (import mod from "node:module") reaching the Tasks specifier via mod.createRequire(...) is caught outright at the import site - verified empirically that node:module\'s default export also carries createRequire as a property', () => {
+test('a default import of node:module (import mod from "node:module") reaching an arbitrary load target via mod.createRequire(...) is caught outright at the import site - verified empirically that node:module\'s default export also carries createRequire as a property', () => {
   const mutantSource = [
     'import modDefault from "node:module";',
     "const ld = modDefault.createRequire(import.meta.url);",
-    'ld("@modelcontextprotocol/sdk/experimental/tasks");',
+    'ld("some-other-package/loaded-path");',
     "",
   ].join("\n");
   const hits = findTasksImports(mutantSource);

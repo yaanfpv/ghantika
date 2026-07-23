@@ -1,126 +1,619 @@
+// NOTE ON THIS FILE'S `eval(...)`/`Function(...)` SNIPPETS: every occurrence
+// below is an inert STRING LITERAL handed to `findTasksImports` as scanned
+// fixture source text - the AST guard under test parses it, nothing in this
+// test file ever executes it. These rows exist to prove the guard flags a
+// real `eval`/`Function` reference wherever it appears in scanned source;
+// none of them run that code.
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import ts from "typescript";
 
-import { checkNoTasksImport, findTasksImports } from "../scripts/check-no-tasks-import.mjs";
+import {
+  checkNoTasksImport,
+  COMPUTED_DYNAMIC_IMPORT_SPECIFIER_LABEL,
+  COMPUTED_NAMESPACE_MEMBER_KEY_LABEL,
+  COMPUTED_REQUIRE_SPECIFIER_LABEL,
+  findTasksImports,
+  TASKS_SYMBOLS,
+} from "../scripts/check-no-tasks-import.mjs";
 
-// --- the real src/ tree, as it exists right now, must be clean ---
+const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const SERVER_PACKAGE_DIST = path.join(
+  REPO_ROOT,
+  "node_modules",
+  "@modelcontextprotocol",
+  "server",
+  "dist"
+);
 
-test("the real src/ tree imports nothing from the Tasks extension", () => {
+/**
+ * Builds a scratch tree DIRECTLY under the repo root (never the OS tmpdir),
+ * so a RELATIVE specifier written inside a fixture can actually resolve
+ * through Node's real module resolver back to this repo's own
+ * `node_modules` - mirroring the identical pattern
+ * `test/loader-escape-matrix.test.ts`'s `loadMutatedGuardCopy` already uses
+ * for the same reason. This repo's `.gitignore` is an ALLOW-LIST (`/*` then
+ * explicit `!/...` un-ignores), so any new top-level directory - this one
+ * included - is untracked automatically; nothing extra is needed to keep it
+ * out of git.
+ */
+function buildRepoRootScratchSrc(files: Record<string, string>): string {
+  const dir = mkdtempSync(path.join(REPO_ROOT, ".ghantika-tasks-resolver-"));
+  for (const [relPath, content] of Object.entries(files)) {
+    const abs = path.join(dir, relPath);
+    mkdirSync(path.dirname(abs), { recursive: true });
+    writeFileSync(abs, content);
+  }
+  return dir;
+}
+
+// ---------------------------------------------------------------------------
+// The real src/ tree, as it exists right now, references nothing from the
+// Tasks extension.
+// ---------------------------------------------------------------------------
+
+test("the real src/ tree references nothing from the Tasks extension", () => {
   assert.deepEqual(checkNoTasksImport(), []);
 });
 
-// --- each of the 5 forbidden import forms, independently ---
+// ---------------------------------------------------------------------------
+// The guard's unit is the SYMBOL (matched by its SOURCE name), not the
+// module specifier - a plain import of an enumerated Tasks symbol is
+// flagged regardless of which of the 19 enumerated names it is, including
+// ones that do NOT begin with the literal string "Task" (ruling out a
+// name-prefix shortcut) and ones that are runtime VALUES, not types.
+// ---------------------------------------------------------------------------
 
-test("a direct import from the tasks subpath is caught", () => {
+test("a plain import of a Tasks symbol from the installed server root is flagged, by its source name", () => {
+  const hits = findTasksImports('import { GetTaskRequest } from "@modelcontextprotocol/server";\n');
+  assert.deepEqual(hits, [
+    'imports Tasks symbol "GetTaskRequest" from "@modelcontextprotocol/server"',
+  ]);
+});
+
+test('CreateTaskResult - a real enumerated Tasks export whose name is NOT prefixed "Task" - is flagged the same as Task/GetTaskRequest, ruling out a name.startsWith("Task") shortcut', () => {
   const hits = findTasksImports(
-    'import { TaskStore } from "@modelcontextprotocol/sdk/experimental/tasks";\n'
+    'import { CreateTaskResult } from "@modelcontextprotocol/server";\n'
   );
-  assert.deepEqual(hits, ["@modelcontextprotocol/sdk/experimental/tasks"]);
-});
-
-test("a type-only import from the tasks subpath is caught", () => {
-  const hits = findTasksImports(
-    'import type { TaskStore } from "@modelcontextprotocol/sdk/experimental/tasks";\n'
+  assert.ok(
+    hits.some((h) => h.includes('"CreateTaskResult"')),
+    `expected CreateTaskResult to be flagged despite not starting with "Task", got: ${JSON.stringify(hits)}`
   );
-  assert.deepEqual(hits, ["@modelcontextprotocol/sdk/experimental/tasks"]);
 });
 
-test("importing the bare /experimental barrel (which itself re-exports tasks) is caught", () => {
-  const hits = findTasksImports(
-    'import { InMemoryTaskStore } from "@modelcontextprotocol/sdk/experimental";\n'
-  );
-  assert.deepEqual(hits, ["@modelcontextprotocol/sdk/experimental"]);
-});
-
-test("an explicit named re-export from the tasks subpath is caught", () => {
-  const hits = findTasksImports(
-    'export { TaskStore } from "@modelcontextprotocol/sdk/experimental/tasks";\n'
-  );
-  assert.deepEqual(hits, ["@modelcontextprotocol/sdk/experimental/tasks"]);
-});
-
-test("a wildcard re-export of the /experimental barrel is caught", () => {
-  const hits = findTasksImports('export * from "@modelcontextprotocol/sdk/experimental";\n');
-  assert.deepEqual(hits, ["@modelcontextprotocol/sdk/experimental"]);
-});
-
-test("a dynamic import() of the tasks subpath is caught", () => {
-  const hits = findTasksImports(
-    'const mod = await import("@modelcontextprotocol/sdk/experimental/tasks");\n'
-  );
-  assert.deepEqual(hits, ["@modelcontextprotocol/sdk/experimental/tasks"]);
-});
-
-test("a deep subpath import (e.g. .../tasks/server.js) is caught too", () => {
-  const hits = findTasksImports(
-    'import { X } from "@modelcontextprotocol/sdk/experimental/tasks/server.js";\n'
-  );
-  assert.deepEqual(hits, ["@modelcontextprotocol/sdk/experimental/tasks/server.js"]);
-});
-
-test("all five forms, mixed together in one file, are each independently caught", () => {
+test('out-of-the-common-three enumeration: CancelTaskRequest and ListTasksRequest (type-only, non-"Task"-prefixed) and the runtime VALUES isTaskAugmentedRequestParams (a function) and RELATED_TASK_META_KEY (a string constant) are each flagged - ruling out an enumeration hand-trimmed to a few frequently-mentioned names', () => {
   const source = [
-    'import { A } from "@modelcontextprotocol/sdk/experimental/tasks";',
-    'import type { B } from "@modelcontextprotocol/sdk/experimental/tasks";',
-    'import { C } from "@modelcontextprotocol/sdk/experimental";',
-    'export { D } from "@modelcontextprotocol/sdk/experimental/tasks";',
-    'const e = await import("@modelcontextprotocol/sdk/experimental/tasks");',
+    'import { CancelTaskRequest } from "@modelcontextprotocol/server";',
+    'import { ListTasksRequest } from "@modelcontextprotocol/server";',
+    'import { isTaskAugmentedRequestParams } from "@modelcontextprotocol/server";',
+    'import { RELATED_TASK_META_KEY } from "@modelcontextprotocol/server";',
     "",
   ].join("\n");
   const hits = findTasksImports(source);
-  assert.equal(hits.length, 5, `expected exactly 5 hits, got: ${JSON.stringify(hits)}`);
+  for (const name of [
+    "CancelTaskRequest",
+    "ListTasksRequest",
+    "isTaskAugmentedRequestParams",
+    "RELATED_TASK_META_KEY",
+  ]) {
+    assert.ok(
+      hits.some((h) => h.includes(`"${name}"`)),
+      `expected ${name} to be flagged, got: ${JSON.stringify(hits)}`
+    );
+  }
 });
 
-// --- green control: a legitimate import is never flagged ---
-
-test("green control - a legitimate SDK import (server, not experimental) is never flagged", () => {
-  const source = [
-    'import { Server } from "@modelcontextprotocol/sdk/server/index.js";',
-    'import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";',
-    'import { CallToolRequestSchema, ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";',
-    "",
-  ].join("\n");
-  assert.deepEqual(findTasksImports(source), []);
-});
-
-test("green control - a Node builtin import is never flagged", () => {
-  const source = [
-    'import { spawn } from "node:child_process";',
-    'import path from "node:path";',
-    "",
-  ].join("\n");
-  assert.deepEqual(findTasksImports(source), []);
-});
-
-test("a fully clean file (only relative + green-control imports) round-trips through checkNoTasksImport-style scanning with zero hits", () => {
-  const source = [
-    'import { dispatchToolCall, listToolDefinitions } from "./registry.js";',
-    'import { Server } from "@modelcontextprotocol/sdk/server/index.js";',
-    "",
-  ].join("\n");
-  assert.deepEqual(findTasksImports(source), []);
-});
-
-// --- the mechanism used to LOAD a module never changes what it resolves
-// to - a require(...) call, or a require obtained via createRequire(...),
-// must be caught the same way a static/dynamic import is. ---
-
-test("form 6: a require(...) call for the forbidden tasks subpath is caught, the same as a static import would be - AND the bare require reference is its own, independent violation", () => {
-  const hits = findTasksImports('require("@modelcontextprotocol/sdk/experimental/tasks");\n');
-  assert.ok(hits.includes("@modelcontextprotocol/sdk/experimental/tasks"));
+test("an aliased import matches on the SOURCE name, never the local binding: `Task as Server` is flagged (source is Task); the inverse `Server as Task` stays green (source is the permitted Server)", () => {
+  const flagged = findTasksImports(
+    'import { Task as Server } from "@modelcontextprotocol/server";\n'
+  );
   assert.ok(
-    hits.some((h) => h.includes("references the global require")),
-    `expected the require reference itself to also be flagged, got: ${JSON.stringify(hits)}`
+    flagged.some((h) => h.includes('"Task"')),
+    `expected the source name Task to be flagged despite the permitted-looking local alias, got: ${JSON.stringify(flagged)}`
+  );
+  const green = findTasksImports(
+    'import { Server as Task } from "@modelcontextprotocol/server";\n'
+  );
+  assert.deepEqual(
+    green,
+    [],
+    "the source name Server is permitted, regardless of the Task-looking local alias"
   );
 });
 
-test("form 6: a require(...) call for the bare /experimental barrel is caught too, alongside the require reference itself", () => {
-  const hits = findTasksImports('require("@modelcontextprotocol/sdk/experimental");\n');
-  assert.ok(hits.includes("@modelcontextprotocol/sdk/experimental"));
-  assert.ok(hits.some((h) => h.includes("references the global require")));
+// ---------------------------------------------------------------------------
+// Tasks is an ARCHITECTURAL boundary, not a capability one (the deliberate
+// opposite of this repo's createRequire ruling, stated in the guard's own
+// header): a type-only reference is flagged in every type-level form.
+// ---------------------------------------------------------------------------
+
+test("a type-only import of a Tasks symbol is flagged - both the statement-level form and the inline per-specifier form", () => {
+  const statementLevel = findTasksImports(
+    'import type { GetTaskRequest } from "@modelcontextprotocol/server";\n'
+  );
+  assert.ok(
+    statementLevel.some((h) => h.includes('"GetTaskRequest"')),
+    `expected the statement-level type-only import to be flagged, got: ${JSON.stringify(statementLevel)}`
+  );
+  const inline = findTasksImports('import { type Task } from "@modelcontextprotocol/server";\n');
+  assert.ok(
+    inline.some((h) => h.includes('"Task"')),
+    `expected the inline type-only specifier to be flagged, got: ${JSON.stringify(inline)}`
+  );
 });
 
-test("form 7: calling createRequire(...) at all is flagged as forbidden, independent of what its returned function is used for - resolved at the IMPORT BINDING itself (see findCreateRequireImports's own doc comment in scripts/lib/ts-ast.mjs), not by matching the call's callee text, which could never see past a renamed import alias", () => {
+test('green control: production\'s real `import type { CallToolResult, Tool } from "@modelcontextprotocol/server"` produces zero hits - a guard keying on type-only-ness instead of Tasks-symbol identity would red this', () => {
+  const hits = findTasksImports(
+    'import type { CallToolResult, Tool } from "@modelcontextprotocol/server";\n'
+  );
+  assert.deepEqual(hits, []);
+});
+
+test('green control: an inline permitted type import - `import { type CallToolResult, Server } from "@modelcontextprotocol/server"` - produces zero hits; the inline `type` modifier on a PERMITTED symbol is not itself a Tasks reference', () => {
+  const hits = findTasksImports(
+    'import { type CallToolResult, Server } from "@modelcontextprotocol/server";\n'
+  );
+  assert.deepEqual(hits, []);
+});
+
+// ---------------------------------------------------------------------------
+// Re-exports hand a symbol onward exactly as an import does, so every
+// enumerated re-export form is flagged too, type-only or not: named
+// (aliased or not), wildcard, and namespace-aliased.
+// ---------------------------------------------------------------------------
+
+test("a named re-export of a Tasks symbol is flagged, including when aliased (matched on the SOURCE name, same as the import side)", () => {
+  const named = findTasksImports('export { Task } from "@modelcontextprotocol/server";\n');
+  assert.ok(named.some((h) => h.includes('"Task"')));
+  const aliased = findTasksImports('export { Task as T } from "@modelcontextprotocol/server";\n');
+  assert.ok(
+    aliased.some((h) => h.includes('"Task"')),
+    `expected the aliased re-export to flag on the SOURCE name Task, got: ${JSON.stringify(aliased)}`
+  );
+});
+
+test("a wildcard re-export (`export * from root`) and a namespace-aliased re-export (`export * as ns from root`) are each flagged - both propagate the whole enumerated Tasks set onward", () => {
+  const wildcard = findTasksImports('export * from "@modelcontextprotocol/server";\n');
+  assert.equal(wildcard.length, 1, JSON.stringify(wildcard));
+  const namespaced = findTasksImports('export * as ns from "@modelcontextprotocol/server";\n');
+  assert.equal(namespaced.length, 1, JSON.stringify(namespaced));
+});
+
+test("type-only re-export forms are flagged too, exactly as their value counterparts: statement-level `export type { X }`, inline `export { type X }`, and `export type * from root`", () => {
+  const statementLevel = findTasksImports(
+    'export type { GetTaskRequest } from "@modelcontextprotocol/server";\n'
+  );
+  assert.ok(statementLevel.some((h) => h.includes('"GetTaskRequest"')));
+  const inline = findTasksImports('export { type Task } from "@modelcontextprotocol/server";\n');
+  assert.ok(inline.some((h) => h.includes('"Task"')));
+  const wildcard = findTasksImports('export type * from "@modelcontextprotocol/server";\n');
+  assert.equal(wildcard.length, 1, JSON.stringify(wildcard));
+});
+
+test('a type-only NAMESPACE re-export (`export type * as ns from root`) is flagged too - a valid TypeScript form (parses with zero diagnostics), owned by the enumerated set rather than left to an open-ended "every form" promise', () => {
+  const source = 'export type * as ns from "@modelcontextprotocol/server";\n';
+  const sourceFile = ts.createSourceFile("x.ts", source, ts.ScriptTarget.Latest, true);
+  assert.deepEqual(
+    (sourceFile as unknown as { parseDiagnostics?: unknown[] }).parseDiagnostics ?? [],
+    [],
+    "sanity: this form must actually parse with zero diagnostics"
+  );
+  const hits = findTasksImports(source);
+  assert.equal(hits.length, 1, JSON.stringify(hits));
+});
+
+test('green control: a permitted-symbol re-export (`export { Server, McpServer } from root`) and a bare `export *` from a NON-server module each produce zero hits - an overbroad "flag any re-export from the server root" guard would red the first; an overbroad "flag any wildcard re-export" guard would red the second', () => {
+  const permitted = findTasksImports(
+    'export { Server, McpServer } from "@modelcontextprotocol/server";\n'
+  );
+  assert.deepEqual(permitted, []);
+  const unrelated = findTasksImports('export * from "./local-module.js";\n');
+  assert.deepEqual(unrelated, []);
+});
+
+test('green control: an inline permitted type re-export - `export { type CallToolResult, Server } from "@modelcontextprotocol/server"` - produces zero hits', () => {
+  const hits = findTasksImports(
+    'export { type CallToolResult, Server } from "@modelcontextprotocol/server";\n'
+  );
+  assert.deepEqual(hits, []);
+});
+
+// ---------------------------------------------------------------------------
+// A namespace member access reaches a Tasks symbol exactly as a named
+// import does - in VALUE position (a PropertyAccessExpression, or the
+// static-bracket-key form) and in TYPE position (a QualifiedName), which
+// this guard proves resolves through the SAME namespace binding as the
+// value-position form.
+// ---------------------------------------------------------------------------
+
+test("a namespace member access in VALUE position (`server.GetTaskRequest`) is flagged; the permitted sibling `server.Server` stays green", () => {
+  const flagged = findTasksImports(
+    'import * as server from "@modelcontextprotocol/server";\nvoid server.GetTaskRequest;\n'
+  );
+  assert.ok(
+    flagged.some((h) => h.includes('"GetTaskRequest"')),
+    `expected the namespace value access to be flagged, got: ${JSON.stringify(flagged)}`
+  );
+  const green = findTasksImports(
+    'import * as server from "@modelcontextprotocol/server";\nvoid server.Server;\n'
+  );
+  assert.deepEqual(green, []);
+});
+
+test('a STATIC bracket-key member access (`server["Task"]`) is flagged the same as the dotted form; the permitted sibling `server["Server"]` stays green - ruling out a guard that only handles dotted member access', () => {
+  const flagged = findTasksImports(
+    'import * as server from "@modelcontextprotocol/server";\nvoid server["Task"];\nvoid server["GetTaskRequest"];\n'
+  );
+  assert.ok(flagged.some((h) => h.includes('"Task"')));
+  assert.ok(flagged.some((h) => h.includes('"GetTaskRequest"')));
+  const green = findTasksImports(
+    'import * as server from "@modelcontextprotocol/server";\nvoid server["Server"];\n'
+  );
+  assert.deepEqual(green, []);
+});
+
+test("fail-closed: a computed namespace member key on a resolved server-root binding (`server[getKey()]`) is flagged with its own EXACT diagnostic, not silently skipped, and not satisfied by either sibling fail-closed diagnostic (the dynamic-import or require() specifier classes) - this guard cannot prove the key avoids a Tasks symbol, and the three fail-closed classes are independently pinned so relabeling one as another cannot go unnoticed", () => {
+  const hits = findTasksImports(
+    'import * as server from "@modelcontextprotocol/server";\n' +
+      "declare function getKey(): string;\n" +
+      "void server[getKey()];\n"
+  );
+  assert.ok(
+    hits.includes(COMPUTED_NAMESPACE_MEMBER_KEY_LABEL),
+    `expected the exact computed-namespace-member-key diagnostic, got: ${JSON.stringify(hits)}`
+  );
+  assert.ok(
+    !hits.includes(COMPUTED_DYNAMIC_IMPORT_SPECIFIER_LABEL) &&
+      !hits.includes(COMPUTED_REQUIRE_SPECIFIER_LABEL),
+    `expected neither sibling fail-closed diagnostic (dynamic-import or require specifier) to be present, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("a namespace-qualified TYPE reference (`type C = server.Task`) is flagged - a QualifiedName inside a type is the same coupling as a value-position member access; the permitted sibling `type S = server.Server` stays green - ruling out a guard that walks PropertyAccessExpression but skips QualifiedName", () => {
+  const flagged = findTasksImports(
+    'import * as server from "@modelcontextprotocol/server";\ntype C = server.Task;\n'
+  );
+  assert.ok(
+    flagged.some((h) => h.includes('"Task"') && /type position/i.test(h)),
+    `expected the type-position namespace reference to be flagged, got: ${JSON.stringify(flagged)}`
+  );
+  const green = findTasksImports(
+    'import * as server from "@modelcontextprotocol/server";\ntype S = server.Server;\n'
+  );
+  assert.deepEqual(green, []);
+});
+
+test('the type-import-QUERY form (`type T = import("@modelcontextprotocol/server").Task`) is flagged - a distinct AST shape from both the dynamic-import call and the namespace-qualified type reference', () => {
+  const flagged = findTasksImports('type T = import("@modelcontextprotocol/server").Task;\n');
+  assert.ok(
+    flagged.some((h) => h.includes('"Task"')),
+    `expected the type-import-query form to be flagged, got: ${JSON.stringify(flagged)}`
+  );
+  const green = findTasksImports('type T = import("@modelcontextprotocol/server").Server;\n');
+  assert.deepEqual(green, []);
+});
+
+// ---------------------------------------------------------------------------
+// A literal-root dynamic-import destructure is statically resolvable, so
+// it is judged on its actual symbol, never waved through merely because
+// the loading mechanism is `import()`.
+// ---------------------------------------------------------------------------
+
+test("a literal-root dynamic-import destructure (`const { GetTaskRequest } = await import(root)`) is flagged; the permitted destructure `const { Server } = await import(root)` stays green", () => {
+  const flagged = findTasksImports(
+    'const { GetTaskRequest } = await import("@modelcontextprotocol/server");\n'
+  );
+  assert.ok(
+    flagged.some((h) => h.includes('"GetTaskRequest"')),
+    `expected the destructure to be flagged, got: ${JSON.stringify(flagged)}`
+  );
+  const green = findTasksImports(
+    'const { Server } = await import("@modelcontextprotocol/server");\n'
+  );
+  assert.deepEqual(green, []);
+});
+
+test("a direct property access off an awaited literal-root dynamic import (`(await import(root)).GetTaskRequest`) is flagged too, the same as the destructure form", () => {
+  const hits = findTasksImports('(await import("@modelcontextprotocol/server")).GetTaskRequest;\n');
+  assert.ok(
+    hits.some((h) => h.includes('"GetTaskRequest"')),
+    `expected the property access off the awaited dynamic import to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Three independently-flagged fail-closed classes for anything this guard
+// cannot statically resolve - never an "or" that lets one pass.
+// ---------------------------------------------------------------------------
+
+test("fail-closed: a computed/non-literal dynamic-import specifier (`import(getName())`) is flagged with its own EXACT diagnostic, not merely something matching /computed/i - a loose regex match would also be satisfied by the sibling require()-specifier diagnostic if the dynamic-import branch were ever relabeled to emit it by mistake (a copy-paste/wrong-constant bug), so this pins the EXACT label and asserts the sibling's absence too", () => {
+  const hits = findTasksImports(
+    "declare function getName(): string;\nconst mod = await import(getName());\n"
+  );
+  assert.ok(
+    hits.includes(COMPUTED_DYNAMIC_IMPORT_SPECIFIER_LABEL),
+    `expected the exact dynamic-import fail-closed diagnostic, got: ${JSON.stringify(hits)}`
+  );
+  assert.ok(
+    !hits.includes(COMPUTED_REQUIRE_SPECIFIER_LABEL),
+    `expected the sibling require()-specifier diagnostic to be absent, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test('fail-closed: a computed/non-literal require() specifier (`require(getName())`) is flagged by its OWN EXACT, independently-pinned diagnostic - deleting this check cannot be masked by the separate global-require-acquisition ban still firing on the same line (asserted separately here too), NOR by the sibling dynamic-import diagnostic (whose text used to contain the substring "require()" too, which a loose `h.includes("require()")` check could not tell apart from this diagnostic\'s own text - see scripts/check-no-tasks-import.mjs\'s label constants, now pairwise distinct as complete strings, even though they still share substrings)', () => {
+  const hits = findTasksImports("declare function getName(): string;\nrequire(getName());\n");
+  assert.ok(
+    hits.includes(COMPUTED_REQUIRE_SPECIFIER_LABEL),
+    `expected the exact require()-specifier fail-closed diagnostic, got: ${JSON.stringify(hits)}`
+  );
+  assert.ok(
+    !hits.includes(COMPUTED_DYNAMIC_IMPORT_SPECIFIER_LABEL),
+    `expected the sibling dynamic-import diagnostic to be absent, got: ${JSON.stringify(hits)}`
+  );
+  assert.ok(
+    hits.some((h) => h.includes("references the global require")),
+    `expected the SEPARATE global-require-acquisition diagnostic to also be present, got: ${JSON.stringify(hits)}`
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Green controls proving the guard is not overbroad. Each is a required
+// member of the suite - the matrix-completeness assertion at the end of
+// this section reds if any one of them is ever deleted.
+// ---------------------------------------------------------------------------
+
+const executedGreenControls = new Set<string>();
+function markGreenControl(name: string): void {
+  executedGreenControls.add(name);
+}
+
+test("green control: the real permitted-only production shape - composited from src/server.ts's `import { ProtocolError, ProtocolErrorCode, Server, deserializeMessage }` + `import type { JSONRPCMessage, Transport }` and src/registry.ts's `import type { CallToolResult, Tool }`, all from the server root - produces zero hits", () => {
+  markGreenControl("permitted-only-production-shape");
+  const source = [
+    'import { ProtocolError, ProtocolErrorCode, Server, deserializeMessage } from "@modelcontextprotocol/server";',
+    'import type { JSONRPCMessage, Transport } from "@modelcontextprotocol/server";',
+    'import type { CallToolResult, Tool } from "@modelcontextprotocol/server";',
+    "",
+  ].join("\n");
+  assert.deepEqual(findTasksImports(source), []);
+});
+
+test("green control: a file that only MENTIONS Tasks symbols in a comment and a string literal, with no real Tasks import/export, produces zero hits - proves the guard reads the AST, not the characters", () => {
+  markGreenControl("comment-string-lookalike");
+  const source = [
+    "// GetTaskRequest handling lives elsewhere",
+    'const label = "CreateTaskResult";',
+    "",
+  ].join("\n");
+  assert.deepEqual(findTasksImports(source), []);
+});
+
+test("green control: a Tasks-NAMED symbol imported from an UNRELATED package produces zero hits - the boundary is the installed server root only, never a universal symbol-name claim", () => {
+  markGreenControl("unrelated-package-task-import");
+  const hits = findTasksImports('import { Task } from "some-unrelated-package";\n');
+  assert.deepEqual(hits, []);
+});
+
+test("green control: a permitted-symbol re-export and a bare wildcard re-export of a non-server module each produce zero hits (re-confirmed here as its own standalone suite member for the completeness assertion below)", () => {
+  markGreenControl("permitted-reexport-and-unrelated-wildcard");
+  assert.deepEqual(
+    findTasksImports('export { Server, McpServer } from "@modelcontextprotocol/server";\n'),
+    []
+  );
+  assert.deepEqual(findTasksImports('export * from "./local-module.js";\n'), []);
+});
+
+test("suite-completeness: the four standalone green controls above each actually ran - the absence of any one reds this assertion, so silently deleting a green control cannot go unnoticed", () => {
+  const required = [
+    "permitted-only-production-shape",
+    "comment-string-lookalike",
+    "unrelated-package-task-import",
+    "permitted-reexport-and-unrelated-wildcard",
+  ];
+  const missing = required.filter((name) => !executedGreenControls.has(name));
+  assert.deepEqual(
+    missing,
+    [],
+    `expected every required green control to have run, missing: ${JSON.stringify(missing)}`
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The enumerated Tasks export set is DERIVED, never hand-listed: this
+// parity test re-derives it independently, straight from the pinned
+// @modelcontextprotocol/server package's real dist/index.d.mts (via the
+// real TypeScript parser, not a regex over the file's raw text), and
+// asserts the guard's own exported TASKS_SYMBOLS deep-equals it - so
+// under- or over-enumerating the guard's list reds this test.
+// ---------------------------------------------------------------------------
+
+/** Parses the pinned server package's root `.d.mts` and returns every PUBLIC export name (after `as`-aliasing) matching /Task/i, straight off its final `export { ... }` statement - real AST traversal, not string matching. */
+function deriveTasksExportNamesFromPinnedDeclarationFile(): string[] {
+  const declarationFilePath = path.join(SERVER_PACKAGE_DIST, "index.d.mts");
+  const text = readFileSync(declarationFilePath, "utf8");
+  const sourceFile = ts.createSourceFile(declarationFilePath, text, ts.ScriptTarget.Latest, true);
+  const names: string[] = [];
+  sourceFile.forEachChild((node) => {
+    if (
+      ts.isExportDeclaration(node) &&
+      !node.moduleSpecifier &&
+      node.exportClause &&
+      ts.isNamedExports(node.exportClause)
+    ) {
+      for (const element of node.exportClause.elements) {
+        names.push(element.name.text);
+      }
+    }
+  });
+  return names.filter((name) => /Task/i.test(name));
+}
+
+test("parity: the guard's TASKS_SYMBOLS deep-equals the /Task/i root-export set re-derived, independently, from the pinned @modelcontextprotocol/server package's real dist/index.d.mts - under- or over-enumeration reds this test", () => {
+  const derived = new Set(deriveTasksExportNamesFromPinnedDeclarationFile());
+  assert.ok(
+    derived.size > 0,
+    "sanity: the derivation itself must find something in the real .d.mts"
+  );
+  assert.deepEqual(
+    TASKS_SYMBOLS,
+    derived,
+    `guard TASKS_SYMBOLS diverges from the pinned package's real /Task/i export set.\nguard: ${JSON.stringify([...TASKS_SYMBOLS].sort())}\nderived: ${JSON.stringify([...derived].sort())}`
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Specifier-resolution ownership: the guarded root is matched by real
+// PACKAGE IDENTITY, not naive realpath-of-the-resolved-file equality - a
+// relative/aliased specifier resolving to the SAME installed package is
+// judged the same as the bare specifier text, and the three real,
+// differently-built entry forms of the identical package version
+// (index.cjs, index.mjs, a file:// URL) all collapse to one identity.
+// These need a REAL file on a REAL path (never the OS tmpdir) so Node's
+// actual resolver can walk up to this repo's own node_modules.
+// ---------------------------------------------------------------------------
+
+test("resolver-equivalence: a RELATIVE specifier resolving to the installed @modelcontextprotocol/server root is flagged for a Tasks symbol; an unrelated REAL package that happens to export a symbol NAMED exactly like a guarded Tasks symbol (Task) stays green - specifically because its package IDENTITY differs from the guarded root, not because the symbol name fails to match. A green control built from a symbol that was never Task-named in the first place (as this test used to use) cannot tell a correct identity check apart from one mutated to treat ANY resolvable package as the guarded root - only a REAL, resolvable, differently-identified package that legitimately exports a Task-named symbol can.", () => {
+  const dir = buildRepoRootScratchSrc({
+    "node_modules/ghantika-fixture-unrelated-task-export/package.json": JSON.stringify(
+      { name: "ghantika-fixture-unrelated-task-export", version: "1.0.0", main: "index.js" },
+      null,
+      2
+    ),
+    "node_modules/ghantika-fixture-unrelated-task-export/index.js":
+      "// A REAL, resolvable scratch package - deliberately a DIFFERENT\n" +
+      "// package identity than @modelcontextprotocol/server - that\n" +
+      '// happens to export a symbol named exactly "Task" (a real\n' +
+      "// TASKS_SYMBOLS member), so this fixture proves the guard\n" +
+      "// discriminates by PACKAGE IDENTITY rather than by whether a\n" +
+      "// specifier merely resolves to something real.\n" +
+      'module.exports.Task = "unrelated task marker - not the guarded server root";\n',
+  });
+  try {
+    const fixturePath = path.join(dir, "tools", "mutant.ts");
+    mkdirSync(path.dirname(fixturePath), { recursive: true });
+    writeFileSync(
+      fixturePath,
+      'import { GetTaskRequest } from "../../node_modules/@modelcontextprotocol/server/dist/index.mjs";\n'
+    );
+    const violations = checkNoTasksImport(dir);
+    assert.ok(
+      violations.some((v) => v.specifier.includes('"GetTaskRequest"')),
+      `expected the relative specifier to be flagged, got: ${JSON.stringify(violations)}`
+    );
+
+    const greenPath = path.join(dir, "tools", "green.ts");
+    writeFileSync(
+      greenPath,
+      'import { Task } from "ghantika-fixture-unrelated-task-export";\nvoid Task;\n'
+    );
+    const greenViolations = checkNoTasksImport(dir).filter((v) => v.file.includes("green.ts"));
+    assert.deepEqual(
+      greenViolations,
+      [],
+      `expected the unrelated real package's Task-named export to stay green - a package-identity check mutated to "any resolvable package == the server root" (return identity !== undefined) would wrongly flag this, got: ${JSON.stringify(greenViolations)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('package-identity discrimination is by real ROOT, not merely by NAME string: a vendored/nested lookalike package that declares the SAME literal name ("@modelcontextprotocol/server") but resolves to a totally different real root stays green for a Task-named symbol - proving the guard compares identity.root (not just identity.name), a distinct dimension from both the different-name case above and the package-root-normalization case elsewhere in this file (the same package reached via different entry files)', () => {
+  const dir = buildRepoRootScratchSrc({
+    "vendor/@modelcontextprotocol/server/package.json": JSON.stringify(
+      { name: "@modelcontextprotocol/server", version: "0.0.1-lookalike", main: "index.js" },
+      null,
+      2
+    ),
+    "vendor/@modelcontextprotocol/server/index.js":
+      "// A DIFFERENT real package that happens to declare the identical\n" +
+      "// literal name as the guarded root, but lives at a completely\n" +
+      "// different real path (never installed under node_modules at\n" +
+      "// all) - proves identity.root, not merely identity.name, is what\n" +
+      "// this guard actually compares.\n" +
+      'module.exports.Task = "lookalike vendored copy, not the pinned real package";\n',
+  });
+  try {
+    const fixturePath = path.join(dir, "tools", "lookalike.ts");
+    mkdirSync(path.dirname(fixturePath), { recursive: true });
+    writeFileSync(
+      fixturePath,
+      'import { Task } from "../vendor/@modelcontextprotocol/server/index.js";\nvoid Task;\n'
+    );
+    const violations = checkNoTasksImport(dir).filter((v) => v.file.includes("lookalike.ts"));
+    assert.deepEqual(
+      violations,
+      [],
+      `expected the same-named-but-different-root vendored lookalike to stay green - a check comparing identity.name alone (dropping the root comparison) would wrongly flag this, got: ${JSON.stringify(violations)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('package-root normalization: three real resolution axes - a specifier resolving to the package\'s index.cjs, one resolving to its index.mjs, and one resolving via a file:// URL - are ALL treated as the SAME server package root and ALL flagged for a Tasks symbol; a naive realpath-of-the-resolved-file guard would split these into three different "roots"', () => {
+  const dir = buildRepoRootScratchSrc({});
+  try {
+    const cjsPath = path.join(dir, "tools", "cjs-axis.ts");
+    mkdirSync(path.dirname(cjsPath), { recursive: true });
+    writeFileSync(
+      cjsPath,
+      'import { GetTaskRequest } from "../../node_modules/@modelcontextprotocol/server/dist/index.cjs";\n'
+    );
+
+    const mjsPath = path.join(dir, "tools", "mjs-axis.ts");
+    writeFileSync(
+      mjsPath,
+      'import { GetTaskRequest } from "../../node_modules/@modelcontextprotocol/server/dist/index.mjs";\n'
+    );
+
+    const fileUrl = pathToFileURL(path.join(SERVER_PACKAGE_DIST, "index.cjs")).href;
+    const fileUrlPath = path.join(dir, "tools", "file-url-axis.ts");
+    writeFileSync(fileUrlPath, `import { GetTaskRequest } from "${fileUrl}";\n`);
+
+    const violations = checkNoTasksImport(dir);
+    for (const [label, relFile] of [
+      ["index.cjs axis", "cjs-axis.ts"],
+      ["index.mjs axis", "mjs-axis.ts"],
+      ["file:// URL axis", "file-url-axis.ts"],
+    ] as const) {
+      assert.ok(
+        violations.some(
+          (v) => v.file.includes(relFile) && v.specifier.includes('"GetTaskRequest"')
+        ),
+        `expected the ${label} to be flagged as the same package root, got: ${JSON.stringify(violations)}`
+      );
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The mechanism used to LOAD a module never changes what it resolves to -
+// a require(...) call, or a require obtained via createRequire(...), is
+// caught the same way a static/dynamic import is. This whole section is
+// UNCHANGED behavior from before the symbol-aware rewrite above: this
+// codebase is frozen ESM end to end, so CommonJS interop (createRequire,
+// the global require/eval/Function/module/Reflect, .constructor property
+// access, and Object.getOwnPropertyDescriptor acquisition) is banned
+// outright, independent of Tasks entirely - see
+// scripts/lib/ts-ast.mjs's findCreateRequireImports for the whole design.
+// Any argument string below is an arbitrary, unrelated placeholder - none
+// of these rows are testing Tasks-symbol detection.
+// ---------------------------------------------------------------------------
+
+test("a require(...) call is caught at the require reference itself, independent of what it is called with", () => {
+  const hits = findTasksImports('require("some-other-package/loaded-path");\n');
+  assert.ok(
+    hits.some((h) => h.includes("references the global require")),
+    `expected the require reference itself to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("calling createRequire(...) at all is flagged as forbidden, independent of what its returned function is used for - resolved at the IMPORT BINDING itself (see findCreateRequireImports's own doc comment in scripts/lib/ts-ast.mjs), not by matching the call's callee text, which could never see past a renamed import alias", () => {
   const hits = findTasksImports(
     'import { createRequire } from "node:module";\nconst require = createRequire(import.meta.url);\n'
   );
@@ -135,11 +628,11 @@ test("form 7: calling createRequire(...) at all is flagged as forbidden, indepen
   );
 });
 
-test("createRequire(...) imported from node:module is flagged at the import site; the local require it produces is then judged as the local callable it is, so a subsequent call through it - even with a forbidden Tasks specifier - adds no second hit, per the same local-binding rule that keeps an ordinary local require green", () => {
+test("createRequire(...) imported from node:module is flagged at the import site; the local require it produces is then judged as the local callable it is, so a subsequent call through it adds no second hit, per the same local-binding rule that keeps an ordinary local require green", () => {
   const source = [
     'import { createRequire } from "node:module";',
     "const require = createRequire(import.meta.url);",
-    'require("@modelcontextprotocol/sdk/experimental/tasks");',
+    'require("some-other-package/loaded-path");',
     "",
   ].join("\n");
   const hits = findTasksImports(source);
@@ -165,17 +658,17 @@ test("a require(...) call with a computed/non-literal specifier fails CLOSED, th
   );
 });
 
-test("green control: a require(...) call to a legitimate, unrelated specifier produces no TASKS-import hit (the bare require reference is still its own, separate violation)", () => {
+test("green control: a require(...) call to a legitimate, unrelated specifier produces no unexpected hit (the bare require reference is still its own, separate violation)", () => {
   const hits = findTasksImports('require("node:path");\n');
   assert.ok(
-    !hits.includes("node:path"),
-    `expected no Tasks-specifier-shaped hit, got: ${JSON.stringify(hits)}`
+    !hits.some((h) => h.includes('"node:path"')),
+    `expected no Tasks-shaped hit naming this specifier, got: ${JSON.stringify(hits)}`
   );
 });
 
-test("green control: a require(...) call through a LOCAL binding - a plain function that merely happens to be named require, never Node's real CommonJS require - is judged as the local callable: a forbidden-looking specifier passed to it is never treated as a real import", () => {
+test("green control: a require(...) call through a LOCAL binding - a plain function that merely happens to be named require, never Node's real CommonJS require - is judged as the local callable: its argument is never treated as a real import", () => {
   const hits = findTasksImports(
-    'function require(x: string) { return x; }\nrequire("@modelcontextprotocol/sdk/experimental/tasks");\n'
+    'function require(x: string) { return x; }\nrequire("some-other-package/loaded-path");\n'
   );
   assert.deepEqual(
     hits,
@@ -198,18 +691,17 @@ test("green control: a file with neither require nor createRequire at all stays 
 // ImportDeclaration node: any route that can deliver createRequire (or the
 // node:module namespace it lives on) is in scope, however it was obtained -
 // including a dynamic `await import("node:module")` destructured for
-// createRequire, which is just as executable a route to the forbidden
-// Tasks subpath at runtime as a static import. Each row below is a
-// distinct entry route, each independently caught, plus green controls
-// proving legitimate dynamic imports and an unrelated property named
-// "require" stay clean.
+// createRequire, which is just as executable a route as a static import.
+// Each row below is a distinct entry route, each independently caught, plus
+// green controls proving legitimate dynamic imports and an unrelated
+// property named "require" stay clean.
 // ---------------------------------------------------------------------------
 
 test("a dynamic import of node:module, destructured for createRequire, is caught - the executable survivor that motivated this fix", () => {
   const hits = findTasksImports(
     'const { createRequire: weaveBridge } = await import("node:module");\n' +
       "const retrieveUnit = weaveBridge(import.meta.url);\n" +
-      'retrieveUnit("@modelcontextprotocol/sdk/experimental/tasks");\n'
+      'retrieveUnit("some-other-package/loaded-path");\n'
   );
   assert.ok(
     hits.some((h) => h.includes("dynamically imports node:module")),
@@ -255,9 +747,7 @@ test('a bare CommonJS require("node:module") call is caught - reaches createRequ
 });
 
 test("module.require(...) is caught - Node's per-module CommonJS require, a second CommonJS-interop primitive distinct from the global require", () => {
-  const hits = findTasksImports(
-    'module.require("@modelcontextprotocol/sdk/experimental/tasks");\n'
-  );
+  const hits = findTasksImports('module.require("some-other-package/loaded-path");\n');
   assert.ok(
     hits.some((h) => h.includes("references the global module")),
     `expected the module-require binding hit, got: ${JSON.stringify(hits)}`
@@ -291,8 +781,7 @@ test("the static aliased-import form from the prior fix still regresses to RED -
 // module.require(...) is a single primitive regardless of how the property
 // access is spelled or wrapped - dotted, computed/bracket, and any depth of
 // parenthesization all denote it, and the guard's own contract already said
-// spelling must not change the result. These two rows are the executable
-// survivors that showed the guard was not living up to that contract yet.
+// spelling must not change the result.
 // ---------------------------------------------------------------------------
 
 test("module.require(...) is caught via computed/bracket property access, not just the dotted spelling", () => {
@@ -320,16 +809,14 @@ test("module.require(...) is caught through a parenthesized callee, not just the
 // ---------------------------------------------------------------------------
 // eval(...) and Function(...) are prohibited OUTRIGHT - flagged
 // unconditionally on their argument, never analysed, because what either
-// produces is undecidable in general. Both are real, executable routes to
-// obtaining node:module dynamically and reaching the forbidden Tasks
-// subpath from it.
+// produces is undecidable in general.
 // ---------------------------------------------------------------------------
 
 test("eval(...) used to obtain a dynamic loader is caught, unconditionally on its argument", () => {
   const hits = findTasksImports(
     "const moduleDeck = await eval('import(\"node:module\")');\n" +
       "const pull = moduleDeck.createRequire(import.meta.url);\n" +
-      'pull("@modelcontextprotocol/sdk/experimental/tasks");\n'
+      'pull("some-other-package/loaded-path");\n'
   );
   assert.ok(
     hits.some((h) => h.includes("references the global eval")),
@@ -342,7 +829,7 @@ test("Function(...) used to construct a dynamic loader is caught, unconditionall
     "const importModule = Function('return import(\"node:module\")');\n" +
       "const moduleDeck = await importModule();\n" +
       "const pull = moduleDeck.createRequire(import.meta.url);\n" +
-      'pull("@modelcontextprotocol/sdk/experimental/tasks");\n'
+      'pull("some-other-package/loaded-path");\n'
   );
   assert.ok(
     hits.some((h) => h.includes("references the global Function")),
@@ -357,12 +844,9 @@ test("green control: a bare eval(...) call with an argument unrelated to any loa
 
 // ---------------------------------------------------------------------------
 // Type-only knowledge of createRequire is permitted; only a binding that can
-// come to hold the runtime capability is forbidden. A statement-level
-// `import type` (or an inline `type` specifier) is fully erased by
-// TypeScript and cannot yield a callable loader under any circumstance -
-// flagging it would be over-blocking, a failure in its own right. A MIXED
-// clause must still red on its value specifier: the type modifier is
-// checked per-specifier, never treated as clearing the whole clause.
+// come to hold the runtime capability is forbidden - this is the createRequire
+// side of this file's own architectural-vs-capability distinction (see
+// scripts/check-no-tasks-import.mjs's header).
 // ---------------------------------------------------------------------------
 
 test("green control: a statement-level 'import type' of createRequire is never flagged - fully erased, no runtime capability", () => {
@@ -409,14 +893,7 @@ test("green control: an unrelated object's own .require(...) method is never con
 // ---------------------------------------------------------------------------
 // The forbidden globals are resolved by real lexical scope, not by name -
 // a LOCAL binding that merely happens to be spelled the same as one of the
-// four never carries the capability. `globalThis` is covered here
-// specifically because a module/block-scope `const globalThis = ...`
-// resolves through a different code path than an ordinary parameter shadow
-// (see ts-ast.mjs's own doc comment on `isUnshadowedGlobalThisReference`).
-// A LOCAL require/createRequire binding is judged as the local callable it
-// is - its argument's shape (even a sibling-looking or Tasks-looking
-// literal) is never treated as a real specifier once the callee itself is
-// shadowed, matching the same green-control principle throughout.
+// four never carries the capability.
 // ---------------------------------------------------------------------------
 
 test("green control: a local const named globalThis, holding harmless properties named eval/Function/require, is never confused with the real global object", () => {
@@ -454,12 +931,7 @@ test("green control: typeof module.require used AS A TYPE is fully erased and ca
 // ---------------------------------------------------------------------------
 // A destructured PARAMETER's own DEFAULT value uses the same `.initializer`
 // field a VariableDeclaration's initializer does, for a different purpose -
-// `function f({ eval } = globalThis)` fires the default whenever a caller
-// omits the argument, so it is exactly as real an acquisition as a
-// variable declaration's initializer, not a hypothetical. Permanent
-// regression coverage for both directions in one place, so the parameter
-// extension can never quietly broaden into flagging a harmless default or
-// a catch binding (which has no default at all to check against).
+// permanent regression coverage for both directions in one place.
 // ---------------------------------------------------------------------------
 
 test("a destructured parameter DEFAULTED from the real globalThis is an acquisition, the same as a variable declaration's initializer", () => {
@@ -492,7 +964,7 @@ test("green control: a catch clause's destructuring pattern has no initializer t
 
 test("green control: a require(...) call through a local binding with a SIBLING-looking literal is judged as the local callable, not a real module load", () => {
   const hits = findTasksImports(
-    'const require = (x: string) => x;\nrequire("@modelcontextprotocol/sdk/experimental/tasks");\n'
+    'const require = (x: string) => x;\nrequire("some-other-package/loaded-path");\n'
   );
   assert.deepEqual(hits, []);
 });
@@ -520,15 +992,11 @@ test("green control: createRequire imported from a package OTHER than node:modul
 
 // ---------------------------------------------------------------------------
 // process.getBuiltinModule, the bare Reflect global, and the .constructor
-// property are all closed as of this file - see findCreateRequireImports's
-// own doc comment for the full acquisition-site design and why banning the
-// whole Reflect/.constructor surface (rather than pattern-matching one
-// demonstrated combination of them) is what actually closes that specific
-// class, plus why the broader reflective/structural category is not
-// claimed exhausted by doing so.
+// property are all closed - see findCreateRequireImports's own doc comment
+// for the full acquisition-site design.
 // ---------------------------------------------------------------------------
 
-test("REGRESSION: obtaining the Function constructor via an ordinary function object's own .constructor property IS now detected", () => {
+test("REGRESSION: obtaining the Function constructor via an ordinary function object's own .constructor property IS detected", () => {
   const hits = findTasksImports('const F = (() => 1).constructor;\nF("return 1");\n');
   assert.ok(
     hits.some((hit) => hit.includes(".constructor")),
@@ -536,7 +1004,7 @@ test("REGRESSION: obtaining the Function constructor via an ordinary function ob
   );
 });
 
-test('REGRESSION: obtaining the global eval via Reflect.get(globalThis, "eval") IS now detected - at the bare Reflect reference itself', () => {
+test('REGRESSION: obtaining the global eval via Reflect.get(globalThis, "eval") IS detected - at the bare Reflect reference itself', () => {
   const hits = findTasksImports('const e = Reflect.get(globalThis, "eval");\ne("1");\n');
   assert.ok(
     hits.some((hit) => hit.includes("references the global Reflect")),
@@ -583,16 +1051,8 @@ test("green control: an object literal's own 'constructor' property KEY (definin
 
 // ---------------------------------------------------------------------------
 // globalThis/process ONE-HOP ALIAS - a local binding that comes to hold the
-// real globalThis/process, either via its own declaration initializer or a
-// later bare reassignment, is exactly as real an acquisition route as the
-// bare name would have been. REGRESSION coverage: a prior version of the
-// resolution helper only recognized `symbol === undefined` as the signal
-// that a `globalThis` reference is genuinely unshadowed, but the real
-// checker returns a TRUTHY symbol with an EMPTY `.declarations` array for
-// that exact case - so the direct, non-aliased form (`globalThis.eval(...)`
-// with no local shadow anywhere) silently stopped being detected at all.
-// That regression is caught here alongside the new alias coverage, since
-// both routes share the same underlying resolution function.
+// real globalThis/process is exactly as real an acquisition route as the
+// bare name would have been.
 // ---------------------------------------------------------------------------
 
 test("REGRESSION: a direct, unshadowed globalThis.eval(...) reference (no alias, no local shadow) is detected", () => {
@@ -663,7 +1123,7 @@ test("green control: an unrelated bare reassignment (never process/globalThis) i
   assert.deepEqual(hits, []);
 });
 
-test("documented boundary: a TWO-HOP alias chain is not chased (const g = globalThis; const h = g; h.eval(x)) - tracked as OPEN-1 in test/loader-escape-matrix.test.ts; guard logic is unchanged, this stays green by design", () => {
+test("documented boundary: a TWO-HOP alias chain is not chased (const g = globalThis; const h = g; h.eval(x)) - guard logic is unchanged, this stays green by design", () => {
   const hits = findTasksImports("const g = globalThis;\nconst h = g;\nh.eval('1');\n");
   assert.deepEqual(hits, []);
 });
@@ -671,9 +1131,7 @@ test("documented boundary: a TWO-HOP alias chain is not chased (const g = global
 // ---------------------------------------------------------------------------
 // Object.getOwnPropertyDescriptor - a DESCRIPTOR READ reaches the same value
 // a direct property access would, without ever writing the target's key as
-// a real property-access AST node - an independent adversarial pass proved
-// both rows below guard-green and runtime-executing before this guard
-// recognized Object.getOwnPropertyDescriptor as an acquisition site at all.
+// a real property-access AST node.
 // ---------------------------------------------------------------------------
 
 test('Object.getOwnPropertyDescriptor(globalThis, "eval")?.value reaches the real eval through a descriptor read, not a direct property access, and is caught', () => {
@@ -750,17 +1208,15 @@ test("green control: a descriptor read for a harmless property on the real proce
 });
 
 // ---------------------------------------------------------------------------
-// process.getBuiltinModule - REGRESSION: an executable fixture demonstrated
-// this route reaches createRequire via a supported Node builtin-module API
-// with no import/require syntax naming "node:module" anywhere - previously
-// undetected, now flagged at the property-access acquisition site the same
-// way the four bare globals are.
+// process.getBuiltinModule - reaches createRequire via a supported Node
+// builtin-module API with no import/require syntax naming "node:module"
+// anywhere - flagged at the property-access acquisition site.
 // ---------------------------------------------------------------------------
 
-test('REGRESSION: process.getBuiltinModule("node:module").createRequire(...) IS now detected (prior out-of-scope behavior, now closed by an executable fixture)', () => {
+test('process.getBuiltinModule("node:module").createRequire(...) is detected', () => {
   const hits = findTasksImports(
     'const r = process.getBuiltinModule("node:module").createRequire(import.meta.url);\n' +
-      'r("@modelcontextprotocol/sdk/experimental/tasks");\n'
+      'r("some-other-package/loaded-path");\n'
   );
   assert.ok(
     hits.some((hit) => hit.includes("getBuiltinModule")),
@@ -823,13 +1279,6 @@ test("green control: every OTHER property of the real process global stays compl
 });
 
 test("green control: process.getBuiltinModule called with a DIFFERENT builtin (not node:module) is still flagged at the acquisition site - the property reference itself is the violation, independent of the argument", () => {
-  // This is deliberately NOT a green control in the usual sense: the
-  // acquisition-site design (see ts-ast.mjs's own header) flags the bare
-  // process.getBuiltinModule REFERENCE, unconditionally on what it is
-  // later called with - the same principle that makes `const r = require;
-  // r("anything")` a violation at `r`'s own definition, not at the call.
-  // A real green control for "process.getBuiltinModule genuinely unused"
-  // is the passing test suite everywhere this string never appears.
   const hits = findTasksImports('const fsModule = process.getBuiltinModule("fs");\n');
   assert.ok(
     hits.some((hit) => hit.includes("getBuiltinModule")),
@@ -839,10 +1288,7 @@ test("green control: process.getBuiltinModule called with a DIFFERENT builtin (n
 
 // ---------------------------------------------------------------------------
 // Six further acquisition shapes, each an idiomatic variant of a route
-// already closed above rather than a new mechanism - permanent regression
-// coverage for each specific spelling, since the acquisition-site checks
-// above were verified against a battery of fixtures but these six shapes
-// were not yet represented as their own dedicated test.
+// already closed above rather than a new mechanism.
 // ---------------------------------------------------------------------------
 
 test("a destructured getBuiltinModule reached DIRECTLY off process (no intermediate alias variable) is caught the same way an aliased base is - const { getBuiltinModule } = process", () => {
