@@ -110,9 +110,17 @@ export const POSIX_DEFAULT_PATH = "/usr/bin:/bin";
  * - `USERPROFILE` (Windows only): the closest Windows analogue to POSIX's
  *   `HOME`, for the same class of tools that expect a home directory.
  *
- * `env.mode: "replace"` uses ONLY the caller's `env.vars` - this base is
- * never applied in that mode, so replace mode still inherits no server
- * env at all.
+ * `env.mode: "replace"` uses ONLY the caller's `env.vars` - this curated
+ * base is never applied in that mode, so nothing THIS FUNCTION adds ever
+ * reaches a replace-mode child. That is not the same claim as "a
+ * replace-mode child's real environment is nothing but the caller's vars,
+ * on every platform" though: on Windows, a layer entirely outside this
+ * function (and outside this codebase's control at all - see
+ * `WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES`'s own docs) force-injects a
+ * separate, smaller, NAMED set of variables into every spawned child
+ * regardless of `env.mode`. Replace mode's honest contract on Windows is
+ * "the caller's vars, plus that one small fixed exception" - not "the
+ * caller's vars alone."
  */
 function computeMinimalBaseEnv(): Record<string, string> {
   if (process.platform === "win32") {
@@ -187,6 +195,17 @@ export function resolveCaseInsensitivePathKey(
  * matches" when building a child's environment on Windows, so passing the
  * caller's keys through exactly as given (rather than normalizing them
  * ourselves) is what lets Node's own documented, correct handling apply.
+ *
+ * What THIS FUNCTION returns for `mode: "replace"` is exactly `{ ...vars }`
+ * on every platform this codebase runs on - that part is not
+ * platform-conditional, and never will be (there is no reasonable way to
+ * strip an already-injected variable back out of a process after it has
+ * been created). What a REAL Windows child actually ends up with can still
+ * differ from this function's own return value, because Node/libuv's own
+ * spawn machinery downstream of `spawnManaged` does its own Windows-only
+ * environment-block construction that this function has no visibility
+ * into and no way to prevent - see `WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES`
+ * for exactly what that machinery adds and why.
  */
 export function buildChildEnv(
   mode: EnvMode,
@@ -197,6 +216,86 @@ export function buildChildEnv(
   }
   return { ...computeMinimalBaseEnv(), ...vars };
 }
+
+/**
+ * `env.mode: "replace"`'s contract - "the caller's `vars`, and nothing
+ * else" (see `buildChildEnv`'s own docs) - is unconditionally true on
+ * POSIX: verified against libuv's real POSIX spawn path
+ * (`deps/uv/src/unix/process.c`, both the `fork`+`execvp` branch and the
+ * `posix_spawn` branch), which passes whatever `envp` array it is given
+ * straight to the exec call with no additions of its own, no matter what
+ * that array does or doesn't contain.
+ *
+ * On Windows it is NOT unconditionally true, and this codebase does not
+ * pretend otherwise. This is the fixed, NAMED set of environment-variable
+ * NAMES that Node's own process-spawning dependency, libuv, force-injects
+ * into a Windows child - regardless of `env.mode`, regardless of what this
+ * codebase passes to `child_process.spawn`, and with no way for this
+ * codebase to opt out short of not using `child_process` at all.
+ *
+ * SOURCED, not guessed - read directly from libuv's real, current source:
+ * `make_program_env()` in `src/win/process.c`
+ * (https://github.com/libuv/libuv/blob/v1.x/src/win/process.c), the same
+ * file Node.js itself vendors at `deps/uv/src/win/process.c`. Its own
+ * `required_vars` table carries this comment, preserved verbatim: "Windows
+ * has a few 'essential' environment variables. winsock will fail to
+ * initialize if SYSTEMROOT is not defined; some APIs make reference to
+ * TEMP. SYSTEMDRIVE is probably also important. We therefore ensure that
+ * these get defined if the input environment block does not contain any
+ * values for them." That table lists exactly the eleven names below. For
+ * each one NOT already present in the env block being spawned (matched
+ * CASE-INSENSITIVELY, via `CompareStringOrdinal(..., TRUE)` - Windows env
+ * keys are case-insensitive, the same fact `resolveCaseInsensitivePathKey`
+ * documents elsewhere in this file), libuv fills it in from
+ * `GetEnvironmentVariableW` called on the SPAWNING process - i.e. from
+ * THIS ghantika server's own `process.env`, never a fixed OS-wide default
+ * - and only if the spawning process actually has that variable set at all
+ * (`GetEnvironmentVariableW` returning a zero-length result means libuv's
+ * own loop skips adding it, per that function's own `if (var_size != 0)`
+ * guard). So the real injected set on any one actual run is this list
+ * FILTERED to whichever of these names the ghantika server process itself
+ * happens to have set - never more than this list, and never a name this
+ * list doesn't contain.
+ *
+ * Deliberately does NOT include `ComSpec`, even though an informal
+ * description of this behavior might reach for it alongside `SystemRoot` -
+ * `ComSpec` is not in libuv's `required_vars` table. Where `ComSpec`
+ * actually matters is a different mechanism entirely: Node's own
+ * `shell: true` handling reads it (falling back to `process.env.ComSpec`,
+ * then `"cmd.exe"`) purely to decide WHICH BINARY to launch as the shell -
+ * that has nothing to do with which variables end up IN a spawned child's
+ * own environment, and `spawnManaged`'s plain `argv` path (what this
+ * constant, and the empirical test that checks it, are about) never goes
+ * through that code at all.
+ *
+ * Honesty about how this was actually verified: this project's own
+ * development happens on macOS, with no Windows machine to run a real
+ * spawn-and-inspect probe against while authoring this list - so the list
+ * itself is sourced from reading libuv's real code (cited above), not from
+ * a live measurement taken here. The corresponding live measurement is
+ * written, not merely planned: `test/e2e-server.test.ts` has a Windows-only
+ * test (gated on `process.platform === "win32"`, skipped everywhere else)
+ * that spawns a real child and reads back its real `process.env`, checked
+ * against exactly this list. There is currently no Windows leg in this
+ * repo's CI matrix at all (temporarily removed; see CHANGELOG), so that
+ * test is not exercised against a real Windows host anywhere right now -
+ * it would run for real the moment a Windows CI leg exists again, or on
+ * anyone's own Windows machine today, but until then this constant's list
+ * is sourced from reading libuv's code, not from a live CI measurement.
+ */
+export const WINDOWS_LIBUV_REQUIRED_ENV_VAR_NAMES: readonly string[] = [
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "LOGONSERVER",
+  "PATH",
+  "SYSTEMDRIVE",
+  "SYSTEMROOT",
+  "TEMP",
+  "USERDOMAIN",
+  "USERNAME",
+  "USERPROFILE",
+  "WINDIR",
+];
 
 // ---------------------------------------------------------------------------
 // Executable resolution (the "bad binary" pre-flight check)
