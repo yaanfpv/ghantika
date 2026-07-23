@@ -13,6 +13,7 @@ import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/sp
 // pgrep/shell-tree fixtures below - see test/harness.ts's own docs.
 import {
   buildWindowsChildTreeArgv,
+  forceKillPidBestEffort,
   parsesAsPgid,
   waitForFile,
   waitForWindowsTaskState,
@@ -39,13 +40,13 @@ import {
  * `process.kill()` unconditionally force-terminates the target regardless
  * of signal name - verified against libuv's own win/process.c `uv_kill`),
  * so `process.on('SIGTERM'/'SIGINT')` never runs there, and this codebase's
- * shutdown-cleanup/reap path never gets a chance to either. That gap is
- * tracked as its own story and is DELIBERATELY left alone here (both the
- * two plain "reaches the real cleanup path" tests near the top of this
- * file, their mutation control, and the SIGTERM-/SIGINT-triggered reap
- * tests further down all still exercise the exact behavior this codebase
- * currently does NOT have on Windows) - fixing test fixtures around it
- * would silently mask a real gap rather than name it.
+ * shutdown-cleanup/reap path never gets a chance to either. That is a
+ * real, separately-scoped product gap and is DELIBERATELY left alone here
+ * (both the two plain "reaches the real cleanup path" tests near the top
+ * of this file, their mutation control, and the SIGTERM-/SIGINT-triggered
+ * reap tests further down all still exercise the exact behavior this
+ * codebase currently does NOT have on Windows) - fixing test fixtures
+ * around it would silently mask a real gap rather than name it.
  */
 
 // The stdin-EOF-triggered reap test below (unlike its SIGTERM/SIGINT
@@ -286,72 +287,6 @@ test(
   }
 );
 
-/**
- * The Windows-native counterpart to `spawnServerWithLiveTree` above: spawns
- * a real server, hands it a real `run` job built from real `child_process`
- * spawns (see `test/helpers/windowsChildTree.mjs`'s own docs) - a leader
- * process plus `descendantCount` real leaf descendants, so the whole tree,
- * not just the one direct child, must be reaped - confirms every pid is
- * genuinely alive via a real external `tasklist` lookup BEFORE ever
- * triggering shutdown, then hands back the server and every pid (leader
- * first, then each descendant) for the caller to trigger its own shutdown
- * path against and verify.
- */
-async function spawnServerWithLiveWindowsTree(): Promise<{
-  server: SpawnedServer;
-  pids: number[];
-}> {
-  const server = spawnServer();
-  await completeHandshake(server);
-
-  const dir = makeTempDir();
-  const leaderMarker = path.join(dir, "leader-pid.txt");
-  const descendantCount = 2; // matches spawnServerWithLiveTree's own "shell + 2 sleeps" shape
-
-  server.send({
-    jsonrpc: "2.0",
-    id: 710,
-    method: "tools/call",
-    params: {
-      name: "run",
-      arguments: { command: buildWindowsChildTreeArgv(leaderMarker, descendantCount, dir) },
-    },
-  });
-  const runLine = await server.nextLine();
-  const runBody = runLine.parsed as RunResponseBody;
-  assert.equal(runBody.error, undefined);
-  assert.notEqual(runBody.result?.isError, true, `run() must succeed: ${JSON.stringify(runBody)}`);
-
-  const leaderPidText = await waitForFile(leaderMarker, { until: parsesAsPgid });
-  const leaderPid = Number(leaderPidText.trim());
-  assert.ok(
-    Number.isInteger(leaderPid) && leaderPid > 0,
-    `expected a real numeric pid from the leader marker file, got: ${JSON.stringify(leaderPidText)}`
-  );
-  const descendantPids = await Promise.all(
-    Array.from({ length: descendantCount }, async (_unused, i) => {
-      const text = await waitForFile(path.join(dir, `child-${i}-pid.txt`), { until: parsesAsPgid });
-      const pid = Number(text.trim());
-      assert.ok(
-        Number.isInteger(pid) && pid > 0,
-        `expected a real numeric pid from descendant ${i}'s marker file, got: ${JSON.stringify(text)}`
-      );
-      return pid;
-    })
-  );
-  const pids = [leaderPid, ...descendantPids];
-
-  for (const pid of pids) {
-    const alive = await waitForWindowsTaskState(pid, true, 3000);
-    assert.ok(
-      alive,
-      `expected pid ${pid} (leader or descendant) alive BEFORE shutdown, tasklist did not see it`
-    );
-  }
-
-  return { server, pids };
-}
-
 test(
   "WINDOWS COUNTERPART: stdin EOF reaps a REAL live job's WHOLE process tree - zero survivors confirmed by a real external tasklist lookup per pid",
   {
@@ -361,23 +296,135 @@ test(
         : "Windows-only - exercises taskkill /t (via shutdown's own reap path) against a real Windows process tree; the POSIX proof of the identical underlying behavior is the pgrep-based test above",
   },
   async () => {
-    const { server, pids } = await spawnServerWithLiveWindowsTree();
+    // Spawns a real server, hands it a real `run` job built from real
+    // `child_process` spawns (see `test/helpers/windowsChildTree.mjs`'s own
+    // docs) - a leader process plus `descendantCount` real leaf
+    // descendants, so the whole tree, not just the one direct child, must
+    // be reaped.
+    const server = spawnServer();
+    await completeHandshake(server);
 
-    server.child.stdin.end(); // closes stdin -> the server observes EOF and runs its real shutdown path
-    const { code, signal } = await server.waitForExit();
-    assert.equal(code, 0, "the server's own shutdown handler must exit cleanly");
-    assert.equal(signal, null);
+    const dir = makeTempDir();
+    const leaderMarker = path.join(dir, "leader-pid.txt");
+    const descendantCount = 2; // matches spawnServerWithLiveTree's own "shell + 2 sleeps" shape
 
-    // THE proof: a REAL, independent `tasklist` lookup per pid AFTER
-    // shutdown - never trusting this codebase's own bookkeeping - must show
-    // every pid in the tree gone, not merely the one direct tracked child.
-    for (const pid of pids) {
-      const alive = await waitForWindowsTaskState(pid, false, 5000);
-      assert.equal(
-        alive,
-        false,
-        `expected pid ${pid} (leader or descendant) gone after stdin-EOF shutdown, tasklist still saw it`
+    server.send({
+      jsonrpc: "2.0",
+      id: 710,
+      method: "tools/call",
+      params: {
+        name: "run",
+        arguments: { command: buildWindowsChildTreeArgv(leaderMarker, descendantCount, dir) },
+      },
+    });
+    const runLine = await server.nextLine();
+    const runBody = runLine.parsed as RunResponseBody;
+    assert.equal(runBody.error, undefined);
+    assert.notEqual(
+      runBody.result?.isError,
+      true,
+      `run() must succeed: ${JSON.stringify(runBody)}`
+    );
+
+    // Every real pid captured so far, added the instant each one becomes
+    // known - never assembled only at the end - so the `finally` block
+    // below can force-reap whatever real processes actually exist even if
+    // a LATER step throws first (a still-missing descendant marker, a
+    // parser failure, the shutdown trigger itself, or an assertion).
+    const capturedPids: number[] = [];
+    try {
+      // Wait for every REAL marker, and require the EXACT expected shape
+      // (decimal digits, one trailing newline, nothing else) as this
+      // test's own explicit assertion - not merely `parsesAsPgid`'s
+      // internal gate, so this requirement stays independently verifiable
+      // even if that gate is ever weakened.
+      const leaderPidText = await waitForFile(leaderMarker, { until: parsesAsPgid });
+      assert.match(
+        leaderPidText,
+        /^\d+\n$/,
+        `expected the leader marker to hold exactly a decimal pid followed by one newline, got: ${JSON.stringify(leaderPidText)}`
       );
+      const leaderPid = Number(leaderPidText.trim());
+      assert.ok(
+        Number.isInteger(leaderPid) && leaderPid > 0,
+        `expected a real numeric pid from the leader marker file, got: ${JSON.stringify(leaderPidText)}`
+      );
+      capturedPids.push(leaderPid);
+
+      const descendantPids = await Promise.all(
+        Array.from({ length: descendantCount }, async (_unused, i) => {
+          const text = await waitForFile(path.join(dir, `child-${i}-pid.txt`), {
+            until: parsesAsPgid,
+          });
+          assert.match(
+            text,
+            /^\d+\n$/,
+            `expected descendant ${i}'s marker to hold exactly a decimal pid followed by one newline, got: ${JSON.stringify(text)}`
+          );
+          const pid = Number(text.trim());
+          assert.ok(
+            Number.isInteger(pid) && pid > 0,
+            `expected a real numeric pid from descendant ${i}'s marker file, got: ${JSON.stringify(text)}`
+          );
+          capturedPids.push(pid);
+          return pid;
+        })
+      );
+      const pids = [leaderPid, ...descendantPids];
+
+      // The tree must have DISTINCT, non-duplicate real pids for the
+      // leader and every descendant, confirmed BEFORE doing anything else
+      // with them - see test/kill.test.ts's own WINDOWS COUNTERPART test
+      // for the full rationale (a marker-writing mutant that duplicates
+      // the leader's own pid into every descendant marker would otherwise
+      // defeat every check below undetected, since this test would never
+      // learn the real, distinct descendant pids at all).
+      const uniquePids = new Set(pids);
+      assert.equal(
+        uniquePids.size,
+        pids.length,
+        `expected ${pids.length} distinct real pids (the leader plus each descendant) - got duplicates: ${JSON.stringify(pids)}`
+      );
+
+      // Confirm the REAL tree is actually up BEFORE we ever touch shutdown
+      // - a real external `tasklist` lookup per pid, never our own
+      // internal bookkeeping.
+      for (const pid of pids) {
+        const alive = await waitForWindowsTaskState(pid, true, 3000);
+        assert.ok(
+          alive,
+          `expected pid ${pid} (leader or descendant) alive BEFORE shutdown, tasklist did not see it`
+        );
+      }
+
+      server.child.stdin.end(); // closes stdin -> the server observes EOF and runs its real shutdown path
+      const { code, signal } = await server.waitForExit();
+      assert.equal(code, 0, "the server's own shutdown handler must exit cleanly");
+      assert.equal(signal, null);
+
+      // THE proof: a REAL, independent `tasklist` lookup per pid AFTER
+      // shutdown - never trusting this codebase's own bookkeeping - must show
+      // every pid in the tree gone, not merely the one direct tracked child.
+      for (const pid of pids) {
+        const alive = await waitForWindowsTaskState(pid, false, 5000);
+        assert.equal(
+          alive,
+          false,
+          `expected pid ${pid} (leader or descendant) gone after stdin-EOF shutdown, tasklist still saw it`
+        );
+      }
+    } finally {
+      // Guaranteed reap, independent of everything above: a setup
+      // failure, an assertion failure, a `tasklist`-parsing failure, a
+      // timeout, or the shutdown path itself failing must never leave a
+      // real process tree running - force-terminate every pid this test
+      // actually captured, directly, never through the shutdown path
+      // under test. This file has no shared, file-level exit-time reaper
+      // the way test/kill.test.ts's own `tracked()` does (each test here
+      // spawns and owns its server directly), so the server's own process
+      // is force-terminated here too if it somehow didn't already exit.
+      for (const pid of capturedPids) forceKillPidBestEffort(pid);
+      if (!server.child.killed) server.child.kill("SIGKILL");
     }
   }
 );

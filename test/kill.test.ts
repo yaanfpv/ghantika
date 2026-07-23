@@ -11,7 +11,7 @@ import type { CallToolResult } from "@modelcontextprotocol/server";
 // import comment for why.
 import * as killTool from "../dist/tools/kill.js";
 import { jobStore } from "../dist/jobStore.js";
-import { spawnManaged } from "../dist/process.js";
+import { isProcessAlive, spawnManaged } from "../dist/process.js";
 
 // Explicit ".ts" extension - this helper has no relative imports of its
 // own (only node: builtins), so Node's native TypeScript support can load
@@ -25,6 +25,7 @@ import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/sp
 // each does and why.
 import {
   buildWindowsChildTreeArgv,
+  forceKillPidBestEffort,
   longRunningNodeArgv,
   parsesAsPgid,
   waitForFile,
@@ -243,7 +244,7 @@ test(
     // leader its own group leader; there is no such concept on win32) and
     // `pgrep -g`, the external oracle that counts a group's live members
     // in one call. Windows has nothing to build either half from, so this
-    // test-harness gap (not a product scope decision - OD-5: Windows is a
+    // test-harness gap (not a product scope decision - Windows is a
     // supported platform, and kill.ts's own win32 branch does reap a real
     // process tree via taskkill, proven below) skips here. The Windows
     // counterpart immediately below proves the SAME underlying behavior
@@ -384,70 +385,129 @@ test(
     const jobId = runBody.result?.structuredContent?.job_id as string;
     assert.equal(typeof jobId, "string");
 
-    // Wait for every REAL marker (the leader's own pid, plus each real
-    // descendant's own pid) - never for mere file existence, the same
-    // "wait for parseable content" discipline THE CENTERPIECE's own pgid
-    // wait uses (see waitForFile's docs).
-    const leaderPidText = await waitForFile(leaderMarker, { until: parsesAsPgid });
-    const leaderPid = Number(leaderPidText.trim());
-    assert.ok(
-      Number.isInteger(leaderPid) && leaderPid > 0,
-      `expected a real numeric pid from the leader marker file, got: ${JSON.stringify(leaderPidText)}`
-    );
-    const descendantPids = await Promise.all(
-      Array.from({ length: descendantCount }, async (_unused, i) => {
-        const text = await waitForFile(path.join(dir, `child-${i}-pid.txt`), {
-          until: parsesAsPgid,
-        });
-        const pid = Number(text.trim());
-        assert.ok(
-          Number.isInteger(pid) && pid > 0,
-          `expected a real numeric pid from descendant ${i}'s marker file, got: ${JSON.stringify(text)}`
-        );
-        return pid;
-      })
-    );
-    const allPids = [leaderPid, ...descendantPids];
-
-    // Confirm the REAL tree is actually up (the leader + 2 descendants)
-    // BEFORE we ever touch kill - a real external `tasklist` lookup per
-    // pid, never our own internal bookkeeping.
-    for (const pid of allPids) {
-      const alive = await waitForWindowsTaskState(pid, true, 3000);
-      assert.ok(alive, `expected pid ${pid} (leader or descendant) to be alive before kill`);
-    }
-
-    server.send({
-      jsonrpc: "2.0",
-      id: 511,
-      method: "tools/call",
-      params: { name: "kill", arguments: { job_id: jobId } },
-    });
-    const killLine = await server.nextLine(8000);
-    const killBody = killLine.parsed as RunResponseBody;
-    assert.equal(killBody.error, undefined);
-    assert.notEqual(
-      killBody.result?.isError,
-      true,
-      `kill() must succeed: ${JSON.stringify(killBody)}`
-    );
-    assert.equal(killBody.result?.structuredContent?.state, "killed");
-
-    // THE proof: a REAL, independent `tasklist` lookup per pid AFTER the
-    // kill - never trusting our own bookkeeping - must show every pid in
-    // the tree gone, not merely the one direct tracked child. This is what
-    // proves src/tools/kill.ts's win32 branch (`taskkill /pid <pid> /t /f`)
-    // actually reaps the WHOLE tree, not just the leader.
-    for (const pid of allPids) {
-      const alive = await waitForWindowsTaskState(pid, false, 5000);
-      assert.equal(
-        alive,
-        false,
-        `expected pid ${pid} (leader or descendant) to be gone after kill, tasklist still saw it`
+    // Every real pid captured so far, added the instant each one becomes
+    // known - never assembled only at the end - so the `finally` block
+    // below can force-reap whatever real processes actually exist even if
+    // a LATER step (a still-missing descendant marker, a parser failure,
+    // the kill call itself, or an assertion) throws first.
+    const capturedPids: number[] = [];
+    try {
+      // Wait for every REAL marker (the leader's own pid, plus each real
+      // descendant's own pid) - never for mere file existence, the same
+      // "wait for parseable content" discipline THE CENTERPIECE's own pgid
+      // wait uses (see waitForFile's docs). Each marker's raw (untrimmed)
+      // text is additionally required to match the EXACT expected shape -
+      // one or more decimal digits followed by exactly one trailing
+      // newline, nothing else - as its own explicit, test-owned assertion:
+      // relying solely on `parsesAsPgid`'s own internal gate would leave
+      // this requirement invisible to anything that mutates that gate away,
+      // since these fixtures write their marker synchronously and in one
+      // shot, so a torn read essentially never occurs in practice either
+      // way - this assertion is what makes the exact-format requirement
+      // itself load-bearing and independently verifiable.
+      const leaderPidText = await waitForFile(leaderMarker, { until: parsesAsPgid });
+      assert.match(
+        leaderPidText,
+        /^\d+\n$/,
+        `expected the leader marker to hold exactly a decimal pid followed by one newline, got: ${JSON.stringify(leaderPidText)}`
       );
-    }
+      const leaderPid = Number(leaderPidText.trim());
+      assert.ok(
+        Number.isInteger(leaderPid) && leaderPid > 0,
+        `expected a real numeric pid from the leader marker file, got: ${JSON.stringify(leaderPidText)}`
+      );
+      capturedPids.push(leaderPid);
 
-    server.child.kill("SIGKILL");
+      const descendantPids = await Promise.all(
+        Array.from({ length: descendantCount }, async (_unused, i) => {
+          const text = await waitForFile(path.join(dir, `child-${i}-pid.txt`), {
+            until: parsesAsPgid,
+          });
+          assert.match(
+            text,
+            /^\d+\n$/,
+            `expected descendant ${i}'s marker to hold exactly a decimal pid followed by one newline, got: ${JSON.stringify(text)}`
+          );
+          const pid = Number(text.trim());
+          assert.ok(
+            Number.isInteger(pid) && pid > 0,
+            `expected a real numeric pid from descendant ${i}'s marker file, got: ${JSON.stringify(text)}`
+          );
+          capturedPids.push(pid);
+          return pid;
+        })
+      );
+      const allPids = [leaderPid, ...descendantPids];
+
+      // The tree must have DISTINCT, non-duplicate real pids for the
+      // leader and every descendant, confirmed BEFORE doing anything else
+      // with them: a mutant that writes the SAME (leader) pid into every
+      // marker - paired with a leader-only termination - would otherwise
+      // defeat every check below undetected, since this test would never
+      // actually learn the real, distinct descendant pids at all, and
+      // would end up re-checking the leader's own pid three times over
+      // instead.
+      const uniquePids = new Set(allPids);
+      assert.equal(
+        uniquePids.size,
+        allPids.length,
+        `expected ${allPids.length} distinct real pids (the leader plus each descendant) - got duplicates: ${JSON.stringify(allPids)}`
+      );
+
+      // Confirm the REAL tree is actually up (the leader + 2 descendants)
+      // BEFORE we ever touch kill - a real external `tasklist` lookup per
+      // pid, never our own internal bookkeeping.
+      for (const pid of allPids) {
+        const alive = await waitForWindowsTaskState(pid, true, 3000);
+        assert.ok(alive, `expected pid ${pid} (leader or descendant) to be alive before kill`);
+      }
+
+      server.send({
+        jsonrpc: "2.0",
+        id: 511,
+        method: "tools/call",
+        params: { name: "kill", arguments: { job_id: jobId } },
+      });
+      const killLine = await server.nextLine(8000);
+      const killBody = killLine.parsed as RunResponseBody;
+      assert.equal(killBody.error, undefined);
+      assert.notEqual(
+        killBody.result?.isError,
+        true,
+        `kill() must succeed: ${JSON.stringify(killBody)}`
+      );
+      assert.equal(killBody.result?.structuredContent?.state, "killed");
+
+      // THE proof: a REAL, independent `tasklist` lookup per pid AFTER the
+      // kill - never trusting our own bookkeeping - must show every pid in
+      // the tree gone, not merely the one direct tracked child. This is
+      // what proves src/tools/kill.ts's win32 branch
+      // (`taskkill /pid <pid> /t /f`) actually reaps the WHOLE tree, not
+      // just the leader.
+      for (const pid of allPids) {
+        const alive = await waitForWindowsTaskState(pid, false, 5000);
+        assert.equal(
+          alive,
+          false,
+          `expected pid ${pid} (leader or descendant) to be gone after kill, tasklist still saw it`
+        );
+      }
+    } finally {
+      // Guaranteed reap, independent of everything above: a setup
+      // failure, an assertion failure, a `tasklist`-parsing failure, a
+      // timeout, or kill() itself failing must never leave a real process
+      // tree running - force-terminate every pid this test actually
+      // captured, directly, never through the `kill` tool under test.
+      // Also inside `finally`, never after it: if any step above throws,
+      // the server itself must still be terminated here, or it would be
+      // left running with an open stdio pipe that keeps this whole test
+      // process from ever reaching a natural exit - `tracked()`'s
+      // file-level exit handler only fires once the LAST test in this
+      // file finishes, which a hung server would prevent from ever
+      // happening cleanly.
+      for (const pid of capturedPids) forceKillPidBestEffort(pid);
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    }
   }
 );
 
@@ -467,52 +527,165 @@ test("kill() over the real wire: unknown job_id is a real tool-execution error, 
   server.child.kill("SIGKILL");
 });
 
-test("kill() over the real wire: a killed job's output buffer remains readable afterward (proven via a real marker-file side effect written before the kill, since output/tail aren't wired to the wire here)", async () => {
+interface OutputResponseBody {
+  readonly error?: unknown;
+  readonly result?: {
+    isError?: boolean;
+    structuredContent?: { events?: Array<{ text: string }> };
+  };
+}
+
+/**
+ * Polls the REAL `output()` tool over the wire, starting request ids at
+ * `startId`, until `token` genuinely appears among `stream`'s events -
+ * never a marker-file stand-in. This is what makes the output-buffer
+ * claim below an actual proof through the surface callers use: a
+ * mutant that cleared a job's buffer on kill would make the AFTER-kill
+ * call site of this function time out and throw, while a mutant that
+ * never wrote real output at all would make the BEFORE-kill call site do
+ * the same.
+ */
+async function waitForTokenInOutput(
+  server: SpawnedServer,
+  jobId: string,
+  stream: "stdout" | "stderr",
+  token: string,
+  startId: number,
+  timeoutMs = 5000
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let id = startId;
+  for (;;) {
+    server.send({
+      jsonrpc: "2.0",
+      id: id++,
+      method: "tools/call",
+      params: { name: "output", arguments: { job_id: jobId, stream } },
+    });
+    const line = await server.nextLine(2000);
+    const body = line.parsed as OutputResponseBody;
+    assert.equal(body.error, undefined);
+    assert.notEqual(body.result?.isError, true, `output() must succeed: ${JSON.stringify(body)}`);
+    const events = body.result?.structuredContent?.events ?? [];
+    if (events.some((event) => event.text.includes(token))) return;
+    if (Date.now() > deadline) {
+      throw new Error(
+        `timed out waiting for token ${JSON.stringify(token)} in ${stream} via output(), last saw: ${JSON.stringify(events)}`
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+test("kill() over the real wire: a killed job's output buffer remains readable afterward, proven through the real output() tool surface", async () => {
   const server = tracked();
   await completeHandshake(server);
   const dir = makeTempDir();
-  const marker = path.join(dir, "wrote-before-kill.txt");
+  const pidMarker = path.join(dir, "pid.txt");
+  const stdoutToken = `GHANTIKA-OUTPUT-SURVIVES-KILL-STDOUT-${Math.random().toString(36).slice(2)}`;
+  const stderrToken = `GHANTIKA-OUTPUT-SURVIVES-KILL-STDERR-${Math.random().toString(36).slice(2)}`;
+
+  // A real, long-lived, NEVER-self-terminating child (mirrors
+  // test/helpers/windowsChildTree.mjs's own "no natural exit" shape via a
+  // no-op interval, rather than a bounded setTimeout a prior version of
+  // this test used): writes its own pid to a marker (so this test can
+  // confirm it is genuinely alive via a real external liveness check
+  // before ever touching kill), writes one unique token to REAL stdout and
+  // a different one to REAL stderr, then blocks forever. A fixture that
+  // CAN exit naturally cannot prove kill caused a termination: a mutant
+  // that makes the fixture die on its own while making kill() itself a
+  // successful no-op would still read as "the tree eventually became
+  // not-alive" either way - a fixture with no natural exit at all, plus
+  // confirming it alive immediately before kill, closes that gap.
+  const scriptBody = [
+    `require("fs").writeFileSync(${JSON.stringify(pidMarker)}, process.pid + "\\n");`,
+    `process.stdout.write(${JSON.stringify(stdoutToken)} + "\\n");`,
+    `process.stderr.write(${JSON.stringify(stderrToken)} + "\\n");`,
+    `setInterval(() => {}, 1 << 30);`,
+  ].join(" ");
+
   server.send({
     jsonrpc: "2.0",
     id: 503,
     method: "tools/call",
     params: {
       name: "run",
-      // A real, cross-platform child that writes the marker file then stays
-      // alive - never a shell one-liner (POSIX `echo ... > file; sleep 30`
-      // has no Windows equivalent: `sleep` is not a real Windows executable,
-      // and cmd.exe's own redirection/chaining syntax differs). Node's own
-      // fs API is portable, so one `-e` snippet does both jobs everywhere.
-      arguments: {
-        command: [
-          process.execPath,
-          "-e",
-          `require("fs").writeFileSync(${JSON.stringify(marker)}, "wrote-this"); setTimeout(() => {}, 30000)`,
-        ],
-      },
+      arguments: { command: [process.execPath, "-e", scriptBody] },
     },
   });
   const runLine = await server.nextLine();
   const runBody = runLine.parsed as RunResponseBody;
+  assert.equal(runBody.error, undefined);
+  assert.notEqual(runBody.result?.isError, true, `run() must succeed: ${JSON.stringify(runBody)}`);
   const jobId = runBody.result?.structuredContent?.job_id as string;
+  assert.equal(typeof jobId, "string");
 
-  await waitForFile(marker, { until: (text) => text.trim() === "wrote-this" });
+  let capturedPid: number | undefined;
+  try {
+    // Wait for the COMPLETE pid, not merely for the marker to exist - and
+    // require the EXACT expected shape (decimal digits, one trailing
+    // newline, nothing else) as this test's own explicit assertion, not
+    // merely `parsesAsPgid`'s internal gate.
+    const pidText = await waitForFile(pidMarker, { until: parsesAsPgid });
+    assert.match(
+      pidText,
+      /^\d+\n$/,
+      `expected the pid marker to hold exactly a decimal pid followed by one newline, got: ${JSON.stringify(pidText)}`
+    );
+    const pid = Number(pidText.trim());
+    assert.ok(
+      Number.isInteger(pid) && pid > 0,
+      `expected a real numeric pid from the marker file, got: ${JSON.stringify(pidText)}`
+    );
+    capturedPid = pid;
 
-  server.send({
-    jsonrpc: "2.0",
-    id: 504,
-    method: "tools/call",
-    params: { name: "kill", arguments: { job_id: jobId } },
-  });
-  const killLine = await server.nextLine(8000);
-  const killBody = killLine.parsed as RunResponseBody;
-  assert.equal(killBody.result?.structuredContent?.state, "killed");
+    // Confirm the real OS process is genuinely alive BEFORE kill - a real,
+    // zero-side-effect `kill -0` probe (the same production-exported
+    // primitive src/tools/kill.ts's own POSIX identity check is built
+    // from), never this codebase's own bookkeeping.
+    assert.ok(isProcessAlive(pid), `expected pid ${pid} to be alive before kill`);
 
-  // The real side effect the job produced before it died is still there -
-  // kill never touched it (a stand-in for output/tail's future assertion
-  // that the buffer itself survives, since those tools aren't wired to the
-  // wire here).
-  assert.equal(fs.readFileSync(marker, "utf8").trim(), "wrote-this");
+    // Confirm the real output is genuinely visible through output() BEFORE
+    // kill too - both streams.
+    await waitForTokenInOutput(server, jobId, "stdout", stdoutToken, 520);
+    await waitForTokenInOutput(server, jobId, "stderr", stderrToken, 620);
 
-  server.child.kill("SIGKILL");
+    server.send({
+      jsonrpc: "2.0",
+      id: 504,
+      method: "tools/call",
+      params: { name: "kill", arguments: { job_id: jobId } },
+    });
+    const killLine = await server.nextLine(8000);
+    const killBody = killLine.parsed as RunResponseBody;
+    assert.equal(killBody.error, undefined);
+    assert.notEqual(
+      killBody.result?.isError,
+      true,
+      `kill() must succeed: ${JSON.stringify(killBody)}`
+    );
+    assert.equal(killBody.result?.structuredContent?.state, "killed");
+
+    // THE proof: read BOTH streams back through the REAL output() tool
+    // AFTER the kill - never a marker-file stand-in - and confirm both
+    // tokens are STILL there. kill never touches a job's output buffers
+    // (src/tools/kill.ts's own docs); this is what actually proves that
+    // claim through the surface callers use, rather than a side-effect
+    // file this test's own fixture happened to leave behind.
+    await waitForTokenInOutput(server, jobId, "stdout", stdoutToken, 720);
+    await waitForTokenInOutput(server, jobId, "stderr", stderrToken, 820);
+  } finally {
+    // Guaranteed reap, independent of everything above: a setup failure,
+    // an assertion failure, a timeout, or kill() itself failing must never
+    // leave this real process running - force-terminate it directly,
+    // never through the `kill` tool under test. Also inside `finally`,
+    // never after it: if any step above throws, the server itself must
+    // still be terminated here, or it would be left running with an open
+    // stdio pipe that keeps this whole test process from ever reaching a
+    // natural exit - `tracked()`'s file-level exit handler only fires once
+    // the LAST test in this file finishes, which a hung server would
+    // prevent from ever happening cleanly.
+    if (capturedPid !== undefined) forceKillPidBestEffort(capturedPid);
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  }
 });

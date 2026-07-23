@@ -310,15 +310,84 @@ export async function waitForPgrepGroupMembers(
 // process tree, not just the direct child").
 // ---------------------------------------------------------------------------
 
-/** True if `pid` is still listed as a live process by a real, external `tasklist` call - Windows' nearest equivalent to `kill -0`/`pgrep` for "does this OS-level process still exist." Checked one pid at a time (never "the whole group") since Windows has nothing group-shaped to query. */
-export function windowsTaskExists(pid: number): boolean {
-  // `/nh` suppresses the column header so the only numeric-looking token in
-  // a genuine match is the pid itself; a non-match prints an informational
-  // "INFO: No tasks..." line instead (and tasklist still exits 0 either
-  // way) - so the pid's own literal decimal text actually appearing in the
-  // output is what distinguishes a real match, not the exit code.
-  const output = execFileSync("tasklist", ["/fi", `PID eq ${pid}`, "/nh"], { encoding: "utf8" });
-  return new RegExp(`(^|[^0-9])${pid}([^0-9]|$)`).test(output);
+/**
+ * Splits one already-CSV-shaped `tasklist /fo csv` line (every field
+ * double-quoted, by that flag's own documented contract) into its raw
+ * field values - matches whole `"..."` groups in order rather than
+ * splitting on every comma, since a field can legitimately contain one of
+ * its own (the `MemUsage` column's `"10,000 K"`).
+ */
+function parseTasklistCsvFields(line: string): string[] {
+  const fields: string[] = [];
+  const fieldPattern = /"([^"]*)"/g;
+  let match: RegExpExecArray | null;
+  while ((match = fieldPattern.exec(line)) !== null) {
+    fields.push(match[1]!);
+  }
+  return fields;
+}
+
+/**
+ * True if `output` (a real `tasklist /fi "PID eq <pid>" /fo csv /nh` blob,
+ * or an equivalent fixture) contains a genuine matching ROW for `pid` -
+ * checked against the exact PID COLUMN of a real, well-formed CSV row
+ * (`/fo csv`'s own documented column order: ImageName, PID, SessionName,
+ * Session#, MemUsage), never a raw substring search over the whole blob.
+ *
+ * A prior version of this function matched the pid's decimal text
+ * appearing ANYWHERE in the output, which two real shapes fooled: a
+ * malformed/diagnostic line that happens to mention the same digits
+ * without being a real row at all, and an UNRELATED row whose OTHER field
+ * (`MemUsage`, most often) happens to contain those digits as a
+ * substring - both reported "alive" for a pid that was never actually
+ * listed.
+ *
+ * Every real CSV row starts with a literal `"` (`/fo csv` quotes every
+ * field); a no-match run's own informational `INFO: No tasks are running
+ * which match the specified criteria.` line - and any other malformed or
+ * non-CSV line - is plain, unquoted text, so it's skipped outright rather
+ * than parsed as a row. Exported for direct unit testing against
+ * hand-built fixture strings, independent of a real `tasklist`
+ * invocation.
+ */
+export function tasklistOutputHasPid(output: string, pid: number): boolean {
+  const expected = String(pid);
+  for (const rawLine of output.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line.startsWith('"')) continue; // not a real CSV row - the no-match INFO line, or garbage
+    const fields = parseTasklistCsvFields(line);
+    if (fields[1] === expected) return true; // the PID column, exactly - never a substring anywhere else in the row
+  }
+  return false;
+}
+
+/**
+ * True if `pid` is still listed as a live process by a real, external
+ * `tasklist` call - Windows' nearest equivalent to `kill -0`/`pgrep` for
+ * "does this OS-level process still exist." Checked one pid at a time
+ * (never "the whole group") since Windows has nothing group-shaped to
+ * query. `/fo csv` (alongside `/nh`, which still just suppresses the
+ * header row) gives a stable, parseable row shape - see
+ * `tasklistOutputHasPid`'s own docs for why matching the real PID column
+ * replaced a looser text search.
+ *
+ * `execEnv` exists solely so tests can point this at a fake `tasklist` on
+ * a custom `PATH` without a real Windows host available - production
+ * callers never pass it, so real callers always search this process's own
+ * inherited `PATH`.
+ *
+ * Fails CLOSED on anything it can't confidently execute: a missing
+ * `tasklist` binary (ENOENT) or a nonzero exit both propagate as a real,
+ * visible exception - never silently treated as "alive" or "gone".
+ * `execFileSync` already throws for both cases by default; this function
+ * makes no attempt to catch and paper over either.
+ */
+export function windowsTaskExists(pid: number, execEnv: NodeJS.ProcessEnv = process.env): boolean {
+  const output = execFileSync("tasklist", ["/fi", `PID eq ${pid}`, "/fo", "csv", "/nh"], {
+    encoding: "utf8",
+    env: execEnv,
+  });
+  return tasklistOutputHasPid(output, pid);
 }
 
 /** Polls `windowsTaskExists(pid)` until it matches `expectedExists` (or times out), mirroring `waitForPgrepGroupMembers`'s own polling shape - returns whatever the final observed state was, so a timeout is reported as "still saw X" rather than silently swallowed. */
@@ -333,6 +402,36 @@ export async function waitForWindowsTaskState(
     if (exists === expectedExists) return exists;
     if (Date.now() - start > timeoutMs) return exists;
     await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+/**
+ * Best-effort, GUARANTEED direct force-termination of a real OS pid -
+ * NEVER routed through this codebase's own `kill` tool or shutdown path
+ * (the very mechanism a test exercising kill/shutdown is trying to
+ * prove), so a broken or no-op `kill`/`shutdown` implementation can never
+ * defeat this cleanup the way it could defeat the behavior under test.
+ * Meant as a test's own `finally`-block safety net: a real spawned
+ * process-tree member must never outlive its owning test, whether that
+ * test finished cleanly, hit a setup failure, an assertion failure, a
+ * `tasklist`-parsing failure, a timeout, or a failure in the very
+ * kill/shutdown operation being verified.
+ *
+ * Idempotent and silent on an already-gone pid or a permission failure -
+ * a cleanup step's job is to reap, never to additionally assert; the
+ * test's own assertions are what report a real failure, this just makes
+ * sure nothing real is left running once they have.
+ */
+export function forceKillPidBestEffort(pid: number): void {
+  try {
+    if (process.platform === "win32") {
+      execFileSync("taskkill", ["/pid", String(pid), "/f"], { stdio: "ignore" });
+    } else {
+      process.kill(pid, "SIGKILL");
+    }
+  } catch {
+    // Already gone, or no permission to signal it - nothing more this
+    // best-effort safety net can or should do.
   }
 }
 
