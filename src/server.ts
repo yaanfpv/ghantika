@@ -9,12 +9,12 @@
  * This file also wires in the `io.modelcontextprotocol/tasks` capability
  * (advertisement at construction, the three registered `tasks/*` methods,
  * and augmenting `run()`'s result on a capable connection) - but only ever
- * by CALLING into `./tasksAdapter.js`, never by importing anything
- * Tasks-shaped from the SDK itself. `src/tasksAdapter.ts` is the single
- * permitted Tasks-extension-import site (enforced by
- * `scripts/check-no-tasks-import.mjs`); this file stays exactly as
- * unaware of the extension's real shape as `registry.ts` and every
- * `tools/*.ts` handler already are.
+ * by CALLING into `./tasksAdapter.js`, never by referencing anything
+ * Tasks-shaped itself. `src/tasksAdapter.ts` is the single file permitted
+ * to reference the extension's shape at all, whether via import or
+ * hand-rolled definition (enforced by `scripts/check-no-tasks-import.mjs`);
+ * this file stays exactly as unaware of the extension's real shape as
+ * `registry.ts` and every `tools/*.ts` handler already are.
  *
  * ## Why stdout purity matters
  *

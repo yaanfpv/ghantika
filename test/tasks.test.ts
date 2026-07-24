@@ -122,8 +122,9 @@ const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
  * it does NOT by itself prove the value is genuine rather than a
  * stable-but-wrong placeholder. A hardcoded `"2000-01-01T00:00:00.000Z"`
  * is a perfectly valid ISO-8601 millisecond timestamp and would pass this
- * check alone; QA proved exactly this escape on the kill path (a stable,
- * wrong `started_at` survived format- and order-checking undetected).
+ * check alone; this exact escape was previously demonstrated on the kill
+ * path (a stable, wrong `started_at` survived format- and order-checking
+ * undetected).
  * Closing that gap is the CALLER's job, not this helper's: every call
  * site below additionally brackets the parsed timestamp against a real
  * wall-clock window the test itself captured immediately before starting
@@ -547,21 +548,21 @@ test("on a capable connection, run() mints a CreateTaskResult even though the ca
 // no CreateTaskResult ever appears
 // ---------------------------------------------------------------------------
 
-test("a non-capable connection's run() returns the plain job projection - a genuine deep-equality check of the COMPLETE real Phase-1 response across BOTH structuredContent and content, key set AND field values (started_at format-checked AND bracketed against a real wall-clock window this test itself observed around the run() call, so a stable-but-wrong ISO value cannot survive), not just presence/absence of a few named fields", async () => {
+test("a non-capable connection's run() returns the plain job projection - a genuine deep-equality check of the COMPLETE real plain PublicJobProjection response across BOTH structuredContent and content, key set AND field values (started_at format-checked AND bracketed against a real wall-clock window this test itself observed around the run() call, so a stable-but-wrong ISO value cannot survive), not just presence/absence of a few named fields", async () => {
   const pair = await startPair(false);
   try {
     // Not `runJob` here, deliberately - that helper (see `runResultStructured`
     // above) discards `CallToolResult.content` entirely and returns only
-    // `structuredContent`, which is exactly the gap QA proved for this test:
-    // a mutant changing ONLY `content` (leaving `structuredContent`
-    // untouched) still passed. The raw `CallToolResult` is kept here so
-    // both halves of the real tool result can be checked.
+    // `structuredContent`, which is exactly the gap previously demonstrated
+    // for this test: a mutant changing ONLY `content` (leaving
+    // `structuredContent` untouched) still passed. The raw `CallToolResult`
+    // is kept here so both halves of the real tool result can be checked.
     //
     // beforeRunMs/afterRunMs bracket the actual run() call below - the
     // real wall-clock window this test itself observed the job start in,
     // used to bind started_at to a genuine observation rather than only
-    // its ISO shape (the same class of gap QA proved on the six-tool mint
-    // rule test's status/kill checks).
+    // its ISO shape (the same class of gap previously demonstrated on the
+    // six-tool mint rule test's status/kill checks).
     const beforeRunMs = Date.now();
     const result = await pair.client.callTool({
       name: "run",
@@ -609,7 +610,7 @@ test("a non-capable connection's run() returns the plain job projection - a genu
         "started_at",
         "state",
       ].sort(),
-      `expected the plain projection's key set to deep-equal the real Phase-1 shape exactly, got: ${JSON.stringify(Object.keys(structured).sort())}`
+      `expected the plain projection's key set to deep-equal the real plain job-projection shape exactly, got: ${JSON.stringify(Object.keys(structured).sort())}`
     );
     assert.equal(
       structured.state,
@@ -633,8 +634,9 @@ test("a non-capable connection's run() returns the plain job projection - a genu
     // the key set and would still have passed here before this fix - and,
     // more subtly, a stable-but-WRONG ISO-shaped value like
     // "2000-01-01T00:00:00.000Z" would ALSO still pass a format-only check,
-    // which is exactly the escape QA proved on this suite's six-tool mint
-    // rule test). The real, produced values are checked directly below:
+    // which is exactly the escape previously demonstrated on this suite's
+    // six-tool mint rule test). The real, produced values are checked
+    // directly below:
     // `label` is exactly what this call passed, `command_summary` is the
     // real argv[0] basename of the default `["true"]` command (see
     // `computeCommandSummary` in src/jobStore.ts), `started_at` is checked
@@ -676,9 +678,9 @@ test("a non-capable connection's run() returns the plain job projection - a genu
     // builds a `content` block holding a real `JSON.stringify(projection,
     // null, 2)` of the SAME projection, not an empty stub (confirmed by
     // direct empirical probing while fixing this: it genuinely carries
-    // this call's real values over this transport). QA proved a mutant
-    // changing ONLY `content` - leaving `structuredContent` untouched -
-    // still passed this test, because nothing here ever looked at
+    // this call's real values over this transport). A mutant changing ONLY
+    // `content` - leaving `structuredContent` untouched - was previously
+    // shown to still pass this test, because nothing here ever looked at
     // `content` at all. Checked directly below.
     const contentBlocks = (result as CallToolResult).content;
     assert.ok(
@@ -736,7 +738,8 @@ test("a non-capable connection's run() returns the plain job projection - a genu
     // And directly - not merely by delegating to the cross-check above -
     // the real values a mutant touching ONLY content's own construction
     // (leaving structuredContent's untouched) would have to fake
-    // correctly to survive: this is exactly the QA-proven escape.
+    // correctly to survive: this is exactly the previously-demonstrated
+    // escape.
     assert.equal(parsedContentRecord.job_id, structured.job_id);
     assert.equal(parsedContentRecord.state, "starting");
     assert.equal(parsedContentRecord.label, "plain-poll-floor");
@@ -894,7 +897,7 @@ test("the registered task/* method set is a genuine SET-EQUALITY over the server
     assert.notDeepEqual(
       afterInjection,
       ["tasks/cancel", "tasks/get", "tasks/update"],
-      "a genuine set-equality check must now DISAGREE with the frozen expected 3-method set once a 7th handler is live - this is exactly the escape QA proved the old presence/absence check could not catch"
+      "a genuine set-equality check must now DISAGREE with the frozen expected 3-method set once a 7th handler is live - this is exactly the escape previously demonstrated to slip past the old presence/absence check"
     );
   } finally {
     await instance.shutdown("tasks.test.ts complete");
@@ -1279,15 +1282,15 @@ function carriesNoHandleTellTale(body: unknown): boolean {
   return HANDLE_TELL_TALE_FIELDS.every((field) => !serialized.includes(`"${field}"`));
 }
 
-test("six-tool mint rule: on a capable connection, run() mints a handle while status/output/tail/kill/list each return their PLAIN response with no handle minted - status/kill (both real PublicJobProjection shapes) are checked by full key-set AND VALUE deep-equality against the real Phase-1 shape (nondeterministic timestamps format-checked, order-checked against each other, AND bracketed against a real wall-clock window this test itself observed around each job's run - so a stable-but-wrong ISO timestamp cannot survive; every other field checked by exact literal value), and list/output/tail are checked by a genuine whole-object comparison against their real, complete values - not just a sweep for handle-tell-tale field names", async () => {
+test("six-tool mint rule: on a capable connection, run() mints a handle while status/output/tail/kill/list each return their PLAIN response with no handle minted - status/kill (both real PublicJobProjection shapes) are checked by full key-set AND VALUE deep-equality against the real plain job-projection shape (nondeterministic timestamps format-checked, order-checked against each other, AND bracketed against a real wall-clock window this test itself observed around each job's run - so a stable-but-wrong ISO timestamp cannot survive; every other field checked by exact literal value), and list/output/tail are checked by a genuine whole-object comparison against their real, complete values - not just a sweep for handle-tell-tale field names", async () => {
   const pair = await startPair(true);
   try {
     // Captured immediately before this job's REAL run() call, and again
     // (below) immediately after its terminal status is observed - the
     // genuine wall-clock window this test itself watched the job run in.
-    // A stable-but-wrong ISO-shaped started_at/ended_at (QA's exact proven
-    // mutant) falls outside this window even though it passes the format
-    // check untouched.
+    // A stable-but-wrong ISO-shaped started_at/ended_at (the exact mutant
+    // previously demonstrated) falls outside this window even though it
+    // passes the format check untouched.
     const beforeFirstJobMs = Date.now();
     const minted = await runJob(pair.client, {
       command: [process.execPath, "-e", "process.stdout.write('x');"],
@@ -1333,20 +1336,22 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
     );
 
     // Key-set equality alone (the check above) does not prove any field's
-    // VALUE is genuine rather than a stable-but-wrong placeholder - QA
-    // proved exactly this twice: a `label` mutation that preserved the
-    // full key set and `job_id` still passed, AND (separately) a
-    // hardcoded-but-ISO-shaped `started_at` survived the format/order
-    // checks below completely undetected, because neither check ties the
-    // value to anything this test actually observed happening. Every
+    // VALUE is genuine rather than a stable-but-wrong placeholder - this
+    // was previously demonstrated exactly twice: a `label` mutation that
+    // preserved the full key set and `job_id` still passed, AND
+    // (separately) a hardcoded-but-ISO-shaped `started_at` survived the
+    // format/order checks below completely undetected, because neither
+    // check ties the value to anything this test actually observed
+    // happening. Every
     // field is checked by its real, expected value below: `started_at`/
     // `ended_at` are genuinely nondeterministic real wall-clock reads, so
     // they are format-checked, order-checked against each other, AND
     // bracketed against `[beforeFirstJobMs, afterFirstJobMs]` - the real
     // wall-clock window this test itself captured immediately before
     // starting this job and immediately after observing its terminal
-    // status - so a stable-but-wrong ISO value (QA's own mutant) now
-    // falls outside the live window and is rejected. Every OTHER field -
+    // status - so a stable-but-wrong ISO value (the same mutant previously
+    // demonstrated) now falls outside the live window and is rejected.
+    // Every OTHER field -
     // including `state`, `command_summary`, and every key inside `counts`
     // - is checked by exact literal deep-equality against this job's
     // real, known values (the command writes a single byte with no
@@ -1387,8 +1392,8 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
     // The old assertion for list/output/tail only swept for the 3
     // handle-tell-tale field names - it never checked for any OTHER
     // unexpected stray field, nor for wrong values in fields it did not
-    // even look at. Confirmed by QA: adding an unexpected non-handle field
-    // to these responses still passed. Strengthened below to a genuine
+    // even look at. Confirmed directly: adding an unexpected non-handle
+    // field to these responses still passed. Strengthened below to a genuine
     // whole-object comparison against each tool's real, complete values -
     // an explicit key-set check plus value checks - not merely "these 3
     // handle-marker names are absent."
@@ -1497,11 +1502,11 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
     );
 
     // Key-set equality alone (the check above) does not prove any field's
-    // VALUE is genuine - the same gap QA proved for the status check
-    // above applies here identically, and QA demonstrated it directly on
-    // THIS kill path: a stable-but-wrong ISO-shaped `started_at`
-    // hardcoded into the kill projection survived format/order checks
-    // alone and this test stayed green. Every field is checked by its
+    // VALUE is genuine - the same gap previously demonstrated for the
+    // status check above applies here identically, and it was demonstrated
+    // directly on THIS kill path: a stable-but-wrong ISO-shaped
+    // `started_at` hardcoded into the kill projection survived format/order
+    // checks alone and this test stayed green. Every field is checked by its
     // real, expected value below: `started_at`/`ended_at` are
     // format-checked, order-checked against each other, AND bracketed
     // against `[beforeSecondJobMs, afterKillMs]` - the real wall-clock
@@ -1737,8 +1742,8 @@ const COMPLETENESS_AREAS: readonly CompletenessArea[] = [
     file: "test/no-tasks-import.test.ts",
     titleContains: "the adapter carveout is narrow: a MIXED adapter file",
   },
-  // (this completeness sweep IS the artifact for "the full suite is green
-  // end-to-end and the completeness sweep reports no orphan AC/test" - no
+  // (this completeness sweep IS the artifact for "every declared capability
+  // behavior has a corresponding test, with nothing silently dropped" - no
   // separate entry needed for a check pointing at itself)
   {
     area: "a simulated Tasks-capable host proves the full negotiate -> unsolicited handle -> tasks/get sequence end to end",

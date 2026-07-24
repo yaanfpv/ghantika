@@ -1,16 +1,23 @@
 /**
- * The SINGLE permitted site in this codebase that imports symbols from the
- * MCP `io.modelcontextprotocol/tasks` extension - enforced mechanically by
- * `scripts/check-no-tasks-import.mjs`'s adapter carveout (see that file's
- * header for the guard, and `test/no-tasks-import.test.ts` for the proof
- * every OTHER `src/` module still reds on a Tasks reference). Every other
- * module (`jobStore.ts`, `process.ts`, `registry.ts`, `server.ts`'s core
- * wiring, every `tools/*.ts` handler) stays completely unaware that Tasks
- * exists: this file is a THIN adapter over the frozen job/output seam
- * (`src/jobStore.ts`'s `jobStore` singleton), never the reverse - it reads
- * job state, it never gains its own persistent state of its own (see
- * `scripts/check-module-boundaries.mjs`, which scans every root-level
- * module including this one for exactly that).
+ * The single Tasks adapter/seam - the only file in this codebase permitted
+ * to reference the MCP `io.modelcontextprotocol/tasks` extension's shape at
+ * all, whether via an import or a hand-rolled definition - enforced
+ * mechanically by `scripts/check-no-tasks-import.mjs`'s adapter carveout
+ * (see that file's header for the guard, and `test/no-tasks-import.test.ts`
+ * for the proof every OTHER `src/` module still reds on a Tasks reference).
+ * As it happens, this file's own imports (below) are all generic SDK types
+ * plus local `jobStore` types - nothing Tasks-shaped is actually imported
+ * from anywhere. The installed SDK DOES still export Task-shaped symbols,
+ * but they're deprecated and back no working registration mechanism this
+ * adapter could use (see "Why this is a hand-rolled adapter" below), so
+ * this file HAND-ROLLS the extension's own constants and types instead of
+ * importing them. Every other module (`jobStore.ts`, `process.ts`, `registry.ts`,
+ * `server.ts`'s core wiring, every `tools/*.ts` handler) stays completely
+ * unaware that Tasks exists: this file is a THIN adapter over the frozen
+ * job/output seam (`src/jobStore.ts`'s `jobStore` singleton), never the
+ * reverse - it reads job state, it never gains its own persistent state of
+ * its own (see `scripts/check-module-boundaries.mjs`, which scans every
+ * root-level module including this one for exactly that).
  *
  * ## Why this is a hand-rolled adapter, not a thin re-export of the SDK's
  * own Task machinery
