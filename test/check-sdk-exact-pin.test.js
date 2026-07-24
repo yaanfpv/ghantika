@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import {
   PINNED_DEV_PACKAGES,
   PINNED_PACKAGES,
+  REQUIRED_MCP_SDK_VERSION,
   checkSdkExactPin,
   isExactSemver,
   resolveLockedVersion,
@@ -109,26 +111,58 @@ function writeFixture(
   );
 }
 
-/** The dev-only client, internally consistent across all three of its sites. */
+/**
+ * The dev-only client, internally consistent across all three of its sites
+ * AND at the real frozen `REQUIRED_MCP_SDK_VERSION` - the whole package
+ * family (server/core/client) is pinned to that ONE version in real life
+ * (see check-sdk-exact-pin.mjs's own doc comment on why), so "clean" means
+ * matching it, not merely agreeing with itself at some other value.
+ */
 const CLEAN_CLIENT = {
   manifestField: "devDependencies",
-  manifestSpec: "2.0.0-beta.4",
+  manifestSpec: REQUIRED_MCP_SDK_VERSION,
   lockRootField: "devDependencies",
-  lockRootSpec: "2.0.0-beta.4",
-  resolvedVersion: "2.0.0-beta.4",
+  lockRootSpec: REQUIRED_MCP_SDK_VERSION,
+  resolvedVersion: REQUIRED_MCP_SDK_VERSION,
   dev: true,
 };
 
+/** The clean production baseline: every site at the real, required frozen version. */
 const CLEAN_FIXTURE = {
-  serverManifestSpec: "2.0.0-beta.4",
-  serverLockedVersion: "2.0.0-beta.4",
-  coreParentSpec: "2.0.0-beta.4",
-  coreLockedVersion: "2.0.0-beta.4",
+  serverManifestSpec: REQUIRED_MCP_SDK_VERSION,
+  serverLockedVersion: REQUIRED_MCP_SDK_VERSION,
+  coreParentSpec: REQUIRED_MCP_SDK_VERSION,
+  coreLockedVersion: REQUIRED_MCP_SDK_VERSION,
 };
+
+/** A plausible, distinct-from-required exact version, used only to construct a mutation away from the clean baseline (never a "clean" value on its own). */
+const OTHER_EXACT_VERSION = "2.0.0-beta.4";
+
+/**
+ * A minimal, VALID vendored schema + recorded digest (the second, distinct
+ * pin this guard also checks) - written into every scratch dir by
+ * `withScratchDir` by default, so the many npm-package-pin tests below stay
+ * isolated from the schema pin entirely (their fixtures exercise
+ * package.json/package-lock.json defects, never the schema). The dedicated
+ * schema-pin mutation tests further down explicitly overwrite or delete
+ * these two files to exercise that check in isolation instead.
+ */
+const CLEAN_SCHEMA_BYTES = Buffer.from('{"fixture":"tasks-extension-schema"}\n', "utf8");
+
+function writeCleanSchemaPin(dir) {
+  mkdirSync(path.join(dir, "schema"), { recursive: true });
+  mkdirSync(path.join(dir, "config"), { recursive: true });
+  writeFileSync(path.join(dir, "schema", "tasks-extension.schema.json"), CLEAN_SCHEMA_BYTES);
+  writeFileSync(
+    path.join(dir, "config", "tasks-schema-digest.json"),
+    JSON.stringify({ sha256: createHash("sha256").update(CLEAN_SCHEMA_BYTES).digest("hex") })
+  );
+}
 
 function withScratchDir(fn) {
   const dir = mkdtempSync(path.join(tmpdir(), "ghantika-sdk-pin-guard-"));
   try {
+    writeCleanSchemaPin(dir);
     fn(dir);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -232,7 +266,7 @@ test("mutation control: a dist-tag (`latest`) on the direct dependency (server) 
 
 test("mutation control: the direct dependency (server) manifest pin DRIFTED from the lockfile's resolved version is flagged", () => {
   withScratchDir((dir) => {
-    writeFixture(dir, { ...CLEAN_FIXTURE, serverLockedVersion: "2.0.0-beta.5" });
+    writeFixture(dir, { ...CLEAN_FIXTURE, serverLockedVersion: OTHER_EXACT_VERSION });
     const problems = checkSdkExactPin(dir);
     assert.equal(problems.length, 1);
     assert.match(problems[0], /drifted apart/);
@@ -443,15 +477,15 @@ test("mutation control: a dist-tag on the dev-only client request is flagged", (
 
 test("mutation control: the dev-only client requested at one exact version in package.json and another in the lockfile root is flagged", () => {
   withScratchDir((dir) => {
-    const problems = problemsForClientMutation(dir, { manifestSpec: "2.0.0-beta.5" });
+    const problems = problemsForClientMutation(dir, { manifestSpec: OTHER_EXACT_VERSION });
     assertSomeProblem(problems, /does not name the same version everywhere/);
-    assertSomeProblem(problems, /2\.0\.0-beta\.5/);
+    assertSomeProblem(problems, /2\.0\.0-beta\.4/);
   });
 });
 
 test("mutation control: the dev-only client resolved at a different exact version than both requests is flagged", () => {
   withScratchDir((dir) => {
-    const problems = problemsForClientMutation(dir, { resolvedVersion: "2.0.0-beta.5" });
+    const problems = problemsForClientMutation(dir, { resolvedVersion: OTHER_EXACT_VERSION });
     assertSomeProblem(problems, /does not name the same version everywhere/);
   });
 });
@@ -514,8 +548,12 @@ test("mutation control: an unrecognised dev-only @modelcontextprotocol/* package
 
 // --- green controls ---
 
-test("green control: PINNED_DEV_PACKAGES names exactly the client, held apart from the production set", () => {
-  assert.deepEqual(PINNED_DEV_PACKAGES, [CLIENT]);
+test("green control: PINNED_DEV_PACKAGES names exactly the client, held apart from the production set, pinned to the same required version as production", () => {
+  assert.deepEqual(
+    PINNED_DEV_PACKAGES.map((devSpec) => devSpec.name),
+    [CLIENT]
+  );
+  assert.equal(PINNED_DEV_PACKAGES[0].version, REQUIRED_MCP_SDK_VERSION);
   assert.equal(Object.keys(PINNED_PACKAGES).includes(CLIENT), false);
 });
 
@@ -530,20 +568,79 @@ test("green control: an exact-pinned dev-only client is permitted and stays clea
   });
 });
 
-test("green control: a dev-only client exact-pinned at a different version than production, consistently across all three sites, is still clean", () => {
+test("mutation control: ASYMMETRIC DRIFT - production (server/core) exact-pinned at the correct required version while the dev-only client is exact-pinned at a DIFFERENT version, consistently across all three of its own sites, is still flagged - internal self-consistency is not enough on its own, it must also match REQUIRED_MCP_SDK_VERSION", () => {
   withScratchDir((dir) => {
     writeFixture(dir, {
       ...CLEAN_FIXTURE,
       client: {
-        manifestSpec: "2.0.0-beta.5",
-        lockRootSpec: "2.0.0-beta.5",
-        resolvedVersion: "2.0.0-beta.5",
+        manifestSpec: OTHER_EXACT_VERSION,
+        lockRootSpec: OTHER_EXACT_VERSION,
+        resolvedVersion: OTHER_EXACT_VERSION,
       },
     });
-    assert.deepEqual(
-      checkSdkExactPin(dir),
-      [],
-      "the rule is exactness and internal agreement, not a hardcoded version"
+    const problems = checkSdkExactPin(dir);
+    assert.ok(
+      problems.length > 0,
+      "a dev-only client pinned exactly and self-consistently at the WRONG version must still be flagged"
+    );
+    for (const problem of problems) {
+      assert.match(problem, /requires exactly/);
+    }
+  });
+});
+
+test("mutation control: a COORDINATED downgrade of the whole package family (server, core, AND the dev-only client all consistently moved to the same other exact version) is flagged with a diagnostic naming the required version - internal agreement across every site does not excuse the wrong absolute version", () => {
+  withScratchDir((dir) => {
+    writeFixture(dir, {
+      serverManifestSpec: OTHER_EXACT_VERSION,
+      serverLockedVersion: OTHER_EXACT_VERSION,
+      coreParentSpec: OTHER_EXACT_VERSION,
+      coreLockedVersion: OTHER_EXACT_VERSION,
+      client: {
+        manifestSpec: OTHER_EXACT_VERSION,
+        lockRootSpec: OTHER_EXACT_VERSION,
+        resolvedVersion: OTHER_EXACT_VERSION,
+      },
+    });
+    const problems = checkSdkExactPin(dir);
+    assert.ok(
+      problems.length > 0,
+      "a fully internally-consistent coordinated downgrade must still be flagged"
+    );
+    for (const problem of problems) {
+      assert.match(
+        problem,
+        /requires exactly "2\.0\.0-beta\.5"/,
+        `expected every problem to name the required version, got: ${problem}`
+      );
+    }
+    // Every one of the three packages' pins must be independently named -
+    // a coordinated downgrade is not "fixed" by only catching one of them.
+    assert.ok(problems.some((p) => p.includes(SERVER)));
+    assert.ok(problems.some((p) => p.includes(CORE)));
+    assert.ok(problems.some((p) => p.includes(CLIENT)));
+  });
+});
+
+test("mutation control: everything at the correct required version EXCEPT one package (server) bumped to a newer exact version (an UPGRADE, not a downgrade) is flagged - the rule is 'equals the required version', not 'at least the required version', so drifting UP is exactly as wrong as drifting down", () => {
+  withScratchDir((dir) => {
+    const NEWER_VERSION = "2.0.0-beta.6";
+    writeFixture(dir, {
+      ...CLEAN_FIXTURE,
+      serverManifestSpec: NEWER_VERSION,
+      serverLockedVersion: NEWER_VERSION,
+    });
+    const problems = checkSdkExactPin(dir);
+    assert.ok(
+      problems.length > 0,
+      "a single package upgraded past the required version, even self-consistently, must still be flagged"
+    );
+    for (const problem of problems) {
+      assert.match(problem, /requires exactly "2\.0\.0-beta\.5"/);
+    }
+    assert.ok(
+      problems.every((p) => !p.includes(CORE)),
+      "core and client stayed correct and must not be flagged"
     );
   });
 });
@@ -608,4 +705,112 @@ test("mutation control: a missing package.json dependency entry for the direct d
     const problems = checkSdkExactPin(dir);
     assert.ok(problems.some((p) => /entry is missing/.test(p)));
   });
+});
+
+// ---------------------------------------------------------------------------
+// The SECOND, distinct pin: the vendored, in-repo, digest-verified Tasks
+// extension schema (schema/tasks-extension.schema.json +
+// config/tasks-schema-digest.json). Never an npm dependency - see the
+// unrecognised-package tests above for the fabricated-dependency half;
+// these exercise the in-repo half.
+// ---------------------------------------------------------------------------
+
+test("green control: a fully clean fixture (npm pins + schema pin) reports zero schema-pin problems", () => {
+  withScratchDir((dir) => {
+    writeFixture(dir, CLEAN_FIXTURE);
+    const problems = checkSdkExactPin(dir);
+    assert.deepEqual(
+      problems.filter((p) => /schema|digest/i.test(p)),
+      []
+    );
+  });
+});
+
+test("mutation control: deleting the vendored schema file entirely is flagged - the in-repo pin must be PRESENT, not just referenced", () => {
+  withScratchDir((dir) => {
+    writeFixture(dir, CLEAN_FIXTURE);
+    rmSync(path.join(dir, "schema", "tasks-extension.schema.json"));
+    const problems = checkSdkExactPin(dir);
+    assert.ok(
+      problems.some((p) => /vendored .* extension schema is missing/.test(p)),
+      `expected a missing-schema problem, got: ${JSON.stringify(problems)}`
+    );
+  });
+});
+
+test("mutation control: deleting the recorded digest file entirely is flagged", () => {
+  withScratchDir((dir) => {
+    writeFixture(dir, CLEAN_FIXTURE);
+    rmSync(path.join(dir, "config", "tasks-schema-digest.json"));
+    const problems = checkSdkExactPin(dir);
+    assert.ok(
+      problems.some((p) => /recorded digest .* is missing/.test(p)),
+      `expected a missing-digest problem, got: ${JSON.stringify(problems)}`
+    );
+  });
+});
+
+test("mutation control: editing the vendored schema's bytes WITHOUT updating the recorded digest is flagged - the recorded digest is ENFORCED, not decorative", () => {
+  withScratchDir((dir) => {
+    writeFixture(dir, CLEAN_FIXTURE);
+    // The digest recorded by writeCleanSchemaPin now disagrees with these
+    // edited bytes.
+    writeFileSync(
+      path.join(dir, "schema", "tasks-extension.schema.json"),
+      '{"fixture":"tasks-extension-schema","tampered":true}\n'
+    );
+    const problems = checkSdkExactPin(dir);
+    assert.ok(
+      problems.some((p) => /does not match/.test(p) && /SHA-256/.test(p)),
+      `expected a digest-mismatch problem, got: ${JSON.stringify(problems)}`
+    );
+  });
+});
+
+test("mutation control: a recorded digest with no sha256 string field is flagged rather than silently treated as a match", () => {
+  withScratchDir((dir) => {
+    writeFixture(dir, CLEAN_FIXTURE);
+    writeFileSync(
+      path.join(dir, "config", "tasks-schema-digest.json"),
+      JSON.stringify({ note: "forgot to record the digest" })
+    );
+    const problems = checkSdkExactPin(dir);
+    assert.ok(
+      problems.some((p) => /no "sha256" string field/.test(p)),
+      `expected a missing-sha256-field problem, got: ${JSON.stringify(problems)}`
+    );
+  });
+});
+
+test("green control: correcting the recorded digest after an intentional schema edit clears the mismatch", () => {
+  withScratchDir((dir) => {
+    writeFixture(dir, CLEAN_FIXTURE);
+    const editedBytes = Buffer.from('{"fixture":"tasks-extension-schema","v":2}\n', "utf8");
+    writeFileSync(path.join(dir, "schema", "tasks-extension.schema.json"), editedBytes);
+    writeFileSync(
+      path.join(dir, "config", "tasks-schema-digest.json"),
+      JSON.stringify({ sha256: createHash("sha256").update(editedBytes).digest("hex") })
+    );
+    const problems = checkSdkExactPin(dir).filter((p) => /schema|digest/i.test(p));
+    assert.deepEqual(problems, []);
+  });
+});
+
+test("mutation control: a fabricated io.modelcontextprotocol Tasks npm dependency in the lockfile is flagged as an unrecognised production package - no such package is ever pinned as an npm dependency", () => {
+  withScratchDir((dir) => {
+    writeFixture(dir, {
+      ...CLEAN_FIXTURE,
+      extraProductionPackages: { "@modelcontextprotocol/experimental-ext-tasks": "1.0.0" },
+    });
+    const problems = checkSdkExactPin(dir);
+    assert.ok(
+      problems.some((p) => /experimental-ext-tasks/.test(p) && /does not recognise/.test(p)),
+      `expected the fabricated Tasks dependency to be flagged as unrecognised, got: ${JSON.stringify(problems)}`
+    );
+  });
+});
+
+test("green control: the real repo state's schema pin passes with zero problems - the actual vendored schema and its recorded digest genuinely agree", () => {
+  const problems = checkSdkExactPin().filter((p) => /schema|digest/i.test(p));
+  assert.deepEqual(problems, []);
 });

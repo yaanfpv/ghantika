@@ -167,6 +167,34 @@ const THIS_FILE_PATH = fileURLToPath(import.meta.url);
 const SERVER_PACKAGE_NAME = "@modelcontextprotocol/server";
 
 /**
+ * The SINGLE permitted Tasks-import site: the thin adapter over the frozen
+ * output-event seam (`src/jobStore.ts`). This is NOT a widening of what the
+ * symbol-aware scan below tolerates - the SAME `findTasksImports` primitive,
+ * unmodified, still runs against this file too, exactly as it runs against
+ * every OTHER `src/` file, NEVER skipped (see
+ * `test/no-tasks-import.test.ts`'s dedicated carveout tests). The carveout
+ * lives entirely in `checkNoTasksImport`'s RESULT filtering, not in what
+ * gets scanned: for this one file, a hit that positively identifies one
+ * specific, legitimately-used Tasks symbol (`isNamedTasksSymbolHit`) is
+ * suppressed, while every OTHER class of finding `findTasksImports` can
+ * produce - a createRequire/CommonJS-loader violation, a wildcard
+ * re-export (which propagates the WHOLE Tasks surface onward, a strictly
+ * bigger hole than this carveout exists to permit), or any fail-closed
+ * "cannot statically verify" diagnostic - still surfaces for the adapter
+ * exactly as it does for any other file. See `isNamedTasksSymbolHit`'s own
+ * doc comment for the precise boundary and why those other classes are
+ * deliberately excluded. Posix-relative to `srcDir` (the function's own
+ * parameter, defaulting to `SRC_DIR`) - the SAME convention
+ * `scripts/check-module-boundaries.mjs`'s `FROZEN_MODULES` list already
+ * uses ("server.ts", "tools/kill.ts", never a "src/"-prefixed form) - so a
+ * test exercising a scratch `srcDir` that is not literally
+ * `<repo root>/src` still resolves the carveout correctly. A basename-only
+ * match would ALSO admit `tools/tasksAdapter.ts` or any other nested
+ * same-named file; matching the exact relative path does not.
+ */
+export const TASKS_ADAPTER_RELATIVE_PATH = "tasksAdapter.ts";
+
+/**
  * The enumerated Tasks export set - exactly the root exports of the pinned
  * `@modelcontextprotocol/server@2.0.0-beta.5` package's `dist/index.d.mts`
  * whose PUBLIC name matches `/Task/i`, copied here by hand from that real,
@@ -476,6 +504,71 @@ function collectRootNamespaceSymbols(checkedSourceFile, checker, fromAbsFilePath
 }
 
 /**
+ * Collects the `ts.Symbol`s of every PLAIN identifier a literal-root
+ * dynamic import of the guarded server root is bound to directly -
+ * `const m = await import(root);` (or the same without an explicit
+ * `await` - `outerNodeAfterAwait` treats both uniformly, the same way
+ * `collectLiteralRootDynamicImportUsageHits` already does for the
+ * destructure form). This is the counterpart to
+ * `collectRootNamespaceSymbols` for `import * as ns from root`, one level
+ * later: a static namespace import binds the module's namespace object to
+ * `ns` directly; this binds the SAME kind of value to a plain `const`/
+ * `let`/`var` identifier instead, via an ordinary variable declaration
+ * rather than import syntax. A later `m.CreateTaskResult` reference is
+ * structurally identical to `ns.CreateTaskResult` off a real namespace
+ * import - both are a property/element access whose base identifier
+ * resolves to a value that IS the imported module's namespace object - so
+ * this function's whole job is producing the SAME kind of `ts.Symbol` set
+ * `collectRootNamespaceSymbols` does, for this different binding route,
+ * so both sets can feed the identical `collectNamespaceMemberAccessHits`
+ * scan (see this file's call site below): reuse, not a parallel primitive.
+ *
+ * A DESTRUCTURING pattern (`const { X } = await import(root)`) is OUT OF
+ * SCOPE here on purpose - that shape is already handled, completely and
+ * separately, by `collectLiteralRootDynamicImportUsageHits` (over the raw,
+ * unchecked source), since a destructured binding never holds the whole
+ * module namespace object itself, only whichever properties were pulled
+ * off it at the destructuring site.
+ *
+ * ZERO-HOP, matching this file's EXISTING precedent for the sibling
+ * namespace-import case: `collectRootNamespaceSymbols` above tracks only
+ * the DIRECT `import * as ns from root` binding's own symbol - it does not
+ * chase a further alias of `ns` itself (`const n = ns;`) - so this
+ * function does not chase a further alias of `m` either
+ * (`const m = await import(root); const n = m;`). This is a DISCLOSED
+ * boundary, not a claimed-closed one (see
+ * `test/no-tasks-import.test.ts`'s own dedicated test for this exact
+ * shape): a further alias hop is a plausible further escape, and closing
+ * it would be a genuine extension of this file's real coverage, not
+ * evidence that this fix failed - the same posture `scripts/lib/ts-ast.mjs`
+ * states explicitly for its own one-hop alias boundaries.
+ */
+function collectDynamicImportBoundIdentifierSymbols(checkedSourceFile, checker, fromAbsFilePath) {
+  const symbols = new Set();
+  ts.forEachChild(checkedSourceFile, function visit(node) {
+    if (isDynamicImportCall(node)) {
+      const [firstArg] = node.arguments;
+      const specifierText = firstArg !== undefined ? stringLiteralText(firstArg) : undefined;
+      if (specifierText !== undefined && isServerRootSpecifier(specifierText, fromAbsFilePath)) {
+        const outer = outerNodeAfterAwait(node);
+        const declParent = outer.parent;
+        if (
+          declParent !== undefined &&
+          ts.isVariableDeclaration(declParent) &&
+          declParent.initializer === outer &&
+          ts.isIdentifier(declParent.name)
+        ) {
+          const symbol = checker.getSymbolAtLocation(declParent.name);
+          if (symbol !== undefined) symbols.add(symbol);
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  });
+  return symbols;
+}
+
+/**
  * Namespace member access off a confirmed server-root binding, in BOTH
  * positions: VALUE (`server.GetTaskRequest`, a `PropertyAccessExpression`,
  * or the static-bracket-key form `server["Task"]`, an
@@ -624,7 +717,23 @@ function findServerRootFindings(sourceFile, fromAbsFilePath) {
     checker,
     fromAbsFilePath
   );
-  collectNamespaceMemberAccessHits(checkedSourceFile, checker, rootNamespaceSymbols, hits);
+  const dynamicImportBoundIdentifierSymbols = collectDynamicImportBoundIdentifierSymbols(
+    checkedSourceFile,
+    checker,
+    fromAbsFilePath
+  );
+  // Both sets bind an identifier to the guarded root's whole namespace
+  // object - one via `import * as ns`, the other via
+  // `const m = await import(root)` - so a later member access off either
+  // is judged by the SAME scan, never a duplicated parallel check. See
+  // collectDynamicImportBoundIdentifierSymbols's own doc comment for why
+  // this reuses collectNamespaceMemberAccessHits rather than a bespoke
+  // pass.
+  const namespaceLikeSymbols =
+    dynamicImportBoundIdentifierSymbols.size === 0
+      ? rootNamespaceSymbols
+      : new Set([...rootNamespaceSymbols, ...dynamicImportBoundIdentifierSymbols]);
+  collectNamespaceMemberAccessHits(checkedSourceFile, checker, namespaceLikeSymbols, hits);
   collectImportTypeQueryHits(sourceFile, fromAbsFilePath, hits);
 
   return hits;
@@ -675,6 +784,48 @@ export function listTsFilesUnder(dir) {
 }
 
 /**
+ * True when `hit` is one of the SIX label shapes `findTasksImports` emits
+ * that positively identify ONE SPECIFIC member of `TASKS_SYMBOLS` actually
+ * being referenced by name - a named import (`namedImportHitLabel`), a
+ * named re-export (`namedReexportHitLabel`), a namespace member access in
+ * either position (`namespaceMemberValueHitLabel` /
+ * `namespaceMemberTypeHitLabel`), a literal-root dynamic-import destructure/
+ * property access (`dynamicImportDestructureHitLabel`), or a type-import
+ * query (`importTypeQueryHitLabel`). Every one of those six functions
+ * shares the literal phrase `Tasks symbol "` immediately before the quoted
+ * symbol name - verified against each of their own template strings above,
+ * and deliberately never reused by any OTHER diagnostic this file emits -
+ * which is what makes this a safe, lightweight classifier rather than a
+ * fragile guess. This is the ONLY class `checkNoTasksImport`'s adapter
+ * carveout is permitted to suppress - see its own call site below.
+ *
+ * Two adjacent classes are DELIBERATELY EXCLUDED, on purpose, not by
+ * oversight:
+ *
+ *   - `wildcardReexportHitLabel` ("...propagates the whole enumerated
+ *     Tasks symbol set onward") names no single symbol; a wildcard
+ *     re-export from the adapter would hand the WHOLE Tasks surface to
+ *     every OTHER file that imports from the adapter, a strictly BIGGER
+ *     hole than the carveout exists to permit (the adapter's own internal
+ *     use of specific, named symbols) - so it stays a violation even here.
+ *   - every fail-closed "cannot statically verify" diagnostic
+ *     (`COMPUTED_NAMESPACE_MEMBER_KEY_LABEL`,
+ *     `COMPUTED_DYNAMIC_IMPORT_SPECIFIER_LABEL`,
+ *     `COMPUTED_REQUIRE_SPECIFIER_LABEL`) and every createRequire/
+ *     CommonJS-loader label (`createRequireImportBindingLabel`) - none of
+ *     these positively identifies a permitted Tasks symbol, and the
+ *     createRequire ban in particular is a COMPLETELY SEPARATE prohibition
+ *     (frozen ESM, independent of Tasks - see this file's header), so
+ *     neither class is something this carveout was ever meant to permit.
+ *
+ * @param {string} hit
+ * @returns {boolean}
+ */
+export function isNamedTasksSymbolHit(hit) {
+  return hit.includes('Tasks symbol "');
+}
+
+/**
  * @param {string} [srcDir]
  * @returns {{ file: string, specifier: string }[]} every violation found
  *   across the whole `src/` tree, empty when clean
@@ -682,9 +833,24 @@ export function listTsFilesUnder(dir) {
 export function checkNoTasksImport(srcDir = SRC_DIR) {
   const violations = [];
   for (const absFile of listTsFilesUnder(srcDir)) {
-    const text = readFileSync(absFile, "utf8");
+    // The single permitted carveout (see TASKS_ADAPTER_RELATIVE_PATH's own
+    // doc comment): the adapter file is SCANNED exactly like every other
+    // src/ file - findTasksImports never skips it - but a hit that
+    // positively identifies one specific, legitimately-used Tasks symbol
+    // is suppressed for this ONE file. Every other class of finding
+    // (createRequire/CommonJS-loader violations, a wildcard re-export,
+    // any fail-closed "cannot verify" diagnostic) still surfaces for the
+    // adapter exactly as it does for any other src/ file - see
+    // isNamedTasksSymbolHit's own doc comment. Matched relative to
+    // `srcDir` itself (not `REPO_ROOT`), so a test exercising a scratch
+    // `srcDir` resolves the carveout the same way the real tree does.
+    const relToSrcDir = path.relative(srcDir, absFile).split(path.sep).join("/");
+    const isAdapterFile = relToSrcDir === TASKS_ADAPTER_RELATIVE_PATH;
+
     const relFile = path.relative(REPO_ROOT, absFile).split(path.sep).join("/");
+    const text = readFileSync(absFile, "utf8");
     for (const specifier of findTasksImports(text, absFile)) {
+      if (isAdapterFile && isNamedTasksSymbolHit(specifier)) continue;
       violations.push({ file: relFile, specifier });
     }
   }
@@ -700,7 +866,9 @@ function main() {
     process.exitCode = 1;
     return;
   }
-  console.log("no Tasks-extension reference found anywhere under src/");
+  console.log(
+    `no forbidden Tasks-extension reference found under src/ outside the permitted ${TASKS_ADAPTER_RELATIVE_PATH} seam`
+  );
 }
 
 if (isMainModule(import.meta.url)) {

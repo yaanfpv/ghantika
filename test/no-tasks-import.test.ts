@@ -17,6 +17,8 @@ import {
   COMPUTED_NAMESPACE_MEMBER_KEY_LABEL,
   COMPUTED_REQUIRE_SPECIFIER_LABEL,
   findTasksImports,
+  isNamedTasksSymbolHit,
+  TASKS_ADAPTER_RELATIVE_PATH,
   TASKS_SYMBOLS,
 } from "../scripts/check-no-tasks-import.mjs";
 
@@ -52,11 +54,164 @@ function buildRepoRootScratchSrc(files: Record<string, string>): string {
 
 // ---------------------------------------------------------------------------
 // The real src/ tree, as it exists right now, references nothing from the
-// Tasks extension.
+// Tasks extension OUTSIDE the one permitted adapter carveout.
 // ---------------------------------------------------------------------------
 
-test("the real src/ tree references nothing from the Tasks extension", () => {
+test("the real src/ tree references nothing from the Tasks extension outside the permitted adapter carveout", () => {
   assert.deepEqual(checkNoTasksImport(), []);
+});
+
+// ---------------------------------------------------------------------------
+// The adapter carveout: src/tasksAdapter.ts is scanned exactly like every
+// other src/ file - the guard never skips it - and only its LEGITIMATE
+// named-symbol hits are filtered out of the reported violations; every
+// other finding class (createRequire, a wildcard re-export, a fail-closed
+// "cannot verify" diagnostic) still surfaces for it exactly as it does for
+// any other file. That filtering is narrow - a REAL Tasks reference in a
+// DIFFERENT file is still caught, and the carveout constant names exactly
+// one path.
+// ---------------------------------------------------------------------------
+
+test("TASKS_ADAPTER_RELATIVE_PATH names exactly one file, tasksAdapter.ts, relative to srcDir (matching FROZEN_MODULES' own convention, never a repo-root-relative or src/-prefixed form)", () => {
+  assert.equal(TASKS_ADAPTER_RELATIVE_PATH, "tasksAdapter.ts");
+});
+
+test("a real Tasks-extension import inside the adapter file itself produces zero hits - the single permitted seam", () => {
+  const dir = buildRepoRootScratchSrc({
+    "tasksAdapter.ts":
+      'import { GetTaskRequest } from "@modelcontextprotocol/server";\nvoid GetTaskRequest;\n',
+  });
+  try {
+    const violations = checkNoTasksImport(dir).filter((v) => v.file.includes("tasksAdapter.ts"));
+    assert.deepEqual(violations, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the SAME real Tasks-extension import is still flagged when it appears in ANY OTHER file - the carveout is narrow, not a blanket exemption for the whole tree", () => {
+  const dir = buildRepoRootScratchSrc({
+    "jobStore.ts":
+      'import { GetTaskRequest } from "@modelcontextprotocol/server";\nvoid GetTaskRequest;\n',
+  });
+  try {
+    const violations = checkNoTasksImport(dir).filter((v) => v.file.includes("jobStore.ts"));
+    assert.ok(
+      violations.some((v) => v.specifier.includes('imports Tasks symbol "GetTaskRequest"')),
+      `expected the core-module Tasks import to still be flagged, got: ${JSON.stringify(violations)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a file literally named tasksAdapter.ts UNDER A SUBDIRECTORY (e.g. tools/tasksAdapter.ts) is NOT covered by the carveout - the skip matches the exact posix-relative path, not just the basename", () => {
+  const dir = buildRepoRootScratchSrc({
+    "tools/tasksAdapter.ts":
+      'import { GetTaskRequest } from "@modelcontextprotocol/server";\nvoid GetTaskRequest;\n',
+  });
+  try {
+    const violations = checkNoTasksImport(dir).filter((v) => v.file.includes("tasksAdapter.ts"));
+    assert.ok(
+      violations.some((v) => v.specifier.includes('imports Tasks symbol "GetTaskRequest"')),
+      `expected a same-named file in a different location to still be scanned, got: ${JSON.stringify(violations)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The adapter carveout is NARROW in a second dimension too: it suppresses
+// only a hit that positively identifies one specific, legitimately-used
+// Tasks symbol - it does NOT exempt the adapter file from the guard's
+// completely separate createRequire/CommonJS-loader prohibition (which the
+// SAME findTasksImports primitive also checks), and it does NOT exempt a
+// wildcard re-export (which propagates the whole Tasks surface onward).
+// ---------------------------------------------------------------------------
+
+test("the adapter carveout is narrow: a MIXED adapter file containing BOTH a permitted Tasks-extension import AND a forbidden createRequire import surfaces ONLY the createRequire violation - the permitted Tasks import stays suppressed, but the SEPARATE createRequire ban still applies to this file exactly as it does to every other src/ file", () => {
+  const dir = buildRepoRootScratchSrc({
+    "tasksAdapter.ts":
+      'import { createRequire } from "node:module";\n' +
+      'import { GetTaskRequest } from "@modelcontextprotocol/server";\n' +
+      "const require = createRequire(import.meta.url);\n" +
+      "void GetTaskRequest;\n" +
+      "void require;\n",
+  });
+  try {
+    const violations = checkNoTasksImport(dir).filter((v) => v.file.includes("tasksAdapter.ts"));
+    assert.ok(
+      violations.some((v) => v.specifier.includes("imports createRequire")),
+      `expected the createRequire violation to surface for the adapter file, got: ${JSON.stringify(violations)}`
+    );
+    assert.ok(
+      !violations.some((v) => v.specifier.includes('Tasks symbol "GetTaskRequest"')),
+      `expected the permitted Tasks-symbol import to stay suppressed, got: ${JSON.stringify(violations)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the adapter carveout does NOT suppress a wildcard/namespace re-export of the guarded root, even inside the adapter file - that class propagates the WHOLE enumerated Tasks symbol set onward to every consumer of the adapter, a strictly bigger hole than the carveout exists to permit", () => {
+  const dir = buildRepoRootScratchSrc({
+    "tasksAdapter.ts": 'export * from "@modelcontextprotocol/server";\n',
+  });
+  try {
+    const violations = checkNoTasksImport(dir).filter((v) => v.file.includes("tasksAdapter.ts"));
+    assert.ok(
+      violations.some((v) =>
+        v.specifier.includes("propagates the whole enumerated Tasks symbol set onward")
+      ),
+      `expected the wildcard re-export to still be flagged even in the adapter file, got: ${JSON.stringify(violations)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the adapter's own REAL current content (its actual imports, none of which are Tasks-symbol names - see src/tasksAdapter.ts's own header on why it hand-rolls its own types instead) still produces zero violations after the carveout fix", () => {
+  const violations = checkNoTasksImport().filter((v) => v.file.endsWith("tasksAdapter.ts"));
+  assert.deepEqual(violations, []);
+});
+
+test("isNamedTasksSymbolHit classifies exactly the six positively-named-symbol hit shapes true, and the wildcard-reexport / every fail-closed / createRequire classes false", () => {
+  assert.equal(
+    isNamedTasksSymbolHit('imports Tasks symbol "Task" from "@modelcontextprotocol/server"'),
+    true
+  );
+  assert.equal(
+    isNamedTasksSymbolHit('re-exports Tasks symbol "Task" from "@modelcontextprotocol/server"'),
+    true
+  );
+  assert.equal(
+    isNamedTasksSymbolHit(
+      'references Tasks symbol "Task" via a namespace member access (value position) on the @modelcontextprotocol/server root'
+    ),
+    true
+  );
+  assert.equal(
+    isNamedTasksSymbolHit(
+      'destructures/accesses Tasks symbol "Task" from a literal-root dynamic import of "@modelcontextprotocol/server"'
+    ),
+    true
+  );
+  assert.equal(isNamedTasksSymbolHit(COMPUTED_NAMESPACE_MEMBER_KEY_LABEL), false);
+  assert.equal(isNamedTasksSymbolHit(COMPUTED_DYNAMIC_IMPORT_SPECIFIER_LABEL), false);
+  assert.equal(isNamedTasksSymbolHit(COMPUTED_REQUIRE_SPECIFIER_LABEL), false);
+  assert.equal(
+    isNamedTasksSymbolHit(
+      'wildcard/namespace re-export of "@modelcontextprotocol/server" propagates the whole enumerated Tasks symbol set onward'
+    ),
+    false
+  );
+  assert.equal(
+    isNamedTasksSymbolHit(
+      '<imports createRequire from node:module (or its unprefixed "module" form) - CommonJS interop is forbidden anywhere in this frozen ESM architecture, regardless of the local alias chosen>'
+    ),
+    false
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -322,6 +477,72 @@ test("a direct property access off an awaited literal-root dynamic import (`(awa
     hits.some((h) => h.includes('"GetTaskRequest"')),
     `expected the property access off the awaited dynamic import to be flagged, got: ${JSON.stringify(hits)}`
   );
+});
+
+// ---------------------------------------------------------------------------
+// A literal-root dynamic import bound to a PLAIN IDENTIFIER, accessed
+// LATER (possibly in a completely separate statement), is exactly as
+// statically resolvable as an IMMEDIATE destructure/property access - see
+// collectDynamicImportBoundIdentifierSymbols's own doc comment in
+// scripts/check-no-tasks-import.mjs for how this reuses the same
+// namespace-member-access scan `import * as ns from root` already feeds.
+// ---------------------------------------------------------------------------
+
+test("a literal-root dynamic import bound to a plain identifier, then accessed later in a SEPARATE statement (`const m = await import(root); void m.CreateTaskResult;`), is flagged - not just the immediate destructure/property-access forms", () => {
+  const hits = findTasksImports(
+    'const m = await import("@modelcontextprotocol/server");\nvoid m.CreateTaskResult;\n'
+  );
+  assert.ok(
+    hits.some((h) => h.includes('"CreateTaskResult"')),
+    `expected the later member access off the plain-identifier binding to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test('the same plain-identifier-bound dynamic import, accessed via a STATIC BRACKET key (`m["CreateTaskResult"]`) instead of dotted, is flagged the same way', () => {
+  const hits = findTasksImports(
+    'const m = await import("@modelcontextprotocol/server");\nvoid m["CreateTaskResult"];\n'
+  );
+  assert.ok(
+    hits.some((h) => h.includes('"CreateTaskResult"')),
+    `expected the bracket-key member access to be flagged, got: ${JSON.stringify(hits)}`
+  );
+});
+
+test("green control: a plain identifier named the same as a dynamic-import-bound variable, but declared in a DIFFERENT SCOPE and never touching the guarded import, is never flagged - even when its own unrelated property happens to share a Tasks symbol's name, proving this is real SYMBOL identity, not name-text matching", () => {
+  const hits = findTasksImports(
+    [
+      "async function elsewhere() {",
+      "  const m = { GetTaskRequest: 1 };",
+      "  void m.GetTaskRequest;",
+      "}",
+      "async function real() {",
+      '  const m = await import("@modelcontextprotocol/server");',
+      "  void m.Server;",
+      "}",
+      "",
+    ].join("\n")
+  );
+  assert.deepEqual(hits, []);
+});
+
+test("documented boundary: a FURTHER alias hop off a dynamic-import-bound plain identifier (`const m = await import(root); const n = m; void n.CreateTaskResult;`) is NOT traced - matching this guard's EXISTING zero-hop precedent for a static `import * as ns from root` binding (a further alias of `ns` itself is not chased there either); this is a disclosed boundary, not a claimed-closed one", () => {
+  const hits = findTasksImports(
+    'const m = await import("@modelcontextprotocol/server");\n' +
+      "const n = m;\n" +
+      "void n.CreateTaskResult;\n"
+  );
+  assert.deepEqual(
+    hits,
+    [],
+    "a one-hop-further alias of the bound identifier is out of this fix's scope, by design"
+  );
+});
+
+test("green control: a plain-identifier-bound dynamic import of the server root that only accesses a PERMITTED symbol (never a Tasks symbol) stays clean", () => {
+  const hits = findTasksImports(
+    'const m = await import("@modelcontextprotocol/server");\nvoid m.Server;\n'
+  );
+  assert.deepEqual(hits, []);
 });
 
 // ---------------------------------------------------------------------------

@@ -49,11 +49,24 @@
  *      `@modelcontextprotocol/*` package that is NOT expected is reported
  *      rather than trusted, the same way an unrecognised production
  *      package is.
+ *   5. EVERY exact pin above - `server`, `core` (via server), and each
+ *      expected dev-only package - is ADDITIONALLY checked against a
+ *      single frozen REQUIRED version this file records
+ *      (`REQUIRED_MCP_SDK_VERSION`), not merely checked for being exact
+ *      and internally self-consistent. Exactness and cross-site agreement
+ *      alone let a COORDINATED change - every site moved together, in
+ *      lockstep, to some other exact version, a downgrade or an upgrade -
+ *      pass silently, because internal agreement is the only thing those
+ *      other checks look at. Comparing every exact pin against this one
+ *      recorded value is what closes that gap: a package pinned exactly
+ *      and self-consistently at the WRONG version is still flagged, by
+ *      name, against the version this repo actually built and tested.
  *
  * Run with:
  *
  *   npm run guard:sdk-pin
  */
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -63,16 +76,110 @@ import { isMainModule } from "./lib/is-main.mjs";
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
 /**
+ * TWO DISTINCT pins, never fused: everything above this point in the file
+ * is the NPM PACKAGE pin (package.json + package-lock.json). This second
+ * pin is the io.modelcontextprotocol/tasks EXTENSION SCHEMA - a vendored
+ * JSON file living in the repo, with its own recorded SHA-256 digest, and
+ * deliberately NEVER an npm dependency (no `@modelcontextprotocol/ext-tasks`
+ * or `@modelcontextprotocol/experimental-ext-tasks` package exists to pin -
+ * both 404 on the registry). The unrecognised-production-package check
+ * above already fails closed on a FABRICATED Tasks npm entry, since neither
+ * name is in PINNED_PACKAGES or PINNED_DEV_PACKAGES; this section pins the
+ * SEPARATE, real, in-repo half.
+ */
+const TASKS_EXTENSION_SCHEMA_RELATIVE_PATH = "schema/tasks-extension.schema.json";
+const TASKS_EXTENSION_SCHEMA_DIGEST_RELATIVE_PATH = "config/tasks-schema-digest.json";
+
+/**
+ * @param {string} root
+ * @returns {string[]}
+ */
+function checkTasksExtensionSchemaPin(root) {
+  const problems = [];
+  const schemaPath = path.join(root, TASKS_EXTENSION_SCHEMA_RELATIVE_PATH);
+  const digestPath = path.join(root, TASKS_EXTENSION_SCHEMA_DIGEST_RELATIVE_PATH);
+
+  let schemaBytes;
+  try {
+    schemaBytes = readFileSync(schemaPath);
+  } catch {
+    problems.push(
+      `the vendored io.modelcontextprotocol/tasks extension schema is missing at "${TASKS_EXTENSION_SCHEMA_RELATIVE_PATH}" - ` +
+        "the extension schema must be pinned IN-REPO (never only as an npm dependency - no such package exists)"
+    );
+  }
+
+  let recordedDigestRaw;
+  try {
+    recordedDigestRaw = JSON.parse(readFileSync(digestPath, "utf8"));
+  } catch {
+    problems.push(
+      `the recorded digest for the vendored extension schema is missing at "${TASKS_EXTENSION_SCHEMA_DIGEST_RELATIVE_PATH}"`
+    );
+  }
+
+  if (schemaBytes === undefined || recordedDigestRaw === undefined) return problems;
+
+  const recordedDigest = /** @type {{ sha256?: unknown }} */ (recordedDigestRaw).sha256;
+  if (typeof recordedDigest !== "string" || recordedDigest.length === 0) {
+    problems.push(
+      `"${TASKS_EXTENSION_SCHEMA_DIGEST_RELATIVE_PATH}" has no "sha256" string field to compare against`
+    );
+    return problems;
+  }
+
+  const actualDigest = createHash("sha256").update(schemaBytes).digest("hex");
+  if (actualDigest !== recordedDigest) {
+    problems.push(
+      `the recorded digest ("${recordedDigest}") in "${TASKS_EXTENSION_SCHEMA_DIGEST_RELATIVE_PATH}" does not match ` +
+        `the actual SHA-256 of "${TASKS_EXTENSION_SCHEMA_RELATIVE_PATH}" ("${actualDigest}") - ` +
+        "the recorded digest is ENFORCED, not decorative; re-run the digest-recording step after any edit to the vendored schema"
+    );
+  }
+
+  return problems;
+}
+
+/**
+ * The single, frozen `@modelcontextprotocol` SDK version this repo is
+ * actually built and tested against, shared by every package in the
+ * pinned family at once - the direct production dependency (`server`),
+ * the transitive one reached through it (`core`), and the dev-only
+ * package the test suite pairs a real Client against a real Server with
+ * (`client`). Exactness and cross-site agreement (`isExactSemver`, the
+ * spec<->lockfile drift check, `checkExpectedDevPackage`'s three-site
+ * agreement check) all catch a pin that goes internally INCONSISTENT;
+ * none of them catch a pin that is exact and consistent everywhere but
+ * simply WRONG, because a COORDINATED change - every site of every
+ * package moved together, in lockstep, to some other exact version, a
+ * downgrade or an upgrade - never disagrees with itself. This constant is
+ * the DATA that closes that gap: `checkSdkExactPin` and
+ * `checkExpectedDevPackage` both compare every exact pin against this one
+ * recorded literal, not just against each other.
+ */
+export const REQUIRED_MCP_SDK_VERSION = "2.0.0-beta.5";
+
+/**
  * The exact production `@modelcontextprotocol/*` package SET this repo
  * depends on. `directDependency: true` means package.json's own
  * "dependencies" carries the pin directly; `false` means it is reached
  * only transitively, through another package in this same set (`via`
  * names that parent), and its pin is read from the PARENT's own recorded
- * dependency requirement in package-lock.json instead.
+ * dependency requirement in package-lock.json instead. `version` is the
+ * single required version this package must resolve to - see
+ * `REQUIRED_MCP_SDK_VERSION`'s own doc comment for why this is checked
+ * separately from exactness/agreement, never folded into either.
  */
 export const PINNED_PACKAGES = {
-  "@modelcontextprotocol/server": { directDependency: true },
-  "@modelcontextprotocol/core": { directDependency: false, via: "@modelcontextprotocol/server" },
+  "@modelcontextprotocol/server": {
+    directDependency: true,
+    version: REQUIRED_MCP_SDK_VERSION,
+  },
+  "@modelcontextprotocol/core": {
+    directDependency: false,
+    via: "@modelcontextprotocol/server",
+    version: REQUIRED_MCP_SDK_VERSION,
+  },
 };
 
 /**
@@ -82,9 +189,14 @@ export const PINNED_PACKAGES = {
  * (see checkExpectedDevPackage), while production pins are read from the
  * manifest or from a parent's recorded requirement. Any dev-only
  * `@modelcontextprotocol/*` package NOT named here is reported as
- * unexpected rather than trusted.
+ * unexpected rather than trusted. Each entry's `version` is the single
+ * required version that package must resolve to, checked the same way
+ * `PINNED_PACKAGES`'s own `version` field is - see
+ * `REQUIRED_MCP_SDK_VERSION`'s own doc comment.
  */
-export const PINNED_DEV_PACKAGES = ["@modelcontextprotocol/client"];
+export const PINNED_DEV_PACKAGES = [
+  { name: "@modelcontextprotocol/client", version: REQUIRED_MCP_SDK_VERSION },
+];
 
 // A bare X.Y.Z, with an optional -prerelease and/or +build-metadata
 // suffix (both valid parts of semver proper) - and nothing else. Any
@@ -237,9 +349,10 @@ function resolveLockEntry(lockfile, packageName) {
  * @param {Record<string, unknown>} pkg
  * @param {Record<string, unknown>} lockfile
  * @param {string} packageName
+ * @param {string} requiredVersion
  * @returns {string[]}
  */
-function checkExpectedDevPackage(pkg, lockfile, packageName) {
+function checkExpectedDevPackage(pkg, lockfile, packageName, requiredVersion) {
   const problems = [];
 
   const manifestDeps = /** @type {Record<string, unknown> | undefined} */ (pkg.dependencies);
@@ -325,6 +438,25 @@ function checkExpectedDevPackage(pkg, lockfile, packageName) {
     );
   }
 
+  // Required version: every present, EXACT site must additionally match
+  // the single frozen SDK version this whole package family is pinned to
+  // (see REQUIRED_MCP_SDK_VERSION's own doc comment) - internal agreement
+  // among the three sites (checked immediately above) says nothing about
+  // whether the version they all agree on is the RIGHT one. A coordinated
+  // change that moves manifestSpec/lockRootSpec/resolvedVersion together,
+  // in lockstep, to some other exact version passes the agreement check
+  // by construction; this is the check that still catches it. Filtered to
+  // EXACT sites only, so an already-flagged non-exact spec (a caret range,
+  // a dist-tag) is never ALSO reported here for failing a comparison it
+  // was never a candidate to pass.
+  for (const site of sites) {
+    if (isExactSemver(site.value) && site.value !== requiredVersion) {
+      problems.push(
+        `${site.label} pins "${packageName}" to "${site.value}", but this repo requires exactly "${requiredVersion}"`
+      );
+    }
+  }
+
   return problems;
 }
 
@@ -372,6 +504,19 @@ export function checkSdkExactPin(root = REPO_ROOT) {
           "the requested spec and the lockfile have drifted apart"
       );
     }
+
+    // Required version (see REQUIRED_MCP_SDK_VERSION's own doc comment):
+    // an exact pin that agrees with the lockfile is not necessarily the
+    // RIGHT pin - a coordinated downgrade or upgrade that moves the
+    // manifest spec and the locked version together, in lockstep, passes
+    // the drift check above by construction. Gated on isExactSemver the
+    // same way the drift check is, so an already-flagged non-exact spec
+    // is never ALSO reported here.
+    if (isExactSemver(requestedSpec) && requestedSpec !== spec.version) {
+      problems.push(
+        `${specSource} pins "${packageName}" to "${requestedSpec}", but this repo requires exactly "${spec.version}"`
+      );
+    }
   }
 
   const knownPackageNames = new Set(Object.keys(PINNED_PACKAGES));
@@ -384,11 +529,11 @@ export function checkSdkExactPin(root = REPO_ROOT) {
     }
   }
 
-  for (const packageName of PINNED_DEV_PACKAGES) {
-    problems.push(...checkExpectedDevPackage(pkg, lockfile, packageName));
+  for (const devSpec of PINNED_DEV_PACKAGES) {
+    problems.push(...checkExpectedDevPackage(pkg, lockfile, devSpec.name, devSpec.version));
   }
 
-  const expectedDevPackageNames = new Set(PINNED_DEV_PACKAGES);
+  const expectedDevPackageNames = new Set(PINNED_DEV_PACKAGES.map((devSpec) => devSpec.name));
   for (const packageName of developmentModelContextProtocolPackages(lockfile)) {
     if (!expectedDevPackageNames.has(packageName)) {
       problems.push(
@@ -397,6 +542,11 @@ export function checkSdkExactPin(root = REPO_ROOT) {
       );
     }
   }
+
+  // The SECOND, DISTINCT pin: the in-repo, digest-verified Tasks extension
+  // schema - see checkTasksExtensionSchemaPin's own doc comment for why
+  // this is never folded into the npm-package checks above.
+  problems.push(...checkTasksExtensionSchemaPin(root));
 
   return problems;
 }
@@ -410,8 +560,9 @@ function main() {
     process.exitCode = 1;
     return;
   }
+  const devPackageNames = PINNED_DEV_PACKAGES.map((devSpec) => devSpec.name).join(", ");
   console.log(
-    `${Object.keys(PINNED_PACKAGES).join(", ")}: every production @modelcontextprotocol/* dependency is exactly pinned and matches package-lock.json's resolved versions, and ${PINNED_DEV_PACKAGES.join(", ")} is exactly pinned and consistent across manifest, lockfile root, and resolved entry`
+    `${Object.keys(PINNED_PACKAGES).join(", ")}: every production @modelcontextprotocol/* dependency is exactly pinned to the required ${REQUIRED_MCP_SDK_VERSION} and matches package-lock.json's resolved versions, and ${devPackageNames} is exactly pinned to the same required version and consistent across manifest, lockfile root, and resolved entry`
   );
 }
 
