@@ -1,88 +1,143 @@
 #!/usr/bin/env node
 /**
- * Checks for an import of the MCP spec's in-progress "Tasks" extension via
- * the monolithic `@modelcontextprotocol/sdk` package's `/experimental`
- * namespace. Fails red if any file under `src/` LOADS a module under that
- * namespace via any means - the loading MECHANISM never changes what
- * module actually gets resolved, so this checks the resolved target, not
- * one fixed syntax:
+ * Enforces the MCP spec's in-progress "Tasks" extension boundary against
+ * the SDK packages this project actually installs. The unit of enforcement
+ * is the SYMBOL, matched by its SOURCE imported/exported name (never a
+ * local alias), not the module specifier - a prior version of this guard
+ * checked for a `@modelcontextprotocol/sdk/experimental` specifier prefix,
+ * which is not a barrier at all: this project depends on the split
+ * `@modelcontextprotocol/{server,core,client}` packages, which expose no
+ * such subpath, and Tasks-related symbols (`Task`, `GetTaskRequest`,
+ * `CreateTaskResult`, and sixteen more - see `TASKS_SYMBOLS` below) are
+ * reachable straight off the installed `@modelcontextprotocol/server`
+ * package's own ROOT specifier, the SAME specifier production imports
+ * `Server`/`ProtocolError`/etc. from. A specifier-prefix check has no
+ * correct target against that shape and cannot be made non-vacuous by
+ * retargeting alone - the fix is symbol-aware enforcement against the real
+ * root, which is what this file now does.
  *
- *   1. a direct import           import { X } from "@modelcontextprotocol/sdk/experimental/tasks";
- *   2. a type-only import        import type { X } from "@modelcontextprotocol/sdk/experimental/tasks";
- *   3. a barrel re-export        import { X } from "@modelcontextprotocol/sdk/experimental";
- *                                 (that barrel's own index.d.ts does `export * from "./tasks/index.js"`
- *                                  in the monolithic package, so importing ANYTHING from the bare
- *                                  "/experimental" barrel would already transitively pull Tasks in,
- *                                  which is why the bare barrel is forbidden too, not just the
- *                                  "/experimental/tasks" subpath)
- *   4. an explicit re-export     export { X } from "@modelcontextprotocol/sdk/experimental/tasks";
- *                                 export * from "@modelcontextprotocol/sdk/experimental";
- *   5. a dynamic import          await import("@modelcontextprotocol/sdk/experimental/tasks");
- *   6. a CommonJS require        require("@modelcontextprotocol/sdk/experimental/tasks");
- *   7. createRequire itself      const require = createRequire(import.meta.url); - calling
- *                                 createRequire AT ALL is forbidden outright, independent
- *                                 of what its returned function later loads, resolved by
- *                                 where the `createRequire` binding itself came from (see
- *                                 `createRequireImportBindingLabel`'s own doc comment)
- *   8. process's dangerous props  process.getBuiltinModule("node:module").createRequire(...) -
- *                                 referencing any of `process.getBuiltinModule`/`.dlopen`/
- *                                 `.binding`, directly or through one local alias hop, is
- *                                 forbidden outright, the same acquisition-site principle as
- *                                 form 7, independent of what specifier it is later called
- *                                 with. `Reflect` (any method), `.constructor` property access
- *                                 (any base, when the key is statically resolvable - dotted,
- *                                 literal-bracketed, or a computed key foldable to the literal
- *                                 through one local alias hop - or via a destructuring
- *                                 pattern), and a descriptor read via
- *                                 `Object.getOwnPropertyDescriptor` naming any of these same
- *                                 identifiers are all closed the same way, outright, as
- *                                 acquisition surfaces rather than named invocation shapes -
- *                                 see scripts/lib/ts-ast.mjs's own header, and
- *                                 `CONSTRUCTOR_PROPERTY_NAME`'s own doc comment, for that
- *                                 design and for the two routes it does NOT yet close: a
- *                                 specifier reaching `"node:module"` through anything other
- *                                 than the two literal spellings this guard's specifier check
- *                                 compares against (an absolute, file-URL, or resolver-alias
- *                                 specifier), and a `.constructor` access whose key is
- *                                 GENUINELY non-resolvable (not foldable through one alias
- *                                 hop) against a base that is neither `globalThis` nor
- *                                 `process` - which fails OPEN, deliberately, rather than
- *                                 over-block ordinary computed property access
+ * SCOPE, STATED PLAINLY (matching scripts/lib/ts-ast.mjs's own
+ * IN-SCOPE/OUT-OF-SCOPE style):
  *
- * WHAT THIS GUARD ACTUALLY COVERS, STATED PLAINLY: this project does not
- * depend on the monolithic `@modelcontextprotocol/sdk` package at all -
- * its real dependencies are the split `@modelcontextprotocol/client`,
- * `@modelcontextprotocol/core`, and `@modelcontextprotocol/server`
- * packages, all at 2.0.0-beta.4. The `/experimental` namespace this guard
- * checks does not exist in those split packages; Tasks-related symbols
- * are instead reachable from `@modelcontextprotocol/server`'s own ROOT
- * specifier, a completely different import shape this guard does NOT
- * check. So today this guard is not an effective barrier against a real
- * import of Tasks from the packages this project actually depends on -
- * it only catches an import of a package this project has never
- * installed. Symbol-aware enforcement against the split packages' root
- * export is separate, tracked work, not implemented here.
+ * IN SCOPE - every ENUMERATED statically-resolvable reference, from a file
+ * under `src/`, to one of the enumerated Tasks symbols (`TASKS_SYMBOLS`
+ * below) via the installed `@modelcontextprotocol/server` package root
+ * (resolved by real PACKAGE IDENTITY - see `isServerRootSpecifier` - so an
+ * aliased, relative, or differently-built (`.cjs` vs `.mjs` vs a `file://`
+ * entry) specifier reaching the SAME installed package is judged the same
+ * as the bare specifier text):
+ *
+ *   1. a plain (value) named import         import { GetTaskRequest } from "@modelcontextprotocol/server";
+ *   2. a TYPE-ONLY import, statement-level   import type { GetTaskRequest } from "@modelcontextprotocol/server";
+ *      or per-specifier                      import { type Task } from "@modelcontextprotocol/server";
+ *   3. a named re-export, value or type-only export { Task } / export type { Task } from "@modelcontextprotocol/server";
+ *      (aliased or not - export { Task as T } from "...";)
+ *   4. a wildcard/namespace re-export, in    export * from "..."; / export * as ns from "...";
+ *      every type-only combination too       export type * from "..."; / export type * as ns from "...";
+ *      (propagates the WHOLE enumerated set onward, so it is flagged as a
+ *      single hit rather than requiring the re-exporting file to spell out
+ *      each symbol by name)
+ *   5. a namespace member access in VALUE    import * as server from "...";
+ *      position - dotted, or a STATIC        void server.GetTaskRequest;
+ *      bracket key (folded through one       void server["Task"];
+ *      local alias hop, same as this file's
+ *      shared `resolvedAccessKeyText`)
+ *   6. a namespace member access in TYPE     import * as server from "...";
+ *      position - a `QualifiedName` inside   type C = server.Task;
+ *      a type, the SAME reference this
+ *      file's own symbol resolution proves
+ *      resolves to the identical namespace
+ *      binding as form 5 (verified empirically)
+ *   7. a literal-root dynamic-import         const { GetTaskRequest } = await import("@modelcontextprotocol/server");
+ *      destructure, or an immediate          (await import("@modelcontextprotocol/server")).GetTaskRequest
+ *      property access off the awaited
+ *      result - statically resolvable, so
+ *      judged on its actual symbol, never
+ *      waved through as "dynamic"
+ *   8. a TYPE-IMPORT-QUERY                   type T = import("@modelcontextprotocol/server").Task;
+ *      (`ImportTypeNode` - a distinct AST
+ *      shape from both form 6's `QualifiedName`
+ *      and form 7's dynamic-import `CallExpression`)
+ *
+ * OUT OF SCOPE, DELIBERATELY, NOT BY OVERSIGHT: a default import of the
+ * server root (this package has no meaningful default export shape worth
+ * enumerating); a CommonJS `require(...)` of a LITERAL, resolvable root
+ * specifier (this codebase is ESM-only end to end - see `createRequire`'s
+ * own outright ban below - so a literal `require(root)` is dead code in
+ * this repo's real architecture, not a live evasion route worth a separate
+ * symbol-aware path); and `import.meta.resolve("@modelcontextprotocol/
+ * server")` (performs real resolution but binds no symbol at the call site
+ * itself - nothing to check without also tracing what the resolved
+ * specifier string is later used for, which this file does not attempt).
+ * A Tasks-named symbol imported from any OTHER package is NOT flagged -
+ * the boundary is the installed server root only, never a universal
+ * symbol-name claim.
+ *
+ * FAIL-CLOSED, IN THREE INDEPENDENTLY-FLAGGED CLASSES, whenever a
+ * reference cannot be proven to avoid the guarded root:
+ *
+ *   (i)   a computed namespace member key on a confirmed server-root
+ *         binding (`server[getKey()]`) - cannot prove the key avoids a
+ *         Tasks symbol;
+ *   (ii)  a computed/non-literal dynamic-import specifier (`import(getName())`)
+ *         - cannot prove the specifier avoids the server root;
+ *   (iii) a computed/non-literal `require(...)` specifier
+ *         (`require(getName())`), scoped to the real, unshadowed global
+ *         `require` the same way `scripts/lib/ts-ast.mjs`'s
+ *         `collectModuleSpecifiers` already scopes it - cannot prove the
+ *         specifier avoids the server root.
+ *
+ * Each is its own diagnostic, never folded into another - deleting any ONE
+ * of the three leaves the other two catching nothing for it. Conversely, a
+ * reference that CAN be statically resolved is judged on its actual
+ * symbol, never waved through merely because the syntax "looks dynamic":
+ * form 7 above is exactly that case.
+ *
+ * THE DELIBERATE OPPOSITE OF THIS REPO'S createRequire RULING: a type-only
+ * reference to `createRequire` (an erased `import type`) is GREEN
+ * elsewhere in this file's design, because `createRequire` is a CAPABILITY
+ * boundary - an erased type-only import carries no runtime capability at
+ * all. Tasks is an ARCHITECTURAL boundary instead: the coupling this phase
+ * forbids is the source-level REFERENCE itself (a type checker resolving a
+ * name, a build depending on a shape), not a runtime capability - so a
+ * type-only reference to a Tasks symbol is RED in every one of the forms
+ * enumerated above, never exempted the way a type-only createRequire
+ * import is.
+ *
+ * SPECIFIER RESOLUTION (see `isServerRootSpecifier` /
+ * `resolvePackageIdentity` in scripts/lib/ts-ast.mjs): the guarded root is
+ * matched by real PACKAGE IDENTITY (the owning `package.json`'s `name` +
+ * that package directory's own real path), not by naive realpath equality
+ * on the resolved FILE - two different entry files of the identical
+ * installed package version (`dist/index.cjs` vs `dist/index.mjs`, or a
+ * `file://` URL naming either) collapse to the same package identity here,
+ * where a naive per-file compare would wrongly treat them as different
+ * roots. This is a resolver-equivalence layer other module-boundary guards
+ * in this repo can build on rather than re-deriving their own. Package-
+ * identity comparison is intentionally
+ * coarser than "exactly the package's `.` export condition" - a specifier
+ * reaching a DIFFERENT subpath of the same installed package (e.g. its
+ * `/stdio` entry) is also treated as the guarded root for symbol-membership
+ * purposes. This cannot cause a missed detection (only, in principle, a
+ * broader-than-strictly-necessary match), and no subpath of this package
+ * exports a Tasks-named symbol today - verified against the pinned
+ * `@modelcontextprotocol/server@2.0.0-beta.5` package tree.
+ *
+ * This file's OWN createRequire ban (calling `createRequire` at all, the
+ * global `require`/`eval`/`Function`/`module`/`Reflect` acquisition sites,
+ * `.constructor` property access, and `Object.getOwnPropertyDescriptor`
+ * acquisition) is UNCHANGED from before this rewrite - see
+ * `scripts/lib/ts-ast.mjs`'s `findCreateRequireImports` for that whole
+ * design, which this file still delegates to unmodified. That ban is
+ * independent of Tasks entirely: this codebase is frozen ESM end to end,
+ * so CommonJS interop is forbidden outright regardless of what it might
+ * ever be used to load.
  *
  * Runs on the real TypeScript AST (see scripts/lib/ts-ast.mjs's header for
- * the full "why AST, not regex" rationale) - every one of forms 1-6 above
- * is a real `ImportDeclaration`/`ExportDeclaration`/dynamic-`import()`/
- * `require(...)`-call AST node regardless of what comments sit between its
- * keywords (`import`/`from`/`import(`/`require(`) and its specifier, or
- * whether the specifier is a plain string or a no-substitution template
- * literal - a comment is trivia attached to a token, never an AST node of
- * its own, so the parser never even considers it part of the expression
- * being matched.
- *
- * A dynamic import or `require(...)` call whose argument is a runtime-
- * computed expression (a variable, string concatenation, an interpolated
- * template) can't be resolved statically - this guard FAILS CLOSED on
- * that case (reports it as a violation) rather than silently passing it
- * through. A computed specifier is exactly the kind of thing that could
- * smuggle a forbidden import past a purely-static check, and this
- * codebase has no legitimate reason to ever compute a module specifier at
- * all - verified against the real src/ tree, which contains zero dynamic
- * imports or `require` calls of any kind (static ES imports only,
- * everywhere).
+ * the full "why AST, not regex" rationale) - a comment or a string literal
+ * that merely spells a Tasks symbol's name is never an AST import/export/
+ * member-access node, so it is never flagged (see the comment/string-
+ * lookalike green control in test/no-tasks-import.test.ts).
  */
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
@@ -90,39 +145,129 @@ import { fileURLToPath } from "node:url";
 
 import { isMainModule } from "./lib/is-main.mjs";
 import {
+  bindingElementSourceKeyText,
   collectModuleSpecifiers,
+  createScopeCheckedProgram,
   findCreateRequireImports,
   isDynamicImportCall,
   isRequireCall,
   parseSourceFile,
+  resolvePackageIdentity,
+  resolvedAccessKeyText,
+  stringLiteralText,
+  ts,
+  unwrapTransparentWrapper,
 } from "./lib/ts-ast.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SRC_DIR = path.join(REPO_ROOT, "src");
+const THIS_FILE_PATH = fileURLToPath(import.meta.url);
 
-const FORBIDDEN_SPECIFIER = "@modelcontextprotocol/sdk/experimental";
-const FORBIDDEN_SPECIFIER_PREFIX = `${FORBIDDEN_SPECIFIER}/`;
-
-const UNRESOLVABLE_DYNAMIC_IMPORT_LABEL =
-  "<dynamic import()/require() with a computed/non-literal specifier - cannot statically verify it avoids the Tasks extension, failing closed>";
+/** The installed package name this guard's root specifier resolves against. Pinned per package.json/package-lock.json: `@modelcontextprotocol/server@2.0.0-beta.5`. */
+const SERVER_PACKAGE_NAME = "@modelcontextprotocol/server";
 
 /**
- * Builds the violation label for a `findCreateRequireImports` hit,
- * describing the exact binding shape found - see that function's own doc
- * comment in scripts/lib/ts-ast.mjs for why each shape is forbidden
- * outright, independent of the local alias chosen or whether the returned
- * loader is ever called. This is the ONLY layer `findTasksImports` uses
- * to flag `createRequire`: it resolves the IMPORT BINDING itself, so an
- * aliased `import { createRequire as makeLoader } from "node:module"`
- * followed by `makeLoader(specifier)` is caught at the import site,
- * independent of the specifier-matching loop below (which only recognizes
- * an unaliased `require(...)` callee and never sees `makeLoader` at all).
- * A name-only callee check (matching any call literally named
- * `createRequire`, wherever it came from) was deliberately NOT used here:
- * it would be fully redundant with this layer for the real case, and it
- * would false-positive on a harmless local `createRequire`-named binding
- * or one imported from a package other than `"node:module"` - provenance
- * is the only thing this guard trusts.
+ * The enumerated Tasks export set - exactly the root exports of the pinned
+ * `@modelcontextprotocol/server@2.0.0-beta.5` package's `dist/index.d.mts`
+ * whose PUBLIC name matches `/Task/i`, copied here by hand from that real,
+ * pinned declaration file (never hand-guessed or trimmed to "the symbols
+ * some earlier row happened to import"). Spans type-only symbols
+ * (`GetTaskRequest`, `TaskStatus`, ...) and real runtime VALUES (the
+ * function `isTaskAugmentedRequestParams`, the string constant
+ * `RELATED_TASK_META_KEY`) - the guard does not distinguish the two, since
+ * a type-level reference is exactly as forbidden as a value one here (see
+ * this file's header on the architectural-vs-capability distinction).
+ *
+ * `test/no-tasks-import.test.ts`'s parity test RE-DERIVES this exact set,
+ * independently, straight from the pinned `.d.mts` at test time (via the
+ * real TypeScript parser, not a regex), and asserts a deep-equal against
+ * this constant - so under- or over-enumerating this list, or the set
+ * drifting out of sync with a future dependency bump, reds that test
+ * rather than silently narrowing (or vacuously widening) what this guard
+ * catches. Byte-identical to `2.0.0-beta.4`'s own `/Task/i` root-export
+ * set (verified by a direct `dist/index.d.mts` diff) - the beta.4 -> beta.5
+ * bump is inert for the Tasks surface this guard cares about.
+ */
+export const TASKS_SYMBOLS = new Set([
+  "CancelTaskRequest",
+  "CancelTaskResult",
+  "CreateTaskResult",
+  "GetTaskPayloadRequest",
+  "GetTaskPayloadResult",
+  "GetTaskRequest",
+  "GetTaskResult",
+  "ListTasksRequest",
+  "ListTasksResult",
+  "RELATED_TASK_META_KEY",
+  "RelatedTaskMetadata",
+  "Task",
+  "TaskAugmentedRequestParams",
+  "TaskCreationParams",
+  "TaskMetadata",
+  "TaskStatus",
+  "TaskStatusNotification",
+  "TaskStatusNotificationParams",
+  "isTaskAugmentedRequestParams",
+]);
+
+/**
+ * The three fail-closed diagnostic label constants below are exported
+ * specifically so `test/no-tasks-import.test.ts` can assert EXACT label
+ * identity (`hits.includes(THE_LABEL)`) rather than a loose substring/regex
+ * match - each label's FULL text is kept pairwise DISTINCT from the other
+ * two (the three constants are simply not equal to one another as complete
+ * strings; they do share several substrings, e.g. "cannot statically
+ * verify it avoids" and "failing closed") precisely so an exact-match
+ * assertion can distinguish "the right diagnostic fired" from "some
+ * diagnostic matching a shared word fired" - see the owning tests' own doc
+ * comments for the mislabeling mutant this guards against (e.g. the
+ * dynamic-import branch emitting the require-specifier label, or vice
+ * versa).
+ */
+export const COMPUTED_NAMESPACE_MEMBER_KEY_LABEL =
+  "<computed namespace member key on a resolved @modelcontextprotocol/server root binding - cannot statically verify it avoids a Tasks-guarded symbol, failing closed>";
+
+export const COMPUTED_DYNAMIC_IMPORT_SPECIFIER_LABEL =
+  "<dynamic import() with a computed/non-literal specifier - cannot statically verify it avoids the Tasks extension, failing closed>";
+
+export const COMPUTED_REQUIRE_SPECIFIER_LABEL =
+  "<computed require() specifier - cannot statically verify it avoids the @modelcontextprotocol/server root, failing closed (independent of the separate global-require-acquisition ban)>";
+
+function namedImportHitLabel(symbolName, specifierText) {
+  return `imports Tasks symbol "${symbolName}" from "${specifierText}"`;
+}
+
+function namedReexportHitLabel(symbolName, specifierText) {
+  return `re-exports Tasks symbol "${symbolName}" from "${specifierText}"`;
+}
+
+function wildcardReexportHitLabel(specifierText) {
+  return `wildcard/namespace re-export of "${specifierText}" propagates the whole enumerated Tasks symbol set onward`;
+}
+
+function namespaceMemberValueHitLabel(symbolName) {
+  return `references Tasks symbol "${symbolName}" via a namespace member access (value position) on the @modelcontextprotocol/server root`;
+}
+
+function namespaceMemberTypeHitLabel(symbolName) {
+  return `references Tasks symbol "${symbolName}" in a TYPE position via a namespace-qualified access on the @modelcontextprotocol/server root`;
+}
+
+function dynamicImportDestructureHitLabel(symbolName) {
+  return `destructures/accesses Tasks symbol "${symbolName}" from a literal-root dynamic import of "${SERVER_PACKAGE_NAME}"`;
+}
+
+function importTypeQueryHitLabel(symbolName, specifierText) {
+  return `references Tasks symbol "${symbolName}" via a type-import query (import("${specifierText}").${symbolName}) on the @modelcontextprotocol/server root`;
+}
+
+/**
+ * Builds the violation label for a `findCreateRequireImports` hit - see
+ * that function's own doc comment in scripts/lib/ts-ast.mjs for why each
+ * shape is forbidden outright, independent of the local alias chosen or
+ * whether the returned loader is ever called. Unchanged from before this
+ * rewrite: createRequire is banned in this frozen-ESM codebase regardless
+ * of Tasks.
  *
  * @param {"named" | "namespace" | "default" | "dynamic-import" | "import-equals" | "commonjs-require" | "module-require" | "eval-call" | "function-constructor-call" | "re-export-named" | "re-export-namespace" | "unresolvable-globalthis-access" | "process-dangerous-property-access" | "unresolvable-process-access" | "reflect-reference" | "constructor-property-access" | "property-descriptor-access"} kind
  * @returns {string}
@@ -168,48 +313,339 @@ function createRequireImportBindingLabel(kind) {
 }
 
 /**
+ * Lazily-computed, memoized package identity of the pinned
+ * `@modelcontextprotocol/server` package, resolved once from THIS file's
+ * own real, on-disk location (always a real file under this repo, so real
+ * resolution always has a genuine node_modules ancestor to walk). `null`
+ * when the package genuinely cannot be resolved (should not happen in a
+ * correctly-installed tree) - the resolver-based fallback in
+ * `isServerRootSpecifier` then simply never matches anything beyond the
+ * literal bare-specifier fast path, degrading safely rather than throwing.
+ */
+let cachedCanonicalServerRoot;
+
+function canonicalServerPackageRoot() {
+  if (cachedCanonicalServerRoot === undefined) {
+    cachedCanonicalServerRoot = resolvePackageIdentity(SERVER_PACKAGE_NAME, THIS_FILE_PATH) ?? null;
+  }
+  return cachedCanonicalServerRoot;
+}
+
+/**
+ * True when `specifierText` (as written in source, resolved relative to
+ * `fromAbsFilePath`) names the guarded `@modelcontextprotocol/server`
+ * package root - either by exact literal text (the fast path: no
+ * filesystem resolution needed at all, correct for the overwhelming common
+ * case and for every test fixture that spells the bare specifier directly),
+ * or by real PACKAGE-IDENTITY resolution (`resolvePackageIdentity` in
+ * scripts/lib/ts-ast.mjs) for anything else - an aliased, relative, or
+ * absolute specifier, or a `file://` URL, that resolves to the SAME
+ * installed package (see this file's header for why package identity, not
+ * naive realpath-of-the-resolved-FILE equality, is the right compare).
+ */
+function isServerRootSpecifier(specifierText, fromAbsFilePath) {
+  if (specifierText === SERVER_PACKAGE_NAME) return true;
+  const canonical = canonicalServerPackageRoot();
+  if (canonical === null) return false;
+  const identity = resolvePackageIdentity(specifierText, fromAbsFilePath);
+  return (
+    identity !== undefined && identity.name === canonical.name && identity.root === canonical.root
+  );
+}
+
+/** Every NAMED import specifier's source name (`propertyName ?? name`) checked against `TASKS_SYMBOLS`; a bare side-effect import or a default/namespace import carries no NAMED specifier here (a namespace import's later member access is handled separately, by `collectRootNamespaceSymbols`/`collectNamespaceMemberAccessHits`). */
+function collectNamedImportSymbolHits(importDeclNode, specifierText, hits) {
+  const importClause = importDeclNode.importClause;
+  if (importClause === undefined) return;
+  const namedBindings = importClause.namedBindings;
+  if (namedBindings === undefined || !ts.isNamedImports(namedBindings)) return;
+  for (const specifier of namedBindings.elements) {
+    const sourceName = (specifier.propertyName ?? specifier.name).text;
+    if (TASKS_SYMBOLS.has(sourceName)) {
+      hits.push(namedImportHitLabel(sourceName, specifierText));
+    }
+  }
+}
+
+/** Every re-export form from the server root: named (aliased or not), wildcard (`export * from root`), and namespace-aliased (`export * as ns from root`) - type-only or not uniformly, since a re-export hands the symbol onward exactly as an import does and Tasks is an architectural, not capability, boundary (see this file's header). */
+function collectReexportSymbolHits(exportDeclNode, specifierText, hits) {
+  const exportClause = exportDeclNode.exportClause;
+  if (exportClause === undefined) {
+    // export * from root; / export type * from root;
+    hits.push(wildcardReexportHitLabel(specifierText));
+    return;
+  }
+  if (ts.isNamespaceExport(exportClause)) {
+    // export * as ns from root; / export type * as ns from root;
+    hits.push(wildcardReexportHitLabel(specifierText));
+    return;
+  }
+  if (ts.isNamedExports(exportClause)) {
+    for (const specifier of exportClause.elements) {
+      const sourceName = (specifier.propertyName ?? specifier.name).text;
+      if (TASKS_SYMBOLS.has(sourceName)) {
+        hits.push(namedReexportHitLabel(sourceName, specifierText));
+      }
+    }
+  }
+}
+
+/** The dynamic-import call's own AwaitExpression parent, when directly awaited - otherwise the call node itself. Both `const { X } = await import(root)` and (in principle) a non-awaited `const { X } = import(root)` are handled uniformly by looking at this "outer" node's own parent next. */
+function outerNodeAfterAwait(callNode) {
+  const parent = callNode.parent;
+  if (parent !== undefined && ts.isAwaitExpression(parent) && parent.expression === callNode) {
+    return parent;
+  }
+  return callNode;
+}
+
+/**
+ * A literal-root dynamic import's specifier is confirmed to be the guarded
+ * server root (checked by the caller before this runs) - this inspects
+ * what the call's result is immediately used for: a destructuring pattern
+ * (`const { X, Y: Z } = await import(root)`), or a direct property access
+ * off the (possibly parenthesized) awaited result
+ * (`(await import(root)).X` / `(await import(root))["X"]`). Each pulled
+ * symbol name is checked against `TASKS_SYMBOLS` the same as any other
+ * enumerated form - a statically-resolvable reference is judged on its
+ * actual symbol, never waved through as "dynamic" merely because the
+ * loading MECHANISM is `import()`.
+ */
+function collectLiteralRootDynamicImportUsageHits(callNode, hits) {
+  const outer = outerNodeAfterAwait(callNode);
+
+  const declParent = outer.parent;
+  if (
+    declParent !== undefined &&
+    ts.isVariableDeclaration(declParent) &&
+    declParent.initializer === outer &&
+    ts.isObjectBindingPattern(declParent.name)
+  ) {
+    for (const element of declParent.name.elements) {
+      if (element.dotDotDotToken) continue; // a rest element carries no single source key
+      const sourceName = bindingElementSourceKeyText(element);
+      if (sourceName !== undefined && TASKS_SYMBOLS.has(sourceName)) {
+        hits.push(dynamicImportDestructureHitLabel(sourceName));
+      }
+    }
+  }
+
+  let accessNode = outer.parent;
+  if (accessNode !== undefined && ts.isParenthesizedExpression(accessNode)) {
+    accessNode = accessNode.parent;
+  }
+  if (
+    accessNode !== undefined &&
+    (ts.isPropertyAccessExpression(accessNode) || ts.isElementAccessExpression(accessNode)) &&
+    unwrapTransparentWrapper(accessNode.expression) === outer
+  ) {
+    const key = ts.isPropertyAccessExpression(accessNode)
+      ? accessNode.name.text
+      : stringLiteralText(accessNode.argumentExpression);
+    if (key !== undefined && TASKS_SYMBOLS.has(key)) {
+      hits.push(dynamicImportDestructureHitLabel(key));
+    }
+  }
+}
+
+/**
+ * Collects the `ts.Symbol`s of every `import * as ns from root` (value or
+ * type-only) namespace-import binding whose specifier resolves to the
+ * guarded server root - the set later member-access checks compare
+ * against, by symbol IDENTITY (never by binding-name text, so a locally
+ * shadowed name of the same text is never confused with the real
+ * namespace).
+ */
+function collectRootNamespaceSymbols(checkedSourceFile, checker, fromAbsFilePath) {
+  const symbols = new Set();
+  ts.forEachChild(checkedSourceFile, function visit(node) {
+    if (ts.isImportDeclaration(node) && node.moduleSpecifier) {
+      const specifierText = stringLiteralText(node.moduleSpecifier);
+      if (specifierText !== undefined && isServerRootSpecifier(specifierText, fromAbsFilePath)) {
+        const importClause = node.importClause;
+        const namedBindings = importClause?.namedBindings;
+        if (namedBindings !== undefined && ts.isNamespaceImport(namedBindings)) {
+          const symbol = checker.getSymbolAtLocation(namedBindings.name);
+          if (symbol !== undefined) symbols.add(symbol);
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  });
+  return symbols;
+}
+
+/**
+ * Namespace member access off a confirmed server-root binding, in BOTH
+ * positions: VALUE (`server.GetTaskRequest`, a `PropertyAccessExpression`,
+ * or the static-bracket-key form `server["Task"]`, an
+ * `ElementAccessExpression`) and TYPE (`type C = server.Task`, a
+ * `QualifiedName` - proven, empirically, to resolve through the SAME
+ * `ts.Symbol` as the value-position form off the identical namespace
+ * import). A key that cannot be statically resolved on a confirmed
+ * server-root base FAILS CLOSED (fail-closed class i, this file's header) -
+ * this guard cannot prove it avoids a Tasks symbol.
+ */
+function collectNamespaceMemberAccessHits(checkedSourceFile, checker, rootNamespaceSymbols, hits) {
+  if (rootNamespaceSymbols.size === 0) return;
+  ts.forEachChild(checkedSourceFile, function visit(node) {
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const base = unwrapTransparentWrapper(node.expression);
+      if (ts.isIdentifier(base)) {
+        const baseSymbol = checker.getSymbolAtLocation(base);
+        if (baseSymbol !== undefined && rootNamespaceSymbols.has(baseSymbol)) {
+          const key = resolvedAccessKeyText(node, checker, checkedSourceFile);
+          if (key === undefined) {
+            hits.push(COMPUTED_NAMESPACE_MEMBER_KEY_LABEL);
+          } else if (TASKS_SYMBOLS.has(key)) {
+            hits.push(namespaceMemberValueHitLabel(key));
+          }
+        }
+      }
+    } else if (ts.isQualifiedName(node) && ts.isIdentifier(node.left)) {
+      const leftSymbol = checker.getSymbolAtLocation(node.left);
+      if (leftSymbol !== undefined && rootNamespaceSymbols.has(leftSymbol)) {
+        const key = node.right.text;
+        if (TASKS_SYMBOLS.has(key)) {
+          hits.push(namespaceMemberTypeHitLabel(key));
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  });
+}
+
+/**
+ * The TYPE-IMPORT-QUERY form - `type T = import("@modelcontextprotocol/
+ * server").Task` - a distinct AST node kind (`ImportTypeNode`, not a
+ * `QualifiedName` and not a dynamic-import `CallExpression`): the module
+ * specifier lives on `.argument` (a `LiteralTypeNode` wrapping a string
+ * literal - always a literal here, since this form has no computed-
+ * specifier grammar to speak of) and the member name on `.qualifier` (an
+ * `Identifier` for a single segment, matching the enumerated form this file
+ * owns). No symbol resolution is needed - the specifier is always a
+ * literal and the qualifier is plain syntax - so this runs over the
+ * original, un-checked `sourceFile` directly.
+ */
+function collectImportTypeQueryHits(sourceFile, fromAbsFilePath, hits) {
+  ts.forEachChild(sourceFile, function visit(node) {
+    if (
+      ts.isImportTypeNode(node) &&
+      ts.isLiteralTypeNode(node.argument) &&
+      ts.isStringLiteral(node.argument.literal) &&
+      node.qualifier !== undefined &&
+      ts.isIdentifier(node.qualifier)
+    ) {
+      const specifierText = node.argument.literal.text;
+      const symbolName = node.qualifier.text;
+      if (isServerRootSpecifier(specifierText, fromAbsFilePath) && TASKS_SYMBOLS.has(symbolName)) {
+        hits.push(importTypeQueryHitLabel(symbolName, specifierText));
+      }
+    }
+    ts.forEachChild(node, visit);
+  });
+}
+
+/**
+ * The whole symbol-aware Tasks-boundary scan for one file: static import/
+ * export specifiers and the two fail-closed computed-specifier classes
+ * (ii - dynamic import, iii - require) via the shared
+ * `collectModuleSpecifiers` primitive (which already scopes a
+ * `require(...)` call to the real, unshadowed global the same way this
+ * file's createRequire ban does, so a local require shadow is never
+ * mistaken for the real thing here either); namespace member access (value
+ * and type position) and literal-root dynamic-import destructure/property-
+ * access symbol inspection via this file's own real-scope-checked pass
+ * (see `collectRootNamespaceSymbols`/`collectNamespaceMemberAccessHits`).
+ *
+ * @param {import("typescript").SourceFile} sourceFile
+ * @param {string} fromAbsFilePath
+ * @returns {string[]}
+ */
+function findServerRootFindings(sourceFile, fromAbsFilePath) {
+  const hits = [];
+
+  for (const { node, text: specifierText } of collectModuleSpecifiers(sourceFile)) {
+    if (ts.isImportDeclaration(node)) {
+      if (specifierText === undefined) continue; // a static import always carries a literal specifier per grammar
+      if (isServerRootSpecifier(specifierText, fromAbsFilePath)) {
+        collectNamedImportSymbolHits(node, specifierText, hits);
+      }
+      continue;
+    }
+    if (ts.isExportDeclaration(node)) {
+      if (specifierText === undefined) continue;
+      if (isServerRootSpecifier(specifierText, fromAbsFilePath)) {
+        collectReexportSymbolHits(node, specifierText, hits);
+      }
+      continue;
+    }
+    if (isDynamicImportCall(node)) {
+      if (specifierText === undefined) {
+        // Fail-closed class ii (this file's header): a computed/non-literal
+        // dynamic-import specifier that cannot be proven not-the-root -
+        // fail closed, independent of whether anything is later
+        // destructured off it.
+        hits.push(COMPUTED_DYNAMIC_IMPORT_SPECIFIER_LABEL);
+        continue;
+      }
+      if (isServerRootSpecifier(specifierText, fromAbsFilePath)) {
+        collectLiteralRootDynamicImportUsageHits(node, hits);
+      }
+      continue;
+    }
+    if (isRequireCall(node)) {
+      if (specifierText === undefined) {
+        // Fail-closed class iii (this file's header): a computed/non-
+        // literal require() specifier - its OWN, independently-flagged
+        // diagnostic, distinct from the global-require-acquisition ban
+        // below (that ban fires on the bare `require` reference regardless
+        // of its argument; this fires on the SPECIFIER being unresolvable,
+        // so deleting this check alone cannot be masked by the other still
+        // firing).
+        hits.push(COMPUTED_REQUIRE_SPECIFIER_LABEL);
+      }
+      // A require() of a LITERAL, resolvable root specifier is out of
+      // scope for symbol-checking (see this file's header) - this
+      // codebase is ESM-only, so that shape is dead code, not a live
+      // evasion route.
+      continue;
+    }
+    // import.meta.resolve(...) and anything else collectModuleSpecifiers
+    // surfaces is out of scope here (see this file's header).
+  }
+
+  const { sourceFile: checkedSourceFile, checker } = createScopeCheckedProgram(
+    sourceFile.fileName,
+    sourceFile.text
+  );
+  const rootNamespaceSymbols = collectRootNamespaceSymbols(
+    checkedSourceFile,
+    checker,
+    fromAbsFilePath
+  );
+  collectNamespaceMemberAccessHits(checkedSourceFile, checker, rootNamespaceSymbols, hits);
+  collectImportTypeQueryHits(sourceFile, fromAbsFilePath, hits);
+
+  return hits;
+}
+
+/**
  * @param {string} sourceText
  * @param {string} [fileName]
- * @returns {string[]} every forbidden specifier (or violation label) found, empty when clean.
- *   A specifier text of `undefined` (a dynamic import or `require()` call
- *   whose argument can't be resolved statically) is reported via
- *   `UNRESOLVABLE_DYNAMIC_IMPORT_LABEL` - see this file's header for why
- *   that fails closed rather than being silently skipped.
+ * @returns {string[]} every forbidden reference (or violation label) found, empty when clean.
  */
 export function findTasksImports(sourceText, fileName = "source.ts") {
   const hits = [];
   const sourceFile = parseSourceFile(fileName, sourceText);
+  const fromAbsFilePath = path.isAbsolute(fileName) ? fileName : path.join(process.cwd(), fileName);
 
-  for (const { node, text: specifier } of collectModuleSpecifiers(sourceFile)) {
-    if (specifier === undefined) {
-      // A static import/export always carries a literal string-or-
-      // template moduleSpecifier per the ECMAScript/TS grammar itself -
-      // `specifier === undefined` for a static import/export node would
-      // mean the parser accepted genuinely invalid syntax, which can't
-      // happen for well-formed source. Only a dynamic import or a
-      // `require(...)` call can legitimately have an unresolvable
-      // (computed) specifier - and that's exactly the case this fails
-      // closed on, per this file's header.
-      if (isDynamicImportCall(node) || isRequireCall(node)) {
-        hits.push(UNRESOLVABLE_DYNAMIC_IMPORT_LABEL);
-      }
-      continue;
-    }
-    if (specifier === FORBIDDEN_SPECIFIER || specifier.startsWith(FORBIDDEN_SPECIFIER_PREFIX)) {
-      hits.push(specifier);
-    }
-  }
+  hits.push(...findServerRootFindings(sourceFile, fromAbsFilePath));
 
-  // The ONLY layer that flags createRequire: it resolves the IMPORT
-  // BINDING itself, structurally (see findCreateRequireImports's own doc
-  // comment in scripts/lib/ts-ast.mjs, and createRequireImportBindingLabel's
-  // own doc comment above for why a name-only callee check was
-  // deliberately not used instead), so an aliased
-  // `import { createRequire as makeLoader } from "node:module"` followed
-  // by `makeLoader("@modelcontextprotocol/sdk/experimental/tasks")` is
-  // caught at the import site - independent of the specifier-matching
-  // loop above, which only recognizes an unaliased `require(...)` callee
-  // and never sees `makeLoader` at all.
+  // The ONLY layer that flags createRequire and the other CommonJS-interop
+  // acquisition sites - see createRequireImportBindingLabel's own doc
+  // comment above. Unchanged from before this rewrite: createRequire is
+  // banned in this frozen-ESM codebase independent of Tasks.
   for (const { kind } of findCreateRequireImports(sourceFile)) {
     hits.push(createRequireImportBindingLabel(kind));
   }
@@ -259,14 +695,12 @@ function main() {
   const violations = checkNoTasksImport();
   if (violations.length > 0) {
     for (const { file, specifier } of violations) {
-      console.error(
-        `${file}: forbidden Tasks-extension import "${specifier}" - this project does not depend on it`
-      );
+      console.error(`${file}: forbidden Tasks-extension reference "${specifier}"`);
     }
     process.exitCode = 1;
     return;
   }
-  console.log("no Tasks-extension import found anywhere under src/");
+  console.log("no Tasks-extension reference found anywhere under src/");
 }
 
 if (isMainModule(import.meta.url)) {
