@@ -603,7 +603,10 @@ test("a non-capable connection's run() returns the plain job projection - a genu
         "diagnostic",
         "ended_at",
         "exit_code",
+        "identity_capture",
+        "identity_confirmed",
         "job_id",
+        "kill_confirmed",
         "label",
         "queue_position",
         "signal",
@@ -619,14 +622,37 @@ test("a non-capable connection's run() returns the plain job projection - a genu
     );
     // The five fields that are only meaningful once a job progresses/ends
     // must be genuinely unset at this fresh, synchronous point - not a
-    // placeholder value of any kind.
-    for (const key of ["ended_at", "exit_code", "signal", "diagnostic", "queue_position"]) {
+    // placeholder value of any kind. kill_confirmed/identity_confirmed
+    // join them here: the eager reap-at-exit that can set kill_confirmed
+    // on an otherwise-never-killed job only fires once the leader has
+    // actually exited, which this freshly-"starting" job has not yet done.
+    for (const key of [
+      "ended_at",
+      "exit_code",
+      "signal",
+      "diagnostic",
+      "queue_position",
+      "kill_confirmed",
+      "identity_confirmed",
+    ]) {
       assert.equal(
         structured[key],
         undefined,
         `expected "${key}" to be unset on a freshly-started job, got ${JSON.stringify(structured[key])}`
       );
     }
+    // identity_capture is unlike the five above: it is captured
+    // asynchronously right after spawn (see captureBirthIdentityPosixAsync's
+    // own docs) rather than being tied to the job's own progression, but at
+    // this exact synchronous instant - immediately after run() returns,
+    // before that real ps-based capture has had any chance to even start -
+    // it must still genuinely read "pending", never a settled value it
+    // could not possibly have reached yet.
+    assert.equal(
+      structured.identity_capture,
+      "pending",
+      `expected a freshly-started job's identity_capture to be "pending" at this synchronous instant, got ${JSON.stringify(structured.identity_capture)}`
+    );
 
     // Key-set presence alone (the check above) does not prove any field's
     // VALUE is genuine rather than a stable-but-wrong placeholder (e.g. a
@@ -712,13 +738,16 @@ test("a non-capable connection's run() returns the plain job projection - a genu
     // untouched - see the key-set comment above), and `JSON.stringify`
     // DROPS any object key whose value is `undefined`. So content's real,
     // honest serialization of this SAME freshly-started projection omits
-    // exactly the five fields confirmed `undefined` on `structured` above,
-    // rather than carrying them through. Verified empirically while fixing
-    // this test, not assumed.
+    // exactly the seven fields confirmed `undefined` on `structured` above
+    // (ended_at/exit_code/signal/diagnostic/queue_position/kill_confirmed/
+    // identity_confirmed), while identity_capture - genuinely defined as
+    // "pending" here, never undefined - survives the stringify pass and
+    // stays present. Verified empirically while fixing this test, not
+    // assumed.
     assert.deepEqual(
       Object.keys(parsedContentRecord).sort(),
-      ["command_summary", "counts", "job_id", "label", "started_at", "state"],
-      `expected content's real JSON-serialized key set to be exactly the DEFINED PublicJobProjection fields (JSON.stringify drops the five undefined optional fields), got: ${JSON.stringify(Object.keys(parsedContentRecord).sort())}`
+      ["command_summary", "counts", "identity_capture", "job_id", "label", "started_at", "state"],
+      `expected content's real JSON-serialized key set to be exactly the DEFINED PublicJobProjection fields (JSON.stringify drops undefined optional fields), got: ${JSON.stringify(Object.keys(parsedContentRecord).sort())}`
     );
 
     // The genuine cross-agreement: content and structuredContent must
@@ -1312,7 +1341,15 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
       "diagnostic",
       "ended_at",
       "exit_code",
+      // identity_capture/identity_confirmed/kill_confirmed are always
+      // present in the real PublicJobProjection (see toPublicProjection in
+      // jobStore.ts) - assigned unconditionally, even when their value is
+      // undefined, so Object.keys always lists all three regardless of
+      // whether this particular job was ever killed.
+      "identity_capture",
+      "identity_confirmed",
       "job_id",
+      "kill_confirmed",
       "label",
       "queue_position",
       "signal",
@@ -1373,8 +1410,23 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
       statusEndedAtMs >= beforeFirstJobMs && statusEndedAtMs <= afterFirstJobMs,
       `expected status's ended_at (${JSON.stringify(statusResult.ended_at)}) to fall inside the real wall-clock bracket [${beforeFirstJobMs}, ${afterFirstJobMs}] this test captured around the job's actual run - a stable-but-wrong ISO-shaped value would fall outside it`
     );
+    // identity_capture is a real, asynchronous ps-based read fired right
+    // after spawn (see captureBirthIdentityPosixAsync's own docs) - it
+    // settles independently of this job's own exit, so its exact timing
+    // relative to `pollUntilTerminal` above is not something this test
+    // controls. Checked for validity here (never a stray/unexpected value),
+    // then excluded from the exact-literal comparison below the same way
+    // started_at/ended_at are - a field genuinely outside this test's
+    // control is checked on its own terms, not hardcoded to one of its
+    // several legitimate outcomes.
+    assert.ok(
+      ["pending", "captured", "unavailable"].includes(statusResult.identity_capture as string),
+      `expected status's identity_capture to be one of pending/captured/unavailable, got: ${JSON.stringify(statusResult.identity_capture)}`
+    );
+    const statusWithoutIdentityCapture = { ...statusResult };
+    delete statusWithoutIdentityCapture.identity_capture;
     assert.deepEqual(
-      withTimestampFieldsChecked(statusResult, ["started_at", "ended_at"]),
+      withTimestampFieldsChecked(statusWithoutIdentityCapture, ["started_at", "ended_at"]),
       {
         job_id: taskId,
         state: "exited",
@@ -1385,8 +1437,17 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
         command_summary: path.basename(process.execPath),
         label: "six-tool-mint-rule",
         counts: { stdout_lines: 1, stdout_bytes: 1, stderr_lines: 0, stderr_bytes: 0 },
+        // This job is never explicitly killed, but its leader's own
+        // natural exit still triggers the eager reap-at-exit (see
+        // reapProcessGroupOnce's own docs) - kill_confirmed reports a
+        // STATE (the process group was observed to hold no members), not
+        // an ACTION, so it is true here too. That reap never re-runs the
+        // leader identity check, so identity_confirmed stays at its unset
+        // default, never fabricated as false.
+        kill_confirmed: true,
+        identity_confirmed: undefined,
       },
-      `expected status's response to deep-equal its real, complete values (timestamps checked separately above), not just the right key set - got: ${JSON.stringify(statusResult)}`
+      `expected status's response to deep-equal its real, complete values (timestamps and identity_capture checked separately above), not just the right key set - got: ${JSON.stringify(statusResult)}`
     );
 
     // The old assertion for list/output/tail only swept for the 3
@@ -1534,8 +1595,27 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
       killEndedAtMs >= beforeSecondJobMs && killEndedAtMs <= afterKillMs,
       `expected kill's ended_at (${JSON.stringify(killResult.ended_at)}) to fall inside the real wall-clock bracket [${beforeSecondJobMs}, ${afterKillMs}] this test captured around the killed job's actual run - a stable-but-wrong ISO-shaped value would fall outside it`
     );
+    // identity_confirmed's exact boolean value depends on a real ps-based
+    // elapsed-time comparison (see evaluatePreSignalIdentityGate's own
+    // docs) - checked for presence/type here, matching the same
+    // typeof-boolean convention kill.test.ts's own default-path tests
+    // already use for this exact field, rather than asserting one
+    // specific value. identity_capture is excluded the same way as the
+    // status() check above, for the same reason.
+    assert.equal(
+      typeof killResult.identity_confirmed,
+      "boolean",
+      `expected kill's identity_confirmed to be present as a boolean once terminal, got: ${JSON.stringify(killResult.identity_confirmed)}`
+    );
+    assert.ok(
+      ["pending", "captured", "unavailable"].includes(killResult.identity_capture as string),
+      `expected kill's identity_capture to be one of pending/captured/unavailable, got: ${JSON.stringify(killResult.identity_capture)}`
+    );
+    const killResultWithoutIdentityFields = { ...killResult };
+    delete killResultWithoutIdentityFields.identity_confirmed;
+    delete killResultWithoutIdentityFields.identity_capture;
     assert.deepEqual(
-      withTimestampFieldsChecked(killResult, ["started_at", "ended_at"]),
+      withTimestampFieldsChecked(killResultWithoutIdentityFields, ["started_at", "ended_at"]),
       {
         job_id: secondTaskId,
         state: "killed",
@@ -1546,8 +1626,11 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
         command_summary: path.basename(process.execPath),
         label: "six-tool-mint-rule-kill-target",
         counts: { stdout_lines: 0, stdout_bytes: 0, stderr_lines: 0, stderr_bytes: 0 },
+        // A real, ordinary SIGTERM kill on a genuinely running job: the
+        // final external pgrep-based check confirms zero survivors.
+        kill_confirmed: true,
       },
-      `expected kill's response to deep-equal its real, complete values (timestamps checked separately above), not just the right key set - got: ${JSON.stringify(killResult)}`
+      `expected kill's response to deep-equal its real, complete values (timestamps and identity fields checked separately above), not just the right key set - got: ${JSON.stringify(killResult)}`
     );
   } finally {
     await pair.close();

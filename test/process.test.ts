@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
+import { waitForFile } from "./harness.ts";
+
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
 // import comment for why.
 import {
@@ -18,8 +20,13 @@ import {
 } from "../dist/process.js";
 import {
   IDENTITY_TOLERANCE_SECONDS,
+  GROUP_CONFIRMATION_TIMEOUT_MS,
   POSIX_KILL_GRACE_PERIOD_MS,
+  captureBirthIdentityPosix,
+  captureBirthIdentityPosixAsync,
   checkProcessIdentity,
+  confirmProcessGroupReapedPosix,
+  evaluatePreSignalIdentityGate,
   hasLiveProcessGroupMembersPosix,
   identityElapsedTimesMatch,
   isProcessAlive,
@@ -646,6 +653,201 @@ test(
   }
 );
 
+// --- captureBirthIdentityPosixAsync (the non-blocking counterpart run()'s
+// own production handler actually calls - see src/tools/run.ts's docs) ---
+
+test(
+  "captureBirthIdentityPosixAsync: a successful real capture reads a near-zero elapsed age for a freshly spawned process, same as the sync version",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const child = spawnManaged(
+      { argv: ["sleep", "2"], cwd: process.cwd(), env: buildChildEnv("merge", {}) },
+      callbacksFor(recorder())
+    );
+    const identity = await captureBirthIdentityPosixAsync(child!.pid!);
+    assert.notEqual(identity, undefined, "expected a real captured identity");
+    assert.equal(typeof identity!.capturedAtMs, "number");
+    assert.ok(
+      identity!.elapsedSecondsAtCapture >= 0 && identity!.elapsedSecondsAtCapture < 5,
+      `expected a near-zero elapsed age, got ${identity!.elapsedSecondsAtCapture}`
+    );
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
+
+test(
+  "captureBirthIdentityPosixAsync: projects forward to the same real elapsed time an independent SYNC captureBirthIdentityPosix reading observes moments later - proving both are the same genuine external observation, not two different mechanisms",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const child = spawnManaged(
+      { argv: ["sleep", "2"], cwd: process.cwd(), env: buildChildEnv("merge", {}) },
+      callbacksFor(recorder())
+    );
+    const asyncIdentity = await captureBirthIdentityPosixAsync(child!.pid!);
+    assert.notEqual(asyncIdentity, undefined);
+    const syncIdentity = captureBirthIdentityPosix(child!.pid!);
+    assert.notEqual(syncIdentity, undefined);
+    const projected =
+      asyncIdentity!.elapsedSecondsAtCapture +
+      (syncIdentity!.capturedAtMs - asyncIdentity!.capturedAtMs) / 1000;
+    assert.ok(
+      Math.abs(projected - syncIdentity!.elapsedSecondsAtCapture) <= 5,
+      `expected the async capture to project forward to the same real elapsed time the sync capture just observed - async: ${JSON.stringify(asyncIdentity)}, sync: ${JSON.stringify(syncIdentity)}`
+    );
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
+
+test(
+  "captureBirthIdentityPosixAsync: a genuinely HUNG ps observer is forcibly killed once the bound elapses and resolves to undefined - never left unsettled indefinitely",
+  {
+    skip: process.platform === "win32" ? "shadows a slow ps on PATH, POSIX-only" : false,
+  },
+  async () => {
+    const realPath = process.env.PATH;
+    // A ps that sleeps far longer (5s) than the short custom timeout this
+    // test passes (300ms) - if execFile's own `timeout` option didn't
+    // actually SIGTERM this child at the bound, this promise would never
+    // settle within any reasonable window and the test would time out
+    // instead of completing.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-hung-ps-"));
+    const psPath = path.join(dir, "ps");
+    fs.writeFileSync(psPath, "#!/bin/sh\nsleep 5\necho '00:00'\n");
+    fs.chmodSync(psPath, 0o755);
+
+    let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
+    let elapsedMs: number;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      const before = Date.now();
+      identity = await captureBirthIdentityPosixAsync(process.pid, 300);
+      elapsedMs = Date.now() - before;
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    assert.equal(
+      identity,
+      undefined,
+      "a ps that never answers within the bound must resolve to undefined (unavailable), never fabricate a value"
+    );
+    assert.ok(
+      elapsedMs < 2000,
+      `expected the bounded timeout to actually fire well before the ps's own 5s sleep - took ${elapsedMs}ms`
+    );
+  }
+);
+
+test(
+  "captureBirthIdentityPosixAsync: a SIGTERM-RESISTANT ps observer (installs a handler and ignores it) still settles within this codebase's own bound, does not block the event loop while doing so, and is genuinely gone afterward - not merely a slow-but-cooperative child",
+  {
+    skip:
+      process.platform === "win32"
+        ? "shadows a resistant ps on PATH and traps SIGTERM in a real shell, POSIX-only"
+        : false,
+  },
+  async () => {
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-resistant-ps-"));
+    const psPath = path.join(dir, "ps");
+    const markerPath = path.join(dir, "observer-pid.txt");
+    // Traps SIGTERM to a no-op FIRST, as literally this shell's first
+    // instruction (the resistance execFile's own `timeout` option cannot
+    // overcome - see this file's own docs for why a request-only signal is
+    // not a settlement bound) - installing the trap before anything else
+    // closes a real race: under real scheduling load, a freshly exec'd
+    // shell can take longer than a short bound to even reach its second
+    // line, and a script that wrote its marker or echoed anything before
+    // trapping was observed (empirically, via repeated timing trials, not
+    // assumed) to sometimes still be terminated by the ordinary SIGTERM
+    // instead of ever exercising the resistant path this test means to
+    // prove. THEN writes its own real pid (so this test can prove it is
+    // actually gone afterward), THEN sleeps far longer than the bound this
+    // test passes - if this codebase's own force-reap didn't SIGKILL it
+    // directly, this process would still be alive and this promise would
+    // still be unsettled by the time this test's own assertions run.
+    fs.writeFileSync(
+      psPath,
+      `#!/bin/sh\ntrap '' TERM\necho $$ > '${markerPath}'\nsleep 5\necho '00:00'\n`
+    );
+    fs.chmodSync(psPath, 0o755);
+
+    let eventLoopTicks = 0;
+    const ticker = setInterval(() => {
+      eventLoopTicks += 1;
+    }, 5);
+
+    let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
+    let elapsedMs: number;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      const before = Date.now();
+      identity = await captureBirthIdentityPosixAsync(process.pid, 1000);
+      elapsedMs = Date.now() - before;
+    } finally {
+      process.env.PATH = realPath;
+      clearInterval(ticker);
+    }
+
+    assert.equal(
+      identity,
+      undefined,
+      "a resistant ps must still resolve to undefined (unavailable) via this codebase's own settlement bound, never fabricate a value"
+    );
+    assert.ok(
+      elapsedMs < 3000,
+      `expected this codebase's OWN caller-side timer to force settlement well before the resistant ps's real 5s sleep - took ${elapsedMs}ms`
+    );
+    // THE assertion that actually tests the product's non-blocking promise,
+    // not merely this call's own latency: an independent timer scheduled
+    // on the SAME event loop must have kept firing WHILE this call was
+    // still pending. A synchronous, blocking implementation would have
+    // starved this timer for the whole span instead.
+    assert.ok(
+      eventLoopTicks >= 10,
+      `expected an independent event-loop timer to keep firing while the resistant observer was pending (proves the single Node event loop was never blocked) - only saw ${eventLoopTicks} ticks in ${elapsedMs}ms`
+    );
+
+    const observerPidText = await waitForFile(markerPath, {
+      until: (content) => /^\d+\s*$/.test(content.trim()),
+    });
+    const observerPid = Number(observerPidText.trim());
+    assert.ok(
+      Number.isInteger(observerPid) && observerPid > 0,
+      `expected the resistant observer to have self-reported a real pid, got: ${JSON.stringify(observerPidText)}`
+    );
+    // SIGKILL delivery and OS-level reaping are asynchronous relative to
+    // the `kill()` call that sent it (the same real async gap this
+    // codebase's own `SIGKILL_CONFIRMATION_TIMEOUT_MS` closes elsewhere) -
+    // polls rather than checking once immediately, so this assertion
+    // reflects the real outcome and not a race against that gap.
+    const goneDeadline = Date.now() + 2000;
+    let stillAlive = true;
+    while (Date.now() < goneDeadline) {
+      try {
+        process.kill(observerPid, 0);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      } catch {
+        stillAlive = false;
+        break;
+      }
+    }
+    assert.equal(
+      stillAlive,
+      false,
+      "expected the resistant observer to have actually been force-reaped (SIGKILLed), not merely abandoned as a leaked process while this codebase moved on"
+    );
+  }
+);
+
+test(
+  "captureBirthIdentityPosixAsync: on Windows, never even attempted - always resolves to undefined there",
+  { skip: process.platform !== "win32" ? "Windows-only assertion" : false },
+  async () => {
+    assert.equal(await captureBirthIdentityPosixAsync(process.pid), undefined);
+  }
+);
+
 // --- parseEtime (pure, no real process needed) ---
 
 test("parseEtime parses mm:ss", () => {
@@ -689,45 +891,56 @@ test("identityElapsedTimesMatch defaults to IDENTITY_TOLERANCE_SECONDS when no t
 });
 
 // --- checkProcessIdentity ---
+//
+// `checkProcessIdentity` now takes a real `ProcessBirthIdentity` (captured
+// via `captureBirthIdentityPosix`, per src/process.ts's own docs), never a
+// raw `Date.now()`-derived number - these tests build one the same way
+// production code does (`captureBirthIdentityPosix` right after a real
+// spawn), or construct one directly for the synthetic not-found/mismatch
+// cases below.
 
-test("checkProcessIdentity: not-found for a pid that plainly doesn't exist", () => {
-  const result = checkProcessIdentity(999_999, Date.now());
+test("checkProcessIdentity: not-found for a pid that plainly doesn't exist", async () => {
+  const result = await checkProcessIdentity(999_999, {
+    capturedAtMs: Date.now(),
+    elapsedSecondsAtCapture: 0,
+  });
   assert.equal(result.status, "not-found");
 });
 
 test(
-  "checkProcessIdentity: alive-confirmed for a real process whose ACTUAL recorded spawn time matches",
+  "checkProcessIdentity: alive-confirmed for a real process whose ACTUAL captured birth identity matches",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async () => {
     const rec = recorder();
     const env = buildChildEnv("merge", {});
-    const spawnedAtMs = Date.now();
     const child = spawnManaged(
       { argv: ["sleep", "3"], cwd: process.cwd(), env },
       callbacksFor(rec)
     );
     await waitFor(() => rec.spawned > 0);
-    const result = checkProcessIdentity(child!.pid!, spawnedAtMs);
+    const birthIdentity = captureBirthIdentityPosix(child!.pid!);
+    assert.notEqual(birthIdentity, undefined, "expected a real, successful capture");
+    const result = await checkProcessIdentity(child!.pid!, birthIdentity!);
     assert.equal(result.status, "alive-confirmed");
     process.kill(-child!.pid!, "SIGKILL"); // cleanup
   }
 );
 
 test(
-  "checkProcessIdentity REFUSES to confirm a real, currently-alive process when the expected spawn time is far in the past - a convincing simulation of PID reuse",
+  "checkProcessIdentity REFUSES to confirm a real, currently-alive process when the captured birth identity is far in the past - a convincing simulation of PID reuse",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async () => {
     // Real pid recycling can't be forced deterministically from a test, so
     // this simulates its ESSENCE instead: a REAL, currently-alive process
-    // (ps reports its REAL, near-0s elapsed time) checked against an
-    // `expectedSpawnedAtMs` far in the past - exactly what a stale, post-
-    // reuse bookkeeping record would look like from the outside (our record
-    // still points at this pid, but the REAL process now living there
-    // started at a very different time than the one we originally spawned).
-    // How convincing this is: fully real `ps` call and fully real elapsed-
-    // time comparison logic, on a genuinely live process - just not an
-    // actual OS-level pid recycling event, which this environment cannot
-    // force to order.
+    // (ps reports its REAL, near-0s elapsed time) checked against a
+    // captured birth identity that claims capture happened far in the
+    // past - exactly what a stale, post-reuse bookkeeping record would
+    // look like from the outside (our record still points at this pid,
+    // but the REAL process now living there started at a very different
+    // time than the one we originally spawned). How convincing this is:
+    // fully real `ps` call and fully real elapsed-time comparison logic,
+    // on a genuinely live process - just not an actual OS-level pid
+    // recycling event, which this environment cannot force to order.
     const rec = recorder();
     const env = buildChildEnv("merge", {});
     const child = spawnManaged(
@@ -735,12 +948,73 @@ test(
       callbacksFor(rec)
     );
     await waitFor(() => rec.spawned > 0);
-    const fakeExpectedSpawnedAtMs = Date.now() - 10 * 60 * 1000; // 10 minutes "ago"
-    const result = checkProcessIdentity(child!.pid!, fakeExpectedSpawnedAtMs);
+    const fakeBirthIdentity = {
+      capturedAtMs: Date.now() - 10 * 60 * 1000, // 10 minutes "ago"
+      elapsedSecondsAtCapture: 0,
+    };
+    const result = await checkProcessIdentity(child!.pid!, fakeBirthIdentity);
     assert.equal(result.status, "identity-mismatch");
     if (result.status === "identity-mismatch") {
       assert.match(result.reason, /reused pid/);
     }
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
+
+// --- evaluatePreSignalIdentityGate (the single real entry point every kill
+// caller uses - wraps checkProcessIdentity plus the "no identity captured
+// at all" case that function can't handle on its own) ---
+
+test(
+  "evaluatePreSignalIdentityGate: alive-confirmed identity -> proceed with identityConfirmed: true",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "3"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const birthIdentity = captureBirthIdentityPosix(child!.pid!);
+    assert.notEqual(birthIdentity, undefined);
+    const gate = await evaluatePreSignalIdentityGate(child!.pid!, birthIdentity);
+    assert.deepEqual(gate, { action: "proceed", identityConfirmed: true });
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
+
+test("evaluatePreSignalIdentityGate: no captured identity at all (undefined) -> proceed, honestly degraded (identityConfirmed: false)", async () => {
+  const gate = await evaluatePreSignalIdentityGate(999_999, undefined);
+  assert.deepEqual(gate, { action: "proceed", identityConfirmed: false });
+});
+
+test("evaluatePreSignalIdentityGate: a genuinely gone pid -> skip (nothing to signal)", async () => {
+  const gate = await evaluatePreSignalIdentityGate(999_999, {
+    capturedAtMs: Date.now(),
+    elapsedSecondsAtCapture: 0,
+  });
+  assert.deepEqual(gate, { action: "skip" });
+});
+
+test(
+  "evaluatePreSignalIdentityGate: a real identity mismatch -> refuse, with an honest reason",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "3"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const fakeBirthIdentity = {
+      capturedAtMs: Date.now() - 10 * 60 * 1000,
+      elapsedSecondsAtCapture: 0,
+    };
+    const gate = await evaluatePreSignalIdentityGate(child!.pid!, fakeBirthIdentity);
+    assert.equal(gate.action, "refuse");
+    if (gate.action === "refuse") assert.match(gate.reason, /reused pid/);
     process.kill(-child!.pid!, "SIGKILL"); // cleanup
   }
 );
@@ -771,7 +1045,7 @@ test("isProcessAlive: false for a pid that plainly doesn't exist", () => {
 // --- signalProcessGroupPosix ---
 
 test(
-  "signalProcessGroupPosix: signaling the group actually reaches it (green control, precursor to the real external-lineage e2e proof in test/kill.test.ts)",
+  "signalProcessGroupPosix: signaling the group actually reaches it",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async () => {
     const rec = recorder();
@@ -822,6 +1096,250 @@ test(
     assert.equal(hasLiveProcessGroupMembersPosix(999_999), false);
   }
 );
+
+test(
+  "hasLiveProcessGroupMembersPosix: a real pgrep EXECUTION failure (missing binary) fails CLOSED to true ('still alive/unconfirmed'), never rethrown",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+
+    const realPath = process.env.PATH;
+    // A real ENOENT fault injection - a PATH with no `pgrep` binary on it
+    // at all - not a mock. hasLiveProcessGroupMembersPosix has no `env`
+    // parameter of its own (it always shells out against this PROCESS's
+    // own process.env), so mutating process.env.PATH is the real fault
+    // path a broken deployment PATH would actually hit.
+    process.env.PATH = "/tmp/does-not-exist-ghantika-empty-path-dir";
+    let result: boolean | undefined;
+    let thrown: unknown;
+    try {
+      result = hasLiveProcessGroupMembersPosix(pid);
+    } catch (error) {
+      thrown = error;
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    assert.equal(
+      thrown,
+      undefined,
+      `must never rethrow a pgrep execution failure - got: ${thrown instanceof Error ? thrown.stack : String(thrown)}`
+    );
+    assert.equal(
+      result,
+      true,
+      "a broken observer must fail CLOSED to true ('cannot confirm gone'), never silently report false ('confirmed zero survivors')"
+    );
+
+    process.kill(-pid, "SIGKILL"); // cleanup
+  }
+);
+
+test(
+  "confirmProcessGroupReapedPosix: a SIGTERM-RESISTANT pgrep observer (installs a handler and ignores it) still settles within this codebase's own bound, does not block the event loop while doing so, and is genuinely gone afterward - not merely a slow-but-cooperative child",
+  {
+    skip:
+      process.platform === "win32"
+        ? "shadows a resistant pgrep on PATH and traps SIGTERM in a real shell, POSIX-only"
+        : false,
+  },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-resistant-pgrep-"));
+    const pgrepPath = path.join(dir, "pgrep");
+    const markerPath = path.join(dir, "observer-pid.txt");
+    // Traps SIGTERM to a no-op as literally this shell's first instruction,
+    // before writing its marker or sleeping - see the sibling
+    // captureBirthIdentityPosixAsync resistant-observer test above for why
+    // installing the trap first (rather than after an initial marker
+    // write) closes a real scheduling race instead of merely reordering
+    // for style.
+    fs.writeFileSync(
+      pgrepPath,
+      `#!/bin/sh\ntrap '' TERM\necho $$ > '${markerPath}'\nsleep 5\necho '${pid}'\n`
+    );
+    fs.chmodSync(pgrepPath, 0o755);
+
+    let eventLoopTicks = 0;
+    const ticker = setInterval(() => {
+      eventLoopTicks += 1;
+    }, 5);
+
+    let confirmed: boolean | undefined;
+    let elapsedMs: number;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      const before = Date.now();
+      confirmed = await confirmProcessGroupReapedPosix(pid, 1000);
+      elapsedMs = Date.now() - before;
+    } finally {
+      process.env.PATH = realPath;
+      clearInterval(ticker);
+      process.kill(-pid, "SIGKILL"); // cleanup the real sleep this test spawned
+    }
+
+    assert.equal(
+      confirmed,
+      false,
+      "a resistant pgrep must still resolve to false (unconfirmed) via this codebase's own settlement bound, never fabricate a confirmed result"
+    );
+    assert.ok(
+      elapsedMs < 3000,
+      `expected this codebase's OWN caller-side timer to force settlement well before the resistant pgrep's real 5s sleep - took ${elapsedMs}ms`
+    );
+    // THE assertion that actually tests the product's non-blocking promise:
+    // an independent timer on the SAME event loop must have kept firing
+    // WHILE this call was pending - a blocking implementation would have
+    // starved it for the whole span instead.
+    assert.ok(
+      eventLoopTicks >= 10,
+      `expected an independent event-loop timer to keep firing while the resistant observer was pending (proves the single Node event loop was never blocked) - only saw ${eventLoopTicks} ticks in ${elapsedMs}ms`
+    );
+
+    const observerPidText = await waitForFile(markerPath, {
+      until: (content) => /^\d+\s*$/.test(content.trim()),
+    });
+    const observerPid = Number(observerPidText.trim());
+    assert.ok(
+      Number.isInteger(observerPid) && observerPid > 0,
+      `expected the resistant observer to have self-reported a real pid, got: ${JSON.stringify(observerPidText)}`
+    );
+    // SIGKILL delivery and OS-level reaping are asynchronous relative to
+    // the `kill()` call that sent it (the same real async gap this
+    // codebase's own `SIGKILL_CONFIRMATION_TIMEOUT_MS` closes elsewhere) -
+    // polls rather than checking once immediately, so this assertion
+    // reflects the real outcome and not a race against that gap.
+    const goneDeadline = Date.now() + 2000;
+    let stillAlive = true;
+    while (Date.now() < goneDeadline) {
+      try {
+        process.kill(observerPid, 0);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      } catch {
+        stillAlive = false;
+        break;
+      }
+    }
+    assert.equal(
+      stillAlive,
+      false,
+      "expected the resistant observer to have actually been force-reaped (SIGKILLed), not merely abandoned as a leaked process while this codebase moved on"
+    );
+  }
+);
+
+test(
+  "confirmProcessGroupReapedPosix: a broken pgrep observer never throws - it honestly reports unconfirmed (false) once its own bound elapses, rather than an uncaught exception",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+
+    const realPath = process.env.PATH;
+    process.env.PATH = "/tmp/does-not-exist-ghantika-empty-path-dir";
+    let confirmed: boolean | undefined;
+    let thrown: unknown;
+    try {
+      // A short bound - the fail-closed "still alive" result from a
+      // broken observer means this loops until the bound elapses, never
+      // resolving early.
+      confirmed = await confirmProcessGroupReapedPosix(pid, 150);
+    } catch (error) {
+      thrown = error;
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    assert.equal(
+      thrown,
+      undefined,
+      `confirmProcessGroupReapedPosix must never throw when pgrep is broken - this is exactly the bug that reached src/tools/kill.ts's handler as an uncaught exception pre-fix - got: ${thrown instanceof Error ? thrown.stack : String(thrown)}`
+    );
+    assert.equal(
+      confirmed,
+      false,
+      "a broken observer must honestly resolve to unconfirmed (false) once the bound elapses, never silently upgraded to true"
+    );
+
+    process.kill(-pid, "SIGKILL"); // cleanup
+  }
+);
+
+// --- confirmProcessGroupReapedPosix (the FINAL, external process-group confirmation) ---
+
+test(
+  "confirmProcessGroupReapedPosix: resolves true once a real process group is genuinely gone",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+    process.kill(-pid, "SIGKILL");
+    await waitFor(() => isProcessAlive(pid) === false);
+    const confirmed = await confirmProcessGroupReapedPosix(pid, 1000);
+    assert.equal(confirmed, true);
+  }
+);
+
+test(
+  "confirmProcessGroupReapedPosix: resolves false within the bound for a group that is genuinely STILL alive - never falsely claims confirmed",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "10"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+    const start = Date.now();
+    const confirmed = await confirmProcessGroupReapedPosix(pid, 150);
+    const elapsed = Date.now() - start;
+    assert.equal(
+      confirmed,
+      false,
+      "a group that is genuinely still alive must never be reported as confirmed-gone"
+    );
+    assert.ok(
+      elapsed >= 150 && elapsed < 1000,
+      `expected to resolve close to the 150ms bound, took ${elapsed}ms`
+    );
+    process.kill(-pid, "SIGKILL"); // cleanup
+  }
+);
+
+test("GROUP_CONFIRMATION_TIMEOUT_MS defaults confirmProcessGroupReapedPosix's own bound", () => {
+  assert.equal(typeof GROUP_CONFIRMATION_TIMEOUT_MS, "number");
+  assert.ok(GROUP_CONFIRMATION_TIMEOUT_MS > 0);
+});
 
 // --- waitForProcessDeath ---
 
@@ -877,6 +1395,11 @@ test(
     assert.equal(result.finalSignal, "SIGTERM");
     assert.equal(result.escalated, false);
     assert.equal(isProcessAlive(child!.pid!), false);
+    assert.equal(
+      result.confirmed,
+      true,
+      "the FINAL external pgrep-based process-group check must confirm zero survivors for a real, fully dead group"
+    );
   }
 );
 
@@ -921,6 +1444,11 @@ test(
       isProcessAlive(child!.pid!),
       false,
       "the SIGTERM-resistant process must actually be dead after SIGKILL escalation"
+    );
+    assert.equal(
+      result.confirmed,
+      true,
+      "the FINAL external pgrep-based process-group check must confirm zero survivors after escalation too"
     );
   }
 );
@@ -1062,9 +1590,13 @@ test(
 // (so pgrep truly doesn't), keeping the survivor-oracle half of every
 // assertion honest.
 
-test("throwUnlessBenignAlreadyGoneRace: a successful signal result is a no-op regardless of signal name", () => {
-  assert.doesNotThrow(() => throwUnlessBenignAlreadyGoneRace(900_101, "SIGTERM", { ok: true }));
-  assert.doesNotThrow(() => throwUnlessBenignAlreadyGoneRace(900_101, "SIGKILL", { ok: true }));
+test("throwUnlessBenignAlreadyGoneRace: a successful signal result is a no-op regardless of signal name", async () => {
+  await assert.doesNotReject(() =>
+    throwUnlessBenignAlreadyGoneRace(900_101, "SIGTERM", { ok: true })
+  );
+  await assert.doesNotReject(() =>
+    throwUnlessBenignAlreadyGoneRace(900_101, "SIGKILL", { ok: true })
+  );
 });
 
 test(
@@ -1081,12 +1613,12 @@ test(
     const pid = child!.pid!;
     try {
       const epermResult = { ok: false, code: "EPERM", message: "kill EPERM" };
-      assert.throws(
+      await assert.rejects(
         () => throwUnlessBenignAlreadyGoneRace(pid, "SIGTERM", epermResult),
         /failed to send SIGTERM to process group/,
         "a genuinely alive, unsignalable group must surface a real error on the SIGTERM name"
       );
-      assert.throws(
+      await assert.rejects(
         () => throwUnlessBenignAlreadyGoneRace(pid, "SIGKILL", epermResult),
         /failed to send SIGKILL to process group/,
         "a genuinely alive, unsignalable group must surface a real error on the SIGKILL name too - the same function, the same arbitration, for both call sites"
@@ -1097,22 +1629,26 @@ test(
   }
 );
 
-test("throwUnlessBenignAlreadyGoneRace: EPERM against a group that is already gone is the benign race, no error, for either signal name", () => {
+test("throwUnlessBenignAlreadyGoneRace: EPERM against a group that is already gone is the benign race, no error, for either signal name", async () => {
   const fakePid = 900_102; // never a real group in this process's lifetime
   const epermResult = { ok: false, code: "EPERM", message: "kill EPERM" };
-  assert.doesNotThrow(() => throwUnlessBenignAlreadyGoneRace(fakePid, "SIGTERM", epermResult));
-  assert.doesNotThrow(() => throwUnlessBenignAlreadyGoneRace(fakePid, "SIGKILL", epermResult));
+  await assert.doesNotReject(() =>
+    throwUnlessBenignAlreadyGoneRace(fakePid, "SIGTERM", epermResult)
+  );
+  await assert.doesNotReject(() =>
+    throwUnlessBenignAlreadyGoneRace(fakePid, "SIGKILL", epermResult)
+  );
 });
 
-test("throwUnlessBenignAlreadyGoneRace: a non-EPERM failure surfaces unconditionally, even when the group is already gone - never consults the survivor oracle at all", () => {
+test("throwUnlessBenignAlreadyGoneRace: a non-EPERM failure surfaces unconditionally, even when the group is already gone - never consults the survivor oracle at all", async () => {
   const fakePid = 900_103; // never a real group in this process's lifetime
   const einvalResult = { ok: false, code: "EINVAL", message: "kill EINVAL" };
-  assert.throws(
+  await assert.rejects(
     () => throwUnlessBenignAlreadyGoneRace(fakePid, "SIGTERM", einvalResult),
     /failed to send SIGTERM to process group/,
     "a non-EPERM failure must surface unconditionally, fail-closed, regardless of whether the group happens to be gone"
   );
-  assert.throws(
+  await assert.rejects(
     () => throwUnlessBenignAlreadyGoneRace(fakePid, "SIGKILL", einvalResult),
     /failed to send SIGKILL to process group/
   );
@@ -1122,12 +1658,13 @@ test("throwUnlessBenignAlreadyGoneRace: a non-EPERM failure surfaces uncondition
 // actually invoke the shared function above, not a copy of its logic. ---
 
 test(
-  "killProcessGroupPosix: the SIGTERM-site already-gone race is treated as success end to end, via a mocked process.kill (EPERM) on a fake pid",
+  "killProcessGroupPosix: the SIGTERM-site already-gone race is treated as success end to end, via a mocked process.kill (EPERM) on a fake pid, WITHOUT ever claiming a delivery that never happened",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async (t) => {
     const fakePid = 900_104; // never a real group in this process's lifetime
     const realKill = process.kill.bind(process);
     t.mock.method(process, "kill", (target: number, signal?: string | number) => {
+      if (target === -fakePid && signal === 0) return undefined; // the pre-signal existence check reports "alive", so the SIGTERM attempt below is actually reached rather than short-circuited
       if (target === -fakePid && signal === "SIGTERM") {
         const err = new Error("kill EPERM") as NodeJS.ErrnoException;
         err.code = "EPERM";
@@ -1140,17 +1677,19 @@ test(
     const result = await killProcessGroupPosix(fakePid, 50, {
       onSignaled: (sig) => signaled.push(sig),
     });
-    assert.deepEqual(result, { finalSignal: "SIGTERM", escalated: false });
+    // confirmed: true - a fake pid was never a real group, so the FINAL
+    // external pgrep-based process-group check correctly reports zero survivors.
+    assert.deepEqual(result, { finalSignal: "SIGTERM", escalated: false, confirmed: true });
     assert.deepEqual(
       signaled,
-      ["SIGTERM"],
-      "onSignaled must still fire for the benign already-gone race - jobStore.markKilled's terminal-state guard makes this safe"
+      [],
+      "onSignaled must NOT fire for the benign already-gone race - nothing was ever delivered, so a caller claiming a terminal kill on the strength of this callback would be recording a natural exit as a requested one"
     );
   }
 );
 
 test(
-  "killProcessGroupPosix: the SIGKILL-site already-gone race is treated as success end to end, via a mocked process.kill (EPERM) on a fake pid - the same fake-pid pattern as the SIGTERM-site proof above, never a real process or signal",
+  "killProcessGroupPosix: the SIGKILL-site already-gone race is treated as success end to end, via a mocked process.kill (EPERM) on a fake pid, WITHOUT claiming the SIGKILL half was delivered when it never was - the same fake-pid pattern as the SIGTERM-site proof above, never a real process or signal",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async (t) => {
     const fakePid = 900_105; // never a real group in this process's lifetime
@@ -1171,8 +1710,19 @@ test(
     const result = await killProcessGroupPosix(fakePid, 50, {
       onSignaled: (sig) => signaled.push(sig),
     });
-    assert.deepEqual(result, { finalSignal: "SIGKILL", escalated: true });
-    assert.deepEqual(signaled, ["SIGTERM", "SIGKILL"]);
+    // confirmed: true - a fake pid was never a real group, so the FINAL
+    // external pgrep-based process-group check correctly reports zero survivors.
+    assert.deepEqual(result, { finalSignal: "SIGKILL", escalated: true, confirmed: true });
+    // The SIGTERM half was a genuine delivery (the mock returned success, not
+    // ESRCH), so it correctly fires. The SIGKILL half hit the benign
+    // already-gone race (EPERM, confirmed gone) - nothing was delivered, so
+    // it must NOT appear here, even though the overall result still reports
+    // the call as a successful, confirmed escalation.
+    assert.deepEqual(
+      signaled,
+      ["SIGTERM"],
+      "onSignaled must fire for the genuinely-delivered SIGTERM but NOT for the benign already-gone SIGKILL race"
+    );
   }
 );
 
@@ -1232,6 +1782,74 @@ test(
     } finally {
       realKill(-pid, "SIGKILL"); // cleanup - the mock never let the real signal through
     }
+  }
+);
+
+test(
+  "killProcessGroupPosix: the disclosed escalation residual, reproduced end to end - once the originally-spawned group has died, this codebase cannot tell an unrelated reused pgid apart from a still-alive original, and escalates to SIGKILL against it anyway",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async (t) => {
+    const fakePid = 900_106; // never a real group in this process's lifetime
+    const realKill = process.kill.bind(process);
+
+    // Pins the exact ownership timeline the disclosed residual describes.
+    // A real kernel pgid reuse cannot be forced from a test (the OS
+    // decides what a freed pgid gets reassigned to, not us) - so, exactly
+    // like the reap-once regression in jobStore.test.ts, this stands in
+    // for it via the mocked process.kill seam used throughout this file,
+    // but for the live escalation path instead of the leader-exit path.
+    // From the moment marked below, every "still alive" this codebase
+    // observes is, per this test's own pinned timeline, actually an
+    // UNRELATED group that has since taken the exact same numeric pgid -
+    // never the group this function originally signaled.
+    let originalGroupDiedAt: number | null = null;
+    let aliveChecksAfterOriginalDied = 0;
+    let sigkillFiredAfterOriginalDied = false;
+
+    t.mock.method(process, "kill", (target: number, signal?: string | number) => {
+      if (target !== -fakePid) return realKill(target, signal);
+      if (signal === "SIGTERM") return undefined;
+      if (signal === 0) {
+        if (originalGroupDiedAt === null) {
+          // The grace period's ordinary, intended outcome: the group this
+          // function actually spawned exits on its own right after this
+          // first existence check - marked here, never observed by the
+          // function itself, which has no channel to learn it.
+          originalGroupDiedAt = Date.now();
+        } else {
+          aliveChecksAfterOriginalDied += 1;
+        }
+        // Every check, before and after the mark, reports "alive" - a
+        // real existence check cannot distinguish a survived original
+        // from a coincidentally-reused one, so neither can this mock.
+        return undefined;
+      }
+      if (signal === "SIGKILL") {
+        if (originalGroupDiedAt !== null) sigkillFiredAfterOriginalDied = true;
+        return undefined;
+      }
+      return realKill(target, signal);
+    });
+
+    const signaled: string[] = [];
+    const result = await killProcessGroupPosix(fakePid, 60, {
+      onSignaled: (sig) => signaled.push(sig),
+    });
+
+    assert.deepEqual(
+      result,
+      { finalSignal: "SIGKILL", escalated: true, confirmed: true },
+      "expected escalation to proceed exactly as a genuine still-alive-original-group case would - this function has no way to distinguish the two, which is the disclosed residual itself"
+    );
+    assert.deepEqual(signaled, ["SIGTERM", "SIGKILL"]);
+    assert.ok(
+      aliveChecksAfterOriginalDied >= 1,
+      `expected at least one existence check to have observed the (per this test's pinned timeline) already-reused pgid as "alive" before escalating - saw ${aliveChecksAfterOriginalDied}`
+    );
+    assert.ok(
+      sigkillFiredAfterOriginalDied,
+      "expected the final SIGKILL to have been sent strictly after the point this test marks the originally-spawned group as gone - proving the signal lands on whatever now holds the pgid, not provably the original"
+    );
   }
 );
 

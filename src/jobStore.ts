@@ -38,6 +38,9 @@ import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 
+import { POSIX_KILL_GRACE_PERIOD_MS, killProcessGroupPosix } from "./process.js";
+import type { ProcessBirthIdentity } from "./process.js";
+
 // ---------------------------------------------------------------------------
 // Frozen shapes
 // ---------------------------------------------------------------------------
@@ -149,6 +152,93 @@ export interface JobRecord {
   queue_position?: number;
   readonly seq: number;
   readonly is_shell: boolean;
+  /**
+   * Set only once `state` is TERMINAL (`killed`, `exited`, or `failed` -
+   * broadened from an earlier "only `killed`" restriction so a
+   * root-exits-first terminal-record reap can disclose its own honest
+   * outcome regardless of the leader's own disposition; see
+   * `setKillConfirmation`'s own docs), and only for a POSIX kill (Windows
+   * has no process-group verification mechanism today - see
+   * `killProcessTreeWindows`'s own docs - so this is left `undefined` there
+   * rather than claiming a confirmation that was never attempted): whether
+   * a bounded, external `pgrep`-based process-group check
+   * (`process.confirmProcessGroupReapedPosix`) actually observed zero
+   * surviving process-group members after the kill signal(s) completed
+   * (`true`), or the bound elapsed without confirming (`false` - an honest
+   * "attempted, not confirmed" disclosure, NEVER silently upgraded to
+   * `true`). Set via `setKillConfirmation`, which itself only ever WRITES
+   * once the record is already terminal - on the DEFAULT path (no caller
+   * signal, or `SIGTERM`) that write happens strictly AFTER, and never
+   * gates, the synchronous `killed` state transition `markKilled`/
+   * `markExited` already performed, so this field only ever refines an
+   * already-settled result's honesty there. A caller-supplied signal other
+   * than `SIGTERM` is the one exception, and it splits in two: for a
+   * signal with no termination guarantee (SIGSTOP is the worked case),
+   * THIS check's own result is what decides whether the job becomes
+   * terminal at all (see `src/tools/kill.ts`'s explicit-signal branch), so
+   * the field is the gate there, not a refinement after one. For a signal
+   * that cannot be caught or ignored (an explicit SIGKILL), the job's
+   * state can independently reach terminal via its own real exit
+   * (`markExited`), unmediated by this check - but this field itself
+   * still only ever gets written once this check actually confirms, so it
+   * stays absent, never `false`, for as long as it hasn't - regardless of
+   * whether the record itself is already terminal by then.
+   */
+  kill_confirmed?: boolean;
+  /**
+   * Whether the PRE-signal identity check (`process.evaluatePreSignalIdentityGate`)
+   * that ran before a real signal was actually sent to this job's process
+   * group came back genuinely CONFIRMED (`true`), or had to proceed via
+   * the honest DEGRADED path - no captured birth identity was ever
+   * available, or the kill-time observer itself failed - without
+   * verifying identity at all (`false`). On the DEFAULT path (no caller
+   * signal, or `SIGTERM`), set as soon as this codebase actually attempts
+   * to signal the group, since that path's `killed` transition is
+   * synchronous and unconditional. A caller-supplied signal other than
+   * `SIGTERM` is different: a real signal is still attempted, but this
+   * field is only ever recorded once the confirmation check itself
+   * actually resolves - for a signal with no termination guarantee
+   * (SIGSTOP is the worked case), that is also the only way the job ever
+   * reaches a terminal state at all, so a signal genuinely being sent is
+   * NOT enough on its own to guarantee this field gets set. For a signal
+   * that cannot be caught or ignored (an explicit SIGKILL), the job's
+   * state can independently turn terminal via its own real exit before
+   * this field is ever written - but the field itself still waits on
+   * confirmation regardless, staying absent until it resolves.
+   * Never set for a job that was refused (identity-mismatch) or skipped
+   * (already gone). Distinct from `kill_confirmed` above, which is a
+   * POST-signal process-group confirmation - this is the PRE-signal identity
+   * confirmation. POSIX only, matching `kill_confirmed`.
+   */
+  identity_confirmed?: boolean;
+  /**
+   * The real-time state of this job's ASYNC, fire-and-forget
+   * birth-identity capture (see `process.captureBirthIdentityPosixAsync`) -
+   * distinct from `identity_confirmed` above, which is a PRE-SIGNAL check
+   * that only ever runs during an actual kill/reap attempt. This field is
+   * about whether a birth identity exists to compare against AT ALL, at
+   * any moment, whether or not a kill has ever been attempted:
+   *
+   * - `undefined`: no capture was ever kicked off for this job (a job that
+   *   never got a live child attached at all, e.g. `createFailedJob`) or
+   *   this is Windows, where capture is never attempted (see
+   *   `captureBirthIdentityPosixAsync`'s own docs).
+   * - `"pending"`: the capture is in flight, from the instant it starts
+   *   (set by `JobStore.attachPendingIdentityCapture`, called synchronously
+   *   right alongside kicking off the capture) until it settles.
+   * - `"captured"`: the capture settled with a real birth identity.
+   * - `"unavailable"`: the capture settled with no identity at all (`ps`
+   *   missing, erroring, unparseable output, or the capture's own bounded
+   *   timeout was hit).
+   *
+   * Purely informational/disclosure - `kill`/the shutdown reaper never
+   * read THIS field to decide anything; they read the tracked child's own
+   * `birthIdentity` (see `TrackedChild`'s own docs), awaiting the
+   * underlying capture promise themselves via
+   * `JobStore.resolveBirthIdentityForKill` when it's still in flight at
+   * the exact moment they need it.
+   */
+  identity_capture?: "pending" | "captured" | "unavailable";
 }
 
 /**
@@ -207,6 +297,12 @@ export interface PublicJobProjection {
   readonly command_summary: string;
   readonly label: string;
   readonly counts: JobOutputCounts;
+  /** See `JobRecord.kill_confirmed`'s own docs - the same value, passed through verbatim. */
+  readonly kill_confirmed?: boolean;
+  /** See `JobRecord.identity_confirmed`'s own docs - the same value, passed through verbatim. */
+  readonly identity_confirmed?: boolean;
+  /** See `JobRecord.identity_capture`'s own docs - the same value, passed through verbatim. */
+  readonly identity_capture?: "pending" | "captured" | "unavailable";
 }
 
 /**
@@ -243,6 +339,9 @@ export function toPublicProjection(
     command_summary: computeCommandSummary(record),
     label: record.label ?? `job ${record.job_id}`,
     counts,
+    kill_confirmed: record.kill_confirmed,
+    identity_confirmed: record.identity_confirmed,
+    identity_capture: record.identity_capture,
   };
 }
 
@@ -858,16 +957,47 @@ interface CreateFailedJobInput extends CreateJobInput {
 
 /**
  * What `JobStore` tracks about a job's real, live child process, alongside
- * the `ChildProcess` handle itself - the pid and the (approximate) real
- * spawn time, both used by `kill` as the birth-identity
- * marker it checks, via a real external OS lookup, before ever signaling a
- * pid. See `attachChild`'s docs for why `spawnedAtMs` is recorded exactly
- * when it is.
+ * the `ChildProcess` handle itself - the pid, the (approximate) real spawn
+ * time, and the leader's real captured birth identity (nullable), the
+ * last of which `kill`/the shutdown reaper actually compare against a
+ * real external OS lookup before ever signaling a pid. See `attachChild`'s
+ * docs for why `spawnedAtMs` is recorded exactly when it is, and
+ * `TrackedChild.birthIdentity`'s own docs for why that field, not
+ * `spawnedAtMs`, is what identity comparison actually uses.
  */
 interface TrackedChild {
   readonly child: ChildProcess;
   readonly pid: number;
   readonly spawnedAtMs: number;
+  /**
+   * The leader's real, `ps`-captured birth identity - `undefined` when
+   * capture itself failed (or was never attempted, e.g. this handle
+   * predates the capture lifecycle), or when an ASYNC capture (see
+   * `identityCapture` below) is still genuinely in flight. Every
+   * kill/shutdown caller uses THIS field for identity comparison now, not
+   * `spawnedAtMs` above (kept only as an informational/back-compat
+   * timestamp - see its own docs) - via `JobStore.resolveBirthIdentityForKill`,
+   * never read directly, so an in-flight `identityCapture` gets a real
+   * chance to settle first (see that method's own docs).
+   */
+  readonly birthIdentity: ProcessBirthIdentity | undefined;
+  /**
+   * The ASYNC birth-identity capture kicked off for this job (see
+   * `process.captureBirthIdentityPosixAsync`) - `undefined` only if none
+   * was ever kicked off in the first place (e.g. this handle predates the
+   * async-capture lifecycle, or the platform is Windows). This field is
+   * NOT cleared once the capture settles: the same promise reference stays
+   * stored for the tracked child's whole lifetime, and `identity_capture`
+   * on the public `JobRecord` (`"pending"` / `"captured"` / `"unavailable"`)
+   * is the field that reflects settlement, not this one. Awaiting an
+   * already-settled promise resolves immediately, so `resolveBirthIdentityForKill`
+   * reading this field is cheap either way - a genuinely in-flight
+   * `identityCapture` gets a real chance to settle first, and an already-
+   * settled one costs nothing extra, without needing this field itself to
+   * be reset to `undefined` to tell the two cases apart (that distinction
+   * lives in `birthIdentity` above and in `identity_capture`).
+   */
+  readonly identityCapture: Promise<ProcessBirthIdentity | undefined> | undefined;
 }
 
 /**
@@ -880,6 +1010,33 @@ export class JobStore {
   private readonly jobs = new Map<string, JobRecord>();
   private readonly children = new Map<string, TrackedChild>();
   private readonly buffers = new Map<string, Record<ManagedStream, StreamBufferState>>();
+  /**
+   * Job ids whose process group has already had a real CLEANUP-REAP
+   * attempt against a TERMINAL record - not a record of every signal this
+   * codebase has ever sent. Two distinct paths write to this set, and only
+   * one of them is gated by it:
+   *
+   * - `reapProcessGroupOnce` (the eager reap at leader-exit, and the
+   *   terminal-record fallback a `kill()`/shutdown call reaching an
+   *   already-terminal record now also routes through) CHECKS this set
+   *   before ever signaling, and marks it as part of the same call - this
+   *   is the actual "at most one cleanup-reap attempt per job" guarantee,
+   *   and it is what a later attempt against a recycled pgid cannot
+   *   re-trigger (see `src/tools/kill.ts`'s own docs for the disclosed
+   *   PGID-reuse residual this narrows).
+   * - A LIVE job's own explicit `kill()` signal marks this set too (so a
+   *   later terminal-record reap knows a cleanup attempt already covered
+   *   this job), but does NOT check it first - a live signal is a
+   *   caller-requested action, never suppressed by this flag. The default
+   *   path marks unconditionally; the custom-signal path marks ONLY for
+   *   `SIGKILL` (the one signal this codebase treats as unable to be
+   *   caught or ignored, so sending it genuinely IS a cleanup reap) -
+   *   a non-terminating custom signal (`SIGSTOP`/`SIGCONT`) never marks
+   *   this set, since nothing was reaped and the real cleanup-reap
+   *   opportunity must stay available for whenever the leader eventually
+   *   exits on its own.
+   */
+  private readonly reapAttempted = new Set<string>();
   private seqCounter = 0;
 
   /** True if a job with this id has ever been registered. */
@@ -969,38 +1126,181 @@ export class JobStore {
   }
 
   /**
-   * Stores the live `ChildProcess` handle for a job, plus its pid and the
+   * Stores the live `ChildProcess` handle for a job, plus its pid, the
    * (approximate) real spawn time recorded at THIS moment - `Date.now()`
    * here, not the async `spawn` event that fires slightly later, since
    * `run.ts` calls this synchronously, immediately after
    * `process.spawnManaged` returns (itself synchronous - see that
    * function's own docs), so the gap to the real OS-level process creation
-   * is at most low single-digit milliseconds - comfortably inside
-   * `process.checkProcessIdentity`'s multi-second tolerance. Internal
-   * bookkeeping only, never exposed publicly except through
-   * `getChildHandle`'s narrow `{pid, spawnedAtMs}` view (never the raw
-   * `ChildProcess` itself) - used by `kill`.
+   * is at most low single-digit milliseconds - and an ALREADY-SETTLED
+   * birth identity, if the caller happens to have one on hand already
+   * (nullable). Internal bookkeeping only, never exposed publicly except
+   * through `getChildHandle`'s narrow view (never the raw `ChildProcess`
+   * itself) - used by `kill`/the shutdown reaper.
+   *
+   * `run()`'s own real production handler always passes `undefined` here
+   * and separately calls `attachPendingIdentityCapture` right afterward to
+   * track its own async, still-in-flight capture (see that method's own
+   * docs) - this `birthIdentity` parameter exists for callers (chiefly this
+   * codebase's own test suite) that already have a real, synchronously-
+   * captured identity in hand and want to attach it directly, with no
+   * pending-capture bookkeeping involved at all.
+   *
+   * @param birthIdentity - omit (or pass `undefined`) when no capture was
+   *   attempted or it failed (or hasn't settled yet) - every real caller
+   *   must then take the honest DEGRADED path at kill time (see
+   *   `process.evaluatePreSignalIdentityGate`'s own docs), never silently
+   *   treat a missing identity as confirmed.
    */
-  attachChild(jobId: string, child: ChildProcess): void {
+  attachChild(jobId: string, child: ChildProcess, birthIdentity?: ProcessBirthIdentity): void {
     const pid = child.pid;
     if (pid === undefined) return; // defensive: spawnManaged only ever returns a child when it has a real pid - see its own docs
-    this.children.set(jobId, { child, pid, spawnedAtMs: Date.now() });
+    this.children.set(jobId, {
+      child,
+      pid,
+      spawnedAtMs: Date.now(),
+      birthIdentity,
+      identityCapture: undefined,
+    });
   }
 
   /**
-   * The tracked child's pid and the (approximate) OS-confirmed spawn time
-   * recorded when it was attached (see `attachChild`) - the birth-identity
-   * marker `kill` checks, via a real external OS lookup,
-   * before ever signaling a pid. `undefined` when no child was ever
-   * attached (a job that started already-failed never gets one - see
-   * `createFailedJob`) or the job id is unknown.
+   * The tracked child's pid, the (approximate) OS-confirmed spawn time
+   * recorded when it was attached (see `attachChild`), its real captured
+   * birth identity (nullable), and any still-in-flight async capture (see
+   * `TrackedChild`'s own docs for both of the latter two). `kill`/the
+   * shutdown reaper never read `birthIdentity` directly off this handle to
+   * decide anything - they call `resolveBirthIdentityForKill` instead,
+   * which awaits a still-pending `identityCapture` first (see that
+   * method's own docs). `undefined` when no child was ever attached (a job
+   * that started already-failed never gets one - see `createFailedJob`) or
+   * the job id is unknown.
    */
-  getChildHandle(
-    jobId: string
-  ): { readonly pid: number; readonly spawnedAtMs: number } | undefined {
+  getChildHandle(jobId: string):
+    | {
+        readonly pid: number;
+        readonly spawnedAtMs: number;
+        readonly birthIdentity: ProcessBirthIdentity | undefined;
+        readonly identityCapture: Promise<ProcessBirthIdentity | undefined> | undefined;
+      }
+    | undefined {
     const tracked = this.children.get(jobId);
     if (!tracked) return undefined;
-    return { pid: tracked.pid, spawnedAtMs: tracked.spawnedAtMs };
+    return {
+      pid: tracked.pid,
+      spawnedAtMs: tracked.spawnedAtMs,
+      birthIdentity: tracked.birthIdentity,
+      identityCapture: tracked.identityCapture,
+    };
+  }
+
+  /**
+   * Updates an ALREADY-tracked child's captured birth identity in place -
+   * used by `attachPendingIdentityCapture`'s own resolution handler below
+   * once the async, fire-and-forget capture kicked off at spawn time
+   * actually resolves with a real identity, strictly AFTER `run()` itself
+   * has already returned. Everything else about the tracked child (`pid`,
+   * `spawnedAtMs`, `identityCapture`) is left untouched.
+   *
+   * A safe no-op when the job's tracked child is no longer present -
+   * defensive: nothing in this codebase today ever removes an entry from
+   * the tracked-children map once `attachChild` adds one, so this is not a
+   * reachable path in practice, but a late-resolving capture must never be
+   * allowed to fabricate or resurrect a tracked-child record for a job id
+   * that isn't (or is no longer) tracked.
+   */
+  setBirthIdentity(jobId: string, birthIdentity: ProcessBirthIdentity): void {
+    const tracked = this.children.get(jobId);
+    if (!tracked) return;
+    this.children.set(jobId, { ...tracked, birthIdentity });
+  }
+
+  /**
+   * Wires an in-flight, async birth-identity capture (see
+   * `process.captureBirthIdentityPosixAsync`) onto an ALREADY-attached
+   * child - `run.ts`'s handler calls this immediately after `attachChild`
+   * itself, WITHOUT ever awaiting the capture (that's the whole point:
+   * `run()` returns before this settles). Records the honest `"pending"`
+   * state on the job record right away (see `JobRecord.identity_capture`'s
+   * own docs), and, once the capture actually settles, records the final
+   * `"captured"`/`"unavailable"` state and - on success - writes the
+   * result onto the tracked child via `setBirthIdentity`.
+   *
+   * The promise itself is ALSO stored on the tracked child
+   * (`getChildHandle`'s own `identityCapture` field) so a `kill()`/reap
+   * call that finds identity still pending at the exact moment it needs it
+   * can await this SAME promise via `resolveBirthIdentityForKill` - bounded
+   * because `readProcessElapsedSecondsAsync` (what
+   * `captureBirthIdentityPosixAsync` awaits) settles on ITS OWN independent
+   * timer regardless of the underlying `ps` process's cooperation, not
+   * merely because `execFile`'s own `timeout` option sends it a signal
+   * (that option only requests SIGTERM; a child that ignores it leaves
+   * `execFile`'s callback genuinely unfired, which is exactly why a second,
+   * caller-side timer exists - see that function's own docs) - rather than
+   * either re-deriving a fresh capture of its own or giving up on identity
+   * confirmation the instant it finds a still-in-flight one (see
+   * `src/tools/kill.ts`'s own docs for exactly why that distinction
+   * matters: it's the difference between a real, confirmed-identity reap
+   * and an unnecessarily degraded one for a kill that simply happened to
+   * race ahead of a capture that was about to succeed).
+   *
+   * A safe no-op if the job's tracked child is no longer present - see
+   * `setBirthIdentity`'s own docs for why that's currently only a
+   * defensive guard, not a reachable path.
+   */
+  attachPendingIdentityCapture(
+    jobId: string,
+    capture: Promise<ProcessBirthIdentity | undefined>
+  ): void {
+    const tracked = this.children.get(jobId);
+    if (!tracked) return;
+    this.children.set(jobId, { ...tracked, identityCapture: capture });
+    const record = this.jobs.get(jobId);
+    if (record) record.identity_capture = "pending";
+    capture.then((identity) => {
+      if (identity !== undefined) {
+        this.setBirthIdentity(jobId, identity);
+      }
+      const settledRecord = this.jobs.get(jobId);
+      if (settledRecord) {
+        settledRecord.identity_capture = identity !== undefined ? "captured" : "unavailable";
+      }
+    });
+  }
+
+  /**
+   * The single real entry point every kill/reap caller (`kill.ts`'s
+   * handler, `server.ts`'s shutdown reaper) uses to obtain a job's birth
+   * identity for comparison - NEVER read `getChildHandle(...).birthIdentity`
+   * directly for this purpose, since a snapshot read at the wrong instant
+   * can catch a real, about-to-succeed capture mid-flight and wrongly
+   * treat it the same as a definitively failed one.
+   *
+   * Returns the already-SETTLED `birthIdentity` immediately when there is
+   * one, or when no capture is currently pending at all (never attempted,
+   * or already settled to "unavailable"). When a capture IS still
+   * genuinely pending at this exact moment, awaits that SAME in-flight
+   * promise (see `attachPendingIdentityCapture`) before returning - this
+   * settles within `process.ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS` plus
+   * a small fixed grace, on the promise's OWN independent timer, regardless
+   * of whether the underlying `ps` process actually exits: that process is
+   * force-reaped (SIGKILL) if it is still alive once that timer fires, so
+   * a `ps` that ignores `execFile`'s own SIGTERM request cannot keep this
+   * pending indefinitely, and cannot outlive the capture as a leaked
+   * process either. This is what preserves a real, confirmed identity
+   * comparison for the common, real race of a kill arriving moments after `run()`
+   * returns, before the async capture has had time to answer - rather than
+   * immediately falling back to the honest but strictly weaker degraded
+   * path the instant identity isn't ALREADY settled.
+   *
+   * `undefined` when the job's child is no longer tracked at all.
+   */
+  async resolveBirthIdentityForKill(jobId: string): Promise<ProcessBirthIdentity | undefined> {
+    const tracked = this.children.get(jobId);
+    if (!tracked) return undefined;
+    if (tracked.birthIdentity !== undefined) return tracked.birthIdentity;
+    if (tracked.identityCapture === undefined) return undefined;
+    return tracked.identityCapture;
   }
 
   /** `starting` -> `running`, once the OS has actually confirmed the process started (the `spawn` event). No-op if the job is already terminal or already running. */
@@ -1115,6 +1415,166 @@ export class JobStore {
     const record = this.jobs.get(jobId);
     if (!record || record.state !== "killed") return;
     record.signal = signal;
+  }
+
+  /**
+   * Records a POSIX kill's bounded, external `pgrep`-based process-group
+   * confirmation result - see `JobRecord.kill_confirmed`'s own docs for
+   * exactly what `true`/`false` mean. A no-op unless the job is ALREADY
+   * terminal (broadened from "already `killed`" - see below). On the
+   * default path and the terminal-record reap, that means this write
+   * never fires before, and never re-triggers, whatever state transition
+   * already settled the job - it only ever refines the already-settled
+   * result's honesty there. A caller-supplied signal other than `SIGTERM`
+   * is different: `src/tools/kill.ts`'s explicit-signal branch calls
+   * `markKilled` and this setter back-to-back, in that order, ONLY once
+   * its own process-group check result comes back confirmed - so from this
+   * setter's own narrow point of view the record is indeed already
+   * terminal by the time it runs, but the SAME check this setter's value
+   * records is what decided, a line earlier, whether that transition
+   * happened at all. This setter is never called for that path while the
+   * result is unconfirmed.
+   *
+   * Broadened from "only a `killed` job" to "any terminal job" so a
+   * TERMINAL record whose leader `exited` (or `failed`) on its own can
+   * still record an honest reap-confirmation outcome: a real process
+   * GROUP where the leader forks descendants and then exits naturally
+   * (root-exits-first) can leave those descendants alive under the SAME
+   * pgid, and `kill`/the shutdown reaper now attempt a real group-level
+   * reap for exactly that case even though the job record itself is
+   * already `exited`, not `killed` - see `src/tools/kill.ts`'s own
+   * "terminal-record" reap docs. The reap's honest confirmed/unconfirmed
+   * outcome deserves the identical disclosure a `killed` job's own reap
+   * gets, regardless of which specific terminal disposition the LEADER's
+   * own record carries - `kill_confirmed`'s real meaning ("did an
+   * external check confirm the job's process group holds zero members")
+   * never depended on the record's own `state` in the first place, and
+   * never depended on a signal having actually been sent either: the
+   * eager reap-at-exit can set this `true` for a job whose group
+   * had nothing left to signal at all, so the field is a STATE claim
+   * (the group was observed empty), never an ACTION claim (a kill was
+   * performed) - see `src/jobStore.ts`'s `reapProcessGroupOnce` docs.
+   */
+  setKillConfirmation(jobId: string, confirmed: boolean): void {
+    const record = this.jobs.get(jobId);
+    if (!record || !isTerminalJobState(record.state)) return;
+    record.kill_confirmed = confirmed;
+  }
+
+  /**
+   * Records whether the PRE-signal identity check that ran before `kill`/
+   * the shutdown reaper actually signaled this job's process group came
+   * back genuinely confirmed, or had to proceed via the honest DEGRADED
+   * path - see `JobRecord.identity_confirmed`'s own docs. Same
+   * terminal-state guard as `setKillConfirmation` above, for the same
+   * reason (never fires before, or re-triggers, the state transition that
+   * already settled the job).
+   */
+  setIdentityConfirmation(jobId: string, confirmed: boolean): void {
+    const record = this.jobs.get(jobId);
+    if (!record || !isTerminalJobState(record.state)) return;
+    record.identity_confirmed = confirmed;
+  }
+
+  /**
+   * True once a real CLEANUP-REAP has already been attempted for this
+   * job's terminal record - see `reapAttempted`'s own docs for exactly
+   * which paths set this and which of them check it first. Only
+   * `reapProcessGroupOnce` checks this before signaling; a live `kill()`
+   * signal is never suppressed by a `true` result here, since a caller-
+   * requested live signal is not a retry of the cleanup reap.
+   */
+  hasReapBeenAttempted(jobId: string): boolean {
+    return this.reapAttempted.has(jobId);
+  }
+
+  /**
+   * Records that this job's process group has had a signal delivered to
+   * it that this codebase treats as covering the cleanup-reap concern -
+   * see `reapAttempted`'s own docs for exactly which signals qualify.
+   * Idempotent: setting it again for the same job id is a harmless no-op.
+   */
+  markReapAttempted(jobId: string): void {
+    this.reapAttempted.add(jobId);
+  }
+
+  /**
+   * Reaps whatever real process-GROUP members might still be alive under a
+   * job's own former leader pid - the root-exits-first case: a leader that
+   * forks descendants and then exits on its own (never `wait`-ing on them)
+   * leaves those descendants alive, orphaned, under the SAME pgid, since
+   * the leader's own natural exit does not kill them.
+   *
+   * Guarded by `hasReapBeenAttempted`/`markReapAttempted`: if a reap has
+   * already been attempted for this job - by the eager call `src/tools/
+   * run.ts`'s `onExit` wiring makes right at leader-exit, or by a LIVE
+   * explicit `kill()` that already signaled this same group directly
+   * (`src/tools/kill.ts`) - this is a pure no-op. That is deliberate, not
+   * merely an optimization: once the moment of guaranteed continuity (the
+   * group has been non-empty, under this exact pgid, since this
+   * codebase's own spawn call) has passed, a LATER attempt has no way to
+   * tell "these are still our own orphaned descendants" from "an
+   * unrelated process later took this recycled number" - see
+   * `src/tools/kill.ts`'s own "PID-reuse defense" header section for the
+   * disclosed residual this narrows to bounded rather than leaving
+   * unbounded.
+   *
+   * Called from `src/tools/run.ts`'s `onExit` callback (fired off WITHOUT
+   * being awaited there) as the PRIMARY path, the instant a job's leader
+   * is observed to have exited on its own: at that exact moment ownership
+   * continuity is real, since a POSIX pgid cannot be recycled while the
+   * group still has a member, and this codebase's own hierarchy has held
+   * it continuously since spawn. Also called from `src/tools/kill.ts`'s
+   * terminal-record branch as a fallback for the rare case the eager call
+   * hasn't run yet - a harmless no-op otherwise.
+   *
+   * Deliberately never runs the leader-pid identity check
+   * (`evaluatePreSignalIdentityGate`) the live `kill()` path uses: that
+   * check exists to refuse signaling an UNRELATED process that happens to
+   * have reused the tracked LEADER's own pid - but the leader here is
+   * ALREADY gone by construction, so a leader-pid comparison would always
+   * read "not-found" and abort before ever reaching a group that can
+   * still hold real, live descendants. `killProcessGroupPosix` itself
+   * checks group EXISTENCE before ever signaling (see that function's own
+   * docs) - an already-empty group is a safe no-op there, never a
+   * delivered signal.
+   *
+   * A no-op when no child was ever attached to this job at all (e.g. a
+   * job that started already-`failed` and never reached a real spawn).
+   *
+   * `graceMs` defaults to the real live-kill grace period
+   * (`POSIX_KILL_GRACE_PERIOD_MS`) - callers reaping during shutdown
+   * (`src/server.ts`) pass its own, shorter shutdown grace period instead,
+   * since this is the same real signal-and-wait sequence either way, just
+   * bounded differently for the two real callers' different tolerances.
+   *
+   * `reaper` defaults to the real `killProcessGroupPosix` and production
+   * code never overrides it - the parameter exists solely so a test can
+   * substitute a spy, following the same injectable-oracle pattern
+   * `src/process.ts`'s own `waitForProcessDeath` already uses for
+   * `isAlive`. This is what makes the reap-once guard's own safety
+   * claim - a job whose reap has already been attempted never signals
+   * again, however its numeric pgid may since have been reused - directly
+   * testable without needing the kernel to hand back a chosen pid: a test
+   * calls this twice for the same job with a `reaper` spy that reports a
+   * live group if it is ever invoked, and confirms the spy runs on the
+   * first call but never on the second, proving no real signal could ever
+   * reach whatever now sits at that recycled pgid on that later call.
+   */
+  async reapProcessGroupOnce(
+    jobId: string,
+    graceMs: number = POSIX_KILL_GRACE_PERIOD_MS,
+    reaper: (pid: number, graceMs: number) => Promise<{ readonly confirmed: boolean }> = (
+      pid,
+      ms
+    ) => killProcessGroupPosix(pid, ms)
+  ): Promise<void> {
+    if (this.hasReapBeenAttempted(jobId)) return;
+    const handle = this.getChildHandle(jobId);
+    if (handle === undefined) return;
+    this.markReapAttempted(jobId);
+    const result = await reaper(handle.pid, graceMs);
+    this.setKillConfirmation(jobId, result.confirmed);
   }
 
   /** Appends one raw data chunk from a job's stdout or stderr to that stream's independent buffer. */

@@ -12,10 +12,15 @@
  * OS-level `spawn`/`error`/`exit` events it wires up are always
  * asynchronous relative to the call returning. So by the time this handler
  * builds its response, at most `resolveCwd`/`resolveExecutable`'s
- * synchronous filesystem checks have run (fast, no child-process I/O
- * involved) - `run` never awaits the spawned command's own execution or
- * completion. Proven under a real client over the real wire in
- * `test/e2e-server.test.ts`.
+ * synchronous filesystem checks have run (fast, no BLOCKING child-process
+ * I/O involved) - `run` never awaits the spawned command's own execution
+ * or completion, and never awaits its own birth-identity capture either
+ * (see "Birth-identity capture, at spawn time" below): the one real
+ * external process this handler's own code launches on its OWN behalf (a
+ * `ps` read, not the caller's job) is fired off and left running in the
+ * background, never on this handler's response path, even against a
+ * deliberately slow `ps` observer - a synchronous capture used to block
+ * this exact response on however long `ps` took.
  *
  * ## Two ways a job can be `failed` before this handler even returns
  *
@@ -26,11 +31,45 @@
  * job that starts already in a terminal state, rather than either
  * throwing a protocol error or racing an async OS-level failure. See
  * `src/process.ts`'s `resolveCwd`/`resolveExecutable`.
+ *
+ * ## Birth-identity capture, at spawn time - ASYNC, never on the response path
+ *
+ * Immediately after a real spawn succeeds, this handler attaches the child
+ * to `jobStore` with NO birth identity yet (`jobStore.attachChild(jobId,
+ * child, undefined)`), then separately kicks off the leader's real,
+ * `ps`-observed birth-identity capture (`process.captureBirthIdentityPosixAsync`)
+ * WITHOUT ever awaiting it, handing the resulting promise to
+ * `jobStore.attachPendingIdentityCapture` to track. That promise resolves
+ * strictly AFTER this handler has already returned its response - `run()`
+ * never awaits the capture's completion, so a genuinely slow or hung `ps`
+ * can never delay that response, only extend how long the job's
+ * identity stays honestly disclosed as `"pending"` (see
+ * `jobStore.ts`'s `JobRecord.identity_capture` docs) before settling to
+ * `"captured"` or `"unavailable"`.
+ *
+ * `kill`/the shutdown reaper later compare a FRESH `ps` read against
+ * whatever this capture settles to - never a value derived purely from
+ * this codebase's own `Date.now()` math at attach time - via
+ * `jobStore.resolveBirthIdentityForKill`, which awaits this SAME in-flight
+ * promise if a kill/reap happens to arrive while it's still pending,
+ * bounded by the capture's own hard timeout (see
+ * `process.ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS`). Nullable by design:
+ * this capture failing (or the platform being Windows, where it's not
+ * attempted at all) never fails `run()` itself - it only means a later
+ * `kill()`/shutdown reap for this job takes the honest, disclosed
+ * DEGRADED path instead of a confirmed one. See
+ * `captureBirthIdentityPosixAsync`'s own docs.
  */
 import type { CallToolResult, Tool } from "@modelcontextprotocol/server";
 
 import { type PublicJobProjection, jobStore, toPublicProjection } from "../jobStore.js";
-import { buildChildEnv, resolveCwd, resolveExecutable, spawnManaged } from "../process.js";
+import {
+  buildChildEnv,
+  captureBirthIdentityPosixAsync,
+  resolveCwd,
+  resolveExecutable,
+  spawnManaged,
+} from "../process.js";
 
 export const name = "run";
 
@@ -221,14 +260,61 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
     {
       onSpawn: () => jobStore.markRunning(jobId),
       onError: (message) => jobStore.markSpawnFailed(jobId, message),
-      onExit: (code, signal) => jobStore.markExited(jobId, code, signal),
+      onExit: (code, signal) => {
+        jobStore.markExited(jobId, code, signal);
+        // The PRIMARY reap path for the root-exits-first case: fired the
+        // instant the leader's own exit is observed, without ever being
+        // awaited here (the same fire-and-forget shape as the async
+        // birth-identity capture below) - see
+        // `jobStore.reapProcessGroupOnce`'s own docs for why this exact
+        // moment is when ownership continuity is real, and why a later
+        // `kill()` call reaching an already-terminal record cannot
+        // recover that fact by checking. Still fire-and-forget (never
+        // awaited here - onExit itself is a synchronous callback with no
+        // caller waiting on this), but a real signal-send failure inside
+        // it is a genuine promise rejection, not merely an unconfirmed
+        // result - caught and logged here so it surfaces as a diagnostic
+        // rather than an unhandled rejection.
+        jobStore.reapProcessGroupOnce(jobId).catch((error: unknown) => {
+          // jobId passed as its own argument, never interpolated into the
+          // format string itself - the static literal below carries no
+          // format specifiers for jobId to forge, regardless of its value.
+          console.error(
+            "[ghantika] error reaping job's process group at leader-exit:",
+            jobId,
+            error
+          );
+        });
+      },
       onStdoutChunk: (chunk) => jobStore.appendOutput(jobId, "stdout", chunk),
       onStderrChunk: (chunk) => jobStore.appendOutput(jobId, "stderr", chunk),
       onStdoutEnd: () => jobStore.finalizeStream(jobId, "stdout"),
       onStderrEnd: () => jobStore.finalizeStream(jobId, "stderr"),
     }
   );
-  if (child !== undefined) jobStore.attachChild(jobId, child);
+  if (child !== undefined) {
+    // Attach the child with NO birth identity yet - run() returns without
+    // ever waiting on an external ps read (see this file's own "Birth-
+    // identity capture" docs above). The real capture is kicked off
+    // separately, immediately, as close to the actual OS-level spawn as
+    // this codebase's own code can get - but WITHOUT ever being awaited
+    // here: captureBirthIdentityPosixAsync's own promise is handed to
+    // jobStore.attachPendingIdentityCapture, which tracks it and updates
+    // the job's bookkeeping once it actually settles, strictly after this
+    // handler has already returned. Nullable by design: a capture failure
+    // (ps unavailable, the process already gone by the time it runs, or
+    // the capture's own bounded timeout firing) must never fail run()
+    // itself - see captureBirthIdentityPosixAsync's own docs - it only
+    // means kill()/shutdown later take the honest, disclosed DEGRADED path
+    // for this one job (after first awaiting this same in-flight capture
+    // if it's still pending at that moment - see
+    // jobStore.resolveBirthIdentityForKill's own docs).
+    jobStore.attachChild(jobId, child, undefined);
+    if (child.pid !== undefined) {
+      const identityCapture = captureBirthIdentityPosixAsync(child.pid);
+      jobStore.attachPendingIdentityCapture(jobId, identityCapture);
+    }
+  }
 
   // Re-read from the store rather than reusing `record`: spawnManaged's
   // synchronous try/catch path (see its docs) can already have called

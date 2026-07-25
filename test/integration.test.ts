@@ -121,14 +121,13 @@ async function withProcessGroupReap<T>(
 }
 
 // =============================================================================
-// THE CENTERPIECE - real stdio client, JOBS=4 concurrent
-// noisy multi-descendant jobs, non-blocking status/output on a live job
-// plus a 5th job started mid-session, JSON-RPC framing integrity under
-// noise.
+// Real stdio client, JOBS=4 concurrent noisy multi-descendant jobs,
+// non-blocking status/output on a live job plus a 5th job started
+// mid-session, JSON-RPC framing integrity under noise.
 // =============================================================================
 
 test(
-  "THE CENTERPIECE: real stdio client drives JOBS=4 concurrent live jobs (DESCENDANTS-per-job=3, NOISE-bytes=64KiB each); while one stays live the SAME session reads its status/output AND starts a 5th job, non-blocking; framing stays clean under the noise",
+  "real stdio client drives JOBS=4 concurrent live jobs (DESCENDANTS-per-job=3, NOISE-bytes=64KiB each); while one stays live the SAME session reads its status/output AND starts a 5th job, non-blocking; framing stays clean under the noise",
   { skip: PGREP_ORACLE_SKIP },
   async () => {
     const server = tracked();
@@ -273,10 +272,10 @@ test(
     // ---------------------------------------------------------------------
     // Cleanup: kill all 4 original noisy jobs (concurrently) - this doubles
     // as this test's own teardown AND is independent evidence toward
-    // the whole-tree-reap requirement (the OWNING test for that is
-    // the dedicated one further down this file, at the full 4x3 scale with
-    // its own explicit external-pgrep before/after transcript - this is
-    // just this test's own belt-and-braces cleanup, kept lightweight).
+    // the process-group-reap requirement, which the dedicated test further
+    // down this file checks at the full 4x3 scale with its own explicit
+    // external-pgrep before/after transcript - this is just this test's
+    // own belt-and-braces cleanup, kept lightweight.
     // ---------------------------------------------------------------------
     const killCalls = jobIds.map((jobId) => ({
       id: nextId(),
@@ -396,7 +395,7 @@ test("output()/tail() buffers remain readable after a real kill() (not just afte
 });
 
 test(
-  "cross-tool: a SIGTERM-resistant job's WHOLE process tree is escalated to real SIGKILL after the real ~5s grace period (confirmed genuinely leader-only mid-escalation: its own descendants, forked before the trap, are already gone from the plain SIGTERM while the leader and its keep-alive job are still alive), and status() independently reflects exactly that signal - proven over the real wire, with real status/output reads and real kill() calls on 3 ordinary jobs provably landing while the escalation is still in flight, and a real external pgrep lineage check",
+  "cross-tool: a SIGTERM-resistant job's WHOLE process group is escalated to real SIGKILL after the real ~5s grace period (confirmed genuinely leader-only mid-escalation: its own descendants, forked before the trap, are already gone from the plain SIGTERM while the leader and its keep-alive job are still alive), and status() independently reflects exactly that signal - proven over the real wire, with real status/output reads and real kill() calls on 3 ordinary jobs provably landing while the escalation is still in flight, and a real external pgrep process-group check",
   { skip: PGREP_ORACLE_SKIP },
   async () => {
     const server = tracked();
@@ -756,7 +755,7 @@ test(
 
       // The ordinary jobs' own kill()s: each dies from the default SIGTERM
       // alone, well inside the grace period, no escalation needed (matching
-      // every other whole-tree kill in this file) - AND, per the same
+      // every other process-group kill in this file) - AND, per the same
       // timestamped proof, the client genuinely read each one's own
       // response before the resistant leader's, i.e. this real state
       // change on other jobs happened while the resistant escalation was
@@ -854,8 +853,8 @@ test(
         "tail() must still return the resistant leader's real noise after it was killed"
       );
 
-      // Bullet 4: the WHOLE tree - the resistant leader itself PLUS its
-      // DESCENDANTS_PER_JOB descendants - is genuinely gone, confirmed by a
+      // Bullet 4: the WHOLE process group - the resistant leader itself
+      // PLUS its DESCENDANTS_PER_JOB descendants - is genuinely gone, confirmed by a
       // real, external `pgrep -g <pgid>` call, never this codebase's own
       // bookkeeping. This is the escalation case specifically: the leader
       // survived plain SIGTERM on its own, so this is what proves SIGKILL
@@ -869,7 +868,7 @@ test(
       assert.deepEqual(
         afterResistantMembers,
         [],
-        `the SIGTERM-resistant leader's whole tree must be zero-survivor after real SIGKILL escalation, pgrep still saw: ${JSON.stringify(afterResistantMembers)}`
+        `the SIGTERM-resistant leader's whole process group must be zero-survivor after real SIGKILL escalation, pgrep still saw: ${JSON.stringify(afterResistantMembers)}`
       );
 
       // And the 3 ordinary jobs' trees too, the same real external check.
@@ -1070,7 +1069,7 @@ test(
 );
 
 test(
-  "whole-tree reap under the FULL 4x3 concurrent load - a real external pgrep confirms ZERO survivors across ALL 4 jobs' full descendant trees after killing them",
+  "process-group reap under concurrent load - a real external pgrep confirms zero surviving process-group members across every one of several concurrently-killed jobs, each with its own real descendant tree",
   { skip: PGREP_ORACLE_SKIP },
   async () => {
     const server = tracked();
@@ -1087,13 +1086,13 @@ test(
     beforeMembersByJob.forEach((members, i) => {
       assert.ok(
         members.length >= 1 + DESCENDANTS_PER_JOB,
-        `job ${i} (pgid ${pgids[i]}) must be alive with >= ${1 + DESCENDANTS_PER_JOB} real process-group members immediately before the whole-tree kill, pgrep saw: ${JSON.stringify(members)}`
+        `job ${i} (pgid ${pgids[i]}) must be alive with >= ${1 + DESCENDANTS_PER_JOB} real process-group members immediately before the kill, pgrep saw: ${JSON.stringify(members)}`
       );
     });
 
-    // Kill all 4 jobs CONCURRENTLY (not the single-job
-    // centerpiece pattern, and not the simpler sequential-friendly
-    // cleanup above) - the FULL 4x3 load this test specifically targets.
+    // Kill all of the jobs CONCURRENTLY (not the earlier single-job
+    // pattern, and not the simpler sequential-friendly cleanup above) -
+    // the multi-job load this test specifically targets.
     const killCalls = jobIds.map((jobId) => ({
       id: nextId(),
       toolName: "kill",
@@ -1108,9 +1107,9 @@ test(
     }
 
     // AFTER: a real, independent `pgrep -g <pgid>` call per job - never this
-    // codebase's own bookkeeping - must show ZERO survivors across the
-    // WHOLE tree for EVERY one of the 4 jobs (12 real descendant processes
-    // plus their 4 leaders, 16 processes total), not merely one job's tree.
+    // codebase's own bookkeeping - must show ZERO surviving process-group
+    // members for every one of the jobs (each job's own leader plus its
+    // full descendant tree), not merely one job's group.
     const afterMembersByJob = await Promise.all(
       pgids.map((pgid) => waitForPgrepGroupMembers(pgid, (members) => members.length === 0, 5000))
     );
@@ -1118,7 +1117,7 @@ test(
       assert.deepEqual(
         members,
         [],
-        `job ${i} (pgid ${pgids[i]}) must have ZERO surviving process-group members after the whole-tree kill, pgrep still saw: ${JSON.stringify(members)}`
+        `job ${i} (pgid ${pgids[i]}) must have ZERO surviving process-group members after the kill, pgrep still saw: ${JSON.stringify(members)}`
       );
     });
 
@@ -1127,7 +1126,7 @@ test(
 );
 
 test(
-  "orphan-proof teardown on a catchable shutdown signal under the FULL 4x3 concurrent load (multiple live jobs at once, not the single-job case)",
+  "orphan-proof teardown on a catchable shutdown signal under concurrent load (multiple live jobs at once, not the single-job case)",
   { skip: PGREP_ORACLE_SKIP },
   async () => {
     async function assertShutdownReapsAllUnderLoad(

@@ -268,6 +268,47 @@ test("markExited after markKilled is ALSO a no-op (the reverse race) - first wri
   assert.equal(after.signal, "SIGTERM");
 });
 
+test("setKillConfirmation records true/false on an already-killed job, and ALSO on any other terminal job (e.g. exited) - but is a no-op on a non-terminal (starting/running) job", () => {
+  const store = new JobStore();
+
+  const killedRecord = store.createJob({ argv: ["echo"], cwd: "/tmp", env: {}, isShell: false });
+  store.markKilled(killedRecord.job_id, "SIGTERM");
+  store.setKillConfirmation(killedRecord.job_id, true);
+  assert.equal(store.get(killedRecord.job_id)!.kill_confirmed, true);
+  store.setKillConfirmation(killedRecord.job_id, false);
+  assert.equal(
+    store.get(killedRecord.job_id)!.kill_confirmed,
+    false,
+    "must be overwritable - the confirmation is settled once, after the state transition, not locked on first write"
+  );
+
+  const runningRecord = store.createJob({ argv: ["echo"], cwd: "/tmp", env: {}, isShell: false });
+  store.setKillConfirmation(runningRecord.job_id, true);
+  assert.equal(
+    store.get(runningRecord.job_id)!.kill_confirmed,
+    undefined,
+    "must never set kill_confirmed on a non-terminal (starting) job"
+  );
+
+  // Broadened (from "only a killed job") so a TERMINAL job whose own
+  // leader merely `exited` (never explicitly killed) can still record an
+  // honest reap-confirmation outcome - the root-exits-first fix (see
+  // src/tools/kill.ts's own `reapTerminalJobProcessGroup` docs): a real
+  // process group can still hold live descendants under an `exited`
+  // leader's own former pgid, and kill()/shutdown now attempt a real
+  // group-level reap for exactly that case.
+  const exitedRecord = store.createJob({ argv: ["echo"], cwd: "/tmp", env: {}, isShell: false });
+  store.markExited(exitedRecord.job_id, 0, null);
+  store.setKillConfirmation(exitedRecord.job_id, true);
+  assert.equal(
+    store.get(exitedRecord.job_id)!.kill_confirmed,
+    true,
+    "must be settable on an exited (terminal, not explicitly killed) job - the root-exits-first reap can confirm/deny a real group-level reap regardless of the leader's own disposition"
+  );
+
+  assert.doesNotThrow(() => store.setKillConfirmation("nope", true));
+});
+
 test("a killed job's output buffer remains readable afterward - markKilled never touches stream buffers", () => {
   const store = new JobStore();
   const record = store.createJob({ argv: ["echo"], cwd: "/tmp", env: {}, isShell: false });
@@ -337,6 +378,85 @@ test(
   }
 );
 
+test(
+  "reapProcessGroupOnce is genuinely a reap-ONCE guard: a second attempt for the same job never consults the reaper again, even if the freed pgid had since been handed to a real, live, unrelated group",
+  {
+    skip:
+      process.platform === "win32"
+        ? "process-group reap-once tracking is POSIX-only - no pgid concept to reuse-guard against on Windows"
+        : false,
+  },
+  async () => {
+    // A portably real, kernel-forced numeric pgid collision cannot be
+    // produced from a test (the OS decides what a freed pgid gets
+    // reassigned to, not us) - so this exercises the actual safety
+    // property directly: a spy standing in for "whatever now sits at
+    // this exact recycled pgid," injected via reapProcessGroupOnce's own
+    // `reaper` parameter (the same injectable-oracle shape
+    // src/process.ts's `waitForProcessDeath` already uses for
+    // `isAlive`), that reports as though it found a live group there.
+    // The guard must never even consult it a second time, regardless of
+    // what it would report.
+    const store = new JobStore();
+    const record = store.createJob({ argv: ["true"], cwd: "/tmp", env: {}, isShell: false });
+    const child = spawnManaged(
+      { argv: ["true"], cwd: process.cwd(), env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } },
+      {
+        onSpawn: () => {},
+        onError: () => {},
+        onExit: () => {},
+        onStdoutChunk: () => {},
+        onStderrChunk: () => {},
+        onStdoutEnd: () => {},
+        onStderrEnd: () => {},
+      }
+    );
+    store.attachChild(record.job_id, child!);
+    store.markExited(record.job_id, 0, null);
+
+    let reaperCalls = 0;
+    const reuseSimulatingReaper = async (): Promise<{ confirmed: boolean }> => {
+      reaperCalls += 1;
+      return { confirmed: false }; // "found something alive there" - must never even be asked a second time
+    };
+
+    await store.reapProcessGroupOnce(record.job_id, 100, reuseSimulatingReaper);
+    assert.equal(reaperCalls, 1, "expected the injected reaper to run on the FIRST reap attempt");
+    assert.equal(
+      store.get(record.job_id)!.kill_confirmed,
+      false,
+      "expected the first attempt's real result to be recorded"
+    );
+
+    // Simulate the exact scenario the reap-once guard exists to make
+    // irrelevant: the pgid this job used has since been reused by a real,
+    // live, unrelated process group. A second attempt must never
+    // re-invoke the reaper to find out, because the guard has already
+    // fired for this job - proving no real signal could ever reach
+    // whatever now occupies that recycled pgid on a later call.
+    await store.reapProcessGroupOnce(record.job_id, 100, reuseSimulatingReaper);
+    assert.equal(
+      reaperCalls,
+      1,
+      "expected the injected reaper to NOT run again on a second reap attempt for the same job - a real reused pgid would otherwise be signaled"
+    );
+    assert.equal(
+      store.get(record.job_id)!.kill_confirmed,
+      false,
+      "expected the FIRST attempt's result to remain untouched by the no-op second attempt"
+    );
+
+    // No cleanup kill here: `true` exits almost immediately on its own and
+    // forks nothing, so by this point the real group is already gone -
+    // unlike the sibling `sleep`-based fixture above, there is nothing
+    // live left to signal, and a raw cleanup kill against an already-gone
+    // group risks the same benign EPERM/ESRCH race this codebase's own
+    // production code exists to arbitrate (see
+    // `throwUnlessBenignAlreadyGoneRace`'s docs), not something a test's
+    // own throwaway cleanup line should have to handle.
+  }
+);
+
 test("getChildHandle returns undefined for a job that never had a child attached (e.g. a job that started already-failed)", () => {
   const store = new JobStore();
   const record = store.createFailedJob({
@@ -347,6 +467,204 @@ test("getChildHandle returns undefined for a job that never had a child attached
     diagnosticMessage: "x",
   });
   assert.equal(store.getChildHandle(record.job_id), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// JobStore: setBirthIdentity / attachPendingIdentityCapture /
+// resolveBirthIdentityForKill (the async-capture bookkeeping run()/kill()
+// actually rely on - see src/tools/run.ts's and src/tools/kill.ts's own
+// docs for the full end-to-end mechanism)
+// ---------------------------------------------------------------------------
+
+/** Spawns a real, disposable child and attaches it to `store` for these bookkeeping-only tests - never a synthetic/fake ChildProcess, matching this file's own established preference for real values over mocks. */
+function attachRealChild(store: JobStore, jobId: string) {
+  const child = spawnManaged(
+    {
+      argv: ["sleep", "2"],
+      cwd: process.cwd(),
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+    },
+    {
+      onSpawn: () => {},
+      onError: () => {},
+      onExit: () => {},
+      onStdoutChunk: () => {},
+      onStderrChunk: () => {},
+      onStdoutEnd: () => {},
+      onStderrEnd: () => {},
+    }
+  );
+  store.attachChild(jobId, child!);
+  return child!;
+}
+
+test(
+  "attachPendingIdentityCapture: records 'pending' immediately, then settles to 'captured' and writes the real identity via setBirthIdentity once the promise resolves",
+  {
+    skip:
+      process.platform === "win32"
+        ? "spawns a real bare `sleep` and cleans it up via a negative-pid kill, POSIX-only"
+        : false,
+  },
+  async () => {
+    const store = new JobStore();
+    const record = store.createJob({ argv: ["sleep"], cwd: "/tmp", env: {}, isShell: false });
+    const child = attachRealChild(store, record.job_id);
+
+    let resolveCapture!: (identity: {
+      capturedAtMs: number;
+      elapsedSecondsAtCapture: number;
+    }) => void;
+    const capture = new Promise<{ capturedAtMs: number; elapsedSecondsAtCapture: number }>(
+      (resolve) => {
+        resolveCapture = resolve;
+      }
+    );
+    store.attachPendingIdentityCapture(record.job_id, capture);
+
+    assert.equal(
+      store.get(record.job_id)!.identity_capture,
+      "pending",
+      "must be recorded as pending the instant the capture is attached, before it ever settles"
+    );
+    assert.equal(
+      store.getChildHandle(record.job_id)!.identityCapture,
+      capture,
+      "the exact same promise must be retrievable so a kill() call can await it directly"
+    );
+    assert.equal(
+      store.getChildHandle(record.job_id)!.birthIdentity,
+      undefined,
+      "birthIdentity must stay undefined while the capture is still pending"
+    );
+
+    const identity = { capturedAtMs: Date.now(), elapsedSecondsAtCapture: 0 };
+    resolveCapture(identity);
+    await capture;
+    await Promise.resolve(); // one extra microtask tick of safety margin around the internal .then() ordering
+
+    assert.equal(store.get(record.job_id)!.identity_capture, "captured");
+    assert.deepEqual(store.getChildHandle(record.job_id)!.birthIdentity, identity);
+
+    process.kill(-child.pid!, "SIGKILL"); // cleanup
+  }
+);
+
+test(
+  "attachPendingIdentityCapture: settles to 'unavailable' (never 'captured', never left 'pending') when the capture resolves with no identity at all",
+  {
+    skip:
+      process.platform === "win32"
+        ? "spawns a real bare `sleep` and cleans it up via a negative-pid kill, POSIX-only"
+        : false,
+  },
+  async () => {
+    const store = new JobStore();
+    const record = store.createJob({ argv: ["sleep"], cwd: "/tmp", env: {}, isShell: false });
+    const child = attachRealChild(store, record.job_id);
+
+    const capture = Promise.resolve(undefined);
+    store.attachPendingIdentityCapture(record.job_id, capture);
+    await capture;
+    await Promise.resolve();
+
+    assert.equal(store.get(record.job_id)!.identity_capture, "unavailable");
+    assert.equal(store.getChildHandle(record.job_id)!.birthIdentity, undefined);
+
+    process.kill(-child.pid!, "SIGKILL"); // cleanup
+  }
+);
+
+test("setBirthIdentity is a safe no-op for an untracked job id - never throws, never fabricates a tracked-child record", () => {
+  const store = new JobStore();
+  assert.doesNotThrow(() =>
+    store.setBirthIdentity("nope", { capturedAtMs: Date.now(), elapsedSecondsAtCapture: 0 })
+  );
+  assert.equal(store.getChildHandle("nope"), undefined);
+});
+
+test("attachPendingIdentityCapture is a safe no-op for an untracked job id - never throws", () => {
+  const store = new JobStore();
+  assert.doesNotThrow(() => store.attachPendingIdentityCapture("nope", Promise.resolve(undefined)));
+  assert.equal(store.getChildHandle("nope"), undefined);
+});
+
+test(
+  "resolveBirthIdentityForKill: returns an ALREADY-settled birthIdentity immediately, with no capture promise involved at all",
+  {
+    skip:
+      process.platform === "win32"
+        ? "spawns a real bare `sleep` and cleans it up via a negative-pid kill, POSIX-only"
+        : false,
+  },
+  async () => {
+    const store = new JobStore();
+    const record = store.createJob({ argv: ["sleep"], cwd: "/tmp", env: {}, isShell: false });
+    const child = spawnManaged(
+      {
+        argv: ["sleep", "2"],
+        cwd: process.cwd(),
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+      },
+      {
+        onSpawn: () => {},
+        onError: () => {},
+        onExit: () => {},
+        onStdoutChunk: () => {},
+        onStderrChunk: () => {},
+        onStdoutEnd: () => {},
+        onStderrEnd: () => {},
+      }
+    );
+    const identity = { capturedAtMs: Date.now(), elapsedSecondsAtCapture: 0 };
+    store.attachChild(record.job_id, child!, identity);
+
+    assert.deepEqual(await store.resolveBirthIdentityForKill(record.job_id), identity);
+
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
+
+test(
+  "resolveBirthIdentityForKill: AWAITS a genuinely still-pending capture and returns its resolved value, rather than reading the not-yet-settled birthIdentity snapshot",
+  {
+    skip:
+      process.platform === "win32"
+        ? "spawns a real bare `sleep` and cleans it up via a negative-pid kill, POSIX-only"
+        : false,
+  },
+  async () => {
+    const store = new JobStore();
+    const record = store.createJob({ argv: ["sleep"], cwd: "/tmp", env: {}, isShell: false });
+    const child = attachRealChild(store, record.job_id);
+
+    const identity = { capturedAtMs: Date.now(), elapsedSecondsAtCapture: 0 };
+    let resolveCapture!: (
+      value: { capturedAtMs: number; elapsedSecondsAtCapture: number } | undefined
+    ) => void;
+    const capture = new Promise<
+      { capturedAtMs: number; elapsedSecondsAtCapture: number } | undefined
+    >((resolve) => {
+      resolveCapture = resolve;
+    });
+    store.attachPendingIdentityCapture(record.job_id, capture);
+
+    // Start the resolution BEFORE the capture settles - proves this
+    // genuinely awaits the in-flight promise rather than returning a
+    // stale `undefined` snapshot read at call time.
+    const resolved = store.resolveBirthIdentityForKill(record.job_id);
+    await new Promise((r) => setTimeout(r, 20)); // let resolveBirthIdentityForKill actually start awaiting
+    resolveCapture(identity);
+
+    assert.deepEqual(await resolved, identity);
+
+    process.kill(-child.pid!, "SIGKILL"); // cleanup
+  }
+);
+
+test("resolveBirthIdentityForKill returns undefined for an untracked job id", async () => {
+  const store = new JobStore();
+  assert.equal(await store.resolveBirthIdentityForKill("nope"), undefined);
 });
 
 // ---------------------------------------------------------------------------
@@ -550,7 +868,10 @@ test("PublicJobProjection's field set is EXACTLY the frozen set, including count
       "diagnostic",
       "ended_at",
       "exit_code",
+      "identity_capture",
+      "identity_confirmed",
       "job_id",
+      "kill_confirmed",
       "label",
       "queue_position",
       "signal",
