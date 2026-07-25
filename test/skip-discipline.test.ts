@@ -18,7 +18,6 @@ import {
   buildTestIdentity,
   checkSkipDiscipline,
   classifyTestCompletionForSkipDiscipline,
-  FIXTURE_MODE_TOKEN,
   isSkippedValue,
   isTodoValue,
   loadCriticalTests,
@@ -27,6 +26,7 @@ import {
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SCRIPT_PATH = path.join(REPO_ROOT, "scripts", "run-tests.mjs");
+const HARNESS_PATH = path.join(REPO_ROOT, "scripts", "run-tests-fixture-harness.mjs");
 const REAL_SKIP_BASELINE_PATH = path.join(REPO_ROOT, "test", "skip-baseline.json");
 const REAL_CRITICAL_TESTS_PATH = path.join(REPO_ROOT, "test", "critical-tests.json");
 
@@ -701,17 +701,21 @@ interface FixtureResult {
 }
 
 /**
- * Spawns `scriptPath` with `env`, collecting the exit status and both
- * streams uniformly regardless of exit code. Deliberately spawnSync, not
- * execFileSync: execFileSync only returns stdout on a zero exit and
- * silently drops stderr in that case (it is captured only on the thrown-
- * error path for a non-zero exit) - spawnSync captures both streams every
- * time, which several assertions below depend on even when the expected
- * exit is 0. Shared by every helper below that spawns a real child process
- * against this exact same interface.
+ * Spawns `scriptPath` with `args` and `env`, collecting the exit status
+ * and both streams uniformly regardless of exit code. Deliberately
+ * spawnSync, not execFileSync: execFileSync only returns stdout on a zero
+ * exit and silently drops stderr in that case (it is captured only on the
+ * thrown-error path for a non-zero exit) - spawnSync captures both
+ * streams every time, which several assertions below depend on even when
+ * the expected exit is 0. Shared by every helper below that spawns a real
+ * child process against this exact same interface.
  */
-function collectChildResult(scriptPath: string, env: NodeJS.ProcessEnv): FixtureResult {
-  const result = spawnSync(process.execPath, [scriptPath], {
+function collectChildResult(
+  scriptPath: string,
+  args: string[],
+  env: NodeJS.ProcessEnv
+): FixtureResult {
+  const result = spawnSync(process.execPath, [scriptPath, ...args], {
     env,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
@@ -725,16 +729,16 @@ function collectChildResult(scriptPath: string, env: NodeJS.ProcessEnv): Fixture
 }
 
 /**
- * Spawns the real scripts/run-tests.mjs as a child process against a
- * throwaway fixture tree, via the GHANTIKA_TEST_DIR / GHANTIKA_SKIP_
- * BASELINE_PATH / GHANTIKA_CRITICAL_TESTS_PATH overrides the script
- * honors - now gated behind GHANTIKA_TEST_FIXTURE_TOKEN, so this is the
- * ONE legitimate place that token is ever set: this helper IS the
- * "deliberate, informed act" the gate exists to require. `buildBaseline`
- * and `buildCriticalTests` receive the fixture directory's absolute path
- * so callers can compute identities with the SAME buildTestIdentity used
- * above, guaranteeing they match what the spawned process itself will
- * compute.
+ * Spawns scripts/run-tests-fixture-harness.mjs - never scripts/run-tests.mjs
+ * itself, which reads no redirect of any kind, by construction, see its own
+ * header comment - as a real child process against a throwaway fixture
+ * tree, passing the fixture's test directory, skip-baseline path, and
+ * critical-tests path as the harness's own explicit positional arguments.
+ * This helper is the harness's one legitimate caller in the whole
+ * codebase. `buildBaseline` and `buildCriticalTests` receive the fixture
+ * directory's absolute path so callers can compute identities with the
+ * SAME buildTestIdentity used above, guaranteeing they match what the
+ * spawned harness process itself will compute.
  *
  * `testFiles` covers every caller whose fixture source is static text
  * decided up front. `buildTestFiles` exists for the one case that can't
@@ -791,18 +795,12 @@ function runSupervisorAgainstFixture({
     // call, and silently skips running the fixture entirely - "clean"
     // for the wrong reason, since nothing actually ran. Confirmed
     // empirically via the "node:test run() is being called recursively"
-    // warning this produces if left in place.
+    // warning this produces if left in place. The harness's own call to
+    // runOnce() invokes node:test's run() exactly like production does,
+    // so this deletion is exactly as necessary here as it always was.
     delete env.NODE_TEST_CONTEXT;
-    env.GHANTIKA_TEST_DIR = dir;
-    env.GHANTIKA_SKIP_BASELINE_PATH = baselinePath;
-    env.GHANTIKA_CRITICAL_TESTS_PATH = criticalPath;
-    // The one legitimate setter of this token in the whole codebase - see
-    // this function's own header comment. Imported directly from
-    // scripts/run-tests.mjs rather than retyped here, so this can never
-    // drift from whatever value production actually checks against.
-    env.GHANTIKA_TEST_FIXTURE_TOKEN = FIXTURE_MODE_TOKEN;
 
-    return collectChildResult(SCRIPT_PATH, env);
+    return collectChildResult(HARNESS_PATH, [dir, baselinePath, criticalPath], env);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -981,20 +979,31 @@ test("the real supervisor exits non-zero and names the offending test for a real
 });
 
 // ---------------------------------------------------------------------------
-// Fixture-mode token gating: GHANTIKA_TEST_DIR, GHANTIKA_SKIP_BASELINE_PATH,
-// and GHANTIKA_CRITICAL_TESTS_PATH must have zero effect on the real
-// production supervisor unless GHANTIKA_TEST_FIXTURE_TOKEN is ALSO present
-// and matches FIXTURE_MODE_TOKEN exactly - see scripts/run-tests.mjs's own
-// module doc comment for why. The tests below prove that boundary directly
-// against a byte-for-byte copy of the real, current production script
-// (never a hand-authored reimplementation, which could silently drift from
-// what actually ships), placed in its own throwaway "repo root". They never
-// point the real, in-place supervisor at THIS repo's own test/ directory -
-// doing that would make the spawned process discover and attempt to run
-// this very file recursively (node:test's default per-file process
-// isolation forks a grandchild for skip-discipline.test.ts, which would
-// spawn a great-grandchild the same way, without bound).
+// Redirection immunity: scripts/run-tests.mjs's production entrypoint must
+// have zero effect from any of the four historical override variable
+// names (a prior design gated three of them behind a fourth, a fixed
+// token string - see scripts/run-tests.mjs's own module doc comment for
+// why that boundary was retired rather than kept). The tests below prove
+// that directly against a byte-for-byte copy of the real, current
+// production script (never a hand-authored reimplementation, which could
+// silently drift from what actually ships), placed in its own throwaway
+// "repo root". They never point the real, in-place supervisor at THIS
+// repo's own test/ directory - doing that would make the spawned process
+// discover and attempt to run this very file recursively (node:test's
+// default per-file process isolation forks a grandchild for
+// skip-discipline.test.ts, which would spawn a great-grandchild the same
+// way, without bound).
 // ---------------------------------------------------------------------------
+
+/**
+ * The exact literal value of the retired fixture-mode token gate this
+ * repo's history once used. Hardcoded here rather than imported - it is
+ * no longer exported by anything, and the whole point of the test below
+ * is proving this value (and the three variable names it used to unlock)
+ * have zero effect now, even for a caller who still has the old literal
+ * memorized or finds it in git history.
+ */
+const RETIRED_FIXTURE_TOKEN = "ghantika-run-tests-fixture-mode-v1";
 
 /**
  * Copies the real, current scripts/run-tests.mjs and its
@@ -1045,56 +1054,71 @@ function gitInitAndCommitAll(root: string): void {
 }
 
 /**
- * A clean child env for the isolated-root helpers below: the token is
- * always deleted first so a caller must explicitly opt back in, and the
- * same NODE_TEST_CONTEXT/GHANTIKA_JUNIT deletions runSupervisorAgainstFixture
+ * A clean child env for the isolated-root helpers below: any retired
+ * override variable that might already be set in this process's own
+ * environment is deleted first so each test starts from a known-clean
+ * slate before deliberately setting its own values, and the same
+ * NODE_TEST_CONTEXT/GHANTIKA_JUNIT deletions runSupervisorAgainstFixture
  * above already relies on carry over here too.
  */
 function baseIsolatedChildEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
   delete env.GHANTIKA_JUNIT;
+  delete env.GHANTIKA_TEST_DIR;
+  delete env.GHANTIKA_SKIP_BASELINE_PATH;
+  delete env.GHANTIKA_CRITICAL_TESTS_PATH;
   delete env.GHANTIKA_TEST_FIXTURE_TOKEN;
   delete env.NODE_TEST_CONTEXT;
   return env;
 }
 
-test("GHANTIKA_TEST_DIR, GHANTIKA_SKIP_BASELINE_PATH, and GHANTIKA_CRITICAL_TESTS_PATH have no effect at all without the exact GHANTIKA_TEST_FIXTURE_TOKEN - the real production script still discovers and scans its own real default test directory", () => {
-  const root = realpathSync(mkdtempSync(path.join(tmpdir(), "ghantika-fixture-gate-noeffect-")));
-  const decoyDir = realpathSync(mkdtempSync(path.join(tmpdir(), "ghantika-fixture-gate-decoy-")));
+test("scripts/run-tests.mjs cannot be redirected even when every historical override variable is set to its exact known value, including the retired fixture token - the real production entrypoint still scans its own real test directory and enforces its own real critical-test list, never the decoy's", () => {
+  const root = realpathSync(mkdtempSync(path.join(tmpdir(), "ghantika-redirect-immunity-")));
+  const decoyDir = realpathSync(
+    mkdtempSync(path.join(tmpdir(), "ghantika-redirect-immunity-decoy-"))
+  );
   try {
     copyProductionScriptIntoIsolatedRoot(root);
 
     const testDir = path.join(root, "test");
     mkdirSync(testDir, { recursive: true });
+    const criticalTestName = "a critical test that only the real test directory declares";
+    const realTestPath = path.join(testDir, "real.test.mjs");
     writeFileSync(
-      path.join(testDir, "real.test.mjs"),
+      realTestPath,
       [
         'import { test } from "node:test";',
-        'test("a passing test discovered from the real default test directory", () => {});',
+        `test(${JSON.stringify(criticalTestName)}, () => {});`,
         "",
       ].join("\n")
     );
     writeFileSync(path.join(testDir, "skip-baseline.json"), "{}");
-    writeFileSync(path.join(testDir, "critical-tests.json"), "[]");
+    writeFileSync(
+      path.join(testDir, "critical-tests.json"),
+      JSON.stringify([buildTestIdentity(realTestPath, criticalTestName, { baseDir: root })])
+    );
     gitInitAndCommitAll(root);
 
-    // The decoy tree sits at a completely different location. If the bug
-    // were still present, GHANTIKA_TEST_DIR would redirect discovery here
-    // instead of root/test - so nothing from this tree may ever surface in
-    // the run below.
+    // The decoy tree sits at a completely different location and carries a
+    // test designed to fail loudly if it is ever actually executed. If
+    // redirection were still possible, this run would either fail on that
+    // marker or exit 0 having silently swapped in the decoy's own test -
+    // either way a visible break from "the real directory ran instead."
     writeFileSync(
       path.join(decoyDir, "decoy.test.mjs"),
-      ['import { test } from "node:test";', 'test("the decoy fixture must never run", () => {});', ""].join(
-        "\n"
-      )
+      [
+        'import { test } from "node:test";',
+        'test("decoy marker - must never execute", () => { throw new Error("DECOY_EXECUTED_MARKER"); });',
+        "",
+      ].join("\n")
     );
     const decoyBaselinePath = path.join(decoyDir, "skip-baseline.json");
     const decoyCriticalPath = path.join(decoyDir, "critical-tests.json");
     writeFileSync(decoyBaselinePath, "{}");
     // Names a critical test that exists nowhere in real.test.mjs: if
-    // GHANTIKA_CRITICAL_TESTS_PATH were honored despite the missing token,
-    // the run would fail loudly on "critical test did not run" instead of
-    // merely passing by coincidence - a regression here cannot go quiet.
+    // GHANTIKA_CRITICAL_TESTS_PATH were somehow still honored, the run
+    // would fail loudly on "critical test did not run" instead of merely
+    // passing by coincidence - a regression here cannot go quiet.
     writeFileSync(
       decoyCriticalPath,
       JSON.stringify([
@@ -1102,45 +1126,50 @@ test("GHANTIKA_TEST_DIR, GHANTIKA_SKIP_BASELINE_PATH, and GHANTIKA_CRITICAL_TEST
       ])
     );
 
-    const scriptPath = path.join(root, "scripts", "run-tests.mjs");
+    const env = baseIsolatedChildEnv();
+    // All four historical variable names, set to their exact known values -
+    // including the literal old token, in case a caller still has it
+    // memorized or finds it in git history.
+    env.GHANTIKA_TEST_DIR = decoyDir;
+    env.GHANTIKA_SKIP_BASELINE_PATH = decoyBaselinePath;
+    env.GHANTIKA_CRITICAL_TESTS_PATH = decoyCriticalPath;
+    env.GHANTIKA_TEST_FIXTURE_TOKEN = RETIRED_FIXTURE_TOKEN;
 
-    for (const token of [undefined, "not-the-real-token"]) {
-      const env = baseIsolatedChildEnv();
-      env.GHANTIKA_TEST_DIR = decoyDir;
-      env.GHANTIKA_SKIP_BASELINE_PATH = decoyBaselinePath;
-      env.GHANTIKA_CRITICAL_TESTS_PATH = decoyCriticalPath;
-      if (token !== undefined) env.GHANTIKA_TEST_FIXTURE_TOKEN = token;
+    const result = collectChildResult(path.join(root, "scripts", "run-tests.mjs"), [], env);
 
-      const result = collectChildResult(scriptPath, env);
-
-      assert.equal(
-        result.status,
-        0,
-        `expected exit 0 with token=${JSON.stringify(token)}, got ${result.status}. stderr: ${result.stderr}`
-      );
-      assert.ok(
-        result.stderr.includes("real.test.mjs"),
-        "the real default test directorys own test must have run"
-      );
-      assert.ok(
-        !result.stdout.includes("decoy") && !result.stderr.includes("decoy"),
-        "the decoy fixture tree must never be referenced - it must never have been used"
-      );
-      assert.ok(
-        !result.stderr.includes("override active"),
-        "fixture-mode override must never report as active without the matching token"
-      );
-    }
+    assert.equal(
+      result.status,
+      0,
+      `expected exit 0 (the real repo's own test ran cleanly), got ${result.status}. stderr: ${result.stderr}`
+    );
+    assert.ok(
+      result.stderr.includes("real.test.mjs"),
+      "the real default test directory's own test must have run"
+    );
+    assert.ok(
+      result.stderr.includes(criticalTestName),
+      "the real default critical-tests.json's own declared critical test must be the one that was enforced"
+    );
+    assert.ok(
+      !result.stdout.includes("decoy") &&
+        !result.stderr.includes("decoy") &&
+        !result.stderr.includes("DECOY_EXECUTED_MARKER"),
+      "the decoy fixture tree must never be referenced or executed"
+    );
+    assert.ok(
+      !result.stderr.includes("override active"),
+      "no fixture-mode override message can ever print again - that whole notion is retired"
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
     rmSync(decoyDir, { recursive: true, force: true });
   }
 });
 
-test("tracked-file parity does not go UNSCANNED when GHANTIKA_TEST_DIR is set without the token - it runs the real git-based check against the copys own tracked test directory and catches a tracked-but-missing-from-disk file", () => {
-  const root = realpathSync(mkdtempSync(path.join(tmpdir(), "ghantika-fixture-gate-parity-")));
+test("tracked-file parity is enforced unconditionally - setting GHANTIKA_TEST_DIR (or any of the other three retired variables, including the old fixture token) does not skip it, and a tracked-but-missing-from-disk file is still caught", () => {
+  const root = realpathSync(mkdtempSync(path.join(tmpdir(), "ghantika-redirect-immunity-parity-")));
   const decoyDir = realpathSync(
-    mkdtempSync(path.join(tmpdir(), "ghantika-fixture-gate-parity-decoy-"))
+    mkdtempSync(path.join(tmpdir(), "ghantika-redirect-immunity-parity-decoy-"))
   );
   try {
     copyProductionScriptIntoIsolatedRoot(root);
@@ -1149,19 +1178,23 @@ test("tracked-file parity does not go UNSCANNED when GHANTIKA_TEST_DIR is set wi
     mkdirSync(testDir, { recursive: true });
     writeFileSync(
       path.join(testDir, "present.test.mjs"),
-      ['import { test } from "node:test";', 'test("a present on-disk tracked test", () => {});', ""].join(
-        "\n"
-      )
+      [
+        'import { test } from "node:test";',
+        'test("a present on-disk tracked test", () => {});',
+        "",
+      ].join("\n")
     );
     // Tracked in git, then deleted from disk after the commit - the exact
-    // shape main()'s tracked-file-parity check treats as a hard failure:
-    // git still lists it, discovery on disk does not.
+    // shape checkTrackedFileParity treats as a hard failure: git still
+    // lists it, discovery on disk does not.
     const ghostPath = path.join(testDir, "ghost.test.mjs");
     writeFileSync(
       ghostPath,
-      ['import { test } from "node:test";', 'test("a test that will vanish from disk", () => {});', ""].join(
-        "\n"
-      )
+      [
+        'import { test } from "node:test";',
+        'test("a test that will vanish from disk", () => {});',
+        "",
+      ].join("\n")
     );
     writeFileSync(path.join(testDir, "skip-baseline.json"), "{}");
     writeFileSync(path.join(testDir, "critical-tests.json"), "[]");
@@ -1170,16 +1203,24 @@ test("tracked-file parity does not go UNSCANNED when GHANTIKA_TEST_DIR is set wi
 
     writeFileSync(
       path.join(decoyDir, "decoy.test.mjs"),
-      ['import { test } from "node:test";', 'test("the decoy fixture must never run", () => {});', ""].join(
-        "\n"
-      )
+      [
+        'import { test } from "node:test";',
+        'test("the decoy fixture must never run", () => {});',
+        "",
+      ].join("\n")
     );
+    const decoyBaselinePath = path.join(decoyDir, "skip-baseline.json");
+    const decoyCriticalPath = path.join(decoyDir, "critical-tests.json");
+    writeFileSync(decoyBaselinePath, "{}");
+    writeFileSync(decoyCriticalPath, "[]");
 
     const env = baseIsolatedChildEnv();
     env.GHANTIKA_TEST_DIR = decoyDir;
-    // GHANTIKA_TEST_FIXTURE_TOKEN intentionally left unset.
+    env.GHANTIKA_SKIP_BASELINE_PATH = decoyBaselinePath;
+    env.GHANTIKA_CRITICAL_TESTS_PATH = decoyCriticalPath;
+    env.GHANTIKA_TEST_FIXTURE_TOKEN = RETIRED_FIXTURE_TOKEN;
 
-    const result = collectChildResult(path.join(root, "scripts", "run-tests.mjs"), env);
+    const result = collectChildResult(path.join(root, "scripts", "run-tests.mjs"), [], env);
 
     assert.notEqual(result.status, 0, `expected non-zero exit, got 0. stdout: ${result.stdout}`);
     assert.ok(
@@ -1191,10 +1232,66 @@ test("tracked-file parity does not go UNSCANNED when GHANTIKA_TEST_DIR is set wi
     assert.ok(result.stderr.includes("ghost.test.mjs"));
     assert.ok(
       !result.stderr.includes("override active") && !result.stderr.includes("UNSCANNED"),
-      "tracked-file parity must not have been skipped as UNSCANNED"
+      "tracked-file parity must not have been skipped"
+    );
+    assert.ok(
+      !result.stdout.includes("decoy") && !result.stderr.includes("decoy"),
+      "the decoy fixture tree must never be referenced"
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
     rmSync(decoyDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Structural consumer check: nothing production-facing ever invokes the
+// test-only fixture harness, and the production entrypoint's own source
+// carries no reference to any of the four historical override variable
+// names. This is a proof about the shipped source itself, not merely
+// about today's runtime behavior - a future edit that reintroduced
+// environment-variable reading in scripts/run-tests.mjs, or wired the
+// harness into an npm script or a workflow step, reds this the same way
+// it would red a mutation.
+// ---------------------------------------------------------------------------
+
+test("nothing production-facing - neither package.json's scripts nor any workflow under .github/workflows/ - ever invokes the test-only fixture harness", () => {
+  const packageJson = JSON.parse(readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"));
+  const harnessBasename = path.basename(HARNESS_PATH);
+
+  const scriptEntries = Object.entries(packageJson.scripts ?? {});
+  assert.ok(scriptEntries.length > 0, "sanity: package.json must declare at least one script");
+  for (const [name, value] of scriptEntries) {
+    assert.ok(
+      typeof value === "string" && !value.includes(harnessBasename),
+      `package.json script "${name}" must never reference the test-only fixture harness`
+    );
+  }
+
+  const workflowsDir = path.join(REPO_ROOT, ".github", "workflows");
+  const workflowFiles = readdirSync(workflowsDir).filter((entry) => /\.ya?ml$/.test(entry));
+  assert.ok(workflowFiles.length > 0, "sanity: at least one workflow file must exist to check");
+  for (const entry of workflowFiles) {
+    const workflowText = readFileSync(path.join(workflowsDir, entry), "utf8");
+    assert.ok(
+      !workflowText.includes(harnessBasename),
+      `workflow file ${entry} must never reference the test-only fixture harness`
+    );
+  }
+});
+
+test("scripts/run-tests.mjs itself contains no reference to any of the four historical fixture override variable names", () => {
+  const sourceText = readFileSync(SCRIPT_PATH, "utf8");
+  const retiredNames = [
+    "GHANTIKA_TEST_DIR",
+    "GHANTIKA_SKIP_BASELINE_PATH",
+    "GHANTIKA_CRITICAL_TESTS_PATH",
+    "GHANTIKA_TEST_FIXTURE_TOKEN",
+  ];
+  for (const name of retiredNames) {
+    assert.ok(
+      !sourceText.includes(name),
+      `scripts/run-tests.mjs must not reference ${name} anywhere in its own source`
+    );
   }
 });

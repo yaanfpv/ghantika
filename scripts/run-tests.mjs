@@ -88,42 +88,50 @@
  * file/handle so a human can go kill it by hand if the OS does not reap it
  * on its own.
  *
- * Four environment variables this script reads. GHANTIKA_JUNIT is
- * additive-only: setting it adds a junit XML file at that path; leaving it
+ * One environment variable this script consults at all: GHANTIKA_JUNIT,
+ * additive-only - setting it adds a junit XML file at that path; leaving it
  * unset means no junit file is written at all, and it cannot narrow the
- * discovered file set, lower any floor, or disable any check below - no
- * gate is needed on it.
+ * discovered file set, lower any floor, or disable any check below.
  *
- * The other three - GHANTIKA_TEST_DIR, GHANTIKA_SKIP_BASELINE_PATH,
- * GHANTIKA_CRITICAL_TESTS_PATH - exist only so the skip-discipline check
- * below (see its own header comment) can be proven end to end against a
- * throwaway fixture tree instead of only ever running against this repo's
- * own real, always-clean test/ directory. Each simply redirects where this
- * script looks; none changes what it looks for once it gets there.
+ * This entrypoint takes no caller-controlled redirect of the test
+ * directory, the skip baseline, or the critical-test list, and consults no
+ * environment variable to decide any of the three. An earlier version of
+ * this file accepted three such redirect variables, gated behind a fourth
+ * (a fixed token string a caller also had to supply), on the theory that
+ * requiring a secret value alongside the redirect would keep casual misuse
+ * out. That boundary proved insufficient: the token was a
+ * plain string constant sitting in this file's own tracked source, so
+ * anyone able to set one environment variable for this process could read
+ * the token's value and set the redirect variables themselves, reaching
+ * the exact same bypass - point discovery at a trivial fixture tree,
+ * supply a fabricated baseline and critical-test list, and walk away with
+ * a fabricated green exit from what is supposed to be the real check. A
+ * check that can be switched off from outside by setting environment
+ * variables is not a check, no matter how many of them have to be set
+ * together, so this file no longer reads any environment variable for this
+ * purpose anywhere in its own code path - not "reads the value but ignores
+ * it", genuinely absent from this source.
  *
- * Because those three simply redirect where a production tool reads its
- * inputs from, honoring them unconditionally would mean anyone able to set
- * process environment for this script - not only this repo's own tests -
- * could point it at a trivial fixture tree, supply a fabricated baseline
- * and critical-test list, and walk away with a fabricated green exit from
- * what is supposed to be the real gate. Worse, GHANTIKA_TEST_DIR being set
- * also turns off tracked-file parity checking entirely (see the
- * `TEST_DIR_OVERRIDE` block in main() below) - so the same variable that
- * redirects discovery also disables the one check that would otherwise
- * notice a suspiciously small discovered set. A guard that can be switched
- * off by an environment variable is not a guard, so all three are gated on
- * `FIXTURE_MODE_ACTIVE` below: they take effect only when
- * GHANTIKA_TEST_FIXTURE_TOKEN is ALSO set and matches FIXTURE_MODE_TOKEN
- * exactly. That token is a fixed string constant defined in this file and
- * nowhere else - never read from a file, never configurable - and the only
- * legitimate caller is this suite's own `runSupervisorAgainstFixture`
- * helper in test/skip-discipline.test.ts, which imports the constant
- * directly rather than duplicating the literal. Absent or mismatched token
- * means all three variables are treated as fully unset: real repo paths,
- * real tracked-file parity, no exceptions. This is not meant to withstand
- * a determined reader of this source - it is meant to make the bypass a
- * deliberate, informed act rather than something that happens by knowing
- * three documented variable names.
+ * The functions below that do discovery, load the skip baseline, load the
+ * critical-test list, and check tracked-file parity (discoverTestFiles,
+ * loadSkipBaseline, loadCriticalTests, checkTrackedFileParity) all take
+ * the paths they need as explicit function arguments, with defaults
+ * computed unconditionally from REPO_ROOT. main() below - what runs for
+ * `npm test`, `npm run coverage`, every CI workflow step, and any other
+ * normal automated invocation of this script - always calls them with
+ * those real repository paths.
+ *
+ * Proving the skip-discipline check end to end against a throwaway
+ * fixture tree, rather than only ever against this repo's own real,
+ * always-clean test/ directory, now goes through a separate file this one
+ * never imports and no production caller ever invokes:
+ * scripts/run-tests-fixture-harness.mjs. That file imports the same
+ * discovery/baseline/critical-test/classification functions this one does
+ * and calls them with fixture paths supplied as its own explicit
+ * arguments - never via an environment variable this file reads. See that
+ * file's own header comment, and the structural check in
+ * test/skip-discipline.test.ts confirming nothing production-facing ever
+ * invokes it.
  */
 import { run } from "node:test";
 import { spec, junit } from "node:test/reporters";
@@ -137,27 +145,12 @@ import { isMainModule } from "./lib/is-main.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
-// Fixed, hard-coded sentinel - never read from a file, never configurable,
-// and not exported for any purpose other than letting this suite's own
-// fixture-spawning helper (test/skip-discipline.test.ts's
-// runSupervisorAgainstFixture) set the matching env var without hand-
-// duplicating the literal. See the module doc comment above for why this
-// exists: GHANTIKA_TEST_DIR, GHANTIKA_SKIP_BASELINE_PATH, and
-// GHANTIKA_CRITICAL_TESTS_PATH below only take effect when
-// process.env.GHANTIKA_TEST_FIXTURE_TOKEN equals this exact string.
-export const FIXTURE_MODE_TOKEN = "ghantika-run-tests-fixture-mode-v1";
-const FIXTURE_MODE_ACTIVE = process.env.GHANTIKA_TEST_FIXTURE_TOKEN === FIXTURE_MODE_TOKEN;
-
-// Overridable so a test can point discovery at a scratch fixture tree
-// instead of this repo's own test/ - see the module doc comment above.
-// Gated on FIXTURE_MODE_ACTIVE: without the matching token this reads as
-// unset regardless of what GHANTIKA_TEST_DIR itself holds, so a normal
-// invocation (npm test, npm run coverage, CI, the local gate - none of
-// which ever sets the token) always resolves to the real repo test/
-// directory, even if GHANTIKA_TEST_DIR somehow ended up set in its
-// environment for an unrelated reason.
-const TEST_DIR_OVERRIDE = FIXTURE_MODE_ACTIVE ? process.env.GHANTIKA_TEST_DIR : undefined;
-const TEST_DIR = TEST_DIR_OVERRIDE ? path.resolve(TEST_DIR_OVERRIDE) : path.join(REPO_ROOT, "test");
+// The real repo's own test/ directory, computed unconditionally from
+// REPO_ROOT. This entrypoint consults no environment variable to decide
+// where discovery looks - see the module doc comment above for why, and
+// scripts/run-tests-fixture-harness.mjs for how a fixture tree is
+// exercised instead.
+const TEST_DIR = path.join(REPO_ROOT, "test");
 
 // The `.test.` infix, not merely a directory, is what makes something a
 // suite. `test/harness.ts` and `test/helpers/spawnServer.ts` sit under
@@ -300,6 +293,37 @@ export function getTrackedTestFiles() {
     .filter((relPath) => TEST_FILE_PATTERN.test(relPath))
     .map((relPath) => path.join(REPO_ROOT, relPath))
     .sort();
+}
+
+/**
+ * Compares node:fs-discovered test files against getTrackedTestFiles()'s
+ * git-tracked set, both scoped to this repo's own test/ directory via
+ * REPO_ROOT. Takes the already-discovered file list as its only argument
+ * rather than a test-directory path: tracked-file parity is inherently a
+ * fact about THIS repo's own git history, so there is nothing meaningful
+ * to check it against for a throwaway fixture tree under a temp
+ * directory - scripts/run-tests-fixture-harness.mjs never calls this at
+ * all, exactly as this production entrypoint never reads a path override
+ * for it.
+ *
+ * @param {string[]} discovered - absolute paths, exactly what
+ *   discoverTestFiles(TEST_DIR) already returned for this same run.
+ * @returns {{ tracked: string[] | null, missingFromDisk: string[], untrackedExtra: string[] }}
+ *   `tracked` is null when git itself is unavailable (see
+ *   getTrackedTestFiles) - callers must treat that as UNSCANNED, never as
+ *   zero tracked files; `missingFromDisk`/`untrackedExtra` are both empty
+ *   in that case since neither has anything real to compare against.
+ */
+export function checkTrackedFileParity(discovered) {
+  const tracked = getTrackedTestFiles();
+  if (tracked === null) {
+    return { tracked: null, missingFromDisk: [], untrackedExtra: [] };
+  }
+  const discoveredSet = new Set(discovered);
+  const missingFromDisk = tracked.filter((f) => !discoveredSet.has(f));
+  const trackedSet = new Set(tracked);
+  const untrackedExtra = discovered.filter((f) => !trackedSet.has(f));
+  return { tracked, missingFromDisk, untrackedExtra };
 }
 
 function rel(absPath) {
@@ -541,21 +565,14 @@ export function checkSkipDiscipline({
   return errors;
 }
 
-// Overridable for the same reason TEST_DIR_OVERRIDE is above, and gated on
-// the identical FIXTURE_MODE_ACTIVE check: a test pointing the real
-// supervisor at a scratch fixture tree needs its own scratch baseline and
-// critical-test list too, not this repo's real, always-clean ones - but
-// only when the fixture-mode token was also supplied. Without it, these
-// resolve to the real tracked files regardless of what the two path env
-// vars hold.
-const SKIP_BASELINE_PATH =
-  FIXTURE_MODE_ACTIVE && process.env.GHANTIKA_SKIP_BASELINE_PATH
-    ? path.resolve(process.env.GHANTIKA_SKIP_BASELINE_PATH)
-    : path.join(REPO_ROOT, "test", "skip-baseline.json");
-const CRITICAL_TESTS_PATH =
-  FIXTURE_MODE_ACTIVE && process.env.GHANTIKA_CRITICAL_TESTS_PATH
-    ? path.resolve(process.env.GHANTIKA_CRITICAL_TESTS_PATH)
-    : path.join(REPO_ROOT, "test", "critical-tests.json");
+// The real repo's own tracked baseline and critical-test list, computed
+// unconditionally from REPO_ROOT. loadSkipBaseline and loadCriticalTests
+// below each accept an explicit path argument - that parameter, supplied
+// by a caller, is how scripts/run-tests-fixture-harness.mjs points the
+// same loaders at a fixture tree's own files instead. This entrypoint
+// itself never reads an environment variable to change either default.
+const SKIP_BASELINE_PATH = path.join(REPO_ROOT, "test", "skip-baseline.json");
+const CRITICAL_TESTS_PATH = path.join(REPO_ROOT, "test", "critical-tests.json");
 
 /** @param {string} [filePath] @returns {Record<string, string[]>} */
 export function loadSkipBaseline(filePath = SKIP_BASELINE_PATH) {
@@ -846,50 +863,31 @@ async function main() {
     return;
   }
 
-  let tracked;
-  if (TEST_DIR_OVERRIDE) {
-    // TEST_DIR_OVERRIDE is only ever non-undefined when FIXTURE_MODE_ACTIVE
-    // was true at module load - see its definition above - so reaching
-    // this branch already proves the caller supplied the matching
-    // GHANTIKA_TEST_FIXTURE_TOKEN, not merely GHANTIKA_TEST_DIR on its own.
-    // A fixture tree under GHANTIKA_TEST_DIR is never the repo's real
-    // git-tracked test/ directory, so `git ls-files -- test` would only
-    // ever report every real tracked file as "missing from disk" here -
-    // not a real problem, just this check looking in the wrong place.
-    // Same UNSCANNED treatment as "git unavailable" below: every other
-    // check still runs.
+  // Always the real check, unconditionally: this entrypoint has no path
+  // by which tracked-file parity is ever skipped except git itself being
+  // genuinely unavailable (see checkTrackedFileParity's own doc comment).
+  const parity = checkTrackedFileParity(discovered);
+  const tracked = parity.tracked;
+  if (tracked === null) {
     console.error(
-      "run-tests: verified fixture-mode GHANTIKA_TEST_DIR override active - " +
-        "tracked-file parity is UNSCANNED this run; every other check below still runs"
+      "run-tests: git unavailable (or this is not a git working tree) - " +
+        "tracked-file parity is UNSCANNED this run; every other check " +
+        "below still runs"
     );
-    tracked = null;
   } else {
-    tracked = getTrackedTestFiles();
-    if (tracked === null) {
+    if (parity.missingFromDisk.length > 0) {
       console.error(
-        "run-tests: git unavailable (or this is not a git working tree) - " +
-          "tracked-file parity is UNSCANNED this run; every other check " +
-          "below still runs"
+        "run-tests: git tracks the following test file(s), but they were not found on disk:"
       );
-    } else {
-      const discoveredSet = new Set(discovered);
-      const missingFromDisk = tracked.filter((f) => !discoveredSet.has(f));
-      if (missingFromDisk.length > 0) {
-        console.error(
-          "run-tests: git tracks the following test file(s), but they were not found on disk:"
-        );
-        for (const f of missingFromDisk) console.error(`  - ${rel(f)}`);
-        process.exitCode = 1;
-        return;
-      }
-      const trackedSet = new Set(tracked);
-      const untrackedExtra = discovered.filter((f) => !trackedSet.has(f));
-      if (untrackedExtra.length > 0) {
-        console.error(
-          "run-tests: untracked test file(s) discovered (permitted, informational only):"
-        );
-        for (const f of untrackedExtra) console.error(`  - ${rel(f)}`);
-      }
+      for (const f of parity.missingFromDisk) console.error(`  - ${rel(f)}`);
+      process.exitCode = 1;
+      return;
+    }
+    if (parity.untrackedExtra.length > 0) {
+      console.error(
+        "run-tests: untracked test file(s) discovered (permitted, informational only):"
+      );
+      for (const f of parity.untrackedExtra) console.error(`  - ${rel(f)}`);
     }
   }
 
