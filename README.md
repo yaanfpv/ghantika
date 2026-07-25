@@ -211,7 +211,7 @@ Ghantika never hands a job its own full environment. Even in `merge` mode the ch
 
 ## Contributing
 
-Contributions are welcome. The design is deliberately small, so open an issue before starting anything large and we'll figure out whether it belongs here. A worked recipe for a job people genuinely sit around waiting on is one of the most useful things you can bring.
+Contributions are welcome. The design is deliberately small, so open an issue before starting anything large and we'll figure out whether it belongs here. A worked recipe for a job people genuinely sit around waiting on is one of the most useful things you can bring. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to set up a dev environment, the checks to run before opening a PR, and what a good PR looks like.
 
 ## License
 

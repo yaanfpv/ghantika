@@ -327,9 +327,13 @@ jobs:
           node-version: "22"
       - run: npm run verify:install-repro
 
-  # The single required check branch protection points at. It depends on
-  # every job above and only succeeds when every one of them reports the
-  # literal result "success".
+  # The aggregate check branch protection points at, over every job above -
+  # it only succeeds when every one of them reports the literal result
+  # "success". This is deliberately NOT the only required check: branch
+  # protection also independently requires `lint` to pass on its own, so a
+  # `gate` job mistakenly (or maliciously) marked `continue-on-error: true`
+  # can't report success while nothing real ran - a second, genuinely
+  # independent check still has to pass regardless of what this job says.
   #
   # `if: always()` is what keeps this job from being marked "skipped" the
   # moment one of the jobs above fails or is cancelled - GitHub treats a
