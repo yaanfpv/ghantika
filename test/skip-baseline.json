@@ -1,0 +1,32 @@
+{
+  "win32": [
+    "test/integration.test.ts::THE CENTERPIECE: real stdio client drives JOBS=4 concurrent live jobs (DESCENDANTS-per-job=3, NOISE-bytes=64KiB each); while one stays live the SAME session reads its status/output AND starts a 5th job, non-blocking; framing stays clean under the noise",
+    "test/integration.test.ts::cross-tool: a SIGTERM-resistant job's WHOLE process tree is escalated to real SIGKILL after the real ~5s grace period (confirmed genuinely leader-only mid-escalation: its own descendants, forked before the trap, are already gone from the plain SIGTERM while the leader and its keep-alive job are still alive), and status() independently reflects exactly that signal - proven over the real wire, with real status/output reads and real kill() calls on 3 ordinary jobs provably landing while the escalation is still in flight, and a real external pgrep lineage check",
+    "test/integration.test.ts::guard: withProcessGroupReap's teardown reaps a resistant leader's real process group even when the mid-escalation assertion throws, and leaves no unhandled rejection behind",
+    "test/integration.test.ts::whole-tree reap under the FULL 4x3 concurrent load - a real external pgrep confirms ZERO survivors across ALL 4 jobs' full descendant trees after killing them",
+    "test/integration.test.ts::orphan-proof teardown on a catchable shutdown signal under the FULL 4x3 concurrent load (multiple live jobs at once, not the single-job case)",
+    "test/jobStore.test.ts::attachChild/getChildHandle: a real attached child's pid and an approximate spawnedAtMs are retrievable, never the raw ChildProcess itself",
+    "test/jobStore.test.ts::REGRESSION: shutdown reaping a job whose process group already exited naturally emits NO false kill error even when the signal-send deterministically reports EPERM, and a real external pgrep independently confirms zero survivors",
+    "test/kill.test.ts::THE CENTERPIECE: kill() reaps a REAL process tree - a real job that itself forked real descendant processes - confirmed by a REAL external pgrep after the kill showing zero survivors across the WHOLE tree, not just the direct child",
+    "test/output-tail.test.ts::non-blocking snapshot consistency, HARDENED: real PGID-alive assertions bracketing both output() and tail(), a per-call deadline, and full seq-integrity checks within every response - never a torn/corrupted/out-of-order event",
+    "test/process.test.ts::spawnManaged (POSIX): a detached child is the LEADER of its own process group (pgid === its own pid) - the containment kill relies on, confirmed via a REAL external ps lookup",
+    "test/process.test.ts::checkProcessIdentity: alive-confirmed for a real process whose ACTUAL recorded spawn time matches",
+    "test/process.test.ts::checkProcessIdentity REFUSES to confirm a real, currently-alive process when the expected spawn time is far in the past - a convincing simulation of PID reuse",
+    "test/process.test.ts::signalProcessGroupPosix: signaling the group actually reaches it (green control, precursor to the real external-lineage e2e proof in test/kill.test.ts)",
+    "test/process.test.ts::signalProcessGroupPosix: signaling an already-gone group is treated as success (ESRCH), not a failure",
+    "test/process.test.ts::hasLiveProcessGroupMembersPosix: reports true for a REAL, genuinely alive process group",
+    "test/process.test.ts::hasLiveProcessGroupMembersPosix: reports false for a group that was never real (a fake/already-gone pid)",
+    "test/process.test.ts::waitForProcessDeath resolves false once the timeout elapses for a still-alive process",
+    "test/process.test.ts::killProcessGroupPosix: a normal (non-resistant) process dies from SIGTERM alone - no escalation needed",
+    "test/process.test.ts::a SIGTERM-resistant process is escalated to SIGKILL after the grace period and actually dies",
+    "test/process.test.ts::isProcessGroupAlive: true while ANY group member is alive, even after the LEADER itself is confirmed dead - isProcessAlive(leaderPid) alone cannot see this",
+    "test/process.test.ts::REGRESSION: killProcessGroupPosix escalates to SIGKILL when the LEADER dies from SIGTERM but a descendant survives, and the descendant actually ends up dead",
+    "test/process.test.ts::throwUnlessBenignAlreadyGoneRace: EPERM against a group that is genuinely still alive throws, for either signal name",
+    "test/process.test.ts::killProcessGroupPosix: the SIGTERM-site already-gone race is treated as success end to end, via a mocked process.kill (EPERM) on a fake pid",
+    "test/process.test.ts::killProcessGroupPosix: the SIGKILL-site already-gone race is treated as success end to end, via a mocked process.kill (EPERM) on a fake pid - the same fake-pid pattern as the SIGTERM-site proof above, never a real process or signal",
+    "test/process.test.ts::killProcessGroupPosix: the SIGKILL-site EPERM-while-genuinely-alive case is a real, surfaced error end to end, via a mocked process.kill against a real SIGTERM-resistant process",
+    "test/shutdown.test.ts::stdin EOF reaps a REAL live job's WHOLE process tree - zero survivors confirmed by a real external pgrep",
+    "test/shutdown.test.ts::SIGTERM reaps a REAL live job's WHOLE process tree - zero survivors confirmed by a real external pgrep",
+    "test/shutdown.test.ts::SIGINT reaps a REAL live job's WHOLE process tree - zero survivors confirmed by a real external pgrep"
+  ]
+}
