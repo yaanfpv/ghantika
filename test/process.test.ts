@@ -2008,7 +2008,10 @@ test(
   async () => {
     const rec = recorder();
     const env = buildChildEnv("merge", {});
-    const child = spawnManaged({ argv: ["sleep", "5"], cwd: process.cwd(), env }, callbacksFor(rec));
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
     await waitFor(() => rec.spawned > 0);
     const pid = child!.pid!;
     const before = Date.now();
@@ -2035,8 +2038,14 @@ test(
     const rec1 = recorder();
     const rec2 = recorder();
     const env = buildChildEnv("merge", {});
-    const child1 = spawnManaged({ argv: ["sleep", "5"], cwd: process.cwd(), env }, callbacksFor(rec1));
-    const child2 = spawnManaged({ argv: ["sleep", "5"], cwd: process.cwd(), env }, callbacksFor(rec2));
+    const child1 = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec1)
+    );
+    const child2 = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec2)
+    );
     await waitFor(() => rec1.spawned > 0 && rec2.spawned > 0);
     const pid1 = child1!.pid!;
     const pid2 = child2!.pid!;
@@ -2063,7 +2072,10 @@ test(
     assert.equal(result.status, "ok");
     if (result.status === "ok") {
       const foundPids = result.rows.map((row) => row.pid).sort((a, b) => a - b);
-      assert.deepEqual(foundPids, [pid1, pid2].sort((a, b) => a - b));
+      assert.deepEqual(
+        foundPids,
+        [pid1, pid2].sort((a, b) => a - b)
+      );
     }
     const invocationCount = fs
       .readFileSync(invocationMarker, "utf8")
@@ -2086,7 +2098,10 @@ test(
   async () => {
     const rec = recorder();
     const env = buildChildEnv("merge", {});
-    const child = spawnManaged({ argv: ["sleep", "5"], cwd: process.cwd(), env }, callbacksFor(rec));
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
     await waitFor(() => rec.spawned > 0);
     const pid = child!.pid!;
 
@@ -2134,7 +2149,10 @@ test(
   async () => {
     const rec = recorder();
     const env = buildChildEnv("merge", {});
-    const child = spawnManaged({ argv: ["sleep", "5"], cwd: process.cwd(), env }, callbacksFor(rec));
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
     await waitFor(() => rec.spawned > 0);
     const pid = child!.pid!;
 
@@ -2246,7 +2264,10 @@ test(
   async () => {
     const rec = recorder();
     const env = buildChildEnv("merge", {});
-    const child = spawnManaged({ argv: ["sleep", "5"], cwd: process.cwd(), env }, callbacksFor(rec));
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
     await waitFor(() => rec.spawned > 0);
     const pid = child!.pid!;
     const snapshot = await captureEscalationIdentitySnapshot(pid);
@@ -2319,7 +2340,10 @@ test(
   async () => {
     const rec = recorder();
     const env = buildChildEnv("merge", {});
-    const child = spawnManaged({ argv: ["sleep", "5"], cwd: process.cwd(), env }, callbacksFor(rec));
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
     await waitFor(() => rec.spawned > 0);
     const pid = child!.pid!;
 
@@ -2353,7 +2377,10 @@ test(
   async () => {
     const rec = recorder();
     const env = buildChildEnv("merge", {});
-    const child = spawnManaged({ argv: ["sleep", "5"], cwd: process.cwd(), env }, callbacksFor(rec));
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
     await waitFor(() => rec.spawned > 0);
     const pid = child!.pid!;
 
@@ -2400,7 +2427,10 @@ test(
   async () => {
     const rec = recorder();
     const env = buildChildEnv("merge", {});
-    const child = spawnManaged({ argv: ["sleep", "5"], cwd: process.cwd(), env }, callbacksFor(rec));
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
     await waitFor(() => rec.spawned > 0);
     const pid = child!.pid!;
     const snapshot = await captureEscalationIdentitySnapshot(pid);
@@ -2426,7 +2456,10 @@ test(
   async () => {
     const rec = recorder();
     const env = buildChildEnv("merge", {});
-    const child = spawnManaged({ argv: ["sleep", "5"], cwd: process.cwd(), env }, callbacksFor(rec));
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
     await waitFor(() => rec.spawned > 0);
     const pid = child!.pid!;
     const snapshot = await captureEscalationIdentitySnapshot(pid);
@@ -2561,7 +2594,10 @@ test(
   async () => {
     const rec = recorder();
     const env = buildChildEnv("merge", {});
-    const child = spawnManaged({ argv: ["sleep", "5"], cwd: process.cwd(), env }, callbacksFor(rec));
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
     await waitFor(() => rec.spawned > 0);
     const pid = child!.pid!;
     const realSnapshot = await captureEscalationIdentitySnapshot(pid);
@@ -2701,8 +2737,15 @@ test(
       clearInterval(ticker);
     }
 
-    assert.equal(gate.action, "refuse", "a timed-out re-read must fail closed, never default to escalation");
-    assert.ok(elapsedMs < 3000, `expected the bound to fire well before the ps's own 5s sleep, took ${elapsedMs}ms`);
+    assert.equal(
+      gate.action,
+      "refuse",
+      "a timed-out re-read must fail closed, never default to escalation"
+    );
+    assert.ok(
+      elapsedMs < 3000,
+      `expected the bound to fire well before the ps's own 5s sleep, took ${elapsedMs}ms`
+    );
     assert.ok(
       eventLoopTicks >= 5,
       `expected the event loop to demonstrably progress while the observer resisted - only saw ${eventLoopTicks} ticks`
@@ -2735,7 +2778,10 @@ test(
   async () => {
     const rec = recorder();
     const env = buildChildEnv("merge", {});
-    const child = spawnManaged({ argv: ["sleep", "5"], cwd: process.cwd(), env }, callbacksFor(rec));
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
     await waitFor(() => rec.spawned > 0);
     const pid = child!.pid!;
 
@@ -2814,11 +2860,7 @@ test(
     // descendant individually.
     const child = spawnManaged(
       {
-        argv: [
-          "bash",
-          "-c",
-          "sleep 60 & sleep 60 & (trap '' TERM; sleep 60) & trap '' TERM; wait",
-        ],
+        argv: ["bash", "-c", "sleep 60 & sleep 60 & (trap '' TERM; sleep 60) & trap '' TERM; wait"],
         cwd: process.cwd(),
         env,
       },
@@ -2838,7 +2880,10 @@ test(
     await killProcessGroupPosix(leaderPid, 300);
 
     const realSignalSends = observedTargets.filter((target) => target !== undefined);
-    assert.ok(realSignalSends.length > 0, "expected at least one real signal send to have been observed");
+    assert.ok(
+      realSignalSends.length > 0,
+      "expected at least one real signal send to have been observed"
+    );
     for (const target of realSignalSends) {
       assert.ok(
         target < 0,

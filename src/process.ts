@@ -1806,8 +1806,7 @@ export async function captureEscalationIdentitySnapshot(
 }
 
 export type EscalationIdentityGateResult =
-  | { readonly action: "escalate" }
-  | { readonly action: "refuse"; readonly reason: string };
+  { readonly action: "escalate" } | { readonly action: "refuse"; readonly reason: string };
 
 /**
  * THE ESCALATION IDENTITY GATE - the single real decision point for

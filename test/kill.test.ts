@@ -2588,7 +2588,7 @@ function extractEscalationGateParagraph(text: string): string {
   return slice;
 }
 
-test('TC.34 - no "provably"/unqualified proof claim beside the escalation identity matcher, surface S1 (README.md) - scoped to that mechanism\'s own paragraph, not the file\'s unrelated pre-existing use of the word elsewhere', () => {
+test("TC.34 - no \"provably\"/unqualified proof claim beside the escalation identity matcher, surface S1 (README.md) - scoped to that mechanism's own paragraph, not the file's unrelated pre-existing use of the word elsewhere", () => {
   const paragraph = extractEscalationGateParagraph(readReadmeText());
   assert.ok(
     !/\bprovably\b/i.test(paragraph),
@@ -2596,7 +2596,7 @@ test('TC.34 - no "provably"/unqualified proof claim beside the escalation identi
   );
 });
 
-test('TC.34 - no "provably"/unqualified proof claim beside the escalation identity matcher, surface S2 (the kill tool\'s tools/list description) - scoped to that mechanism\'s own paragraph', () => {
+test("TC.34 - no \"provably\"/unqualified proof claim beside the escalation identity matcher, surface S2 (the kill tool's tools/list description) - scoped to that mechanism's own paragraph", () => {
   const paragraph = extractEscalationGateParagraph(killTool.description as string);
   assert.ok(
     !/\bprovably\b/i.test(paragraph),
@@ -2736,14 +2736,18 @@ test(
 );
 
 /** Waits for `child`'s stdout to contain `marker` - a small local helper matching the pattern already used inline throughout this file's own resistant-process tests. */
-async function waitForStdout(child: ReturnType<typeof spawnManaged>, marker: string): Promise<void> {
+async function waitForStdout(
+  child: ReturnType<typeof spawnManaged>,
+  marker: string
+): Promise<void> {
   let buffer = "";
   child!.stdout!.on("data", (chunk: Buffer) => {
     buffer += chunk.toString("utf8");
   });
   const deadline = Date.now() + 5000;
   while (!buffer.includes(marker)) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for stdout to include "${marker}"`);
+    if (Date.now() > deadline)
+      throw new Error(`timed out waiting for stdout to include "${marker}"`);
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
