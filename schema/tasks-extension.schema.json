@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/yaanfpv/ghantika/schema/tasks-extension.schema.json",
+  "title": "ghantika io.modelcontextprotocol/tasks extension result",
+  "description": "Vendored, in-repo pin (never an npm dependency - no io.modelcontextprotocol/tasks package exists to depend on) for the shape of every response ghantika's Tasks-extension adapter (src/tasksAdapter.ts) returns: a minted CreateTaskResult (from run() on a Tasks-capable connection), a tasks/get result, or the interim tasks/update / tasks/cancel result - all four share this one shape - plus the single fixed not-found shape returned when a taskId does not resolve to a live job. The extension identity and the four-value status enum are the load-bearing, digest-verified facts this schema pins; config/tasks-schema-digest.json records this file's SHA-256 so drift between the two is caught, not silently trusted (see scripts/check-sdk-exact-pin.mjs).",
+  "oneOf": [{ "$ref": "#/$defs/taskResult" }, { "$ref": "#/$defs/taskNotFound" }],
+  "$defs": {
+    "extensionUri": {
+      "const": "io.modelcontextprotocol/tasks"
+    },
+    "taskStatus": {
+      "description": "The closed status enum this adapter ever produces. Deliberately four values, not the five the (deprecated, 2025-11-25, no-SDK-runtime) upstream TaskStatus vocabulary carries: this adapter never produces 'input_required' (a job-backed task has no client-input step), so it is not pinned here - a narrower, honestly-reachable set rather than an unreachable value copied for parity. 'expired' is never a member: this adapter has no mechanism today that removes a completed/terminal task record on its own schedule, and a task that no longer resolves to a job simply reads as task_not_found rather than surfacing its own terminal status.",
+      "enum": ["working", "completed", "failed", "cancelled"]
+    },
+    "taskOutputCounts": {
+      "type": "object",
+      "description": "The backing job's real, ever-cumulative output volume (never decremented by retention eviction) - present once the task reaches a terminal status, so tasks/get's terminal snapshot carries real evidence of what the job produced rather than a canned empty result.",
+      "properties": {
+        "stdout_lines": { "type": "integer", "minimum": 0 },
+        "stdout_bytes": { "type": "integer", "minimum": 0 },
+        "stderr_lines": { "type": "integer", "minimum": 0 },
+        "stderr_bytes": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["stdout_lines", "stdout_bytes", "stderr_lines", "stderr_bytes"],
+      "additionalProperties": false
+    },
+    "taskResult": {
+      "type": "object",
+      "description": "A live snapshot of a task bound to a real backing job. taskId is always the job's own randomUUID() job_id (one handle namespace, no separate task table).",
+      "properties": {
+        "extension": { "$ref": "#/$defs/extensionUri" },
+        "taskId": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/taskStatus" },
+        "createdAt": { "type": "string", "minLength": 1 },
+        "pollIntervalMs": { "type": "integer", "exclusiveMinimum": 0 },
+        "exitCode": { "type": "integer" },
+        "output": { "$ref": "#/$defs/taskOutputCounts" }
+      },
+      "required": ["extension", "taskId", "status", "createdAt"],
+      "additionalProperties": false
+    },
+    "taskNotFound": {
+      "type": "object",
+      "description": "The single fixed shape returned by tasks/get, tasks/update, and tasks/cancel alike for a taskId that does not resolve to any job - identical across all three methods, never an arbitrary/varying shape.",
+      "properties": {
+        "extension": { "$ref": "#/$defs/extensionUri" },
+        "error": { "const": "task_not_found" },
+        "taskId": { "type": "string", "minLength": 1 }
+      },
+      "required": ["extension", "error", "taskId"],
+      "additionalProperties": false
+    }
+  }
+}

@@ -72,11 +72,22 @@ const SRC_DIR = path.join(REPO_ROOT, "src");
 
 // The frozen module list, posix-relative to src/.
 // `src/index.ts` is deliberately excluded - see this file's header.
+//
+// `tasksAdapter.ts` is the single permitted
+// io.modelcontextprotocol/tasks-import site - see
+// `scripts/check-no-tasks-import.mjs`'s adapter carveout. It is scanned by
+// EVERY check this file runs exactly like every other frozen module
+// (the frozen-set membership check, and - since it is not in
+// STATE_SCAN_EXCLUDED_ROOT_FILES - the persistent-state scan too, so it
+// may never grow its own Map/Set/mutable module state either): admitting
+// it here widens WHICH FILE is allowed to exist, not what rules apply to
+// it once it does.
 export const FROZEN_MODULES = [
   "jobStore.ts",
   "process.ts",
   "registry.ts",
   "server.ts",
+  "tasksAdapter.ts",
   "tools/kill.ts",
   "tools/list.ts",
   "tools/output.ts",

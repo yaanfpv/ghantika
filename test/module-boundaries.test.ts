@@ -37,11 +37,17 @@ test("the real src/ tree has zero module-boundary violations", () => {
   assert.deepEqual(checkModuleBoundaries(), []);
 });
 
-test("FROZEN_MODULES lists exactly ten modules: four core files plus six tool handlers", () => {
-  assert.equal(FROZEN_MODULES.length, 10);
+test("FROZEN_MODULES lists exactly eleven modules: five core files plus six tool handlers", () => {
+  assert.equal(FROZEN_MODULES.length, 11);
   const core = FROZEN_MODULES.filter((f) => !f.startsWith("tools/"));
   const tools = FROZEN_MODULES.filter((f) => f.startsWith("tools/"));
-  assert.deepEqual([...core].sort(), ["jobStore.ts", "process.ts", "registry.ts", "server.ts"]);
+  assert.deepEqual([...core].sort(), [
+    "jobStore.ts",
+    "process.ts",
+    "registry.ts",
+    "server.ts",
+    "tasksAdapter.ts",
+  ]);
   assert.deepEqual([...tools].sort(), [
     "tools/kill.ts",
     "tools/list.ts",
@@ -69,7 +75,7 @@ const CLEAN_FIXTURE_FILES: Record<string, string> = Object.fromEntries(
 );
 CLEAN_FIXTURE_FILES["index.ts"] = "// entry point, excluded from the frozen set\n";
 
-test("an exact ten-file fixture (matching FROZEN_MODULES) is reported clean", () => {
+test("an exact eleven-file fixture (matching FROZEN_MODULES) is reported clean", () => {
   const dir = buildFixtureSrc(CLEAN_FIXTURE_FILES);
   try {
     assert.deepEqual(checkFrozenModuleSet(dir), { extra: [], missing: [] });
@@ -118,6 +124,39 @@ test("an extra core-level file (outside tools/) is caught as extra too", () => {
     assert.deepEqual(extra, ["schema.ts"]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- the widened frozen set admits tasksAdapter.ts specifically, without
+// becoming an unconditional widening: an UNRELATED new src/ file is still
+// rejected exactly as before. Both assertions in one test, on purpose - a
+// set that merely grew larger without checking the second half would pass
+// the first assertion even if the guard had regressed into ignoring the
+// module list entirely. ---
+
+test("the frozen set admits src/tasksAdapter.ts, and a DIFFERENT unknown new src/ module is still rejected", () => {
+  const withAdapter = buildFixtureSrc(CLEAN_FIXTURE_FILES);
+  try {
+    const { extra, missing } = checkFrozenModuleSet(withAdapter);
+    assert.deepEqual(extra, [], "tasksAdapter.ts must not be reported as an unexpected extra file");
+    assert.deepEqual(missing, []);
+  } finally {
+    rmSync(withAdapter, { recursive: true, force: true });
+  }
+
+  const withStrayFile = buildFixtureSrc({
+    ...CLEAN_FIXTURE_FILES,
+    "somethingElse.ts": "// a DIFFERENT new module - the widening is not unconditional\n",
+  });
+  try {
+    const { extra } = checkFrozenModuleSet(withStrayFile);
+    assert.deepEqual(
+      extra,
+      ["somethingElse.ts"],
+      "a src/ file OTHER than tasksAdapter.ts must still be rejected as extra"
+    );
+  } finally {
+    rmSync(withStrayFile, { recursive: true, force: true });
   }
 });
 

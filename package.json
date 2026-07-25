@@ -23,6 +23,8 @@
   },
   "files": [
     "dist",
+    "schema",
+    "config/tasks-schema-digest.json",
     "README.md",
     "LICENSE"
   ],

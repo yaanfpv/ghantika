@@ -6,6 +6,16 @@
  * classes directly - `src/registry.ts` owns what the six tools ARE,
  * this file owns wiring them onto the wire.
  *
+ * This file also wires in the `io.modelcontextprotocol/tasks` capability
+ * (advertisement at construction, the three registered `tasks/*` methods,
+ * and augmenting `run()`'s result on a capable connection) - but only ever
+ * by CALLING into `./tasksAdapter.js`, never by referencing anything
+ * Tasks-shaped itself. `src/tasksAdapter.ts` is the single file permitted
+ * to reference the extension's shape at all, whether via import or
+ * hand-rolled definition (enforced by `scripts/check-no-tasks-import.mjs`);
+ * this file stays exactly as unaware of the extension's real shape as
+ * `registry.ts` and every `tools/*.ts` handler already are.
+ *
  * ## Why stdout purity matters
  *
  * MCP over stdio uses the server's own stdout as the ENTIRE protocol
@@ -63,6 +73,7 @@ import { Readable } from "node:stream";
 import { isTerminalJobState, jobStore } from "./jobStore.js";
 import { checkProcessIdentity, killProcessGroupPosix, killProcessTreeWindows } from "./process.js";
 import { dispatchToolCall, listToolDefinitions } from "./registry.js";
+import * as tasksAdapter from "./tasksAdapter.js";
 
 const SERVER_NAME = "ghantika";
 // Kept as a literal here (rather than reading package.json at runtime) so
@@ -127,7 +138,18 @@ export interface GhantikaServer {
 export function createServer(transport: Transport = createStdioTransport()): GhantikaServer {
   const server = new Server(
     { name: SERVER_NAME, version: SERVER_VERSION },
-    { capabilities: { tools: {} } }
+    {
+      capabilities: {
+        tools: {},
+        // Advertises io.modelcontextprotocol/tasks at the CONNECTION layer
+        // (the initialize/capability handshake) - see tasksAdapter.ts's own
+        // header for why this is the `extensions` bag, never the SDK's
+        // deprecated `capabilities.tasks` field. This is the only place
+        // server.ts reaches into tasksAdapter.ts for capability shape; the
+        // adapter owns the descriptor's contents.
+        ...tasksAdapter.tasksServerCapabilitiesFragment(),
+      },
+    }
   );
 
   // The tools/call gate below must open only after the client has
@@ -237,8 +259,41 @@ export function createServer(transport: Transport = createStdioTransport()): Gha
         "tools/call rejected: the client has not completed the initialize/initialized handshake yet"
       );
     }
-    return dispatchToolCall(request.params.name, request.params.arguments);
+    const result = await dispatchToolCall(request.params.name, request.params.arguments);
+    // ONLY run() is ever handed to the adapter - status/output/tail/kill/
+    // list pass straight through unchanged, so the plain poll floor stays
+    // reachable on every connection regardless of Tasks capability.
+    // Capability is read fresh off the CONNECTION
+    // (server.getClientCapabilities(), populated once at initialize) -
+    // never off anything in `request` itself, which is what keeps minting
+    // connection-level rather than per-request.
+    if (request.params.name === "run") {
+      const capable = tasksAdapter.isConnectionTasksCapable(server.getClientCapabilities());
+      return tasksAdapter.maybeAugmentRunResult(result, capable);
+    }
+    return result;
   });
+
+  // The three registered task methods - see tasksAdapter.ts's header for
+  // why tasks/update and tasks/cancel share getTask's one read-only
+  // snapshot as their complete interim behavior, and why no tasks/list or
+  // tasks/result method is registered at all (the legacy result/list
+  // surface is deliberately not implemented).
+  server.setRequestHandler(
+    "tasks/get",
+    { params: tasksAdapter.taskIdParamsSchema() },
+    async (params) => tasksAdapter.getTask(params.taskId)
+  );
+  server.setRequestHandler(
+    "tasks/update",
+    { params: tasksAdapter.taskIdParamsSchema() },
+    async (params) => tasksAdapter.getTask(params.taskId)
+  );
+  server.setRequestHandler(
+    "tasks/cancel",
+    { params: tasksAdapter.taskIdParamsSchema() },
+    async (params) => tasksAdapter.getTask(params.taskId)
+  );
 
   let shuttingDown: Promise<void> | undefined;
   const shutdown = (reason: string): Promise<void> => {
