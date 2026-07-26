@@ -260,7 +260,7 @@ test(
     assert.deepEqual(
       afterMembers,
       [],
-      `expected zero surviving process-group members after stdin-EOF shutdown, pgrep still saw: ${JSON.stringify(afterMembers)}`
+      `expected zero surviving process-group members after stdin-EOF shutdown, pgrep still saw: ${JSON.stringify(afterMembers)} (server stderr: ${server.stderrText()})`
     );
   }
 );
@@ -284,7 +284,7 @@ test(
     assert.deepEqual(
       afterMembers,
       [],
-      `expected zero surviving process-group members after SIGTERM shutdown, pgrep still saw: ${JSON.stringify(afterMembers)}`
+      `expected zero surviving process-group members after SIGTERM shutdown, pgrep still saw: ${JSON.stringify(afterMembers)} (server stderr: ${server.stderrText()})`
     );
   }
 );
@@ -308,7 +308,7 @@ test(
     assert.deepEqual(
       afterMembers,
       [],
-      `expected zero surviving process-group members after SIGINT shutdown, pgrep still saw: ${JSON.stringify(afterMembers)}`
+      `expected zero surviving process-group members after SIGINT shutdown, pgrep still saw: ${JSON.stringify(afterMembers)} (server stderr: ${server.stderrText()})`
     );
   }
 );

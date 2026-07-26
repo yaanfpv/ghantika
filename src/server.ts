@@ -497,6 +497,19 @@ async function reapOneJobOnShutdown(jobId: string, state: JobState): Promise<voi
       console.error(
         `[ghantika] job ${jobId}'s process-group reap could not be externally confirmed within the bound during shutdown - signal(s) were sent, but zero surviving members was not observed in time`
       );
+      if (result.escalationRefusedReason !== undefined) {
+        // Distinguishes "SIGKILL was sent but the external confirmation
+        // read itself failed/timed out" from "escalation was refused, so
+        // no SIGKILL was ever sent at all" - the generic message above
+        // reads identically in both cases, and only this field (set by
+        // evaluateEscalationIdentityGate) tells them apart. There is no
+        // MCP client left to read this back once the process exits, so
+        // this is the only place it can surface.
+        // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- jobId is this codebase's own randomUUID(), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
+        console.error(
+          `[ghantika] job ${jobId}'s SIGKILL escalation was refused during shutdown: ${result.escalationRefusedReason}`
+        );
+      }
     }
   } catch (error) {
     // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- jobId is this codebase's own randomUUID(), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
