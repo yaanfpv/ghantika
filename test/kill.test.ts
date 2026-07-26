@@ -2512,3 +2512,238 @@ test("state-vs-fields prose guard, surface S2 (the kill tool's tools/list descri
     "expected the kill tool's tools/list description to NEVER claim kill_confirmed/identity_confirmed arrive immediately with the early terminal state - found it present, even if the accurate distinction sits beside it"
   );
 });
+
+// ---------------------------------------------------------------------------
+// The escalation identity gate (a6-a11): prose guards for TC.28 (the
+// residual is disclosed as MATERIALLY NARROWED, never closed or
+// eliminated) and TC.34 (no "provably"/unqualified-proof claim beside the
+// identity matcher), plus the wire-level combined-degraded cell (TC.35).
+// ---------------------------------------------------------------------------
+
+/**
+ * The narrowed-residual sentence, byte-identical on both surfaces up to
+ * the point they diverge (README appends its own explicit "narrowed,
+ * never closed or eliminated" clause; the served description does not
+ * repeat that exact tail, but never claims the opposite either - checked
+ * separately below).
+ */
+const NARROWED_RESIDUAL_REQUIRED_SUBSTRING =
+  "This narrows the residual described above materially, not completely: the check and the signal remain two separate syscalls, so a member proven alive an instant before the SIGKILL runs can still exit, and an unrelated group receiving the exact same recycled id within the same whole second could still read as a match";
+
+/** A planted claim that the escalation gate's residual is fully closed - independently false from "eliminated" below, so each needs its own row. */
+const FORBIDDEN_ESCALATION_CLOSED_CLAIM =
+  "This closes the residual described above, not merely narrows it";
+/** A planted claim that the escalation gate's residual is fully eliminated - independently false from "closed" above. */
+const FORBIDDEN_ESCALATION_ELIMINATED_CLAIM =
+  "the escalation identity gate eliminates the check-to-signal race entirely";
+
+test("TC.28 - narrowed-residual prose guard, surface S1 (README.md): states the residual is MATERIALLY NARROWED and never claims it is closed or eliminated", () => {
+  const readme = readReadmeText();
+  assert.ok(
+    readme.includes(NARROWED_RESIDUAL_REQUIRED_SUBSTRING),
+    "expected README.md to state the escalation gate's residual is materially narrowed, not completely closed - it is missing or has been reworded away"
+  );
+  assert.ok(
+    !readme.includes(FORBIDDEN_ESCALATION_CLOSED_CLAIM),
+    "expected README.md to NEVER claim the escalation gate's residual is fully closed"
+  );
+  assert.ok(
+    !readme.includes(FORBIDDEN_ESCALATION_ELIMINATED_CLAIM),
+    "expected README.md to NEVER claim the escalation gate's residual is fully eliminated"
+  );
+});
+
+test("TC.28 - narrowed-residual prose guard, surface S2 (the kill tool's tools/list description): states the residual is MATERIALLY NARROWED and never claims it is closed or eliminated", () => {
+  const description = killTool.description as string;
+  assert.ok(
+    description.includes(NARROWED_RESIDUAL_REQUIRED_SUBSTRING),
+    "expected the kill tool's tools/list description to state the escalation gate's residual is materially narrowed, not completely closed - it is missing or has been reworded away"
+  );
+  assert.ok(
+    !description.includes(FORBIDDEN_ESCALATION_CLOSED_CLAIM),
+    "expected the kill tool's tools/list description to NEVER claim the escalation gate's residual is fully closed"
+  );
+  assert.ok(
+    !description.includes(FORBIDDEN_ESCALATION_ELIMINATED_CLAIM),
+    "expected the kill tool's tools/list description to NEVER claim the escalation gate's residual is fully eliminated"
+  );
+});
+
+/**
+ * TC.34 - scoped specifically to the escalation-identity-gate paragraph on
+ * each surface (delimited by these two anchors, both real substrings this
+ * session's own additions introduced), rather than the whole file: a
+ * PRE-EXISTING, unrelated "provably" usage already lives elsewhere in both
+ * README.md and kill.ts (the reap-once continuity argument for a
+ * DIFFERENT mechanism entirely - see a7's own text on why that usage is
+ * out of scope for this rule), so a whole-file ban would false-positive on
+ * an already-correct sentence. This function extracts the identity-gate's
+ * OWN paragraph and checks only that slice.
+ */
+function extractEscalationGateParagraph(text: string): string {
+  const start = text.indexOf("A further identity gate applies");
+  assert.ok(start >= 0, "expected to find the escalation identity gate's own paragraph start");
+  const end = text.indexOf("Before signaling on POSIX", start);
+  const slice = end >= 0 ? text.slice(start, end) : text.slice(start, start + 2000);
+  return slice;
+}
+
+test('TC.34 - no "provably"/unqualified proof claim beside the escalation identity matcher, surface S1 (README.md) - scoped to that mechanism\'s own paragraph, not the file\'s unrelated pre-existing use of the word elsewhere', () => {
+  const paragraph = extractEscalationGateParagraph(readReadmeText());
+  assert.ok(
+    !/\bprovably\b/i.test(paragraph),
+    `expected the escalation identity gate's own README paragraph to never claim its matcher "provably" identifies the group - a known false-match path (same-second pid reuse) is admitted elsewhere in this story, so an unqualified proof claim beside the matcher would be a real overclaim. Paragraph: ${JSON.stringify(paragraph)}`
+  );
+});
+
+test('TC.34 - no "provably"/unqualified proof claim beside the escalation identity matcher, surface S2 (the kill tool\'s tools/list description) - scoped to that mechanism\'s own paragraph', () => {
+  const paragraph = extractEscalationGateParagraph(killTool.description as string);
+  assert.ok(
+    !/\bprovably\b/i.test(paragraph),
+    `expected the escalation identity gate's own tools/list paragraph to never claim its matcher "provably" identifies the group. Paragraph: ${JSON.stringify(paragraph)}`
+  );
+});
+
+// --- TC.35: THE COMBINED DEGRADED CELL, at the real handler/wire level ---
+
+test(
+  "kill: TC.35 THE COMBINED DEGRADED CELL - a2's pre-signal identity was never captured AND a6's pre-SIGTERM snapshot ALSO fails (ps/pgrep unavailable): SIGTERM is still sent (best-effort), escalation is REFUSED with no SIGKILL, identity_confirmed is false, escalation_refused_reason is present and honestly describes the send as best-effort (never 'confirmed'/'guarded'), and the real process survives (never falsely marked dead by an unsent SIGKILL)",
+  {
+    skip:
+      process.platform === "win32"
+        ? "manipulates the server process's own PATH to make ps/pgrep unavailable, POSIX-only"
+        : false,
+  },
+  async () => {
+    const realPath = process.env.PATH;
+    const record = jobStore.createJob({
+      argv: ["sleep", "10"],
+      cwd: process.cwd(),
+      env: { PATH: realPath ?? "/usr/bin:/bin" },
+      isShell: false,
+    });
+    // A SIGTERM-RESISTANT real process - ignores the initial SIGTERM
+    // entirely, so it genuinely survives the grace period and forces
+    // escalation to actually be evaluated (rather than the job dying from
+    // SIGTERM alone, which would never reach the escalation gate at all).
+    const child = spawnManaged(
+      {
+        argv: [
+          "node",
+          "-e",
+          "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000)",
+        ],
+        cwd: process.cwd(),
+        env: { PATH: realPath ?? "/usr/bin:/bin" },
+      },
+      {
+        onSpawn: () => jobStore.markRunning(record.job_id),
+        onError: (message) => jobStore.markSpawnFailed(record.job_id, message),
+        onExit: (code, signal) => jobStore.markExited(record.job_id, code, signal),
+        onStdoutChunk: () => {},
+        onStderrChunk: () => {},
+        onStdoutEnd: () => {},
+        onStderrEnd: () => {},
+      }
+    );
+    // a2's OWN degraded cell: attach with NO birth identity at all (the
+    // third argument omitted) - matching evaluatePreSignalIdentityGate's
+    // own documented "no identity captured at all" degraded path, which
+    // never even attempts a ps call for the FIRST signal.
+    jobStore.attachChild(record.job_id, child!);
+    await waitForStdout(child!, "ready");
+
+    assert.equal(
+      isProcessAlive(child!.pid!),
+      true,
+      "expected the real resistant process to be alive before kill"
+    );
+
+    // a6's OWN degraded cell: ps/pgrep unavailable for the WHOLE duration
+    // of the kill() call, so the escalation identity gate's own
+    // pre-SIGTERM snapshot also fails to capture anything usable.
+    process.env.PATH = "/tmp/does-not-exist-ghantika-empty-path-dir-tc35";
+    let result: Awaited<ReturnType<typeof killTool.handler>>;
+    try {
+      result = await killTool.handler({ job_id: record.job_id });
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    assert.notEqual(
+      result.isError,
+      true,
+      `kill() must never surface this combined degradation as a thrown/protocol error: ${JSON.stringify(result)}`
+    );
+    const structured = result.structuredContent as Record<string, unknown>;
+
+    // THE SIGTERM was still sent, best-effort - the job's state is
+    // "killed" via the existing, unmodified synchronous mark-on-SIGTERM
+    // mechanism (see kill.ts's own "kill/exit race" docs) - this
+    // assertion documents that EXISTING, untouched behavior, not a new
+    // claim this story introduces.
+    assert.equal(structured.state, "killed");
+    assert.equal(
+      structured.identity_confirmed,
+      false,
+      "a2's pre-signal identity was never captured at all - honestly disclosed as unconfirmed"
+    );
+    assert.equal(
+      typeof structured.escalation_refused_reason,
+      "string",
+      `expected an honest, disclosed escalation-refusal reason once escalation was evaluated and refused, got: ${JSON.stringify(structured)}`
+    );
+    const reason = structured.escalation_refused_reason as string;
+    // THE HARD CELL: this combined case must NEVER describe the earlier
+    // SIGTERM as "confirmed" or "guarded" - it was a best-effort send,
+    // since neither the pre-signal layer nor this escalation snapshot
+    // ever positively confirmed anything.
+    assert.match(
+      reason,
+      /best-effort/,
+      `expected the combined-degraded reason to honestly describe the earlier SIGTERM as best-effort, got: ${JSON.stringify(reason)}`
+    );
+    // "confirmed" legitimately appears as part of NEGATIONS here ("never
+    // confirmed", "not confirmed") - what must never appear is an
+    // AFFIRMATIVE claim that the send itself was confirmed or guarded.
+    assert.ok(
+      !/\bwas confirmed\b/i.test(reason) && !/\bsigterm was guarded\b/i.test(reason),
+      `expected the combined-degraded reason to never affirmatively claim the earlier SIGTERM "was confirmed" or "was guarded" - only that identity was NOT confirmed at either layer, got: ${JSON.stringify(reason)}`
+    );
+    assert.match(
+      reason,
+      /never confirmed|not confirmed/,
+      `expected the combined-degraded reason to explicitly state identity was never/not confirmed, got: ${JSON.stringify(reason)}`
+    );
+    assert.ok(
+      !/\bguarded\b/.test(reason),
+      `expected the combined-degraded reason to never describe the earlier SIGTERM as "guarded" - that word is reserved for the a2-positive-plus-a6-failed case, which this is not, got: ${JSON.stringify(reason)}`
+    );
+
+    // No SIGKILL was ever sent - the real, resistant process must still
+    // genuinely be alive (never falsely marked dead by a signal this
+    // handler correctly refused to send).
+    assert.equal(
+      isProcessAlive(child!.pid!),
+      true,
+      "expected the real resistant process to have SURVIVED - escalation was correctly refused, so no SIGKILL was ever sent"
+    );
+
+    // Real cleanup - this test's own broken-PATH window deliberately left
+    // the process unreaped by the code under test.
+    process.kill(-child!.pid!, "SIGKILL");
+  }
+);
+
+/** Waits for `child`'s stdout to contain `marker` - a small local helper matching the pattern already used inline throughout this file's own resistant-process tests. */
+async function waitForStdout(child: ReturnType<typeof spawnManaged>, marker: string): Promise<void> {
+  let buffer = "";
+  child!.stdout!.on("data", (chunk: Buffer) => {
+    buffer += chunk.toString("utf8");
+  });
+  const deadline = Date.now() + 5000;
+  while (!buffer.includes(marker)) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for stdout to include "${marker}"`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}

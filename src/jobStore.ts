@@ -239,6 +239,25 @@ export interface JobRecord {
    * the exact moment they need it.
    */
   identity_capture?: "pending" | "captured" | "unavailable";
+  /**
+   * Present only when the DEFAULT terminating path's escalation identity
+   * gate (`process.evaluateEscalationIdentityGate`) actually ran and
+   * REFUSED to send SIGKILL - i.e. the group survived the SIGTERM grace
+   * period, but no originally-recorded process-group member could be
+   * re-confirmed at escalation time (see that function's own docs for the
+   * full enumeration of why: a degraded pre-SIGTERM snapshot, a timed-out
+   * or failed re-read, every recorded member gone, or every present one
+   * reporting a different start time). A short, honest description of
+   * which cell fired - never a claim that the process group is confirmed
+   * gone (it may still be alive; this codebase simply never sent it a
+   * second signal), and never a claim that the earlier SIGTERM was
+   * "confirmed" or "guarded" when identity could not be verified at
+   * either the pre-signal (`identity_confirmed`) or this pre-SIGTERM-
+   * snapshot layer - see `src/tools/kill.ts`'s own docs for that combined
+   * cell. Absent whenever escalation was never reached at all (the group
+   * died within grace, or was already gone) or when escalation proceeded.
+   */
+  escalation_refused_reason?: string;
 }
 
 /**
@@ -303,6 +322,8 @@ export interface PublicJobProjection {
   readonly identity_confirmed?: boolean;
   /** See `JobRecord.identity_capture`'s own docs - the same value, passed through verbatim. */
   readonly identity_capture?: "pending" | "captured" | "unavailable";
+  /** See `JobRecord.escalation_refused_reason`'s own docs - the same value, passed through verbatim. */
+  readonly escalation_refused_reason?: string;
 }
 
 /**
@@ -342,6 +363,7 @@ export function toPublicProjection(
     kill_confirmed: record.kill_confirmed,
     identity_confirmed: record.identity_confirmed,
     identity_capture: record.identity_capture,
+    escalation_refused_reason: record.escalation_refused_reason,
   };
 }
 
@@ -1474,6 +1496,24 @@ export class JobStore {
     const record = this.jobs.get(jobId);
     if (!record || !isTerminalJobState(record.state)) return;
     record.identity_confirmed = confirmed;
+  }
+
+  /**
+   * Records the escalation identity gate's own refusal reason - see
+   * `JobRecord.escalation_refused_reason`'s own docs for exactly what this
+   * discloses and why it is never present when escalation proceeded or
+   * was never reached. Same terminal-state guard as `setKillConfirmation`/
+   * `setIdentityConfirmation` above: by the time the default terminating
+   * path's `killProcessGroupPosix` call resolves, the job's `killed`
+   * transition has already happened synchronously (see
+   * `src/tools/kill.ts`'s own docs on the kill/exit race), so this always
+   * writes onto an already-terminal record - it never gates or precedes
+   * that transition, it only ever adds an honest disclosure alongside it.
+   */
+  setEscalationRefusedReason(jobId: string, reason: string): void {
+    const record = this.jobs.get(jobId);
+    if (!record || !isTerminalJobState(record.state)) return;
+    record.escalation_refused_reason = reason;
   }
 
   /**

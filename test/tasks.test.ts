@@ -585,7 +585,7 @@ test("a non-capable connection's run() returns the plain job projection - a genu
 
     // The COMPLETE key set the real PublicJobProjection shape carries -
     // see src/jobStore.ts's own toPublicProjection, which always writes
-    // all eleven fields (the five optional ones included, EXPLICITLY as
+    // all twelve fields (the six optional ones included, EXPLICITLY as
     // `undefined` when a job hasn't reached that point yet - verified
     // empirically here rather than assumed: InMemoryTransport passes the
     // structured content through without an actual JSON.stringify pass,
@@ -602,6 +602,7 @@ test("a non-capable connection's run() returns the plain job projection - a genu
         "counts",
         "diagnostic",
         "ended_at",
+        "escalation_refused_reason",
         "exit_code",
         "identity_capture",
         "identity_confirmed",
@@ -626,6 +627,9 @@ test("a non-capable connection's run() returns the plain job projection - a genu
     // join them here: the eager reap-at-exit that can set kill_confirmed
     // on an otherwise-never-killed job only fires once the leader has
     // actually exited, which this freshly-"starting" job has not yet done.
+    // escalation_refused_reason joins them too: it is only ever written
+    // once an actual escalation attempt has been refused, which cannot
+    // have happened yet either.
     for (const key of [
       "ended_at",
       "exit_code",
@@ -634,6 +638,7 @@ test("a non-capable connection's run() returns the plain job projection - a genu
       "queue_position",
       "kill_confirmed",
       "identity_confirmed",
+      "escalation_refused_reason",
     ]) {
       assert.equal(
         structured[key],
@@ -1341,11 +1346,13 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
       "diagnostic",
       "ended_at",
       "exit_code",
-      // identity_capture/identity_confirmed/kill_confirmed are always
-      // present in the real PublicJobProjection (see toPublicProjection in
-      // jobStore.ts) - assigned unconditionally, even when their value is
-      // undefined, so Object.keys always lists all three regardless of
-      // whether this particular job was ever killed.
+      // escalation_refused_reason/identity_capture/identity_confirmed/
+      // kill_confirmed are always present in the real PublicJobProjection
+      // (see toPublicProjection in jobStore.ts) - assigned unconditionally,
+      // even when their value is undefined, so Object.keys always lists
+      // all four regardless of whether this particular job was ever killed
+      // or had its escalation refused.
+      "escalation_refused_reason",
       "identity_capture",
       "identity_confirmed",
       "job_id",
@@ -1446,6 +1453,9 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
         // default, never fabricated as false.
         kill_confirmed: true,
         identity_confirmed: undefined,
+        // This job was never signalled at all (a natural exit), so the
+        // escalation identity gate never ran - stays at its unset default.
+        escalation_refused_reason: undefined,
       },
       `expected status's response to deep-equal its real, complete values (timestamps and identity_capture checked separately above), not just the right key set - got: ${JSON.stringify(statusResult)}`
     );
@@ -1629,6 +1639,10 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
         // A real, ordinary SIGTERM kill on a genuinely running job: the
         // final external pgrep-based check confirms zero survivors.
         kill_confirmed: true,
+        // This job died from the initial SIGTERM within the grace period,
+        // so escalation was never even attempted - stays at its unset
+        // default.
+        escalation_refused_reason: undefined,
       },
       `expected kill's response to deep-equal its real, complete values (timestamps and identity fields checked separately above), not just the right key set - got: ${JSON.stringify(killResult)}`
     );

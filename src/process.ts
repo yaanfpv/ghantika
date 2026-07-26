@@ -1040,6 +1040,23 @@ export function waitForProcessDeath(
  */
 export const POSIX_KILL_GRACE_PERIOD_MS = 5000;
 
+/**
+ * The whole-phase budget for EACH of the two real observations the
+ * escalation identity gate makes - the pre-SIGTERM membership snapshot
+ * (`captureEscalationIdentitySnapshot`) and the escalation-time re-read
+ * (`evaluateEscalationIdentityGate`). Both phases get their OWN fresh
+ * 2000ms, never one budget shared or split across the two - a slow
+ * snapshot never eats into the re-read's own allowance, and neither
+ * phase's cost scales with how many process-group members it observes
+ * (see `readPidStartTimesBatchPosix`'s own docs: every member is read in
+ * ONE batched `ps` call, never one call per member).
+ *
+ * Strictly less than `POSIX_KILL_GRACE_PERIOD_MS` (asserted directly by
+ * this codebase's own test suite, not just eyeballed here) - so neither
+ * observation phase can ever outlast the grace window it sits beside.
+ */
+export const PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS = 2000;
+
 export interface PosixKillResult {
   readonly finalSignal: "SIGTERM" | "SIGKILL";
   /** True if SIGTERM alone was NOT enough within the grace period, and SIGKILL was actually sent too. */
@@ -1055,6 +1072,23 @@ export interface PosixKillResult {
    * why the state transition can't wait on this.
    */
   readonly confirmed: boolean;
+  /**
+   * Present ONLY when the group survived the grace period AND the
+   * escalation identity gate (`evaluateEscalationIdentityGate`) refused to
+   * confirm the group is still the one this codebase spawned - in which
+   * case no SIGKILL was ever sent (`escalated` stays `false`, the same as
+   * a group that died from SIGTERM alone). Absent whenever escalation was
+   * never reached at all (the group died within grace, or was already
+   * gone) - never present-as-undefined-string, genuinely absent. The
+   * value is a short, honest description of WHICH fail-closed cell fired
+   * (see `evaluateEscalationIdentityGate`'s own docs for the full
+   * enumeration) - never a claim that the group is confirmed gone, and
+   * never a claim that the earlier SIGTERM was "confirmed" or "guarded"
+   * when identity could not be verified at all (see this field's own
+   * combined-degraded wording in `captureEscalationIdentitySnapshot`'s
+   * docs).
+   */
+  readonly escalationRefusedReason?: string;
 }
 
 export interface PosixKillCallbacks {
@@ -1332,6 +1366,536 @@ export async function throwUnlessBenignAlreadyGoneRace(
   }
 }
 
+// ---------------------------------------------------------------------------
+// The escalation identity gate: before the SIGKILL escalation, prove the
+// group is still the one this codebase spawned - never before the FIRST
+// SIGTERM (that send is covered by process.evaluatePreSignalIdentityGate's
+// own, separate etime-based mechanism, out of scope here by design).
+// ---------------------------------------------------------------------------
+
+/** One originally-recorded process-group member's real, OS-read identity: a pid plus the instant it started (never a `Date.now()`-derived guess). */
+export interface RecordedGroupMember {
+  readonly pid: number;
+  /** Epoch milliseconds, parsed under the frozen `LC_ALL=C`/`TZ=UTC0` grammar `parsePidLstartRow` implements. */
+  readonly startTimeMs: number;
+}
+
+/**
+ * The real outcome of one batched `ps -p <pid[,pid...]> -o pid=,lstart=`
+ * read - never per-member sequential calls, so this observer's cost never
+ * scales with how many pids are asked about (see this function's own docs
+ * further down for why that single-batch shape is what keeps a group of
+ * any size inside ONE whole-operation deadline).
+ *
+ * `rows` holds only the pids whose row parsed cleanly under
+ * `parsePidLstartRow`'s frozen six-token grammar - a pid simply absent from
+ * `rows` may mean it has genuinely exited (the normal, expected "not
+ * found" outcome - real `ps` silently omits a nonexistent pid from a
+ * multi-pid query rather than erroring, confirmed empirically), or that
+ * its own row was present but malformed and therefore discarded (a10:
+ * "never guessed at"). Distinguishing those two would require attributing
+ * a malformed row to a specific pid, which a10 explicitly forbids - so
+ * this deliberately does not attempt to; the caller's own "did any
+ * ORIGINALLY-RECORDED pid still produce an exactly-matching row" question
+ * never needs that distinction; it only needs to know a pid's own
+ * attempted read failed to produce a positive match.
+ */
+export type PidBatchReadResult =
+  | { readonly status: "ok"; readonly rows: readonly RecordedGroupMember[] }
+  | { readonly status: "observer-failure"; readonly reason: string };
+
+/** Looks up `pid`'s start time in a `PidBatchReadResult`'s (or a snapshot's) `readonly RecordedGroupMember[]` rows - a plain linear scan over a small, per-call, never-persisted array (see this module's own "no persistent state outside jobStore.ts" boundary), not a `Map`. */
+function findRecordedStartTime(
+  rows: readonly RecordedGroupMember[],
+  pid: number
+): number | undefined {
+  return rows.find((row) => row.pid === pid)?.startTimeMs;
+}
+
+/** `ps`'s ordinary weekday abbreviations under the `C` locale - part of a10's frozen six-token grammar's own sanity check, not merely a token-count check. */
+const LSTART_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+/** `ps`'s ordinary month abbreviations under the `C` locale. */
+const LSTART_MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
+
+/**
+ * Parses ONE `ps -p <pid> -o pid=,lstart=` output ROW - a10's frozen
+ * grammar: `pid weekday month day HH:MM:SS year`, produced under pinned
+ * `LC_ALL=C`/`TZ=UTC0` - into a real pid plus an epoch-millisecond instant.
+ * Splits on any RUN of whitespace, never a single space: `ps` pads its
+ * `lstart` column to a fixed width, so a single-digit day (`" 5"` rather
+ * than `"25"`) would otherwise shift plain single-space splitting off by
+ * one token (verified empirically against the real installed `ps`).
+ *
+ * Returns `undefined` - a failed read for this row, never a partial or
+ * best-effort one - for ANY of: not exactly six tokens after that
+ * whitespace-collapse; an unrecognized weekday or month abbreviation; a
+ * day/hour/minute/second/year field that isn't the right shape; or a
+ * parsed instant that does not ROUND-TRIP exactly back through
+ * `Date.UTC` (e.g. a day value `Date` would otherwise silently normalize
+ * into the next month) - a10's own words: "a guard exactly right about
+ * which token is which and silently wrong by hours about what it means
+ * is worse than one that fails to parse."
+ *
+ * The zone is FROZEN, not merely the layout: `lstart` itself carries no
+ * zone token at all, so the pinned `TZ=UTC0` environment (see
+ * `readPidStartTimesBatchPosix`) is what makes treating tokens 2-6 as a
+ * plain UTC instant (via `Date.UTC`, no offset math) correct - this
+ * function trusts that environment was actually set by its one real
+ * caller, it does not (and cannot) verify it from the string alone.
+ */
+export function parsePidLstartRow(rawLine: string): RecordedGroupMember | undefined {
+  const tokens = rawLine.trim().split(/\s+/);
+  if (tokens.length !== 6) return undefined;
+  const [pidRaw, weekday, month, dayRaw, time, yearRaw] = tokens as [
+    string,
+    string,
+    string,
+    string,
+    string,
+    string,
+  ];
+  if (!/^\d+$/.test(pidRaw)) return undefined;
+  const pid = Number(pidRaw);
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  if (!LSTART_WEEKDAYS.includes(weekday)) return undefined;
+  const monthIndex = LSTART_MONTHS.indexOf(month);
+  if (monthIndex === -1) return undefined;
+  if (!/^\d{1,2}$/.test(dayRaw)) return undefined;
+  const day = Number(dayRaw);
+  const timeParts = time.split(":");
+  if (timeParts.length !== 3 || timeParts.some((part) => !/^\d{2}$/.test(part))) return undefined;
+  const [hours, minutes, seconds] = timeParts.map(Number) as [number, number, number];
+  if (!/^\d{4}$/.test(yearRaw)) return undefined;
+  const year = Number(yearRaw);
+
+  const startTimeMs = Date.UTC(year, monthIndex, day, hours, minutes, seconds);
+  const roundTrip = new Date(startTimeMs);
+  if (
+    roundTrip.getUTCFullYear() !== year ||
+    roundTrip.getUTCMonth() !== monthIndex ||
+    roundTrip.getUTCDate() !== day ||
+    roundTrip.getUTCHours() !== hours ||
+    roundTrip.getUTCMinutes() !== minutes ||
+    roundTrip.getUTCSeconds() !== seconds
+  ) {
+    return undefined; // did not round-trip - invalid/out-of-range/ambiguous, never guessed at
+  }
+  return { pid, startTimeMs };
+}
+
+function parseLstartBatchOutput(stdout: string): RecordedGroupMember[] {
+  const rows: RecordedGroupMember[] = [];
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    const parsed = parsePidLstartRow(trimmed);
+    if (parsed !== undefined) rows.push(parsed);
+  }
+  return rows;
+}
+
+/**
+ * Reads pid+lstart for a SET of pids in ONE real `ps -p <comma-list>` call
+ * - a10's frozen six-token grammar, run under pinned `LC_ALL=C`/`TZ=UTC0`
+ * (never the server's own inherited locale/zone, which could vary the
+ * output shape) - batched so this observer's cost is ONE real subprocess
+ * call regardless of how many members the group has (a9: "an N-member
+ * group cannot create N sequential timeout windows").
+ *
+ * Bounded and force-reaped exactly like this file's other async `ps`/`pgrep`
+ * observers (`readProcessElapsedSecondsAsync`, `hasLiveProcessGroupMembersPosixAsync`):
+ * `execFile`'s own `timeout` option only REQUESTS SIGTERM, so a second,
+ * independent settlement timer forces this promise to resolve at
+ * `timeoutMs` plus a small fixed grace regardless of the child's own
+ * cooperation, SIGKILLing it directly if it is still alive then - a
+ * resistant `ps` can never leave this pending indefinitely, and can never
+ * outlive this call as a leaked process either.
+ *
+ * `ps -p <list>` returns exit code 1 with EMPTY output when NONE of the
+ * requested pids currently exist (confirmed empirically) - a real,
+ * confident "nothing there" result, `{status: "ok", rows: <empty>}`,
+ * never an observer failure. Any OTHER execution failure (a missing
+ * binary, a permission failure, this call's own settlement timer firing)
+ * is `{status: "observer-failure"}` - genuinely different: this observer
+ * never ran successfully at all, so there is no basis for either "found"
+ * or "not found" about ANY requested pid.
+ *
+ * An empty `pids` array is a defensive no-op (`{status: "ok", rows: <empty>}`
+ * without ever shelling out) - there is nothing to ask `ps` about.
+ */
+export function readPidStartTimesBatchPosix(
+  pids: readonly number[],
+  timeoutMs: number = PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS
+): Promise<PidBatchReadResult> {
+  if (pids.length === 0) return Promise.resolve({ status: "ok", rows: [] });
+  return new Promise((resolve) => {
+    let settled = false;
+    const child = execFile(
+      "ps",
+      ["-p", pids.join(","), "-o", "pid=,lstart="],
+      {
+        encoding: "utf8",
+        timeout: timeoutMs,
+        env: { ...process.env, LC_ALL: "C", TZ: "UTC0" },
+      },
+      (error, stdout) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(externalBound);
+        if (error === null) {
+          resolve({ status: "ok", rows: parseLstartBatchOutput(stdout) });
+          return;
+        }
+        const err = error as ExecFileCallbackError;
+        if (err.code === 1) {
+          // ps's own documented "none of the requested pids matched" exit
+          // code - a real, confident "nothing there" result, not an
+          // observer failure.
+          resolve({ status: "ok", rows: [] });
+          return;
+        }
+        resolve({
+          status: "observer-failure",
+          reason:
+            typeof err.code === "string"
+              ? `ps failed to execute (${err.code})`
+              : `ps failed unexpectedly: ${err.message ?? String(error)}`,
+        });
+      }
+    );
+    const externalBound = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      resolve({
+        status: "observer-failure",
+        reason: `ps did not settle within ${timeoutMs}ms (observer unresponsive to SIGTERM)`,
+      });
+    }, timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS);
+  });
+}
+
+/** The real outcome of enumerating a process group's current membership via `pgrep -g <pgid>`. */
+export type PgrepEnumerationResult =
+  | { readonly status: "ok"; readonly pids: readonly number[] }
+  | { readonly status: "observer-failure"; readonly reason: string };
+
+/**
+ * Enumerates a process group's CURRENT real members via `pgrep -g <pgid>` -
+ * bounded and force-reaped on the identical shape `readPidStartTimesBatchPosix`
+ * above and `hasLiveProcessGroupMembersPosixAsync` (elsewhere in this file)
+ * both already use. A pgrep line that isn't a bare positive integer marks
+ * the WHOLE enumeration malformed (`observer-failure`) rather than
+ * silently discarding just that one line - unlike a `ps` row (where a
+ * malformed ROW only ever costs that one pid's identity, never the
+ * others'), a malformed pgrep line means this codebase cannot trust that
+ * it has correctly enumerated membership AT ALL, so the safe, fail-closed
+ * reading is to distrust the whole read rather than guess at a partial
+ * member list.
+ */
+function enumerateProcessGroupMembersPosixAsync(
+  pid: number,
+  timeoutMs: number
+): Promise<PgrepEnumerationResult> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const child = execFile(
+      "pgrep",
+      ["-g", String(pid)],
+      { encoding: "utf8", timeout: timeoutMs },
+      (error, stdout) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(externalBound);
+        if (error === null) {
+          const parsed = parsePgrepPidList(stdout);
+          if (parsed === undefined) {
+            resolve({
+              status: "observer-failure",
+              reason: `pgrep produced output this codebase could not parse: ${JSON.stringify(stdout)}`,
+            });
+            return;
+          }
+          resolve({ status: "ok", pids: parsed });
+          return;
+        }
+        const err = error as ExecFileCallbackError & { status?: number };
+        if (err.status === 1 || err.code === 1) {
+          resolve({ status: "ok", pids: [] }); // pgrep's own "nothing matched" exit code
+          return;
+        }
+        resolve({
+          status: "observer-failure",
+          reason:
+            typeof err.code === "string"
+              ? `pgrep failed to execute (${err.code})`
+              : `pgrep failed unexpectedly: ${err.message ?? String(error)}`,
+        });
+      }
+    );
+    const externalBound = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      resolve({
+        status: "observer-failure",
+        reason: `pgrep did not settle within ${timeoutMs}ms (observer unresponsive to SIGTERM)`,
+      });
+    }, timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS);
+  });
+}
+
+function parsePgrepPidList(stdout: string): number[] | undefined {
+  const lines = stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const pids: number[] = [];
+  for (const line of lines) {
+    if (!/^\d+$/.test(line)) return undefined; // malformed - never guessed at
+    const parsedPid = Number(line);
+    if (!Number.isInteger(parsedPid) || parsedPid <= 0) return undefined;
+    pids.push(parsedPid);
+  }
+  return pids;
+}
+
+/**
+ * The pre-SIGTERM membership snapshot the escalation identity gate is
+ * built on: the leader's own pid plus every CURRENTLY-live descendant's
+ * pid, each paired with its real, `ps`-read start time (a10's grammar) -
+ * captured BEFORE the first signal in this escalation is ever sent, never
+ * re-derived later. `degraded: true` means this snapshot captured ZERO
+ * usable records (every candidate pid was gone, unreadable, or the
+ * observation itself failed/timed out/produced malformed output) - see
+ * `degradedReason` for which. A degraded snapshot is never fatal to the
+ * SIGTERM this codebase is about to send (terminating the job is the
+ * user's own request, and must not be blocked by an observation failure -
+ * see `killProcessGroupPosix`'s own call site) - it only means the
+ * escalation gate below has nothing positive to prove later, and must
+ * therefore refuse (see `evaluateEscalationIdentityGate`'s own docs).
+ */
+export interface EscalationIdentitySnapshot {
+  readonly members: readonly RecordedGroupMember[];
+  readonly degraded: boolean;
+  readonly degradedReason?: string;
+}
+
+/**
+ * Captures `EscalationIdentitySnapshot` for `leaderPid`'s process group -
+ * the ORIGINAL membership the escalation identity gate later re-reads and
+ * compares against. Three real observations, in order, ALL sharing ONE
+ * overall `timeoutMs` deadline (never `timeoutMs` per step - see this
+ * function's own docs for why that single shared deadline is what keeps
+ * this phase's total cost independent of how it happens to be internally
+ * split):
+ *
+ * 1. The leader's OWN start time, read on its own (`readPidStartTimesBatchPosix`
+ *    with a single pid) - independently observable/testable from step 2's
+ *    own failure modes (this is "the initial leader read").
+ * 2. The group's CURRENT descendants, discovered via `pgrep -g leaderPid`
+ *    (`enumerateProcessGroupMembersPosixAsync`) - "member enumeration".
+ * 3. Every discovered descendant's own start time, in ONE batched
+ *    `readPidStartTimesBatchPosix` call.
+ *
+ * FAIL CLOSED, WITH THE CASES ENUMERATED: a genuine observer failure at
+ * ANY of the three steps above (a timeout, a missing binary, malformed
+ * enumeration output) marks the WHOLE snapshot `degraded`, even if an
+ * earlier step already captured a usable record - a member enumeration
+ * that itself timed out or came back malformed means this codebase cannot
+ * trust that it has correctly discovered the group's real membership, so
+ * the safe reading is to distrust the whole attempt, not to quietly keep
+ * whatever partial success came before it. Distinct from a pid simply
+ * being ABSENT from a successful read (gone, not malformed, not timed
+ * out) - that is a legitimate, expected outcome (a member that
+ * disappeared on its own, or was never there), never itself a
+ * degradation, and never prevents another, still-present member from
+ * being recorded. Zero usable records after an otherwise-clean read is
+ * ALSO `degraded` (there is nothing to compare against later, regardless
+ * of whether every step "succeeded").
+ */
+export async function captureEscalationIdentitySnapshot(
+  leaderPid: number,
+  timeoutMs: number = PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS
+): Promise<EscalationIdentitySnapshot> {
+  const deadline = Date.now() + timeoutMs;
+  const remainingBudget = (): number => Math.max(0, deadline - Date.now());
+
+  let sawObserverFailure = false;
+  let observerFailureReason: string | undefined;
+  const recorded: RecordedGroupMember[] = [];
+
+  // Step 1: the initial leader read - independently observable from step 2's own timeout/failure below.
+  const leaderBudget = remainingBudget();
+  if (leaderBudget <= 0) {
+    sawObserverFailure = true;
+    observerFailureReason =
+      "pre-SIGTERM snapshot budget exhausted before the initial leader read could run";
+  } else {
+    const leaderRead = await readPidStartTimesBatchPosix([leaderPid], leaderBudget);
+    if (leaderRead.status === "observer-failure") {
+      sawObserverFailure = true;
+      observerFailureReason = `the initial leader read failed: ${leaderRead.reason}`;
+    } else {
+      const leaderStart = findRecordedStartTime(leaderRead.rows, leaderPid);
+      if (leaderStart !== undefined) recorded.push({ pid: leaderPid, startTimeMs: leaderStart });
+    }
+  }
+
+  // Step 2: member enumeration - who else is currently in this group.
+  const enumerationBudget = remainingBudget();
+  let descendantPids: readonly number[] = [];
+  if (enumerationBudget <= 0) {
+    sawObserverFailure = true;
+    observerFailureReason ??=
+      "pre-SIGTERM snapshot budget exhausted before member enumeration could run";
+  } else {
+    const enumeration = await enumerateProcessGroupMembersPosixAsync(leaderPid, enumerationBudget);
+    if (enumeration.status === "observer-failure") {
+      sawObserverFailure = true;
+      observerFailureReason ??= `member enumeration failed: ${enumeration.reason}`;
+    } else {
+      descendantPids = enumeration.pids.filter((candidate) => candidate !== leaderPid);
+    }
+  }
+
+  // Step 3: every discovered descendant's own start time, batched in ONE call.
+  if (descendantPids.length > 0) {
+    const readBudget = remainingBudget();
+    if (readBudget <= 0) {
+      sawObserverFailure = true;
+      observerFailureReason ??=
+        "pre-SIGTERM snapshot budget exhausted before the descendant start-time read could run";
+    } else {
+      const descendantRead = await readPidStartTimesBatchPosix(descendantPids, readBudget);
+      if (descendantRead.status === "observer-failure") {
+        sawObserverFailure = true;
+        observerFailureReason ??= `descendant start-time read failed: ${descendantRead.reason}`;
+      } else {
+        for (const candidate of descendantPids) {
+          const startTimeMs = findRecordedStartTime(descendantRead.rows, candidate);
+          if (startTimeMs !== undefined) recorded.push({ pid: candidate, startTimeMs });
+        }
+      }
+    }
+  }
+
+  if (sawObserverFailure || recorded.length === 0) {
+    return {
+      members: [],
+      degraded: true,
+      degradedReason:
+        observerFailureReason ??
+        "zero usable identity records captured (every candidate pid was gone, unreadable, or malformed)",
+    };
+  }
+  return { members: recorded, degraded: false };
+}
+
+export type EscalationIdentityGateResult =
+  | { readonly action: "escalate" }
+  | { readonly action: "refuse"; readonly reason: string };
+
+/**
+ * THE ESCALATION IDENTITY GATE - the single real decision point for
+ * whether `killProcessGroupPosix` may send its SIGKILL escalation.
+ * Boundedly re-reads ONLY the pids `snapshot` already recorded (never a
+ * fresh enumeration - the group is compared against its OWN prior
+ * snapshot, not re-discovered) via ONE batched `readPidStartTimesBatchPosix`
+ * call, on its OWN fresh `timeoutMs` budget (never the snapshot phase's
+ * leftover budget - see `PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS`'s own
+ * docs for why each phase gets its own independent allowance).
+ *
+ * THE ALGORITHM, exactly: if ANY ONE originally-recorded member's current
+ * start time EXACTLY matches its recorded value, the group is still ours
+ * and escalation proceeds - the leader is NOT a special case here, it is
+ * compared through the identical exact-match rule as every descendant, no
+ * tolerance window. If NONE matches, escalation is refused. This is a
+ * strict superset of every enumerated fail-closed cell, because every one
+ * of them collapses to the same observable fact - "no positive match was
+ * found":
+ *
+ * - the snapshot itself never captured a usable original member
+ *   (`snapshot.degraded`) - nothing to compare against at all;
+ * - the bounded re-read TIMES OUT or the observer fails to execute -
+ *   `observer-failure`, so no member's current state could be read;
+ * - every recorded member is gone at re-read (a real `ps -p <list>` read
+ *   that simply omits every one of them - the SIGTERM working, never
+ *   itself a failure);
+ * - a recorded member is still present but its start time DIFFERS from
+ *   the record (the recycled-pid case);
+ * - a recorded member's row came back malformed (a10: discarded, never
+ *   guessed at - contributes no match, same as if it were absent).
+ *
+ * In every one of those, `matched` below is `false`, and this function
+ * refuses - there is no separate branch to keep in sync with this list,
+ * so a change to any one of them can never silently diverge from the
+ * others.
+ *
+ * IDENTITY IS THE GATE, NEVER THE TARGET: this function only ever decides
+ * WHETHER to escalate - the escalation itself remains the single
+ * group-granularity `kill(-pgid, SIGKILL)` `killProcessGroupPosix` already
+ * sends; nothing here ever signals an individual member's own pid.
+ *
+ * THE RESIDUAL, DISCLOSED AS NARROWED, NEVER AS CLOSED: this gate does not
+ * make identity-and-signal atomic. After this function returns `escalate`,
+ * the member that proved the match can still exit, and the numeric pgid
+ * can still become reusable, in the real gap between this check completing
+ * and the caller's own `kill(-pgid, SIGKILL)` syscall - two separate
+ * syscalls, with no atomic check-and-signal for a process group anywhere
+ * in portable POSIX. This narrows the exposure from the multi-second
+ * grace window (the OLD, un-gated behavior) down to one syscall-to-syscall
+ * interval plus this gate's own whole-second `lstart` resolution - it does
+ * not eliminate it.
+ */
+export async function evaluateEscalationIdentityGate(
+  snapshot: EscalationIdentitySnapshot,
+  timeoutMs: number = PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS
+): Promise<EscalationIdentityGateResult> {
+  if (snapshot.degraded || snapshot.members.length === 0) {
+    return {
+      action: "refuse",
+      reason:
+        "escalation refused: the pre-SIGTERM identity snapshot never captured a usable original process-group member" +
+        (snapshot.degradedReason !== undefined ? ` (${snapshot.degradedReason})` : ""),
+    };
+  }
+
+  const pids = snapshot.members.map((member) => member.pid);
+  const read = await readPidStartTimesBatchPosix(pids, timeoutMs);
+  if (read.status === "observer-failure") {
+    return {
+      action: "refuse",
+      reason: `escalation refused: the escalation-time identity re-read failed (${read.reason})`,
+    };
+  }
+
+  const matched = snapshot.members.some(
+    (member) => findRecordedStartTime(read.rows, member.pid) === member.startTimeMs
+  );
+  if (!matched) {
+    return {
+      action: "refuse",
+      reason:
+        "escalation refused: none of the originally-recorded process-group members still report their original start time (each is either gone, has a differing start time, or could not be read)",
+    };
+  }
+  return { action: "escalate" };
+}
+
 export async function killProcessGroupPosix(
   pid: number,
   graceMs: number = POSIX_KILL_GRACE_PERIOD_MS,
@@ -1349,6 +1913,18 @@ export async function killProcessGroupPosix(
   if (!isProcessGroupAlive(pid)) {
     return { finalSignal: "SIGTERM", escalated: false, confirmed: true };
   }
+
+  // Snapshot the ORIGINAL process-group membership - the leader plus every
+  // currently-live descendant, each one's pid and real OS-read start time -
+  // BEFORE the first signal below is ever sent. This is the escalation
+  // identity gate's own pre-SIGTERM observation (see
+  // captureEscalationIdentitySnapshot's own docs for the full three-step
+  // capture and its fail-closed cells). A degraded/failed snapshot here
+  // NEVER blocks this SIGTERM - terminating the job is the caller's own
+  // request, and must not be held hostage by an observation failure - it
+  // only means the escalation gate further down has nothing positive to
+  // prove later and must therefore refuse (see evaluateEscalationIdentityGate).
+  const identitySnapshot = await captureEscalationIdentitySnapshot(pid);
 
   const termResult = signalProcessGroupPosix(pid, "SIGTERM");
   await throwUnlessBenignAlreadyGoneRace(pid, "SIGTERM", termResult);
@@ -1380,28 +1956,40 @@ export async function killProcessGroupPosix(
 
   // Re-check existence immediately before escalating. The group can empty
   // during the grace period just waited out - that is the normal,
-  // intended outcome of the SIGTERM above - and its numeric pgid can be
-  // recycled before this exact instant. A gone group here is treated as
-  // success, never as a reason to retry or to escalate further: escalating
-  // against a group that no longer exists would only ever land on
-  // whatever, if anything, has since taken its number. This narrows the
-  // window between "still alive" and "about to send SIGKILL" as far as an
-  // existence check can, but does not close it: an unrelated group that
-  // happens to receive this exact recycled pgid in between this check and
-  // the SIGKILL call below reads identically to a survived original one,
-  // and would receive that SIGKILL - disclosed in README.md and this
-  // tool's own served `description`, distinct from the eager-reap gap
-  // (`reapProcessGroupOnce`'s own docs), which is a single scheduling
-  // tick, not a whole grace period, and arises only when a job's leader
-  // exits on its own rather than being actively signaled here. The
-  // once-per-job reap guard does not help here either: it prevents a
-  // LATER `kill` call from re-signaling this job, not a reused pgid
-  // encountered within this SAME escalation.
+  // intended outcome of the SIGTERM above.
   if (!isProcessGroupAlive(pid)) {
     return {
       finalSignal: "SIGTERM",
       escalated: false,
       confirmed: await confirmProcessGroupReapedPosix(pid),
+    };
+  }
+
+  // THE ESCALATION IDENTITY GATE (see evaluateEscalationIdentityGate's own
+  // docs for the full algorithm and its complete fail-closed enumeration):
+  // boundedly re-reads ONLY the members identitySnapshot already recorded
+  // and requires at least one of them to still report an EXACTLY matching
+  // start time before this codebase will ever send SIGKILL. This narrows -
+  // materially, not completely - the window between "still alive" and
+  // "about to send SIGKILL": an unrelated group that happens to receive
+  // this exact recycled pgid, with a member whose start time happens to
+  // fall within the SAME whole second as an originally-recorded one, would
+  // still read as a match and would still receive this SIGKILL - the
+  // check and the signal below remain two separate syscalls, and portable
+  // POSIX offers no atomic check-and-signal for a process group. This is
+  // distinct from the eager-reap gap (`reapProcessGroupOnce`'s own docs),
+  // which is a single scheduling tick, not a whole grace period, and
+  // arises only when a job's leader exits on its own rather than being
+  // actively signaled here. The once-per-job reap guard does not help
+  // here either: it prevents a LATER `kill` call from re-signaling this
+  // job, not a reused pgid encountered within this SAME escalation.
+  const identityGate = await evaluateEscalationIdentityGate(identitySnapshot);
+  if (identityGate.action === "refuse") {
+    return {
+      finalSignal: "SIGTERM",
+      escalated: false,
+      confirmed: await confirmProcessGroupReapedPosix(pid),
+      escalationRefusedReason: identityGate.reason,
     };
   }
 

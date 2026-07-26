@@ -867,6 +867,7 @@ test("PublicJobProjection's field set is EXACTLY the frozen set, including count
       "counts",
       "diagnostic",
       "ended_at",
+      "escalation_refused_reason",
       "exit_code",
       "identity_capture",
       "identity_confirmed",
