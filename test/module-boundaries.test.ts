@@ -648,7 +648,7 @@ test("green control: an unrelated bare reassignment (never process/globalThis) i
   assert.deepEqual(hits, []);
 });
 
-test("documented boundary: a TWO-HOP alias chain is not chased (const g = globalThis; const h = g; h.eval(x)) - tracked as OPEN-1 in test/loader-escape-matrix.test.ts; guard logic is unchanged, this stays green by design", () => {
+test("a TWO-HOP alias chain is not flagged - const g = globalThis; const h = g; h.eval(x): the guard's alias resolution follows exactly one hop, so a second reassignment before the dangerous call passes through unflagged (see the matching section in test/loader-escape-matrix.test.ts for the guard's full checked boundary)", () => {
   const hits = siblingImportsFrom("const g = globalThis;\nconst h = g;\nh.eval('1');\n");
   assert.deepEqual(hits, []);
 });
