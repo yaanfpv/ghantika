@@ -460,6 +460,17 @@ export type IdentityCheckResult =
 export const IDENTITY_TOLERANCE_SECONDS = 5;
 
 /**
+ * The widest `dd` (leading days) value `parseEtime` will accept, chosen to
+ * be far larger than any real process this codebase could ever observe
+ * (a freshly spawned job, or - at the far end - an unrelated long-lived
+ * system process a reused pid happens to point at) while still rejecting
+ * a malformed or corrupted read several orders of magnitude past any real
+ * machine's uptime. No documented real-world uptime approaches even a
+ * small fraction of this.
+ */
+const MAX_PLAUSIBLE_ETIME_DAYS = 36_500; // 100 years
+
+/**
  * Parses `ps -o etime=`'s output - `[[dd-]hh:]mm:ss` (verified empirically
  * against the installed macOS/BSD `ps`; GNU/procps `ps` on Linux formats
  * `etime` compatibly per its own documented man page - `etime` was chosen
@@ -473,18 +484,28 @@ export const IDENTITY_TOLERANCE_SECONDS = 5;
  * fail the identity check).
  *
  * `hh`, `mm`, and `ss` are each REQUIRED to be exactly two digits (verified
- * empirically: a fresh process reads `00:01`, never `0:1` or `0:01`) - only
- * the leading `dd` field, extracted separately above, is unbounded width.
- * Accepting any-length digit runs in the other fields let a single
- * corrupted or concatenated read parse as a syntactically-valid but
- * physically-impossible elapsed time (a 14-digit "seconds" field silently
- * producing a value on the order of a million years) instead of the
- * `observer-failure` a malformed read actually is.
+ * empirically: a fresh process reads `00:01`, never `0:1` or `0:01`).
+ * Accepting any-length digit runs in these fields let a single corrupted
+ * or concatenated read parse as a syntactically-valid but physically-
+ * impossible elapsed time (a 14-digit "seconds" field silently producing a
+ * value on the order of a million years) instead of the `observer-failure`
+ * a malformed read actually is.
+ *
+ * The leading `dd` field has no fixed width in real `ps` output (a
+ * genuinely long-lived process can show any number of days), so it cannot
+ * be digit-width-bounded the way the other three fields are - but it is
+ * still bounded to `MAX_PLAUSIBLE_ETIME_DAYS`: the same corrupted-value
+ * class the digit-width check closes for `hh`/`mm`/`ss` can equally
+ * produce an absurd `dd` value (observed directly: a malformed real read
+ * that parsed, before this bound existed, as ~441 million days), and an
+ * unbounded leading field would let that same class of corruption straight
+ * back through this parser's other side.
  */
 export function parseEtime(raw: string): number | undefined {
   const trimmed = raw.trim();
   const dayMatch = trimmed.match(/^(\d+)-(.+)$/);
   const days = dayMatch ? Number(dayMatch[1]) : 0;
+  if (days > MAX_PLAUSIBLE_ETIME_DAYS) return undefined;
   const rest = dayMatch ? dayMatch[2]! : trimmed;
   const parts = rest.split(":");
   if (parts.length < 2 || parts.length > 3 || parts.some((part) => !/^\d{2}$/.test(part))) {

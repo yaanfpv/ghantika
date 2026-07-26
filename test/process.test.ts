@@ -935,6 +935,21 @@ test("parseEtime rejects a non-2-digit mm/ss/hh field, even when every character
   assert.equal(parseEtime("123:00:00"), undefined);
 });
 
+test("parseEtime rejects an implausibly large leading days field, even when every other field is validly formatted - the same corrupted-value class the mm/ss/hh tightening closes can equally corrupt the unbounded days field", () => {
+  // The exact second real CI failure this closes: a genuinely real,
+  // synchronous `ps -p <pid> -o etime=` read against a freshly spawned
+  // process (alive for well under a second) parsed - through the
+  // already-tightened hh/mm/ss check above - as 38,109,073,018,720
+  // seconds via this decomposition: 441,077,234 days (~1.2 million years)
+  // plus a validly-2-digit-formatted "00:18:40" remainder. The mm/ss/hh
+  // fix alone does not catch this shape, since every field it checks is
+  // correctly 2 digits; only bounding the days field itself does.
+  assert.equal(parseEtime("441077234-00:18:40"), undefined);
+  // A merely large but genuinely plausible days count must still parse -
+  // this bound must never reject a real long-lived process.
+  assert.equal(parseEtime("100-00:00:00"), 100 * 86_400);
+});
+
 // --- identityElapsedTimesMatch (pure comparison, checkProcessIdentity's building block) ---
 
 test("identityElapsedTimesMatch: within tolerance is a match", () => {
