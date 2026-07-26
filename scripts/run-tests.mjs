@@ -88,14 +88,54 @@
  * file/handle so a human can go kill it by hand if the OS does not reap it
  * on its own.
  *
- * The only environment input this script reads is GHANTIKA_JUNIT, and it
- * is additive-only: setting it adds a junit XML file at that path. It
- * cannot narrow the discovered file set, lower any floor, or disable any
- * check below. Leaving it unset means no junit file is written at all.
+ * One environment variable this script consults at all: GHANTIKA_JUNIT,
+ * additive-only - setting it adds a junit XML file at that path; leaving it
+ * unset means no junit file is written at all, and it cannot narrow the
+ * discovered file set, lower any floor, or disable any check below.
+ *
+ * This entrypoint takes no caller-controlled redirect of the test
+ * directory, the skip baseline, or the critical-test list, and consults no
+ * environment variable to decide any of the three. An earlier version of
+ * this file accepted three such redirect variables, gated behind a fourth
+ * (a fixed token string a caller also had to supply), on the theory that
+ * requiring a secret value alongside the redirect would keep casual misuse
+ * out. That boundary proved insufficient: the token was a
+ * plain string constant sitting in this file's own tracked source, so
+ * anyone able to set one environment variable for this process could read
+ * the token's value and set the redirect variables themselves, reaching
+ * the exact same bypass - point discovery at a trivial fixture tree,
+ * supply a fabricated baseline and critical-test list, and walk away with
+ * a fabricated green exit from what is supposed to be the real check. A
+ * check that can be switched off from outside by setting environment
+ * variables is not a check, no matter how many of them have to be set
+ * together, so this file no longer reads any environment variable for this
+ * purpose anywhere in its own code path - not "reads the value but ignores
+ * it", genuinely absent from this source.
+ *
+ * The functions below that do discovery, load the skip baseline, load the
+ * critical-test list, and check tracked-file parity (discoverTestFiles,
+ * loadSkipBaseline, loadCriticalTests, checkTrackedFileParity) all take
+ * the paths they need as explicit function arguments, with defaults
+ * computed unconditionally from REPO_ROOT. main() below - what runs for
+ * `npm test`, `npm run coverage`, every CI workflow step, and any other
+ * normal automated invocation of this script - always calls them with
+ * those real repository paths.
+ *
+ * Proving the skip-discipline check end to end against a throwaway
+ * fixture tree, rather than only ever against this repo's own real,
+ * always-clean test/ directory, now goes through a separate file this one
+ * never imports and no production caller ever invokes:
+ * scripts/run-tests-fixture-harness.mjs. That file imports the same
+ * discovery/baseline/critical-test/classification functions this one does
+ * and calls them with fixture paths supplied as its own explicit
+ * arguments - never via an environment variable this file reads. See that
+ * file's own header comment, and the structural check in
+ * test/skip-discipline.test.ts confirming nothing production-facing ever
+ * invokes it.
  */
 import { run } from "node:test";
 import { spec, junit } from "node:test/reporters";
-import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -104,6 +144,12 @@ import { Writable } from "node:stream";
 import { isMainModule } from "./lib/is-main.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
+
+// The real repo's own test/ directory, computed unconditionally from
+// REPO_ROOT. This entrypoint consults no environment variable to decide
+// where discovery looks - see the module doc comment above for why, and
+// scripts/run-tests-fixture-harness.mjs for how a fixture tree is
+// exercised instead.
 const TEST_DIR = path.join(REPO_ROOT, "test");
 
 // The `.test.` infix, not merely a directory, is what makes something a
@@ -249,8 +295,293 @@ export function getTrackedTestFiles() {
     .sort();
 }
 
+/**
+ * Compares node:fs-discovered test files against getTrackedTestFiles()'s
+ * git-tracked set, both scoped to this repo's own test/ directory via
+ * REPO_ROOT. Takes the already-discovered file list as its only argument
+ * rather than a test-directory path: tracked-file parity is inherently a
+ * fact about THIS repo's own git history, so there is nothing meaningful
+ * to check it against for a throwaway fixture tree under a temp
+ * directory - scripts/run-tests-fixture-harness.mjs never calls this at
+ * all, exactly as this production entrypoint never reads a path override
+ * for it.
+ *
+ * @param {string[]} discovered - absolute paths, exactly what
+ *   discoverTestFiles(TEST_DIR) already returned for this same run.
+ * @returns {{ tracked: string[] | null, missingFromDisk: string[], untrackedExtra: string[] }}
+ *   `tracked` is null when git itself is unavailable (see
+ *   getTrackedTestFiles) - callers must treat that as UNSCANNED, never as
+ *   zero tracked files; `missingFromDisk`/`untrackedExtra` are both empty
+ *   in that case since neither has anything real to compare against.
+ */
+export function checkTrackedFileParity(discovered) {
+  const tracked = getTrackedTestFiles();
+  if (tracked === null) {
+    return { tracked: null, missingFromDisk: [], untrackedExtra: [] };
+  }
+  const discoveredSet = new Set(discovered);
+  const missingFromDisk = tracked.filter((f) => !discoveredSet.has(f));
+  const trackedSet = new Set(tracked);
+  const untrackedExtra = discovered.filter((f) => !trackedSet.has(f));
+  return { tracked, missingFromDisk, untrackedExtra };
+}
+
 function rel(absPath) {
   return path.relative(REPO_ROOT, absPath);
+}
+
+/**
+ * Skip discipline: the guard against a test being quietly switched to
+ * `skip: true` (or otherwise disappearing) while the rest of the suite
+ * still reports green. Setting a test's `skip` unconditionally produces
+ * no red and no warning on its own: the run finishes, every remaining
+ * test passes, and the process exits 0. Because this repo's own guards
+ * (module-boundaries, no-tasks-import, stdio-purity, ...) are themselves
+ * tests, a one-line skip on any of them silently disables the thing that
+ * proves that guard can ever fail.
+ *
+ * Two tracked, hand-maintained files this reads and never re-derives:
+ *
+ *   test/skip-baseline.json    per-platform SET of test identities that
+ *                              are legitimately skipped there (a
+ *                              POSIX-only test skipped on win32, say)
+ *   test/critical-tests.json   the exact identities of tests that must
+ *                              always run and pass - never skipped,
+ *                              never absent
+ *
+ * A test's identity is `${posixRelativePathFromRepoRoot}::${test name}`
+ * (see buildTestIdentity below), normalized with the same
+ * path.relative(...).split(path.sep).join("/") idiom scripts/check-no-
+ * tasks-import.mjs, scripts/check-stdio-purity.mjs, scripts/check-npm-
+ * ci-usage.mjs, and scripts/verify-install-reproducibility.mjs already
+ * use - without it, a hand-written baseline entry (always written with
+ * forward slashes) would silently fail to match on win32, where
+ * path.sep is "\\".
+ *
+ * There is no `test:skip` event. node:test's TestsStream reports skip as
+ * PAYLOAD STATE instead: the TestPass, TestFail, and TestComplete event
+ * payloads each carry an optional `skip?: string | boolean` field (see
+ * node_modules/@types/node/test.d.ts). A result is treated as skipped
+ * when that field is `true` or a non-empty string; `false`, an empty
+ * string, and absent all mean "ran" (confirmed empirically against a
+ * throwaway fixture covering all four shapes, not assumed from the
+ * type alone). isSkippedValue below is the single classification every
+ * check in this file shares - the unsanctioned-skip check, the
+ * critical-must-run check, and their diagnostics all read the exact same
+ * classified result, never a second, independently-derived notion of
+ * "skipped".
+ */
+export function isSkippedValue(skip) {
+  return skip === true || (typeof skip === "string" && skip.length > 0);
+}
+
+/**
+ * A TODO test carries the same two-shape payload field as skip
+ * (`todo?: string | boolean`), classified by the identical rule: a bare
+ * `true` or a non-empty reason string both count, `false`/empty/absent
+ * mean "not TODO" (confirmed empirically against a throwaway fixture: a
+ * `todo` test declared with no function body at all completes with
+ * `passed: true` and `skip` absent, indistinguishable from a genuinely
+ * executed passing test unless this field is also read). Node's own
+ * `todo` semantics differ from `skip` - a todo test whose body IS
+ * provided and throws still runs that body and is not counted as a
+ * fatal failure - but that distinction does not matter here: this guard
+ * only needs to know whether a declared-critical test's completion
+ * carries a truthy `todo`, exactly as it already needs to know whether
+ * it carries a truthy `skip`.
+ */
+export function isTodoValue(todo) {
+  return todo === true || (typeof todo === "string" && todo.length > 0);
+}
+
+/**
+ * @param {string} absFile
+ * @param {string} testName
+ * @param {{
+ *   baseDir?: string,
+ *   pathImpl?: { relative: (from: string, to: string) => string, sep: string },
+ * }} [opts] `pathImpl` is injectable so a test can prove the normalization
+ *   is correct for a win32-style separator from any host OS, via node's
+ *   own `path.win32` - production always uses the real, host-native
+ *   `node:path`.
+ * @returns {string}
+ */
+export function buildTestIdentity(
+  absFile,
+  testName,
+  { baseDir = REPO_ROOT, pathImpl = path } = {}
+) {
+  const relPath = pathImpl.relative(baseDir, absFile).split(pathImpl.sep).join("/");
+  return `${relPath}::${testName}`;
+}
+
+/**
+ * True only for node:test's own synthetic "this whole file, as a test"
+ * completion - the rollup isolation:'process' emits once a file's child
+ * process has actually exited - and never for a real test's own
+ * completion, even one that happens to be named identically to its own
+ * absolute file path. node:test allows a real `test()` to be declared
+ * with that name; it is then a genuine, distinct completion with its
+ * own source line, indistinguishable from the synthetic wrapper by name
+ * alone.
+ *
+ * `data.name === data.file` is necessary but not sufficient: it is also
+ * true for that legitimately-named real test, so relying on it alone
+ * drops the real test's own result (and any skip on it) from the
+ * results this guard collects. The second, reliable signal - confirmed
+ * empirically against a throwaway fixture, not assumed - is that the
+ * synthetic wrapper's event payload is built with a null prototype
+ * (`Object.getPrototypeOf(data) === null`), while every real per-test
+ * completion carries the ordinary `Object.prototype`, regardless of its
+ * name, its line, or whether it is itself skipped or TODO. The wrapper
+ * is also always reported at line 1, column 1 - the position of the
+ * file itself, never any specific `test()` call site - but that is
+ * corroborating, not primary: a single-statement CJS file can place a
+ * real test's own call site at line 1 too (confirmed empirically), so
+ * only the null-prototype check is treated as authoritative here.
+ *
+ * @param {{ name: string, file?: string }} data
+ * @returns {boolean}
+ */
+function isFileSyntheticCompletion(data) {
+  return data.name === data.file && Object.getPrototypeOf(data) === null;
+}
+
+/**
+ * Classifies one raw `test:complete` payload for the skip-discipline
+ * guard: null when the event is not a real, individually-identified
+ * test (the file's own synthetic completion, or a suite/"describe"
+ * node), otherwise the `{ identity, skip, todo }` record this guard
+ * feeds into checkSkipDiscipline's `results`. Exported and pure - no
+ * TestsStream or child process needed - so the classification itself is
+ * directly unit-testable against a hand-built event object, in
+ * particular the case a real fixture proved matters: a real test named
+ * identically to its own file must classify as a real result, never be
+ * mistaken for the synthetic wrapper.
+ *
+ * @param {{
+ *   name: string,
+ *   file?: string,
+ *   skip?: string | boolean,
+ *   todo?: string | boolean,
+ *   details?: { type?: string },
+ * }} data
+ * @returns {{ identity: string, skip: string | boolean | undefined, todo: string | boolean | undefined } | null}
+ */
+export function classifyTestCompletionForSkipDiscipline(data) {
+  if (!data?.file) return null;
+  if (isFileSyntheticCompletion(data)) return null;
+  if (data?.details?.type === "suite") return null;
+  return { identity: buildTestIdentity(data.file, data.name), skip: data.skip, todo: data.todo };
+}
+
+/**
+ * Pure core of the guard. Takes already-collected results (as run-
+ * tests.mjs's own real run() wiring builds them below) rather than a live
+ * TestsStream, so it is directly unit-testable without spawning anything.
+ *
+ * @param {{
+ *   results: { identity: string, skip: string | boolean | undefined, todo?: string | boolean }[],
+ *   baseline: Record<string, string[]>,
+ *   criticalTests: string[],
+ *   platform?: string,
+ * }} args `baseline` is keyed by platform (`process.platform`'s own
+ *   values, e.g. "win32"); `platform` selects which key is consulted and
+ *   defaults to the real `process.platform` so callers never have to pass
+ *   it in production, only in a test that wants to exercise another
+ *   platform's legitimacy rules from this host.
+ * @returns {string[]} human-readable problems found; empty means clean.
+ */
+export function checkSkipDiscipline({
+  results,
+  baseline,
+  criticalTests,
+  platform = process.platform,
+}) {
+  const errors = [];
+  const sanctioned = new Set(baseline?.[platform] ?? []);
+
+  // Every completion for an identity is kept, never collapsed to the
+  // last one seen. node:test allows duplicate test names within one
+  // file - two `test('same name', ...)` calls, or a colliding subtest
+  // name - so a `[skip: true, skip: false]` pair for the same identity
+  // is real input, not malformed data. A last-write-wins Map here would
+  // let the second, non-skipped completion silently erase the first
+  // one's skip, and a declared-critical identity in that state would
+  // read as clean when it was not. Failing closed on this: an identity
+  // is classified as skipped (or TODO) if ANY of its occurrences is, so
+  // one real skip anywhere in the set can never be overwritten by a
+  // later completion of the same identity.
+  const seen = new Map();
+  for (const { identity, skip, todo } of results) {
+    let occurrences = seen.get(identity);
+    if (!occurrences) {
+      occurrences = [];
+      seen.set(identity, occurrences);
+    }
+    occurrences.push({ skip, todo });
+  }
+
+  // The set is real per-platform data, kept narrow: an identity is
+  // legitimate only when it appears in THIS platform's own sanctioned
+  // list, never because some other platform's list is non-empty and
+  // never because other, unrelated skips on this same platform are
+  // legitimate. Sorted so the diagnostic order is deterministic.
+  const unsanctioned = [...seen.entries()]
+    .filter(
+      ([identity, occurrences]) =>
+        occurrences.some((o) => isSkippedValue(o.skip)) && !sanctioned.has(identity)
+    )
+    .map(([identity]) => identity)
+    .sort();
+  for (const identity of unsanctioned) {
+    errors.push(
+      `unsanctioned skip: "${identity}" was reported skipped, but is not in the "${platform}" set of test/skip-baseline.json`
+    );
+  }
+
+  // A declared-critical test that never showed up in the results at all
+  // (renamed or deleted), one that showed up but reported skipped, and
+  // one that showed up only as TODO (declared but never genuinely run -
+  // node:test still reports a passing-shaped completion for a
+  // no-body-yet todo test) are all failures, named distinctly so the
+  // reader knows which happened. Set membership on `identity` is
+  // exact-string, never substring or prefix, so a renamed critical test
+  // cannot be satisfied by an unrelated survivor whose name happens to
+  // contain it. Skipped takes priority over TODO when a duplicate
+  // identity's occurrences carry both, since a real skip is the more
+  // specific, more actionable diagnosis.
+  for (const identity of criticalTests) {
+    const occurrences = seen.get(identity);
+    if (!occurrences) {
+      errors.push(`critical test did not run (absent from the results): "${identity}"`);
+    } else if (occurrences.some((o) => isSkippedValue(o.skip))) {
+      errors.push(`critical test reported skipped: "${identity}"`);
+    } else if (occurrences.some((o) => isTodoValue(o.todo))) {
+      errors.push(`critical test reported TODO (did not genuinely run): "${identity}"`);
+    }
+  }
+
+  return errors;
+}
+
+// The real repo's own tracked baseline and critical-test list, computed
+// unconditionally from REPO_ROOT. loadSkipBaseline and loadCriticalTests
+// below each accept an explicit path argument - that parameter, supplied
+// by a caller, is how scripts/run-tests-fixture-harness.mjs points the
+// same loaders at a fixture tree's own files instead. This entrypoint
+// itself never reads an environment variable to change either default.
+const SKIP_BASELINE_PATH = path.join(REPO_ROOT, "test", "skip-baseline.json");
+const CRITICAL_TESTS_PATH = path.join(REPO_ROOT, "test", "critical-tests.json");
+
+/** @param {string} [filePath] @returns {Record<string, string[]>} */
+export function loadSkipBaseline(filePath = SKIP_BASELINE_PATH) {
+  return JSON.parse(readFileSync(filePath, "utf8"));
+}
+
+/** @param {string} [filePath] @returns {string[]} */
+export function loadCriticalTests(filePath = CRITICAL_TESTS_PATH) {
+  return JSON.parse(readFileSync(filePath, "utf8"));
 }
 
 /**
@@ -318,9 +649,11 @@ function flushJunitSync(junitPath, buffer) {
  *   tracked: string[] | null,
  *   junitPath: string | null,
  *   options: { testTimeoutMs: number, idleTimeoutMs: number, wallTimeoutMs: number, leakWindowMs: number },
+ *   skipBaseline: Record<string, string[]>,
+ *   criticalTests: string[],
  * }} args
  */
-export function runOnce({ discovered, tracked, junitPath, options }) {
+export function runOnce({ discovered, tracked, junitPath, options, skipBaseline, criticalTests }) {
   return new Promise((resolve) => {
     const stream = run({ files: discovered, timeout: options.testTimeoutMs });
 
@@ -344,6 +677,24 @@ export function runOnce({ discovered, tracked, junitPath, options }) {
     // process has actually exited - confirmed empirically against a
     // throwaway fixture, not assumed).
     const filesWithOwnCompletion = new Set();
+
+    // Skip-discipline results, collected from the SAME "test:complete"
+    // payloads noteEvent() below is already watching for the hang
+    // watchdog, filtered down to real, individual tests via
+    // classifyTestCompletionForSkipDiscipline (see its header comment for
+    // why `name === file` alone is not a safe filter: a real test can be
+    // named identically to its own file). See checkSkipDiscipline's
+    // header comment above for why "test:complete" (never
+    // "test:pass"/"test:fail" alone) is the right event: it fires exactly
+    // once per real test regardless of pass, fail, or skip outcome,
+    // carrying the same `skip`/`todo` fields either way (confirmed
+    // empirically: a skipped test always reports via "test:pass", never
+    // "test:fail").
+    const skipResults = [];
+    stream.on("test:complete", (data) => {
+      const classified = classifyTestCompletionForSkipDiscipline(data);
+      if (classified) skipResults.push(classified);
+    });
 
     function noteEvent(name, data) {
       lastEvent = { name, file: data?.file, name_: data?.name };
@@ -414,8 +765,20 @@ export function runOnce({ discovered, tracked, junitPath, options }) {
         console.error("run-tests: tracked test file(s) produced no test-runner event at all:");
         for (const f of missingFloor) console.error(`  - ${rel(f)}`);
       }
+
+      const skipErrors = checkSkipDiscipline({
+        results: skipResults,
+        baseline: skipBaseline,
+        criticalTests,
+        platform: process.platform,
+      });
+      if (skipErrors.length > 0) {
+        console.error("run-tests: skip-discipline violation(s):");
+        for (const error of skipErrors) console.error(`  - ${error}`);
+      }
+
       flushJunitSync(junitPath, junitBuffer);
-      const ok = !didFail && missingFloor.length === 0;
+      const ok = !didFail && missingFloor.length === 0 && skipErrors.length === 0;
       process.exitCode = ok ? 0 : 1;
 
       // The post-completion leak check. This timer is .unref()'d on
@@ -500,7 +863,11 @@ async function main() {
     return;
   }
 
-  const tracked = getTrackedTestFiles();
+  // Always the real check, unconditionally: this entrypoint has no path
+  // by which tracked-file parity is ever skipped except git itself being
+  // genuinely unavailable (see checkTrackedFileParity's own doc comment).
+  const parity = checkTrackedFileParity(discovered);
+  const tracked = parity.tracked;
   if (tracked === null) {
     console.error(
       "run-tests: git unavailable (or this is not a git working tree) - " +
@@ -508,29 +875,43 @@ async function main() {
         "below still runs"
     );
   } else {
-    const discoveredSet = new Set(discovered);
-    const missingFromDisk = tracked.filter((f) => !discoveredSet.has(f));
-    if (missingFromDisk.length > 0) {
+    if (parity.missingFromDisk.length > 0) {
       console.error(
         "run-tests: git tracks the following test file(s), but they were not found on disk:"
       );
-      for (const f of missingFromDisk) console.error(`  - ${rel(f)}`);
+      for (const f of parity.missingFromDisk) console.error(`  - ${rel(f)}`);
       process.exitCode = 1;
       return;
     }
-    const trackedSet = new Set(tracked);
-    const untrackedExtra = discovered.filter((f) => !trackedSet.has(f));
-    if (untrackedExtra.length > 0) {
+    if (parity.untrackedExtra.length > 0) {
       console.error(
         "run-tests: untracked test file(s) discovered (permitted, informational only):"
       );
-      for (const f of untrackedExtra) console.error(`  - ${rel(f)}`);
+      for (const f of parity.untrackedExtra) console.error(`  - ${rel(f)}`);
     }
+  }
+
+  let skipBaseline;
+  try {
+    skipBaseline = loadSkipBaseline();
+  } catch (err) {
+    console.error(`run-tests: could not read ${rel(SKIP_BASELINE_PATH)}: ${err.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  let criticalTests;
+  try {
+    criticalTests = loadCriticalTests();
+  } catch (err) {
+    console.error(`run-tests: could not read ${rel(CRITICAL_TESTS_PATH)}: ${err.message}`);
+    process.exitCode = 1;
+    return;
   }
 
   const junitPath = process.env.GHANTIKA_JUNIT ? path.resolve(process.env.GHANTIKA_JUNIT) : null;
 
-  await runOnce({ discovered, tracked, junitPath, options });
+  await runOnce({ discovered, tracked, junitPath, options, skipBaseline, criticalTests });
 }
 
 if (isMainModule(import.meta.url)) {

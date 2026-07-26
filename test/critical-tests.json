@@ -1,0 +1,5 @@
+[
+  "test/module-boundaries.test.ts::the real src/ tree has zero module-boundary violations",
+  "test/no-tasks-import.test.ts::the real src/ tree references nothing from the Tasks extension outside the permitted adapter carveout",
+  "test/stdio-purity.test.ts::static half: the real src/ tree contains no console.log or process.stdout reference"
+]
