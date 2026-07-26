@@ -1,15 +1,7 @@
 import assert from "node:assert/strict";
 import { before, test } from "node:test";
 import { spawnSync } from "node:child_process";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -20,19 +12,14 @@ import { checkStdioPurity } from "../scripts/check-stdio-purity.mjs";
 
 /**
  * Executes 45 physical mutation-test cases covering the module-loader
- * guards' full documented escape-route class against this repo's ACTUAL,
- * CURRENT head - never a stale commit any prior planning was authored
- * against. A prior result is always void once the head moves; this file
- * always re-executes in full rather than carrying a prior result forward.
+ * guards' full documented escape-route class. Every case runs a real
+ * fixture against the real, current guard code on every invocation,
+ * rather than asserting a cached or hardcoded result.
  *
  * PLUS three additional cases (grouped in their own section below) that
- * are NOT part of the 45-case set and are NOT required to red: they
- * evidence a two-hop acquisition frontier this guard intentionally leaves
- * open, one hop past the closed one-hop alias/computed-member forms
- * earlier in this file. This file's authoritative-open-ledger status now
- * covers both: every case that must red still must red exactly as
- * before, and the three open cases must stay green - a change to either
- * is void on head move.
+ * are not required to red: they evidence a two-hop acquisition frontier
+ * this guard intentionally leaves open, one hop past the closed one-hop
+ * alias/computed-member forms earlier in this file.
  *
  * Methodology, matching test/guard-mutation-coverage.test.ts: a real
  * scratch directory on disk (`mkdtempSync`), a fixture file written into
@@ -66,6 +53,26 @@ import { checkStdioPurity } from "../scripts/check-stdio-purity.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
+/**
+ * The two TRACKED guard files' bytes, captured ONCE at module load - before
+ * any test in this file has run, and in particular before any guard-self
+ * mutation case below has copied and mutated them. The final restoration
+ * check re-reads both files fresh and compares against these captured
+ * bytes directly, so a guard-self case that accidentally wrote to the
+ * TRACKED file (instead of only ever its own scratch copy) is caught by an
+ * actual content comparison - not by `existsSync`, which stays true no
+ * matter what bytes a file holds and would pass unchanged even if a case
+ * overwrote the tracked guard with arbitrary content.
+ */
+const ORIGINAL_MODULE_BOUNDARIES_GUARD_TEXT = readFileSync(
+  path.join(REPO_ROOT, "scripts", "check-module-boundaries.mjs"),
+  "utf8"
+);
+const ORIGINAL_NO_TASKS_GUARD_TEXT = readFileSync(
+  path.join(REPO_ROOT, "scripts", "check-no-tasks-import.mjs"),
+  "utf8"
+);
+
 /** Builds a scratch src/-shaped tree from a flat map of relative path -> file contents. Mirrors test/guard-mutation-coverage.test.ts's own helper of the same name. */
 function buildScratchSrc(files: Record<string, string>): string {
   const dir = mkdtempSync(path.join(tmpdir(), "ghantika-loader-escape-"));
@@ -82,11 +89,11 @@ function buildScratchSrc(files: Record<string, string>): string {
  * (a trivial `export {};` stub for each), then overwrites `mutantRelPath`
  * - one of those same frozen names, never an extra file - with the real
  * fixture content. `checkModuleBoundaries`'s frozen-module-completeness
- * check and `checkNoTasksImport`'s whole-tree scan can BOTH return a
- * literal, unfiltered empty array against a tree built this way (verified
- * empirically), which is the stronger, more defensible form for a case
- * that must prove "genuinely unflagged," not merely "unflagged once an
- * unrelated check's noise is filtered out."
+ * check and `checkNoTasksImport`'s whole-tree scan both return a
+ * literal, unfiltered empty array against a tree built this way, which
+ * is the stronger, more defensible form for a case that must prove
+ * "genuinely unflagged," not merely "unflagged once an unrelated
+ * check's noise is filtered out."
  */
 function buildCompleteFrozenScratchSrc(mutantRelPath: string, mutantContent: string): string {
   const dir = mkdtempSync(path.join(tmpdir(), "ghantika-loader-escape-frozen-"));
@@ -103,10 +110,8 @@ function buildCompleteFrozenScratchSrc(mutantRelPath: string, mutantContent: str
 
 /**
  * Replaces `search` with `replace` in `text`, but only after confirming
- * `search` appears EXACTLY ONCE - a mutation discipline matching the
- * governing standard ("applied to exactly one target"). Refuses an
- * ambiguous (zero, or more than one occurrence) mutation rather than
- * silently guessing.
+ * `search` appears EXACTLY ONCE. Refuses an ambiguous (zero, or more than
+ * one occurrence) mutation rather than silently guessing.
  */
 function mutateExactlyOnce(text: string, search: string, replace: string): string {
   const occurrences = text.split(search).length - 1;
@@ -170,9 +175,8 @@ async function loadMutatedGuardCopy(
  * files, and parses the real, current pass/fail/tests counts off its
  * summary lines - never a hardcoded historical figure. Node's default
  * (non-TTY) test-runner summary reporter prints `ℹ tests N` / `ℹ pass N` /
- * `ℹ fail N` (verified empirically against this exact invocation before
- * writing this helper); the `#`-prefixed TAP form is accepted too as a
- * defensive fallback in case the reporter's exact prefix ever changes.
+ * `ℹ fail N`; the `#`-prefixed TAP form is accepted too as a defensive
+ * fallback in case the reporter's exact prefix ever changes.
  */
 function runPermanentGuardSuite(): { tests: number; pass: number; fail: number; raw: string } {
   // NODE_TEST_CONTEXT / NODE_TEST_WORKER_ID are set by the OUTER `node
@@ -181,10 +185,10 @@ function runPermanentGuardSuite(): { tests: number; pass: number; fail: number; 
   // the child's own `node --test` invocation think it is a recursive
   // re-entry into an already-running test file and print "run() is being
   // called recursively within a test file. skipping running files."
-  // instead of actually running anything (verified empirically: without
-  // this strip, the child prints only that warning and zero test output).
-  // Stripping just these two lets the child run as a genuinely independent
-  // process, matching how CI or a bare terminal invocation would run it.
+  // instead of actually running anything: without this strip, the child
+  // prints only that warning and zero test output. Stripping just these
+  // two lets the child run as a genuinely independent process, matching
+  // how CI or a bare terminal invocation would run it.
   const childEnv = { ...process.env };
   delete childEnv.NODE_TEST_CONTEXT;
   delete childEnv.NODE_TEST_WORKER_ID;
@@ -224,7 +228,8 @@ before(() => {
 // ACQUISITION: how the loader capability is OBTAINED (19 executions). All
 // must RED. The first ten are owned by the no-tasks guard except for two
 // specifier-resolution cases owned by module-boundaries; the remaining
-// eight (adversarially-verified acquisition escapes) are all owned by the
+// eight (acquisition escapes reached via aliasing, computed access, and
+// property-descriptor reads) are all owned by the
 // no-tasks guard, which walks the whole src/ tree.
 //
 // The one-hop alias and computed-member acquisition cases close the
@@ -606,12 +611,11 @@ test('ambient declare const Reflect: {...}; Reflect.get(globalThis, "eval") is c
 // =============================================================================
 // THE INTENTIONALLY OPEN TWO-HOP FRONTIER (3 executions). This guard is a
 // hop-bounded HYGIENE contract, never a security boundary: the one-hop
-// alias and computed-member acquisition cases above are CLOSED, and a
-// second hop of the identical kind is a DISCLOSED, deliberately-unchased
-// boundary - not a gap found later and left unspoken. Closing it would
-// only move the frontier to three hops, which this guard's own scope does
-// not chase, the same judgment call `check-stdio-purity.mjs`'s own
-// `MAX_ALIAS_CHAIN_HOPS` doc comment already makes for a sibling guard's
+// alias and computed-member acquisition cases above are checked, and a
+// second hop of the identical kind is outside this guard's scope. Closing
+// it would only move the boundary to three hops, which this guard does
+// not chase - the same bounded scope `check-stdio-purity.mjs`'s own
+// `MAX_ALIAS_CHAIN_HOPS` doc comment states for a sibling guard's
 // stdout/stderr-purity check.
 //
 // Each case is EVIDENCED, not merely asserted not-to-red: every fixture is
@@ -623,12 +627,10 @@ test('ambient declare const Reflect: {...}; Reflect.get(globalThis, "eval") is c
 // no filtering to explain away) AND a real, successfully-EXECUTING use of
 // the forbidden capability under Node - so this is a proven open route,
 // never an artifact of a fixture that merely never ran. These cases are
-// GREEN CONTROLS for the disclosed boundary - the mirror image of the
-// green controls near the end of this file (which guard already-covered
-// green paths against a false red) - do NOT add a deeper-hop variant
-// here, and do NOT change guard logic to chase these: guard logic is
-// UNCHANGED here - the correction is that this frontier is now
-// DISCLOSED, not that it is closed.
+// GREEN CONTROLS demonstrating the two-hop boundary - the mirror image of
+// the green controls near the end of this file (which guard already-
+// covered green paths against a false red). This guard's checked scope
+// stops at one hop; these cases exist to keep that boundary visible.
 // =============================================================================
 
 test("TWO-HOP globalThis-base alias - const g = globalThis; const h = g; h.eval(x) - stays guard-green (both guards LITERALLY empty, no filtering) at both entry points AND genuinely executes - the disclosed one-hop hygiene boundary", async () => {
@@ -638,7 +640,7 @@ test("TWO-HOP globalThis-base alias - const g = globalThis; const h = g; h.eval(
     assert.deepEqual(
       checkNoTasksImport(dir),
       [],
-      "expected the two-hop globalThis-base alias to stay guard-green (checkNoTasksImport) - a real hit here means the disclosed boundary moved and the known-open list is stale"
+      "expected the two-hop globalThis-base alias to stay guard-green (checkNoTasksImport) - a real hit here would mean this disclosed boundary has moved"
     );
     assert.deepEqual(
       checkModuleBoundaries(dir),
@@ -675,7 +677,7 @@ test("TWO-HOP process-base alias - const p = process; const q = p; q.getBuiltinM
     assert.deepEqual(
       checkNoTasksImport(dir),
       [],
-      "expected the two-hop process-base alias to stay guard-green (checkNoTasksImport) - a real hit here means the disclosed boundary moved and the known-open list is stale"
+      "expected the two-hop process-base alias to stay guard-green (checkNoTasksImport) - a real hit here would mean this disclosed boundary has moved"
     );
     assert.deepEqual(
       checkModuleBoundaries(dir),
@@ -712,7 +714,7 @@ test('TWO-HOP variable-keyed computed .constructor - const k1 = "constructor"; c
     assert.deepEqual(
       checkNoTasksImport(dir),
       [],
-      "expected the two-hop variable-keyed .constructor access to stay guard-green (checkNoTasksImport) - a real hit here means the disclosed boundary moved and the known-open list is stale"
+      "expected the two-hop variable-keyed .constructor access to stay guard-green (checkNoTasksImport) - a real hit here would mean this disclosed boundary has moved"
     );
     assert.deepEqual(
       checkModuleBoundaries(dir),
@@ -744,8 +746,9 @@ test('TWO-HOP variable-keyed computed .constructor - const k1 = "constructor"; c
 // shape a static import cannot syntactically carry - a permitted dynamic
 // import()) so the module-boundary specifier diagnostic is the ONLY thing
 // that can produce the red, never an acquisition diagnostic from a banned
-// loader (a self-masking failure mode this file's own history has hit and
-// corrected before).
+// loader, which would mask the specifier check behind an unrelated
+// acquisition red - a self-masking failure mode worth guarding against
+// explicitly.
 // =============================================================================
 
 test("an ordinary string literal relative specifier naming a sibling is caught, naming the resolved sibling path", () => {
@@ -1066,86 +1069,61 @@ test('new Function("return require")() is caught as a banned construct naming Fu
 });
 
 // =============================================================================
-// THE GUARD GUARDS ITSELF (4 executions: one stays NOT EXECUTABLE - its
-// dependency, a standalone external integrity guard, does not exist in
-// code yet; the other three are each executed via a mutated SCRATCH COPY
-// of the guard source - the TRACKED files under scripts/ are never
-// written to.
+// THE GUARD GUARDS ITSELF (4 executions: one asserts only that a
+// standalone external integrity guard is absent from the frozen module
+// list and performs no mutation; the other three are each executed via
+// a mutated SCRATCH COPY of the guard source - the TRACKED files under
+// scripts/ are never written to.
 // =============================================================================
 
-test("delete the assertion that owns any acquisition case above - NOT EXECUTABLE at this head, since its own dependency does not exist in code", () => {
-  // The ruled disposition for this case: reported NOT EXECUTABLE, neither
-  // a pass nor a failure - nothing tested it - kept in its own column
-  // rather than folded into either. It must not block the guard work
-  // overall, because this case's own text has said since it was first
-  // written that the guard it depends on does not exist; a dependency
-  // disclosed at authoring time is not a defect discovered at execution
-  // time. The reason: it would require a standalone external integrity
-  // guard, which does not exist in code. (The canonical-resolution
-  // guard-self case below was originally dispositioned alongside this one
-  // at a stale head, and is executed separately below - its own
-  // precondition has since changed; see that test's comment.)
-  //
-  // No mutation is invented here to force an artificial result on a guard
-  // that does not exist, because doing so would fabricate evidence about
-  // absent code, exactly what the ruled disposition warns against. The
-  // one concrete, checkable fact assertable without inventing anything is
-  // that the REAL, current frozen module list still names no such guard
-  // module.
+test("no standalone integrity guard exists in the frozen module list, so this test asserts only that dependency's absence and performs no guard mutation", () => {
+  // No standalone integrity guard exists in FROZEN_MODULES, so this test
+  // asserts only that dependency's absence and cannot perform the
+  // described guard mutation. No mutation is invented here to force an
+  // artificial result on a guard that does not exist, because doing so
+  // would fabricate evidence about absent code.
   assert.ok(
     !FROZEN_MODULES.some((m) => /integrity/i.test(m)),
-    "the external integrity guard this case depends on still does not appear in the frozen module list at this head - its NOT-EXECUTABLE precondition still holds"
+    "no external integrity guard appears in the frozen module list, so this case cannot perform its described mutation"
   );
 });
 
-test("replace canonical resolution (remove the real resolver, reverting to layer-1-only string/path arithmetic) - the specifier-resolution cases' owning assertions go RED under the mutant, proving those assertions are non-vacuous now that the resolver they depend on exists", async () => {
-  // This case was originally dispositioned NOT EXECUTABLE at an earlier
-  // head, because the code did not yet have a canonical resolver to
-  // degrade - there was nothing to mutate, so the mutation described was
-  // not applicable. It becomes executable once the absolute-path/file-URL/
-  // package-alias specifier cases above are implemented via a real
-  // resolver, and must be run in the same pass that closes them.
+test("replace canonical resolution (remove the real resolver, reverting to layer-1-only string/path arithmetic) - the specifier-resolution cases' owning assertions go RED under the mutant, proving those assertions are non-vacuous: removing the resolver they depend on makes them fail", async () => {
+  // This case exercises the real resolver that the absolute-path,
+  // file-URL, and package-alias specifier cases above depend on:
+  // resolveModuleSpecifierRealPath (scripts/lib/ts-ast.mjs) plus a
+  // canonical isRealPathInsideDir containment compare (path.relative-
+  // based, in scripts/check-module-boundaries.mjs).
   //
-  // At THIS head, that precondition has changed: the absolute-path,
-  // file-URL, and package-alias specifier cases above all pass via a real
-  // resolver (resolveModuleSpecifierRealPath in scripts/lib/ts-ast.mjs)
-  // plus a canonical isRealPathInsideDir containment compare
-  // (path.relative-based, in scripts/check-module-boundaries.mjs) - not
-  // the string/path arithmetic the original disposition describes as
-  // absent. This case is executed in this same pass accordingly.
+  // Replacing only isRealPathInsideDir's path.relative-based compare with
+  // a naive startsWith prefix test on the ALREADY-RESOLVED real path does
+  // not distinguish these fixtures, because a genuinely-resolved absolute
+  // real path is a valid string prefix of its real containing directory
+  // too, absent an adversarial "shares-a-string-prefix-but-isn't-really-
+  // inside" sibling like tools-backup/ - which these fixtures don't
+  // construct, since that tests OVER-blocking prevention, a different
+  // property than this case asks about.
   //
-  // The mutation: EMPIRICALLY, swapping only isRealPathInsideDir's
-  // path.relative-based compare for a naive startsWith prefix test on the
-  // ALREADY-RESOLVED real path does NOT distinguish the two implementations
-  // for these fixtures (a genuinely-resolved absolute real path is a valid
-  // string prefix of its real containing directory too, absent an
-  // adversarial "shares-a-string-prefix-but-isn't-really-inside" sibling
-  // like tools-backup/ - which these fixtures don't construct, since that
-  // tests OVER-blocking prevention, a different property than this case
-  // asks about). Tried first, found not to distinguish, not reported
-  // silently.
-  //
-  // The mutation this case actually names - "replace CANONICAL
+  // The mutation this case actually applies - "replace CANONICAL
   // RESOLUTION" - is the whole real-resolver step, not merely its
   // downstream compare: resolveModuleSpecifierRealPath (scripts/lib/
   // ts-ast.mjs) forced to return undefined, reverting to exactly the
-  // "string/path arithmetic" (layer-1 dot-specifier fast path) state that
-  // existed before this resolver was built. This is the mutation
-  // independently confirmed, outside this file, to produce the expected
-  // cascade across the absolute-path/directory-index/file-URL/symlink/
-  // package-alias/transitive-barrel cases above.
+  // "string/path arithmetic" (layer-1 dot-specifier fast path) behavior
+  // the code falls back to without a real resolver. This mutation
+  // produces the expected cascade across the absolute-path/directory-
+  // index/file-URL/symlink/package-alias/transitive-barrel cases above.
   const { mod, scratchDir } = await loadMutatedGuardCopy("check-module-boundaries.mjs", (text) =>
     mutateExactlyOnce(
       text,
       '  resolveModuleSpecifierRealPath,\n  ts,\n} from "./lib/ts-ast.mjs";',
       '  ts,\n} from "./lib/ts-ast.mjs";\n' +
-        "/* GUARD-SELF MUTANT: canonical resolution replaced - the real resolver is gone, reverting to the pre-existing string/path arithmetic (layer 1) alone */\n" +
+        "/* GUARD-SELF MUTANT: canonical resolution replaced - the real resolver is gone, falling back to string/path arithmetic (layer 1) alone */\n" +
         "function resolveModuleSpecifierRealPath() {\n  return undefined;\n}"
     )
   );
-  const spec7Dir = buildScratchSrc({ "tools/sibling.ts": "export const marker = 1;\n" });
-  const spec10aDir = buildScratchSrc({ "tools/sibling.ts": "export const marker = 1;\n" });
-  const spec10bDir = buildScratchSrc({
+  const absolutePathDir = buildScratchSrc({ "tools/sibling.ts": "export const marker = 1;\n" });
+  const symlinkDir = buildScratchSrc({ "tools/sibling.ts": "export const marker = 1;\n" });
+  const packageAliasDir = buildScratchSrc({
     "tools/sibling.ts": "export const marker = 1;\n",
     "package.json": JSON.stringify({
       name: "fixture",
@@ -1155,74 +1133,84 @@ test("replace canonical resolution (remove the real resolver, reverting to layer
   try {
     const mutatedCheckModuleBoundaries = mod.checkModuleBoundaries as (dir?: string) => string[];
 
-    const spec7Tools = path.join(spec7Dir, "tools");
-    const spec7AbsSpecifier = path.join(spec7Tools, "sibling.js");
+    const absolutePathToolsDir = path.join(absolutePathDir, "tools");
+    const absolutePathSpecifier = path.join(absolutePathToolsDir, "sibling.js");
     writeFileSync(
-      path.join(spec7Tools, "mutant.ts"),
-      `import { x } from "${spec7AbsSpecifier}";\n`
+      path.join(absolutePathToolsDir, "mutant.ts"),
+      `import { x } from "${absolutePathSpecifier}";\n`
     );
-    const spec7Mutated = mutatedCheckModuleBoundaries(spec7Dir);
+    const absolutePathMutatedViolations = mutatedCheckModuleBoundaries(absolutePathDir);
     assert.equal(
-      spec7Mutated.filter((v) => v.includes("tools/mutant.ts") && v.includes("imports sibling"))
-        .length,
+      absolutePathMutatedViolations.filter(
+        (v) => v.includes("tools/mutant.ts") && v.includes("imports sibling")
+      ).length,
       0,
-      `expected the absolute-path case's assertion to go RED (zero violations) under the resolver-removal mutant, got: ${JSON.stringify(spec7Mutated)}`
+      `expected the absolute-path case's assertion to go RED (zero violations) under the resolver-removal mutant, got: ${JSON.stringify(absolutePathMutatedViolations)}`
     );
 
-    const spec10aTools = path.join(spec10aDir, "tools");
-    const spec10aLib = path.join(spec10aDir, "lib");
-    mkdirSync(spec10aLib, { recursive: true });
-    symlinkSync(path.join(spec10aTools, "sibling.ts"), path.join(spec10aLib, "sibling-alias.ts"));
+    const symlinkToolsDir = path.join(symlinkDir, "tools");
+    const symlinkLibDir = path.join(symlinkDir, "lib");
+    mkdirSync(symlinkLibDir, { recursive: true });
+    symlinkSync(
+      path.join(symlinkToolsDir, "sibling.ts"),
+      path.join(symlinkLibDir, "sibling-alias.ts")
+    );
     writeFileSync(
-      path.join(spec10aTools, "mutant.ts"),
+      path.join(symlinkToolsDir, "mutant.ts"),
       'import { x } from "../lib/sibling-alias.js";\n'
     );
-    const spec10aMutated = mutatedCheckModuleBoundaries(spec10aDir);
+    const symlinkMutatedViolations = mutatedCheckModuleBoundaries(symlinkDir);
     assert.equal(
-      spec10aMutated.filter((v) => v.includes("tools/mutant.ts") && v.includes("imports sibling"))
-        .length,
+      symlinkMutatedViolations.filter(
+        (v) => v.includes("tools/mutant.ts") && v.includes("imports sibling")
+      ).length,
       0,
-      `expected the symlink case's assertion to go RED (zero violations) under the resolver-removal mutant, got: ${JSON.stringify(spec10aMutated)}`
+      `expected the symlink case's assertion to go RED (zero violations) under the resolver-removal mutant, got: ${JSON.stringify(symlinkMutatedViolations)}`
     );
 
-    writeFileSync(path.join(spec10bDir, "tools", "mutant.ts"), 'import { x } from "#sibling";\n');
-    const spec10bMutated = mutatedCheckModuleBoundaries(spec10bDir);
+    writeFileSync(
+      path.join(packageAliasDir, "tools", "mutant.ts"),
+      'import { x } from "#sibling";\n'
+    );
+    const packageAliasMutatedViolations = mutatedCheckModuleBoundaries(packageAliasDir);
     assert.equal(
-      spec10bMutated.filter((v) => v.includes("tools/mutant.ts") && v.includes("imports sibling"))
-        .length,
+      packageAliasMutatedViolations.filter(
+        (v) => v.includes("tools/mutant.ts") && v.includes("imports sibling")
+      ).length,
       0,
-      `expected the package-alias case's assertion to go RED (zero violations) under the resolver-removal mutant, got: ${JSON.stringify(spec10bMutated)}`
+      `expected the package-alias case's assertion to go RED (zero violations) under the resolver-removal mutant, got: ${JSON.stringify(packageAliasMutatedViolations)}`
     );
 
     // Contrast: the REAL, unmutated guard (imported at the top of this
     // file) DOES catch all three on the identical fixtures - proving the
     // mutation genuinely matters and the fixtures are valid.
-    const spec7Real = checkModuleBoundaries(spec7Dir);
+    const absolutePathRealViolations = checkModuleBoundaries(absolutePathDir);
     assert.ok(
-      spec7Real.some(
-        (v) => v.includes("tools/mutant.ts") && v.includes(`imports sibling "${spec7AbsSpecifier}"`)
+      absolutePathRealViolations.some(
+        (v) =>
+          v.includes("tools/mutant.ts") && v.includes(`imports sibling "${absolutePathSpecifier}"`)
       ),
-      `expected the REAL guard to still catch the absolute-path fixture, got: ${JSON.stringify(spec7Real)}`
+      `expected the REAL guard to still catch the absolute-path fixture, got: ${JSON.stringify(absolutePathRealViolations)}`
     );
-    const spec10aReal = checkModuleBoundaries(spec10aDir);
+    const symlinkRealViolations = checkModuleBoundaries(symlinkDir);
     assert.ok(
-      spec10aReal.some(
+      symlinkRealViolations.some(
         (v) =>
           v.includes("tools/mutant.ts") && v.includes('imports sibling "../lib/sibling-alias.js"')
       ),
-      `expected the REAL guard to still catch the symlink fixture, got: ${JSON.stringify(spec10aReal)}`
+      `expected the REAL guard to still catch the symlink fixture, got: ${JSON.stringify(symlinkRealViolations)}`
     );
-    const spec10bReal = checkModuleBoundaries(spec10bDir);
+    const packageAliasRealViolations = checkModuleBoundaries(packageAliasDir);
     assert.ok(
-      spec10bReal.some(
+      packageAliasRealViolations.some(
         (v) => v.includes("tools/mutant.ts") && v.includes('imports sibling "#sibling"')
       ),
-      `expected the REAL guard to still catch the package-alias fixture, got: ${JSON.stringify(spec10bReal)}`
+      `expected the REAL guard to still catch the package-alias fixture, got: ${JSON.stringify(packageAliasRealViolations)}`
     );
   } finally {
-    rmSync(spec7Dir, { recursive: true, force: true });
-    rmSync(spec10aDir, { recursive: true, force: true });
-    rmSync(spec10bDir, { recursive: true, force: true });
+    rmSync(absolutePathDir, { recursive: true, force: true });
+    rmSync(symlinkDir, { recursive: true, force: true });
+    rmSync(packageAliasDir, { recursive: true, force: true });
     rmSync(scratchDir, { recursive: true, force: true });
   }
 });
@@ -1241,10 +1229,10 @@ test("make the fail-closed branch fail OPEN (in a scratch COPY of check-module-b
   );
   const fixtureDir = buildScratchSrc({
     "tools/sibling.ts": "export const marker = 1;\n",
-    "tools/spec3.ts": 'const seg = "sibling";\nimport(`./${seg}.js`);\n',
-    "tools/spec4.ts": 'import("./" + "sibling.js");\n',
-    "tools/spec5.ts": "const specifier = getSiblingPath();\nimport(specifier);\n",
-    "tools/eva3.ts": 'const parts = ["./", "sibling.js"];\nimport(parts.join(""));\n',
+    "tools/interpolated-template.ts": 'const seg = "sibling";\nimport(`./${seg}.js`);\n',
+    "tools/string-concat.ts": 'import("./" + "sibling.js");\n',
+    "tools/computed-variable.ts": "const specifier = getSiblingPath();\nimport(specifier);\n",
+    "tools/assembled-join.ts": 'const parts = ["./", "sibling.js"];\nimport(parts.join(""));\n',
   });
   try {
     const mutatedCheckModuleBoundaries = mod.checkModuleBoundaries as (dir?: string) => string[];
@@ -1260,7 +1248,12 @@ test("make the fail-closed branch fail OPEN (in a scratch COPY of check-module-b
     // the mutation genuinely matters and the fixture is valid, not merely
     // that the mutated import failed silently.
     const realViolations = checkModuleBoundaries(fixtureDir);
-    for (const file of ["spec3.ts", "spec4.ts", "spec5.ts", "eva3.ts"]) {
+    for (const file of [
+      "interpolated-template.ts",
+      "string-concat.ts",
+      "computed-variable.ts",
+      "assembled-join.ts",
+    ]) {
       assert.ok(
         realViolations.some(
           (v) => v.includes(`tools/${file}`) && v.includes("computed/non-literal specifier")
@@ -1283,7 +1276,7 @@ test("narrow the guard's file glob so src/tools/ is no longer scanned (in a scra
     )
   );
   const fixtureDir = buildScratchSrc({
-    "tools/obt1.ts": 'import { createRequire } from "node:module";\n',
+    "tools/named-import-create-require.ts": 'import { createRequire } from "node:module";\n',
   });
   try {
     const mutatedCheckNoTasksImport = mod.checkNoTasksImport as (
@@ -1393,7 +1386,7 @@ test("the existing permanent guard-test suite is unchanged - same denominator - 
   );
 });
 
-test("the three permanent guard test files pass at a literal, self-consistent baseline observed at THIS head (never a stale hardcoded figure) - both production guard commands also exit 0", () => {
+test("the three permanent guard test files pass at a literal, self-consistent, runtime-derived baseline - both production guard commands also exit 0", () => {
   assert.ok(baseline, "the before() hook must have captured the baseline first");
   assert.equal(
     baseline!.fail,
@@ -1450,9 +1443,18 @@ test("final restoration check: the REAL (non-scratch) src/ tree is still complet
     "the real src/ tree must report zero stdio-purity violations"
   );
   // The two TRACKED guard files the guard-self cases above read (but only
-  // ever copied, never wrote to) must also still be byte-identical to
-  // what a fresh read returns now - a final proof that this file never
-  // wrote to them.
-  assert.ok(existsSync(path.join(REPO_ROOT, "scripts", "check-module-boundaries.mjs")));
-  assert.ok(existsSync(path.join(REPO_ROOT, "scripts", "check-no-tasks-import.mjs")));
+  // ever copied, never wrote to) must also still be byte-identical to the
+  // content captured at module load, before any case ran - a real content
+  // comparison, not merely a presence check, so a case that wrote to the
+  // tracked file instead of its own scratch copy would be caught here.
+  assert.equal(
+    readFileSync(path.join(REPO_ROOT, "scripts", "check-module-boundaries.mjs"), "utf8"),
+    ORIGINAL_MODULE_BOUNDARIES_GUARD_TEXT,
+    "the tracked check-module-boundaries.mjs must be byte-identical to what it was before any guard-self case ran"
+  );
+  assert.equal(
+    readFileSync(path.join(REPO_ROOT, "scripts", "check-no-tasks-import.mjs"), "utf8"),
+    ORIGINAL_NO_TASKS_GUARD_TEXT,
+    "the tracked check-no-tasks-import.mjs must be byte-identical to what it was before any guard-self case ran"
+  );
 });
