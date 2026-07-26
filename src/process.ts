@@ -487,11 +487,7 @@ export function parseEtime(raw: string): number | undefined {
   const days = dayMatch ? Number(dayMatch[1]) : 0;
   const rest = dayMatch ? dayMatch[2]! : trimmed;
   const parts = rest.split(":");
-  if (
-    parts.length < 2 ||
-    parts.length > 3 ||
-    parts.some((part) => !/^\d{2}$/.test(part))
-  ) {
+  if (parts.length < 2 || parts.length > 3 || parts.some((part) => !/^\d{2}$/.test(part))) {
     return undefined;
   }
   const numbers = parts.map(Number);
