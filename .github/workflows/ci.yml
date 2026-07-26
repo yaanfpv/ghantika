@@ -230,7 +230,7 @@ jobs:
       # zizmor lints the workflow files themselves for security issues
       # (excess permissions, unpinned actions, injectable expressions and
       # the like), so it runs against this repo's own .github/workflows.
-      - run: pip install zizmor==1.27.0
+      - run: pip install zizmor==1.28.0
       - run: zizmor .
 
   actionlint:
