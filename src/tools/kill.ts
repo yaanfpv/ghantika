@@ -106,9 +106,10 @@
  *
  * THE RESIDUAL is disclosed as MATERIALLY NARROWED, never as closed or
  * eliminated: this gate does not make identity-and-signal atomic. After
- * it proves an original member alive, and before the SIGKILL syscall
- * actually runs, that member can exit and the numeric pgid can become
- * reusable - the check and the signal are two separate syscalls, and
+ * it establishes an original member is still alive, and before the
+ * SIGKILL syscall actually runs, that member can exit and the numeric
+ * pgid can become reusable - the check and the signal are two separate
+ * syscalls, and
  * portable POSIX offers no atomic check-and-signal for a process group.
  * This narrows the exposure from the multi-second grace window down to
  * one syscall-to-syscall interval plus this gate's own whole-second
@@ -210,23 +211,37 @@
  * ## Idempotency and races
  *
  * An already-terminal JOB RECORD is NOT the same thing as "nothing left
- * to reap": a real process GROUP where the leader forks descendants and
- * then exits on its own (root-exits-first - e.g. a shell script that
- * backgrounds children and never `wait`s on them) leaves those
+ * to reap." Two genuinely different real situations both reach this
+ * handler's terminal-job branch with something still alive to reap: the
+ * ROOT-EXITS-FIRST case (a real process GROUP where the leader forks
+ * descendants and then exits on its own - e.g. a shell script that
+ * backgrounds children and never `wait`s on them - leaves those
  * descendants alive and orphaned under the SAME pgid, since the leader's
- * own natural exit does not kill them. So a terminal record still gets a
- * real, external, group-level reap attempt (see
- * `reapTerminalJobProcessGroup` below) before this handler ever returns -
- * this NEVER re-checks the leader's own identity (the leader is already
- * gone by construction whenever this runs, so that check would always
- * read "not-found" and abort before ever reaching a still-populated
- * group); it relies purely on the real, external process-group
- * containment `killProcessGroupPosix` already provides (an already-fully-
- * gone group is a cheap no-op there - see that function's own docs).
- * POSIX only: Windows has no equivalent root-exits-first fix today (no
- * pgid concept to reap against post-hoc - see
- * `process.killProcessTreeWindows`'s own docs on why a Windows tree walk
- * can't reach an already-reparented descendant either way).
+ * own natural exit does not kill them), and the COMBINED-DEGRADED RETRY
+ * case (a job whose earlier `kill()` call left it terminal - `killed`,
+ * set synchronously by `onSignaled` - but whose group was never actually
+ * confirmed reaped, because neither identity layer could confirm
+ * anything and the SIGKILL escalation was correctly refused; see the
+ * "escalation identity gate" section above and `jobStore.markReapAttempted`'s
+ * own call-site docs below). The first case's leader is always already
+ * gone; the second case's leader can be very much still alive. So a
+ * terminal record still gets a real, external, group-level reap attempt
+ * (see `jobStore.reapProcessGroupOnce`) before this handler ever
+ * returns - this NEVER re-checks the leader's own identity via the
+ * pre-signal gate (`evaluatePreSignalIdentityGate`): in the root-exits-
+ * first case that check would always read "not-found" and abort before
+ * ever reaching a still-populated group; in the retry case it is the
+ * SAME tracked pid this codebase has held continuously since spawn, not
+ * a fresh one that could have been recycled out from under it, so that
+ * check has nothing to add there either - real protection for the retry
+ * case instead comes from a FRESH run of the escalation identity gate
+ * inside `killProcessGroupPosix` itself. Either way this relies purely on
+ * the real, external process-group containment `killProcessGroupPosix`
+ * already provides (an already-fully-gone group is a cheap no-op there -
+ * see that function's own docs). POSIX only: Windows has no equivalent
+ * root-exits-first fix today (no pgid concept to reap against post-hoc -
+ * see `process.killProcessTreeWindows`'s own docs on why a Windows tree
+ * walk can't reach an already-reparented descendant either way).
  *
  * Otherwise, deterministic linearization for a genuinely LIVE job comes
  * for free from `JobStore.markKilled` following the identical
@@ -251,7 +266,7 @@ import {
 export const name = "kill";
 
 export const description =
-  'Terminate a running background job by signaling its whole POSIX process group. Default: SIGTERM, a 5-second grace period, then SIGKILL if still alive - this is also what an explicit "SIGTERM" does, since that IS the default. Pass a different "signal" (including "SIGKILL") to skip the grace period and send exactly that one signal once. The grace period carries a disclosed residual: the group can fully empty during that wait - its ordinary, intended outcome - and have its numeric id recycled by an unrelated later group before the pre-SIGKILL existence check that follows the wait actually runs; that check narrows the window between "still alive" and "about to send SIGKILL" as far as an existence check can, but cannot close it, since existence alone cannot tell a survived original group apart from a coincidentally-reused one. This is distinct from the eager-reap gap described below, which is a single scheduling tick rather than up to a whole grace period, and is not addressed by the once-per-job reap guard, which only ever prevents a later kill call from re-signaling, not a reused id encountered within this same escalation. A further identity gate applies specifically to that SIGKILL escalation: right before the SIGTERM above is sent, this server snapshots the group\'s original membership - the leader plus every currently-live descendant, each one\'s pid and real OS-read start time - then, once the grace period has elapsed and the group is still alive, boundedly re-reads only those same recorded members. If any one of them still reports an exactly matching start time, the group is still the one this server spawned and the SIGKILL proceeds; if none matches, escalation is refused and no SIGKILL is ever sent, disclosed via an "escalation_refused_reason" field once the job reaches a terminal state. This narrows the residual described above materially, not completely: the check and the signal remain two separate syscalls, so a member proven alive an instant before the SIGKILL runs can still exit, and an unrelated group receiving the exact same recycled id within the same whole second could still read as a match. Any failure while making this observation - a timeout, an unreadable start time, malformed output, or capturing zero usable members at all - refuses escalation rather than defaulting to it. When identity could not be confirmed at either this layer or the pre-signal check below, the earlier SIGTERM is honestly disclosed as an unconfirmed best-effort send, never as confirmed or guarded. Before signaling, a real external check confirms the tracked leader is still genuinely the process this server spawned, comparing real vs. expected elapsed lifetime within a several-second tolerance - best-effort, not a cryptographic guarantee; a clear mismatch refuses to signal at all. That birth identity is captured asynchronously right after the job started; a kill sent moments later may briefly await that in-flight capture rather than giving up on it. When identity can\'t be verified at all, the group is still signaled, honestly disclosed via "identity_confirmed": false once the job reaches a terminal state. A job whose leader already exited on its own gets a real external reap for any process-group members it left behind - attempted automatically the instant that exit is observed, at most once per job, with a later kill call only attempting it if it has not already run; that reap only ever sets "kill_confirmed", never "identity_confirmed", since the leader is already gone and its identity is never re-checked there. While the group still holds a member the OS cannot recycle its id, so continuity proves ownership up to the moment the last member leaves - but where the leader has no surviving descendants, it IS the last member, and the group empties at exactly that exit, so no continuity reaches this server\'s own callback. The residual this leaves is the gap between the group emptying and that callback\'s existence check actually running: normally very short, but with no fixed upper bound, since it is event-loop scheduling latency a busy event loop can stretch well past - unlike the several-second birth-identity tolerance above, this is deliberately never stated as a wall-clock bound. "kill_confirmed" true means an external process-table check found no processes still assigned to the job\'s ORIGINAL PROCESS GROUP - never a whole-tree or zero-surviving-descendants guarantee; false if that couldn\'t be confirmed within the bound. On the DEFAULT path (no "signal", or explicit "SIGTERM"), both fields are set once the job is actually terminated, and the job\'s "killed" state itself is reported synchronously. A caller-supplied signal OTHER than "SIGTERM" is different: for a non-terminating one (SIGSTOP), confirmation is what makes the job terminal at all, so both fields stay simply absent while it remains non-terminal. For a terminating one, including an explicit "SIGKILL", the state can independently reach "killed" via the process\'s own real exit, while both fields still stay simply absent - never false - until confirmation actually lands. Windows: an immediate, forceful whole-tree kill via taskkill /t /f, with no graceful phase - real and recursive, but not atomic; no identity check or process-group confirmation is performed on Windows today. A descendant that calls setsid() or otherwise moves itself into a different process group is neither signaled by this containment nor observed by its confirmation check; reparenting alone is not such an escape, since reparenting changes a process\'s parent, never its process group. If your command spawns a process that detaches into its own group or session, you are responsible for tracking and terminating it yourself - this tool will not, and does not claim to. Idempotent: killing an already-terminal job is a no-op with respect to the job\'s own recorded state, though it may still attempt a real cleanup reap.';
+  'Terminate a running background job by signaling its whole POSIX process group. Default: SIGTERM, a 5-second grace period, then SIGKILL if still alive - this is also what an explicit "SIGTERM" does, since that IS the default. Pass a different "signal" (including "SIGKILL") to skip the grace period and send exactly that one signal once. An unconfirmed kill can leave the real process group still alive even though the job now shows a terminal state; when that happens, calling "kill" again with the SAME "job_id" is the actual recovery path, since it runs a fresh identity check against that same group and can genuinely signal or reap it for real, rather than finding nothing left to retry. The grace period carries a disclosed residual: the group can fully empty during that wait - its ordinary, intended outcome - and have its numeric id recycled by an unrelated later group before the pre-SIGKILL existence check that follows the wait actually runs; that check narrows the window between "still alive" and "about to send SIGKILL" as far as an existence check can, but cannot close it, since existence alone cannot tell a survived original group apart from a coincidentally-reused one. This is distinct from the eager-reap gap described below, which is a single scheduling tick rather than up to a whole grace period, and is not addressed by the once-per-job reap guard, which only ever prevents a later kill call from re-signaling, not a reused id encountered within this same escalation. A further identity gate applies specifically to that SIGKILL escalation: right before the SIGTERM above is sent, this server snapshots the group\'s original membership - the leader plus every currently-live descendant, each one\'s pid and real OS-read start time - then, once the grace period has elapsed and the group is still alive, boundedly re-reads only those same recorded members. If any one of them still reports an exactly matching start time, the group is still the one this server spawned and the SIGKILL proceeds; if none matches, escalation is refused and no SIGKILL is ever sent, disclosed via an "escalation_refused_reason" field once the job reaches a terminal state. This narrows the residual described above materially, not completely: the check and the signal remain two separate syscalls, so a member proven alive an instant before the SIGKILL runs can still exit, and an unrelated group receiving the exact same recycled id within the same whole second could still read as a match. Any failure while making this observation - a timeout, an unreadable start time, malformed output, or capturing zero usable members at all - refuses escalation rather than defaulting to it. When identity could not be confirmed at either this layer or the pre-signal check below, the earlier SIGTERM is honestly disclosed as an unconfirmed best-effort send, never as confirmed or guarded. Before signaling, a real external check confirms the tracked leader is still genuinely the process this server spawned, comparing real vs. expected elapsed lifetime within a several-second tolerance - best-effort, not a cryptographic guarantee; a clear mismatch refuses to signal at all. That birth identity is captured asynchronously right after the job started; a kill sent moments later may briefly await that in-flight capture rather than giving up on it. When identity can\'t be verified at all, the group is still signaled, honestly disclosed via "identity_confirmed": false once the job reaches a terminal state. A job whose leader already exited on its own gets a real external reap for any process-group members it left behind - attempted automatically the instant that exit is observed, at most once per job, with a later kill call only attempting it if it has not already run; that reap only ever sets "kill_confirmed", never "identity_confirmed", since the leader is already gone and its identity is never re-checked there. While the group still holds a member the OS cannot recycle its id, so continuity proves ownership up to the moment the last member leaves - but where the leader has no surviving descendants, it IS the last member, and the group empties at exactly that exit, so no continuity reaches this server\'s own callback. The residual this leaves is the gap between the group emptying and that callback\'s existence check actually running: normally very short, but with no fixed upper bound, since it is event-loop scheduling latency a busy event loop can stretch well past - unlike the several-second birth-identity tolerance above, this is deliberately never stated as a wall-clock bound. "kill_confirmed" true means an external process-table check found no processes still assigned to the job\'s ORIGINAL PROCESS GROUP - never a whole-tree or zero-surviving-descendants guarantee; false if that couldn\'t be confirmed within the bound. On the DEFAULT path (no "signal", or explicit "SIGTERM"), both fields are set once the job is actually terminated, and the job\'s "killed" state itself is reported synchronously. A caller-supplied signal OTHER than "SIGTERM" is different: for a non-terminating one (SIGSTOP), confirmation is what makes the job terminal at all, so both fields stay simply absent while it remains non-terminal. For a terminating one, including an explicit "SIGKILL", the state can independently reach "killed" via the process\'s own real exit, while both fields still stay simply absent - never false - until confirmation actually lands. Windows: an immediate, forceful whole-tree kill via taskkill /t /f, with no graceful phase - real and recursive, but not atomic; no identity check or process-group confirmation is performed on Windows today. A descendant that calls setsid() or otherwise moves itself into a different process group is neither signaled by this containment nor observed by its confirmation check; reparenting alone is not such an escape, since reparenting changes a process\'s parent, never its process group. If your command spawns a process that detaches into its own group or session, you are responsible for tracking and terminating it yourself - this tool will not, and does not claim to. Idempotent: killing an already-terminal job is a no-op with respect to the job\'s own recorded state, though it may still attempt a real cleanup reap.';
 
 export const inputSchema: Tool["inputSchema"] = {
   type: "object",
@@ -479,14 +494,30 @@ export async function handler(args: Record<string, unknown> | undefined): Promis
   // wedged in uninterruptible sleep survives receipt of it, and a zombie
   // is already un-killable because it is already dead), so this state
   // decision does not depend on when the external confirmation below
-  // actually resolves.
+  // actually resolves. CLAIMING THE TERMINAL SLOT stays exactly this
+  // synchronous, unconditional shape - it is what wins the race above,
+  // and nothing below changes it.
   //
-  // Marked as a reap attempt BEFORE signaling, same reasoning as the
-  // explicit-signal branch above: this is the moment of guaranteed
-  // continuity, and `killProcessGroupPosix` itself now checks group
-  // existence before it ever sends a signal (see that function's own
-  // docs).
-  jobStore.markReapAttempted(jobId);
+  // CONSUMING THE ONE REAP ATTEMPT is a separate decision from claiming
+  // the terminal slot, and it is deliberately NOT made up front alongside
+  // it - see the mark below, once this call's own outcome is known.
+  // Marking it here, before this call even ran, used to mean a group
+  // that survived this whole call UNCONFIRMED (the combined-degraded
+  // cell: neither the pre-signal identity gate above nor the escalation
+  // gate's own pre-SIGTERM snapshot could confirm anything, escalation
+  // was correctly refused, and no SIGKILL was ever sent - see this file's
+  // own "escalation identity gate" header section) still had its ONE
+  // cleanup-reap attempt permanently spent by a call that never actually
+  // reaped anything. A real, still-alive, SIGTERM-resistant group left in
+  // exactly that state was then unreachable forever: a follow-up `kill()`
+  // call against the same (now-terminal) job record routes through this
+  // handler's own terminal-job branch above, which calls
+  // `jobStore.reapProcessGroupOnce` - and that call is a pure no-op
+  // whenever `hasReapBeenAttempted` already reads `true`, regardless of
+  // whether the group is genuinely still alive. Fixing this needs no new
+  // API or flag: `reapProcessGroupOnce`'s existing guard just needs the
+  // SAME flag to actually mean "a reap was attempted AND CONFIRMED," never
+  // merely "a reap was attempted, confirmed or not."
   const result = await killProcessGroupPosix(handle.pid, POSIX_KILL_GRACE_PERIOD_MS, {
     onSignaled: (sentSignal) => {
       if (sentSignal === "SIGTERM") {
@@ -502,6 +533,20 @@ export async function handler(args: Record<string, unknown> | undefined): Promis
   // onto the job, never touching the state machine itself. The PRE-signal
   // identity gate's own outcome is recorded alongside it.
   jobStore.setKillConfirmation(jobId, result.confirmed);
+  if (result.confirmed) {
+    // Consume the one cleanup-reap attempt now, and ONLY now that this
+    // call's own external check actually confirmed zero survivors - see
+    // this block's own header comment above for why this moved off the
+    // front of the call instead of running unconditionally beforehand. An
+    // UNCONFIRMED outcome (including the combined-degraded refused-
+    // escalation cell) leaves this flag UNSET, so a follow-up `kill()`
+    // call reaching this job's already-terminal record finds
+    // `hasReapBeenAttempted` still `false`, runs a FRESH identity gate via
+    // `reapProcessGroupOnce`, and can genuinely signal/reap again -
+    // rather than finding its one attempt already spent on a call that
+    // never actually reaped anything.
+    jobStore.markReapAttempted(jobId);
+  }
   jobStore.setIdentityConfirmation(jobId, gate.identityConfirmed);
   if (result.escalationRefusedReason !== undefined) {
     // THE COMBINED-DEGRADED CELL, composed here rather than inside

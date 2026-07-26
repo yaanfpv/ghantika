@@ -1047,9 +1047,12 @@ export const POSIX_KILL_GRACE_PERIOD_MS = 5000;
  * (`evaluateEscalationIdentityGate`). Both phases get their OWN fresh
  * 2000ms, never one budget shared or split across the two - a slow
  * snapshot never eats into the re-read's own allowance, and neither
- * phase's cost scales with how many process-group members it observes
- * (see `readPidStartTimesBatchPosix`'s own docs: every member is read in
- * ONE batched `ps` call, never one call per member).
+ * phase's OBSERVATION COUNT scales with how many process-group members
+ * it observes (see `readPidStartTimesBatchPosix`'s own docs: every
+ * member is read in ONE batched `ps` call, never one call per member) -
+ * though that one batched call still constructs, emits, and parses data
+ * proportional to the group's own size, so the byte cost of a single
+ * observation is not itself size-independent, only its call count is.
  *
  * Strictly less than `POSIX_KILL_GRACE_PERIOD_MS` (asserted directly by
  * this codebase's own test suite, not just eyeballed here) - so neither
@@ -1367,10 +1370,11 @@ export async function throwUnlessBenignAlreadyGoneRace(
 }
 
 // ---------------------------------------------------------------------------
-// The escalation identity gate: before the SIGKILL escalation, prove the
-// group is still the one this codebase spawned - never before the FIRST
-// SIGTERM (that send is covered by process.evaluatePreSignalIdentityGate's
-// own, separate etime-based mechanism, out of scope here by design).
+// The escalation identity gate: before the SIGKILL escalation, check
+// whether the group is still the one this codebase spawned - never before
+// the FIRST SIGTERM (that send is covered by
+// process.evaluatePreSignalIdentityGate's own, separate etime-based
+// mechanism, out of scope here by design).
 // ---------------------------------------------------------------------------
 
 /** One originally-recorded process-group member's real, OS-read identity: a pid plus the instant it started (never a `Date.now()`-derived guess). */
@@ -1382,10 +1386,16 @@ export interface RecordedGroupMember {
 
 /**
  * The real outcome of one batched `ps -p <pid[,pid...]> -o pid=,lstart=`
- * read - never per-member sequential calls, so this observer's cost never
- * scales with how many pids are asked about (see this function's own docs
- * further down for why that single-batch shape is what keeps a group of
- * any size inside ONE whole-operation deadline).
+ * read - never per-member sequential calls, so the NUMBER OF REAL CALLS
+ * this observer makes never scales with how many pids are asked about
+ * (see this function's own docs further down for why that single-batch
+ * shape is what keeps a group of any size inside ONE whole-operation
+ * deadline). That single call's own BYTE cost is a different question:
+ * it still constructs a comma-joined pid list, and `ps` still emits and
+ * this function still parses one row per requested pid, so the data a
+ * batch of size N produces and this function processes genuinely grows
+ * with N - only the CALL COUNT is size-independent, not the work inside
+ * that one call.
  *
  * `rows` holds only the pids whose row parsed cleanly under
  * `parsePidLstartRow`'s frozen six-token grammar - a pid simply absent from
@@ -1442,12 +1452,18 @@ const LSTART_MONTHS = [
  * Returns `undefined` - a failed read for this row, never a partial or
  * best-effort one - for ANY of: not exactly six tokens after that
  * whitespace-collapse; an unrecognized weekday or month abbreviation; a
- * day/hour/minute/second/year field that isn't the right shape; or a
- * parsed instant that does not ROUND-TRIP exactly back through
- * `Date.UTC` (e.g. a day value `Date` would otherwise silently normalize
- * into the next month) - a10's own words: "a guard exactly right about
- * which token is which and silently wrong by hours about what it means
- * is worse than one that fails to parse."
+ * day/hour/minute/second/year field that isn't the right shape; a parsed
+ * instant that does not ROUND-TRIP exactly back through `Date.UTC` (e.g.
+ * a day value `Date` would otherwise silently normalize into the next
+ * month); or a weekday token that is a recognized abbreviation but
+ * disagrees with the day-of-week the other five tokens actually compute
+ * to. `Date.UTC` never looks at the weekday token at all, so without this
+ * last check a row like `123 Mon Jul 25 15:00:00 2026` would parse
+ * identically to the genuinely correct `123 Sat Jul 25 15:00:00 2026` (25
+ * July 2026 is a real Saturday) even though the two rows contradict each
+ * other - a10's own words: "a guard exactly right about which token is
+ * which and silently wrong by hours about what it means is worse than
+ * one that fails to parse."
  *
  * The zone is FROZEN, not merely the layout: `lstart` itself carries no
  * zone token at all, so the pinned `TZ=UTC0` environment (see
@@ -1470,7 +1486,8 @@ export function parsePidLstartRow(rawLine: string): RecordedGroupMember | undefi
   if (!/^\d+$/.test(pidRaw)) return undefined;
   const pid = Number(pidRaw);
   if (!Number.isInteger(pid) || pid <= 0) return undefined;
-  if (!LSTART_WEEKDAYS.includes(weekday)) return undefined;
+  const weekdayIndex = LSTART_WEEKDAYS.indexOf(weekday);
+  if (weekdayIndex === -1) return undefined;
   const monthIndex = LSTART_MONTHS.indexOf(month);
   if (monthIndex === -1) return undefined;
   if (!/^\d{1,2}$/.test(dayRaw)) return undefined;
@@ -1489,9 +1506,13 @@ export function parsePidLstartRow(rawLine: string): RecordedGroupMember | undefi
     roundTrip.getUTCDate() !== day ||
     roundTrip.getUTCHours() !== hours ||
     roundTrip.getUTCMinutes() !== minutes ||
-    roundTrip.getUTCSeconds() !== seconds
+    roundTrip.getUTCSeconds() !== seconds ||
+    roundTrip.getUTCDay() !== weekdayIndex
   ) {
-    return undefined; // did not round-trip - invalid/out-of-range/ambiguous, never guessed at
+    // Either did not round-trip (invalid/out-of-range/ambiguous), or DID
+    // round-trip to a real instant whose actual day-of-week contradicts
+    // the weekday token this row claimed - never guessed at either way.
+    return undefined;
   }
   return { pid, startTimeMs };
 }
@@ -1685,7 +1706,7 @@ function parsePgrepPidList(stdout: string): number[] | undefined {
  * SIGTERM this codebase is about to send (terminating the job is the
  * user's own request, and must not be blocked by an observation failure -
  * see `killProcessGroupPosix`'s own call site) - it only means the
- * escalation gate below has nothing positive to prove later, and must
+ * escalation gate below has nothing positive to work with later, and must
  * therefore refuse (see `evaluateEscalationIdentityGate`'s own docs).
  */
 export interface EscalationIdentitySnapshot {
@@ -1922,7 +1943,7 @@ export async function killProcessGroupPosix(
   // NEVER blocks this SIGTERM - terminating the job is the caller's own
   // request, and must not be held hostage by an observation failure - it
   // only means the escalation gate further down has nothing positive to
-  // prove later and must therefore refuse (see evaluateEscalationIdentityGate).
+  // work with later and must therefore refuse (see evaluateEscalationIdentityGate).
   const identitySnapshot = await captureEscalationIdentitySnapshot(pid);
 
   const termResult = signalProcessGroupPosix(pid, "SIGTERM");

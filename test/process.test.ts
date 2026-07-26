@@ -58,6 +58,43 @@ const POSIX_PROCESS_GROUP_SKIP =
     ? "exercises a real POSIX process-group primitive (ps/pgrep/negative-pid kill) with no win32 equivalent path here"
     : false;
 
+/**
+ * The caller-side settlement bound this file's own SIGTERM-resistant
+ * observer tests (a fake `ps`/`pgrep` on PATH that traps SIGTERM, writes a
+ * marker, then sleeps) pass to the function under test - shared by all
+ * four of them so a future retune changes one number, not four.
+ *
+ * ROOT-CAUSE HISTORY: this used to be a much tighter 1000ms, chosen only
+ * to keep a single test fast in isolation. That was tight enough to lose
+ * a REAL scheduling race under genuine concurrent load: the caller-side
+ * force-reap timer that ends this bound (`bound + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS`
+ * - see `src/process.ts`'s own docs on that constant) fires strictly on
+ * WALL-CLOCK time from the moment the call starts, completely independent
+ * of whether the freshly forked resistant script has actually been
+ * SCHEDULED to run its own first instruction yet. Reproduced directly (not
+ * merely inferred): running six concurrent copies of this whole file
+ * under `node --test` reliably starved every one of these four fixtures
+ * of CPU time long enough that the old 1000ms bound elapsed, and the
+ * caller-side timer SIGKILLed the fake observer, BEFORE it had ever been
+ * scheduled to execute even its own `trap` line - the marker file the
+ * test later waits for was consequently never written at all (confirmed
+ * by inspecting the fixture's own scratch directory afterward: the `ps`/
+ * `pgrep` script was present, `observer-pid.txt` was not), so the
+ * subsequent `waitForFile` call could only ever time out. Widening this
+ * bound (and the resistant script's own sleep duration alongside it, so
+ * the script doesn't just finish naturally before the wider bound
+ * elapses) leaves comfortably more real wall-clock room for the fork/exec
+ * itself to actually happen before this codebase's own force-reap timer
+ * fires - verified stable by re-running that same six-way concurrent
+ * reproduction repeatedly at this widened value with zero failures, where
+ * the old value failed on every single attempt.
+ */
+const RESISTANT_OBSERVER_BOUND_MS = 4000;
+/** Must comfortably outlast `RESISTANT_OBSERVER_BOUND_MS + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS` so the fixture is still genuinely running (and thus still resistant) when this codebase's own force-reap timer fires, rather than having already exited naturally on its own schedule. */
+const RESISTANT_OBSERVER_SLEEP_SECONDS = 12;
+/** The generous upper bound this file's own resistant-observer tests assert the call settles within - comfortably above `RESISTANT_OBSERVER_BOUND_MS` plus its own settlement grace, comfortably below `RESISTANT_OBSERVER_SLEEP_SECONDS * 1000`. */
+const RESISTANT_OBSERVER_ELAPSED_ASSERTION_MS = 6000;
+
 // A structural guarantee: a real child's stdout must never
 // be wired directly to the server's own stdout. "pipe" hands the server a
 // stream it must explicitly read from and forward somewhere (JobStore) -
@@ -770,10 +807,13 @@ test(
     // actually gone afterward), THEN sleeps far longer than the bound this
     // test passes - if this codebase's own force-reap didn't SIGKILL it
     // directly, this process would still be alive and this promise would
-    // still be unsettled by the time this test's own assertions run.
+    // still be unsettled by the time this test's own assertions run. See
+    // `RESISTANT_OBSERVER_BOUND_MS`'s own docs above for why this sleep
+    // duration and the bound below are what they are, not the tighter
+    // values this file used to use.
     fs.writeFileSync(
       psPath,
-      `#!/bin/sh\ntrap '' TERM\necho $$ > '${markerPath}'\nsleep 5\necho '00:00'\n`
+      `#!/bin/sh\ntrap '' TERM\necho $$ > '${markerPath}'\nsleep ${RESISTANT_OBSERVER_SLEEP_SECONDS}\necho '00:00'\n`
     );
     fs.chmodSync(psPath, 0o755);
 
@@ -787,7 +827,7 @@ test(
     try {
       process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
       const before = Date.now();
-      identity = await captureBirthIdentityPosixAsync(process.pid, 1000);
+      identity = await captureBirthIdentityPosixAsync(process.pid, RESISTANT_OBSERVER_BOUND_MS);
       elapsedMs = Date.now() - before;
     } finally {
       process.env.PATH = realPath;
@@ -800,8 +840,8 @@ test(
       "a resistant ps must still resolve to undefined (unavailable) via this codebase's own settlement bound, never fabricate a value"
     );
     assert.ok(
-      elapsedMs < 3000,
-      `expected this codebase's OWN caller-side timer to force settlement well before the resistant ps's real 5s sleep - took ${elapsedMs}ms`
+      elapsedMs < RESISTANT_OBSERVER_ELAPSED_ASSERTION_MS,
+      `expected this codebase's OWN caller-side timer to force settlement well before the resistant ps's own long sleep - took ${elapsedMs}ms`
     );
     // THE assertion that actually tests the product's non-blocking promise,
     // not merely this call's own latency: an independent timer scheduled
@@ -1177,7 +1217,7 @@ test(
     // for style.
     fs.writeFileSync(
       pgrepPath,
-      `#!/bin/sh\ntrap '' TERM\necho $$ > '${markerPath}'\nsleep 5\necho '${pid}'\n`
+      `#!/bin/sh\ntrap '' TERM\necho $$ > '${markerPath}'\nsleep ${RESISTANT_OBSERVER_SLEEP_SECONDS}\necho '${pid}'\n`
     );
     fs.chmodSync(pgrepPath, 0o755);
 
@@ -1191,7 +1231,7 @@ test(
     try {
       process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
       const before = Date.now();
-      confirmed = await confirmProcessGroupReapedPosix(pid, 1000);
+      confirmed = await confirmProcessGroupReapedPosix(pid, RESISTANT_OBSERVER_BOUND_MS);
       elapsedMs = Date.now() - before;
     } finally {
       process.env.PATH = realPath;
@@ -1205,8 +1245,8 @@ test(
       "a resistant pgrep must still resolve to false (unconfirmed) via this codebase's own settlement bound, never fabricate a confirmed result"
     );
     assert.ok(
-      elapsedMs < 3000,
-      `expected this codebase's OWN caller-side timer to force settlement well before the resistant pgrep's real 5s sleep - took ${elapsedMs}ms`
+      elapsedMs < RESISTANT_OBSERVER_ELAPSED_ASSERTION_MS,
+      `expected this codebase's OWN caller-side timer to force settlement well before the resistant pgrep's own long sleep - took ${elapsedMs}ms`
     );
     // THE assertion that actually tests the product's non-blocking promise:
     // an independent timer on the SAME event loop must have kept firing
@@ -1945,7 +1985,10 @@ test("parsePidLstartRow parses a well-formed six-token row into the correct epoc
 });
 
 test("parsePidLstartRow collapses ps's own column-padding whitespace (a single-digit day is padded with an extra space) rather than shifting tokens off by one", () => {
-  const parsed = parsePidLstartRow("12345 Sat Jul  5 13:39:12 2026");
+  // 5 July 2026 is genuinely a Sunday - the weekday token here must agree
+  // with the actual date (see the dedicated contradictory-weekday test
+  // below), not merely be A recognized abbreviation.
+  const parsed = parsePidLstartRow("12345 Sun Jul  5 13:39:12 2026");
   assert.notEqual(parsed, undefined);
   assert.equal(parsed!.pid, 12345);
   assert.equal(parsed!.startTimeMs, Date.UTC(2026, 6, 5, 13, 39, 12));
@@ -1988,6 +2031,21 @@ test("parsePidLstartRow REFUSES a value that does not ROUND-TRIP through Date.UT
   // February never has a 30th - Date.UTC would normalize this into March,
   // which would silently misreport the month were this not checked.
   assert.equal(parsePidLstartRow("12345 Mon Feb 30 13:39:12 2026"), undefined);
+});
+
+test("parsePidLstartRow REFUSES a recognized-but-CONTRADICTORY weekday token - the weekday must match the day-of-week its own year/month/day actually compute to, never merely be a recognized abbreviation", () => {
+  // 25 July 2026 is genuinely a Saturday - the correctly-paired row parses
+  // cleanly, and this is what the contradictory row below is compared
+  // against: same pid, same date, same time, only the weekday differs.
+  const correct = parsePidLstartRow("123 Sat Jul 25 15:00:00 2026");
+  assert.notEqual(correct, undefined);
+  assert.equal(correct!.pid, 123);
+  assert.equal(correct!.startTimeMs, Date.UTC(2026, 6, 25, 15, 0, 0));
+  // `Date.UTC` never looks at the weekday token at all, so a parser that
+  // only checks the weekday is a RECOGNIZED abbreviation (never that it
+  // agrees with the computed date) would parse this identically to the
+  // row above - the exact bug this test exists to close.
+  assert.equal(parsePidLstartRow("123 Mon Jul 25 15:00:00 2026"), undefined);
 });
 
 test("parsePidLstartRow REFUSES an empty string", () => {
@@ -2198,7 +2256,7 @@ test(
     const markerPath = path.join(dir, "observer-pid.txt");
     fs.writeFileSync(
       psPath,
-      `#!/bin/sh\ntrap '' TERM\necho $$ > '${markerPath}'\nsleep 5\necho '12345 Sat Jul 25 13:39:12 2026'\n`
+      `#!/bin/sh\ntrap '' TERM\necho $$ > '${markerPath}'\nsleep ${RESISTANT_OBSERVER_SLEEP_SECONDS}\necho '12345 Sat Jul 25 13:39:12 2026'\n`
     );
     fs.chmodSync(psPath, 0o755);
 
@@ -2212,11 +2270,13 @@ test(
     try {
       process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
       const before = Date.now();
-      // 1000ms (not a tighter bound) - matching this file's own established
-      // resistant-observer convention elsewhere, since a genuinely fresh
-      // process spawn needs real scheduling time before it can even reach
-      // its own marker-file write, independent of anything under test.
-      result = await readPidStartTimesBatchPosix([12345], 1000);
+      // `RESISTANT_OBSERVER_BOUND_MS` (not a tighter bound) - matching this
+      // file's own established resistant-observer convention elsewhere,
+      // since a genuinely fresh process spawn needs real scheduling time
+      // before it can even reach its own marker-file write, independent of
+      // anything under test - see that constant's own docs for the real
+      // concurrent-load scheduling race this width is sized against.
+      result = await readPidStartTimesBatchPosix([12345], RESISTANT_OBSERVER_BOUND_MS);
       elapsedMs = Date.now() - before;
     } finally {
       process.env.PATH = realPath;
@@ -2225,8 +2285,8 @@ test(
 
     assert.equal(result.status, "observer-failure");
     assert.ok(
-      elapsedMs < 3000,
-      `expected the bounded timeout to fire well before the ps's own 5s sleep - took ${elapsedMs}ms`
+      elapsedMs < RESISTANT_OBSERVER_ELAPSED_ASSERTION_MS,
+      `expected the bounded timeout to fire well before the ps's own long sleep - took ${elapsedMs}ms`
     );
     assert.ok(
       eventLoopTicks >= 5,
@@ -2712,7 +2772,7 @@ test(
     const markerPath = path.join(dir, "observer-pid.txt");
     fs.writeFileSync(
       psPath,
-      `#!/bin/sh\ntrap '' TERM\necho $$ > '${markerPath}'\nsleep 5\necho '424242 Sat Jul 25 13:39:12 2026'\n`
+      `#!/bin/sh\ntrap '' TERM\necho $$ > '${markerPath}'\nsleep ${RESISTANT_OBSERVER_SLEEP_SECONDS}\necho '424242 Sat Jul 25 13:39:12 2026'\n`
     );
     fs.chmodSync(psPath, 0o755);
 
@@ -2727,10 +2787,12 @@ test(
     try {
       process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
       const before = Date.now();
-      // 1000ms, matching this file's established resistant-observer
-      // convention (a fresh process spawn needs real scheduling time
-      // before it can even reach its own marker-file write).
-      gate = await evaluateEscalationIdentityGate(snapshot, 1000);
+      // `RESISTANT_OBSERVER_BOUND_MS`, matching this file's established
+      // resistant-observer convention (a fresh process spawn needs real
+      // scheduling time before it can even reach its own marker-file
+      // write - see that constant's own docs for the real concurrent-load
+      // scheduling race this width is sized against).
+      gate = await evaluateEscalationIdentityGate(snapshot, RESISTANT_OBSERVER_BOUND_MS);
       elapsedMs = Date.now() - before;
     } finally {
       process.env.PATH = realPath;
@@ -2743,8 +2805,8 @@ test(
       "a timed-out re-read must fail closed, never default to escalation"
     );
     assert.ok(
-      elapsedMs < 3000,
-      `expected the bound to fire well before the ps's own 5s sleep, took ${elapsedMs}ms`
+      elapsedMs < RESISTANT_OBSERVER_ELAPSED_ASSERTION_MS,
+      `expected the bound to fire well before the ps's own long sleep, took ${elapsedMs}ms`
     );
     assert.ok(
       eventLoopTicks >= 5,

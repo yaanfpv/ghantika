@@ -1050,13 +1050,20 @@ export class JobStore {
    *   later terminal-record reap knows a cleanup attempt already covered
    *   this job), but does NOT check it first - a live signal is a
    *   caller-requested action, never suppressed by this flag. The default
-   *   path marks unconditionally; the custom-signal path marks ONLY for
-   *   `SIGKILL` (the one signal this codebase treats as unable to be
-   *   caught or ignored, so sending it genuinely IS a cleanup reap) -
-   *   a non-terminating custom signal (`SIGSTOP`/`SIGCONT`) never marks
-   *   this set, since nothing was reaped and the real cleanup-reap
-   *   opportunity must stay available for whenever the leader eventually
-   *   exits on its own.
+   *   path marks ONLY once its own external process-group confirmation
+   *   actually observes zero survivors (`result.confirmed` - see
+   *   `src/tools/kill.ts`'s own docs on why this moved off the front of
+   *   that call): an UNCONFIRMED outcome - including the combined-
+   *   degraded cell where neither identity layer could confirm anything
+   *   and the SIGKILL escalation was correctly refused - leaves this flag
+   *   UNSET, precisely so a still-genuinely-alive group is not
+   *   permanently stranded by a call that never actually reaped it. The
+   *   custom-signal path marks ONLY for `SIGKILL` (the one signal this
+   *   codebase treats as unable to be caught or ignored, so sending it
+   *   genuinely IS a cleanup reap) - a non-terminating custom signal
+   *   (`SIGSTOP`/`SIGCONT`) never marks this set, since nothing was
+   *   reaped and the real cleanup-reap opportunity must stay available
+   *   for whenever the leader eventually exits on its own.
    */
   private readonly reapAttempted = new Set<string>();
   private seqCounter = 0;
@@ -1565,16 +1572,31 @@ export class JobStore {
    * continuity is real, since a POSIX pgid cannot be recycled while the
    * group still has a member, and this codebase's own hierarchy has held
    * it continuously since spawn. Also called from `src/tools/kill.ts`'s
-   * terminal-record branch as a fallback for the rare case the eager call
-   * hasn't run yet - a harmless no-op otherwise.
+   * terminal-record branch, which now serves TWO real cases rather than
+   * one: the rare timing window where the eager call above hasn't run yet
+   * (a harmless no-op otherwise), and the RETRY path for a job whose
+   * earlier `kill()` call left it terminal but genuinely UNCONFIRMED -
+   * see `src/tools/kill.ts`'s own `markReapAttempted` call-site docs for
+   * why an unconfirmed outcome leaves `hasReapBeenAttempted` `false`
+   * rather than permanently spent. In that second case the leader can be
+   * very much still alive (a real, SIGTERM-resistant group whose earlier
+   * SIGKILL escalation was correctly refused), unlike the root-exits-
+   * first case this function was originally written for.
    *
    * Deliberately never runs the leader-pid identity check
-   * (`evaluatePreSignalIdentityGate`) the live `kill()` path uses: that
-   * check exists to refuse signaling an UNRELATED process that happens to
-   * have reused the tracked LEADER's own pid - but the leader here is
-   * ALREADY gone by construction, so a leader-pid comparison would always
-   * read "not-found" and abort before ever reaching a group that can
-   * still hold real, live descendants. `killProcessGroupPosix` itself
+   * (`evaluatePreSignalIdentityGate`) the live `kill()` path uses, in
+   * EITHER of the two cases above: in the root-exits-first case the
+   * leader is already gone by construction, so a leader-pid comparison
+   * would always read "not-found" and abort before ever reaching a group
+   * that can still hold real, live descendants; in the combined-degraded
+   * RETRY case the leader may still be alive, but it is the SAME tracked
+   * pid this codebase has held continuously since spawn - nothing about
+   * this retry involves a fresh pid that could have been recycled out
+   * from under it, so the check that guards against a REUSED leader pid
+   * has nothing to add here either. Real protection for the retry case
+   * comes from `killProcessGroupPosix`'s own escalation identity gate,
+   * run fresh on every call (see `src/process.ts`'s
+   * `evaluateEscalationIdentityGate`). `killProcessGroupPosix` itself
    * checks group EXISTENCE before ever signaling (see that function's own
    * docs) - an already-empty group is a safe no-op there, never a
    * delivered signal.
