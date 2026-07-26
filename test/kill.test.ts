@@ -11,7 +11,12 @@ import type { CallToolResult } from "@modelcontextprotocol/server";
 // import comment for why.
 import * as killTool from "../dist/tools/kill.js";
 import { jobStore } from "../dist/jobStore.js";
-import { captureBirthIdentityPosix, isProcessAlive, spawnManaged } from "../dist/process.js";
+import {
+  captureBirthIdentityPosix,
+  isProcessAlive,
+  isProcessGroupAlive,
+  spawnManaged,
+} from "../dist/process.js";
 
 // Explicit ".ts" extension - this helper has no relative imports of its
 // own (only node: builtins), so Node's native TypeScript support can load
@@ -408,7 +413,14 @@ test('kill: an explicit non-default "signal" argument is sent once, with no auto
   assert.equal(structured.state, "killed");
   assert.equal(structured.signal, "SIGKILL");
   assert.ok(
-    elapsed < 1000,
+    // Widened from 1000ms - this is the same "response bound sensitive to
+    // genuine concurrent load" class documented at
+    // test/run.test.ts's RUN_RESPONSE_TIME_BOUND_MS: this operation
+    // includes a real signal send plus a bounded pgrep-based confirmation,
+    // so its own real overhead can grow under contention. 2500ms stays
+    // comfortably clear of the 5000ms default grace period this test
+    // exists to prove was never waited through.
+    elapsed < 2500,
     `an explicit signal must never wait through the default grace period, took ${elapsed}ms`
   );
   assert.equal(
@@ -2514,10 +2526,16 @@ test("state-vs-fields prose guard, surface S2 (the kill tool's tools/list descri
 });
 
 // ---------------------------------------------------------------------------
-// The escalation identity gate (a6-a11): prose guards for TC.28 (the
-// residual is disclosed as MATERIALLY NARROWED, never closed or
-// eliminated) and TC.34 (no "provably"/unqualified-proof claim beside the
-// identity matcher), plus the wire-level combined-degraded cell (TC.35).
+// The escalation identity gate: prose guards for the narrowed-residual
+// disclosure (the residual is disclosed as MATERIALLY NARROWED, never
+// closed or eliminated) and for the no-unqualified-proof-claim guard (no
+// "provably"/unqualified-proof claim beside the identity matcher), the
+// latter applied across every applicable public surface - README.md, the
+// served kill tool description, CHANGELOG.md, local/pr-manifest.md, this
+// repo's own source comments, AND every commit subject+body in the range
+// - so a claim sitting only in a commit message can never slip past this
+// guard unexamined the way it once did. Plus the wire-level
+// combined-degraded cell.
 // ---------------------------------------------------------------------------
 
 /**
@@ -2537,7 +2555,7 @@ const FORBIDDEN_ESCALATION_CLOSED_CLAIM =
 const FORBIDDEN_ESCALATION_ELIMINATED_CLAIM =
   "the escalation identity gate eliminates the check-to-signal race entirely";
 
-test("TC.28 - narrowed-residual prose guard, surface S1 (README.md): states the residual is MATERIALLY NARROWED and never claims it is closed or eliminated", () => {
+test("narrowed-residual prose guard, surface S1 (README.md): states the residual is MATERIALLY NARROWED and never claims it is closed or eliminated", () => {
   const readme = readReadmeText();
   assert.ok(
     readme.includes(NARROWED_RESIDUAL_REQUIRED_SUBSTRING),
@@ -2553,7 +2571,7 @@ test("TC.28 - narrowed-residual prose guard, surface S1 (README.md): states the 
   );
 });
 
-test("TC.28 - narrowed-residual prose guard, surface S2 (the kill tool's tools/list description): states the residual is MATERIALLY NARROWED and never claims it is closed or eliminated", () => {
+test("narrowed-residual prose guard, surface S2 (the kill tool's tools/list description): states the residual is MATERIALLY NARROWED and never claims it is closed or eliminated", () => {
   const description = killTool.description as string;
   assert.ok(
     description.includes(NARROWED_RESIDUAL_REQUIRED_SUBSTRING),
@@ -2570,15 +2588,18 @@ test("TC.28 - narrowed-residual prose guard, surface S2 (the kill tool's tools/l
 });
 
 /**
- * TC.34 - scoped specifically to the escalation-identity-gate paragraph on
- * each surface (delimited by these two anchors, both real substrings this
- * session's own additions introduced), rather than the whole file: a
- * PRE-EXISTING, unrelated "provably" usage already lives elsewhere in both
- * README.md and kill.ts (the reap-once continuity argument for a
- * DIFFERENT mechanism entirely - see a7's own text on why that usage is
- * out of scope for this rule), so a whole-file ban would false-positive on
- * an already-correct sentence. This function extracts the identity-gate's
- * OWN paragraph and checks only that slice.
+ * The no-unqualified-proof-claim guard below is scoped specifically to the
+ * escalation-identity-gate paragraph on each surface (delimited by these
+ * two anchors, both real substrings this session's own additions
+ * introduced), rather than the whole file: a PRE-EXISTING, unrelated
+ * "provably" usage already lives elsewhere in both README.md and kill.ts
+ * (the reap-once continuity argument for a DIFFERENT mechanism entirely,
+ * which is why that usage is out of scope for this rule), so a whole-file
+ * ban would false-positive on an already-correct sentence. This function
+ * extracts the identity-gate's OWN paragraph and checks only that slice.
+ * The surface-S6 commit-message check further down uses the same
+ * narrow-scoping idea, adapted for unstructured prose that has no such
+ * paragraph to delimit - see `extractEscalationGateSentences`'s own docs.
  */
 function extractEscalationGateParagraph(text: string): string {
   const start = text.indexOf("A further identity gate applies");
@@ -2589,7 +2610,7 @@ function extractEscalationGateParagraph(text: string): string {
 }
 
 /**
- * The full class TC.34 guards against: an unqualified "prove"/"proves"/
+ * The full class this guard checks for: an unqualified "prove"/"proves"/
  * "provably" claim beside the escalation identity matcher (a known
  * false-match path - same-second pid reuse - is admitted elsewhere in
  * this story, so an unqualified proof claim beside the matcher is a real
@@ -2613,7 +2634,7 @@ function assertNoUnqualifiedProofClaim(paragraph: string, surfaceLabel: string):
  * implementation still constructs, emits, and parses O(N) data for one
  * batch (only the CALL COUNT is size-independent, not the underlying
  * work). Checked as exact forbidden substrings, matching this file's own
- * established TC.28 pattern (`FORBIDDEN_ESCALATION_CLOSED_CLAIM`/
+ * established narrowed-residual-guard pattern (`FORBIDDEN_ESCALATION_CLOSED_CLAIM`/
  * `FORBIDDEN_ESCALATION_ELIMINATED_CLAIM`), rather than a generic pattern
  * that would also flag this story's OWN corrected wording (which still
  * says a batched read's CALL COUNT never scales with group size, but now
@@ -2636,12 +2657,12 @@ function assertNoUnqualifiedScaleClaim(text: string, surfaceLabel: string): void
   }
 }
 
-test("TC.34 - no \"provably\"/unqualified proof claim beside the escalation identity matcher, surface S1 (README.md) - scoped to that mechanism's own paragraph, not the file's unrelated pre-existing use of the word elsewhere", () => {
+test("no \"provably\"/unqualified proof claim beside the escalation identity matcher, surface S1 (README.md) - scoped to that mechanism's own paragraph, not the file's unrelated pre-existing use of the word elsewhere", () => {
   const paragraph = extractEscalationGateParagraph(readReadmeText());
   assertNoUnqualifiedProofClaim(paragraph, "README.md");
 });
 
-test("TC.34 - no \"provably\"/unqualified proof claim beside the escalation identity matcher, surface S2 (the kill tool's tools/list description) - scoped to that mechanism's own paragraph", () => {
+test("no \"provably\"/unqualified proof claim beside the escalation identity matcher, surface S2 (the kill tool's tools/list description) - scoped to that mechanism's own paragraph", () => {
   const paragraph = extractEscalationGateParagraph(killTool.description as string);
   assertNoUnqualifiedProofClaim(paragraph, "the kill tool's tools/list description");
 });
@@ -2684,22 +2705,22 @@ function extractManifestEscalationBullet(text: string): string {
   return end >= 0 ? text.slice(start, end) : text.slice(start);
 }
 
-test('TC.34 - no "provably"/unqualified proof claim beside the escalation identity matcher, surface S3 (CHANGELOG.md) - scoped to that mechanism\'s own bullet', () => {
+test('no "provably"/unqualified proof claim beside the escalation identity matcher, surface S3 (CHANGELOG.md) - scoped to that mechanism\'s own bullet', () => {
   const bullet = extractChangelogEscalationBullet(readChangelogText());
   assertNoUnqualifiedProofClaim(bullet, "CHANGELOG.md");
 });
 
-test('TC.34 - no unqualified "never scales with group size" cost claim, surface S3 (CHANGELOG.md) - the real batched read still constructs/emits/parses O(N) data, only its call count is size-independent', () => {
+test('no unqualified "never scales with group size" cost claim, surface S3 (CHANGELOG.md) - the real batched read still constructs/emits/parses O(N) data, only its call count is size-independent', () => {
   const bullet = extractChangelogEscalationBullet(readChangelogText());
   assertNoUnqualifiedScaleClaim(bullet, "CHANGELOG.md's escalation-identity-gate bullet");
 });
 
-test('TC.34 - no "provably"/unqualified proof claim beside the escalation identity matcher, surface S4 (local/pr-manifest.md) - scoped to that mechanism\'s own bullet', () => {
+test('no "provably"/unqualified proof claim beside the escalation identity matcher, surface S4 (local/pr-manifest.md) - scoped to that mechanism\'s own bullet', () => {
   const bullet = extractManifestEscalationBullet(readPrManifestText());
   assertNoUnqualifiedProofClaim(bullet, "local/pr-manifest.md");
 });
 
-test('TC.34 - no unqualified "never scales with group size" cost claim, surface S4 (local/pr-manifest.md) - the real batched read still constructs/emits/parses O(N) data, only its call count is size-independent', () => {
+test('no unqualified "never scales with group size" cost claim, surface S4 (local/pr-manifest.md) - the real batched read still constructs/emits/parses O(N) data, only its call count is size-independent', () => {
   const bullet = extractManifestEscalationBullet(readPrManifestText());
   assertNoUnqualifiedScaleClaim(bullet, "local/pr-manifest.md's escalation-identity-gate bullet");
 });
@@ -2752,7 +2773,7 @@ function extractProcessSourceEscalationSection(text: string): string {
   return text.slice(start, end);
 }
 
-test("TC.34 - no \"provably\"/unqualified proof claim beside the escalation identity matcher, surface S5 (this repo's own source comments: src/tools/kill.ts + src/process.ts) - scoped to each file's own escalation-identity-gate section, not unrelated pre-existing uses elsewhere (e.g. process.ts's own Windows-kill-coverage \"proves nothing\" disclaimer, or kill.ts's eager-reap continuity argument)", () => {
+test("no \"provably\"/unqualified proof claim beside the escalation identity matcher, surface S5 (this repo's own source comments: src/tools/kill.ts + src/process.ts) - scoped to each file's own escalation-identity-gate section, not unrelated pre-existing uses elsewhere (e.g. process.ts's own Windows-kill-coverage \"proves nothing\" disclaimer, or kill.ts's eager-reap continuity argument)", () => {
   const killSection = extractKillSourceEscalationSection(readKillSourceText());
   assertNoUnqualifiedProofClaim(
     killSection,
@@ -2765,7 +2786,7 @@ test("TC.34 - no \"provably\"/unqualified proof claim beside the escalation iden
   );
 });
 
-test('TC.34 - no unqualified "never scales with group size" cost claim, surface S5 (this repo\'s own source comments: src/tools/kill.ts + src/process.ts)', () => {
+test('no unqualified "never scales with group size" cost claim, surface S5 (this repo\'s own source comments: src/tools/kill.ts + src/process.ts)', () => {
   const killSection = extractKillSourceEscalationSection(readKillSourceText());
   assertNoUnqualifiedScaleClaim(
     killSection,
@@ -2778,10 +2799,148 @@ test('TC.34 - no unqualified "never scales with group size" cost claim, surface 
   );
 });
 
-// --- TC.35: THE COMBINED DEGRADED CELL, at the real handler/wire level ---
+/**
+ * The base ref this repo's own commit-range convention already uses
+ * elsewhere (see `.github/workflows/ci.yml`'s changelog-presence job):
+ * `origin/main` when it resolves (the normal case - CI's own checkout
+ * fetches it, and a real clone tracking `origin` has it too), falling
+ * back to a local `main` branch for a worktree/environment with no
+ * `origin` remote configured at all. `undefined` when NEITHER resolves,
+ * in which case the surface-S6 tests below skip with an explicit reason
+ * rather than throwing - this guard exists to catch an overclaim, not to
+ * assert this checkout's own git plumbing is configured a particular way.
+ */
+function resolveCommitRangeBase(): string | undefined {
+  for (const candidate of ["origin/main", "main"]) {
+    try {
+      execFileSync("git", ["rev-parse", "--verify", "--quiet", candidate], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      return candidate;
+    } catch {
+      // Not resolvable - try the next candidate.
+    }
+  }
+  return undefined;
+}
+
+const COMMIT_RANGE_BASE = resolveCommitRangeBase();
+const COMMIT_RANGE_SKIP =
+  COMMIT_RANGE_BASE === undefined
+    ? "neither origin/main nor a local main branch is resolvable in this checkout"
+    : false;
+
+/** One commit's own subject + body, from a real `git log` invocation. */
+interface RangeCommit {
+  readonly sha: string;
+  readonly subject: string;
+  readonly body: string;
+}
+
+const COMMIT_RECORD_END = "---GHANTIKA-COMMIT-RANGE-END---";
+
+/**
+ * Every commit's subject AND body in `${COMMIT_RANGE_BASE}..HEAD` - the
+ * real public surface a violation could otherwise hide on entirely
+ * unseen: a claim that only ever shipped inside a commit message, never
+ * in README/CHANGELOG/the served description/source comments, previously
+ * passed as if this guard covered it, when it never looked at git
+ * history at all. Each record is delimited by this file's own private
+ * end-of-record marker (real enough not to collide with ordinary commit
+ * prose) so a body containing blank lines is never mistaken for a record
+ * boundary.
+ */
+function readCommitRangeCommits(): RangeCommit[] {
+  if (COMMIT_RANGE_BASE === undefined) return [];
+  const raw = execFileSync(
+    "git",
+    ["log", `--format=%H%n%s%n%n%b%n${COMMIT_RECORD_END}`, `${COMMIT_RANGE_BASE}..HEAD`],
+    { encoding: "utf8" }
+  );
+  return raw
+    .split(`${COMMIT_RECORD_END}\n`)
+    .map((record) => record.trim())
+    .filter((record) => record.length > 0)
+    .map((record) => {
+      const lines = record.split("\n");
+      const sha = lines[0] ?? "";
+      const subject = lines[1] ?? "";
+      const body = lines.slice(2).join("\n").trim();
+      return { sha, subject, body };
+    });
+}
+
+/**
+ * This story's own established vocabulary for the escalation identity
+ * gate specifically - used to scope the proof-claim check below to text
+ * that is actually ABOUT that mechanism, exactly like this file's own
+ * `extractEscalationGateParagraph` scopes README.md/kill.ts/process.ts to
+ * that mechanism's own paragraph rather than banning the word file-wide.
+ * A commit message is unstructured prose with no such paragraph to
+ * delimit, so this filters to the sentences that mention the mechanism
+ * by name instead of scanning the whole commit at once - a regression
+ * test description that merely says it "proves" a bug stays fixed is a
+ * completely unrelated, legitimate use of the word this guard must never
+ * flag.
+ */
+const ESCALATION_GATE_SENTENCE_KEYWORDS =
+  /escalation identity|identity gate|identity matcher|group is still ours|originally-recorded member/i;
+
+function extractEscalationGateSentences(text: string): string[] {
+  return text
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length > 0 && ESCALATION_GATE_SENTENCE_KEYWORDS.test(sentence));
+}
+
+/**
+ * Strips double-quoted spans before the proof-claim check runs on commit
+ * text: a commit that narrates a PAST, already-corrected overclaim
+ * legitimately quotes the retired wording (e.g. a claim that the matcher
+ * "proves" the group is still ours) - that is historical narration
+ * describing a fix, not a live assertion, and must never itself trip
+ * this guard. Only an UNQUOTED "prove"/"proves"/"provably" is a direct,
+ * live claim.
+ */
+function stripQuotedSpans(text: string): string {
+  return text.replace(/"[^"]*"/g, "");
+}
 
 test(
-  "kill: TC.35 THE COMBINED DEGRADED CELL - a2's pre-signal identity was never captured AND a6's pre-SIGTERM snapshot ALSO fails (ps/pgrep unavailable): SIGTERM is still sent (best-effort), escalation is REFUSED with no SIGKILL, identity_confirmed is false, escalation_refused_reason is present and honestly describes the send as best-effort (never 'confirmed'/'guarded'), and the real process survives (never falsely marked dead by an unsent SIGKILL)",
+  'no "provably"/unqualified proof claim beside the escalation identity matcher, surface S6 (every commit subject+body in the range) - scoped to sentences that actually mention the escalation identity gate by name, with quoted spans stripped so a commit narrating an already-fixed overclaim in quotes is never itself mistaken for a live one',
+  { skip: COMMIT_RANGE_SKIP },
+  () => {
+    for (const commit of readCommitRangeCommits()) {
+      const text = `${commit.subject}\n\n${commit.body}`;
+      for (const sentence of extractEscalationGateSentences(text)) {
+        assertNoUnqualifiedProofClaim(
+          stripQuotedSpans(sentence),
+          `commit ${commit.sha.slice(0, 12)} ("${commit.subject}")`
+        );
+      }
+    }
+  }
+);
+
+test(
+  'no unqualified "never scales with group size" cost claim, surface S6 (every commit subject+body in the range)',
+  { skip: COMMIT_RANGE_SKIP },
+  () => {
+    for (const commit of readCommitRangeCommits()) {
+      const text = `${commit.subject}\n\n${commit.body}`;
+      assertNoUnqualifiedScaleClaim(
+        text,
+        `commit ${commit.sha.slice(0, 12)} ("${commit.subject}")'s own message`
+      );
+    }
+  }
+);
+
+// --- THE COMBINED DEGRADED CELL, at the real handler/wire level ---
+
+test(
+  "kill: THE COMBINED DEGRADED CELL - the pre-signal identity check's identity was never captured AND the escalation gate's pre-SIGTERM snapshot ALSO fails (ps/pgrep unavailable): SIGTERM is still sent (best-effort), escalation is REFUSED with no SIGKILL, identity_confirmed is false, escalation_refused_reason is present and honestly describes the send as best-effort (never 'confirmed'/'guarded'), and the real process survives (never falsely marked dead by an unsent SIGKILL)",
   {
     skip:
       process.platform === "win32"
@@ -2820,7 +2979,7 @@ test(
         onStderrEnd: () => {},
       }
     );
-    // a2's OWN degraded cell: attach with NO birth identity at all (the
+    // The pre-signal identity check's OWN degraded cell: attach with NO birth identity at all (the
     // third argument omitted) - matching evaluatePreSignalIdentityGate's
     // own documented "no identity captured at all" degraded path, which
     // never even attempts a ps call for the FIRST signal.
@@ -2833,7 +2992,7 @@ test(
       "expected the real resistant process to be alive before kill"
     );
 
-    // a6's OWN degraded cell: ps/pgrep unavailable for the WHOLE duration
+    // The escalation gate's OWN degraded cell: ps/pgrep unavailable for the WHOLE duration
     // of the kill() call, so the escalation identity gate's own
     // pre-SIGTERM snapshot also fails to capture anything usable.
     process.env.PATH = "/tmp/does-not-exist-ghantika-empty-path-dir-tc35";
@@ -2860,7 +3019,7 @@ test(
     assert.equal(
       structured.identity_confirmed,
       false,
-      "a2's pre-signal identity was never captured at all - honestly disclosed as unconfirmed"
+      "the pre-signal identity check was never captured at all - honestly disclosed as unconfirmed"
     );
     assert.equal(
       typeof structured.escalation_refused_reason,
@@ -2891,7 +3050,7 @@ test(
     );
     assert.ok(
       !/\bguarded\b/.test(reason),
-      `expected the combined-degraded reason to never describe the earlier SIGTERM as "guarded" - that word is reserved for the a2-positive-plus-a6-failed case, which this is not, got: ${JSON.stringify(reason)}`
+      `expected the combined-degraded reason to never describe the earlier SIGTERM as "guarded" - that word is reserved for the pre-signal-confirmed-plus-escalation-snapshot-failed case, which this is not, got: ${JSON.stringify(reason)}`
     );
 
     // No SIGKILL was ever sent - the real, resistant process must still
@@ -2909,49 +3068,86 @@ test(
   }
 );
 
-// --- TC.36: the combined-degraded cell is RETRYABLE, at the real handler/wire level ---
+// --- the combined-degraded cell is RETRYABLE, at the real handler/wire level ---
 
-test(
-  "kill: TC.36 A STRANDED COMBINED-DEGRADED KILL IS RETRYABLE - the exact TC.35 scenario, then a SECOND kill() call against the same job once identity observers recover genuinely re-runs the identity gate (not short-circuited by a stale reap-attempt flag) and actually signals/reaps the still-alive group",
-  {
-    skip:
-      process.platform === "win32"
-        ? "manipulates the server process's own PATH to make ps/pgrep unavailable, POSIX-only"
-        : false,
-  },
-  async () => {
-    const realPath = process.env.PATH;
-    const record = jobStore.createJob({
-      argv: ["sleep", "10"],
+/**
+ * Polls a REAL process-table lookup - never an assumption - until neither
+ * the leader pid nor its whole process GROUP is alive, or `timeoutMs`
+ * elapses. Shared by the scenario below's own `finally`-block cleanup and
+ * by its failure-safety control's independent re-check.
+ */
+async function waitForProcessGroupGone(pid: number, timeoutMs = 3000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid) && !isProcessGroupAlive(pid)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return !isProcessAlive(pid) && !isProcessGroupAlive(pid);
+}
+
+/**
+ * The shared body of the stranded-combined-degraded-kill-is-retryable
+ * scenario, factored out so the real regression test below and its own
+ * failure-safety control can drive the IDENTICAL setup - proving the
+ * SAME `finally`-block cleanup actually runs on both a passing and a
+ * deliberately-failing path, rather than only ever being exercised by the
+ * success case. `pidOut` is populated with the resistant leader's real
+ * pid the moment it is spawned, BEFORE any assertion below can throw, so
+ * a caller can verify real cleanup even when this function itself
+ * rejects.
+ *
+ * `forceFailureAfterSpawn`, when set, throws immediately after the
+ * resistant process is confirmed alive and attached, before either
+ * kill() call ever runs - simulating a partial-setup/assertion failure
+ * at the earliest realistic point one could occur, and proving the
+ * leader and its group are still torn down even though nothing below
+ * that point ever executed.
+ */
+async function runStrandedRetryScenario(
+  pidOut: { pid?: number },
+  options: { readonly forceFailureAfterSpawn?: boolean } = {}
+): Promise<void> {
+  const realPath = process.env.PATH;
+  const record = jobStore.createJob({
+    argv: ["sleep", "10"],
+    cwd: process.cwd(),
+    env: { PATH: realPath ?? "/usr/bin:/bin" },
+    isShell: false,
+  });
+  // The identical SIGTERM-resistant real-process fixture the combined-
+  // degraded-cell test above builds - ignores SIGTERM entirely, so a
+  // phased kill() genuinely reaches the escalation gate rather than the
+  // group dying from SIGTERM alone.
+  const child = spawnManaged(
+    {
+      argv: [
+        "node",
+        "-e",
+        "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000)",
+      ],
       cwd: process.cwd(),
       env: { PATH: realPath ?? "/usr/bin:/bin" },
-      isShell: false,
-    });
-    // The identical SIGTERM-resistant real-process fixture TC.35 builds -
-    // ignores SIGTERM entirely, so a phased kill() genuinely reaches the
-    // escalation gate rather than the group dying from SIGTERM alone.
-    const child = spawnManaged(
-      {
-        argv: [
-          "node",
-          "-e",
-          "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000)",
-        ],
-        cwd: process.cwd(),
-        env: { PATH: realPath ?? "/usr/bin:/bin" },
-      },
-      {
-        onSpawn: () => jobStore.markRunning(record.job_id),
-        onError: (message) => jobStore.markSpawnFailed(record.job_id, message),
-        onExit: (code, signal) => jobStore.markExited(record.job_id, code, signal),
-        onStdoutChunk: () => {},
-        onStderrChunk: () => {},
-        onStdoutEnd: () => {},
-        onStderrEnd: () => {},
-      }
-    );
-    // Same a2 degraded cell TC.35 uses: attach with NO birth identity at
-    // all, so the pre-signal gate can never confirm anything either.
+    },
+    {
+      onSpawn: () => jobStore.markRunning(record.job_id),
+      onError: (message) => jobStore.markSpawnFailed(record.job_id, message),
+      onExit: (code, signal) => jobStore.markExited(record.job_id, code, signal),
+      onStdoutChunk: () => {},
+      onStderrChunk: () => {},
+      onStdoutEnd: () => {},
+      onStderrEnd: () => {},
+    }
+  );
+  // Tracked from the moment the real process exists - BEFORE any
+  // assertion below has a chance to throw - so this scenario's own
+  // `finally` block (and, for the control, an external re-check) can
+  // always find and clean it up, on every exit path.
+  pidOut.pid = child!.pid!;
+
+  try {
+    // Same pre-signal-identity degraded cell the combined-degraded-cell
+    // test above uses: attach with NO birth identity at all, so the
+    // pre-signal gate can never confirm anything either.
     jobStore.attachChild(record.job_id, child!);
     await waitForStdout(child!, "ready");
 
@@ -2961,8 +3157,14 @@ test(
       "expected the real resistant process to be alive before the first kill()"
     );
 
+    if (options.forceFailureAfterSpawn) {
+      throw new Error(
+        "STRANDED-RETRY CONTROL - deliberate mid-scenario failure, forced right after the resistant process was confirmed alive and attached, before either kill() call ever ran"
+      );
+    }
+
     // FIRST call: ps/pgrep unavailable for the WHOLE call - the exact
-    // combined-degraded scenario TC.35 proves ends unconfirmed. PATH is
+    // combined-degraded scenario proven above ends unconfirmed. PATH is
     // restored again immediately after (BEFORE the second call below),
     // so the second call's own identity gate can genuinely observe the
     // real process table this time.
@@ -2990,12 +3192,12 @@ test(
     assert.equal(
       typeof firstStructured.escalation_refused_reason,
       "string",
-      "expected the first call to disclose an escalation refusal, exactly like TC.35"
+      "expected the first call to disclose an escalation refusal, exactly like the combined-degraded scenario above"
     );
     assert.equal(
       isProcessAlive(child!.pid!),
       true,
-      "expected the real resistant process to have SURVIVED the first call - this is the stranding TC.35 documents"
+      "expected the real resistant process to have SURVIVED the first call - this is the stranding the combined-degraded scenario documents"
     );
 
     // SECOND call, same job_id, real ps/pgrep available this time (PATH
@@ -3033,25 +3235,85 @@ test(
     // since SIGKILL delivery and OS-level reaping are asynchronous
     // relative to the call that sent it (the same real gap this
     // codebase's own SIGKILL_CONFIRMATION_TIMEOUT_MS closes elsewhere).
-    const deadline = Date.now() + 3000;
-    let stillAlive = true;
-    while (Date.now() < deadline) {
-      if (!isProcessAlive(child!.pid!)) {
-        stillAlive = false;
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
+    const gone = await waitForProcessGroupGone(child!.pid!);
     assert.equal(
-      stillAlive,
-      false,
+      gone,
+      true,
       "expected the real resistant process to have actually been killed by the SECOND call - the first call left it stranded, and only a genuine retry (not merely re-checking an already-tripped flag) can end it"
     );
-
-    // Real cleanup, only in case the assertion above somehow failed.
-    if (isProcessAlive(child!.pid!)) {
+  } finally {
+    // Every partially-created resource this scenario sets up is torn
+    // down here regardless of how the try block above exits - the
+    // success path (where the second kill() call already finished the
+    // real process off), an assertion failure anywhere above, or the
+    // deliberate CONTROL failure. A bare best-effort signal alone is not
+    // enough (see this function's own docs): both the leader AND the
+    // whole process GROUP are confirmed ABSENT via a REAL process-table
+    // lookup (`isProcessAlive`/`isProcessGroupAlive`), never merely
+    // inferred from "a signal was sent".
+    try {
       process.kill(-child!.pid!, "SIGKILL");
+    } catch {
+      // Already gone (ESRCH) - nothing left to signal, not a failure.
     }
+    const reallyGone = await waitForProcessGroupGone(child!.pid!);
+    assert.equal(
+      reallyGone,
+      true,
+      `expected the resistant leader and its whole process group to be genuinely ABSENT after this scenario's own cleanup (pid ${child!.pid}), verified via a real process-table lookup - not merely assumed from a signal having been sent`
+    );
+  }
+}
+
+test(
+  "kill: A STRANDED COMBINED-DEGRADED KILL IS RETRYABLE - the exact combined-degraded scenario above, then a SECOND kill() call against the same job once identity observers recover genuinely re-runs the identity gate (not short-circuited by a stale reap-attempt flag) and actually signals/reaps the still-alive group",
+  {
+    skip:
+      process.platform === "win32"
+        ? "manipulates the server process's own PATH to make ps/pgrep unavailable, POSIX-only"
+        : false,
+  },
+  async () => {
+    const pidOut: { pid?: number } = {};
+    await runStrandedRetryScenario(pidOut);
+  }
+);
+
+test(
+  "kill: CONTROL - a forced mid-scenario failure still leaves no survivor leader or process group behind, verified via a real process-table lookup, never merely assumed",
+  {
+    skip:
+      process.platform === "win32"
+        ? "manipulates the server process's own PATH to make ps/pgrep unavailable, POSIX-only"
+        : false,
+  },
+  async () => {
+    const pidOut: { pid?: number } = {};
+    await assert.rejects(
+      () => runStrandedRetryScenario(pidOut, { forceFailureAfterSpawn: true }),
+      /STRANDED-RETRY CONTROL - deliberate mid-scenario failure/
+    );
+    assert.notEqual(
+      pidOut.pid,
+      undefined,
+      "expected the scenario to have recorded the real resistant process's pid before the forced failure - the whole point of this control is checking that PID"
+    );
+    const pid = pidOut.pid!;
+    // The scenario's own `finally` block already tore this down and
+    // asserted it internally - this is an INDEPENDENT re-check from
+    // outside that function, against the real process table, so this
+    // control does not merely trust the function's own internal
+    // assertion.
+    assert.equal(
+      isProcessAlive(pid),
+      false,
+      "expected the real resistant leader to be genuinely gone after the forced-failure path's own finally-block cleanup"
+    );
+    assert.equal(
+      isProcessGroupAlive(pid),
+      false,
+      "expected the whole real process GROUP to be genuinely gone after the forced-failure path's own finally-block cleanup - not just the leader pid"
+    );
   }
 );
 

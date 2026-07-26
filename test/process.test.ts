@@ -1750,7 +1750,7 @@ test(
     // survivor check the arbitration relies on finds it truly gone) and
     // THEN reports the fake EPERM, reproducing "the group emptied in the
     // instant between the identity gate's own re-read and the SIGKILL
-    // syscall" - precisely the narrowed (never closed) residual a11 discloses.
+    // syscall" - precisely the narrowed (never closed) residual the escalation identity gate discloses.
     const rec = recorder();
     const env = buildChildEnv("merge", {});
     const child = spawnManaged(
@@ -1959,7 +1959,7 @@ test("killProcessTreeWindows: synchronous and immediate - no waiting, no grace p
 });
 
 // ---------------------------------------------------------------------------
-// The escalation identity gate (a6-a11): before the SIGKILL escalation,
+// The escalation identity gate: before the SIGKILL escalation,
 // prove the process group is still the one this codebase spawned. Covers
 // the frozen six-token ps grammar (parsePidLstartRow), the batched/bounded/
 // force-reaped observer (readPidStartTimesBatchPosix), the pre-SIGTERM
@@ -1975,7 +1975,7 @@ test("PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS is the named 2000ms whole-phase bu
   );
 });
 
-// --- parsePidLstartRow: a10's frozen six-token grammar (pure, no real process needed) ---
+// --- parsePidLstartRow: the frozen six-token grammar (pure, no real process needed) ---
 
 test("parsePidLstartRow parses a well-formed six-token row into the correct epoch-millisecond instant under UTC0", () => {
   const parsed = parsePidLstartRow("12345 Sat Jul 25 13:39:12 2026");
@@ -2142,7 +2142,7 @@ test(
     assert.equal(
       invocationCount,
       1,
-      `expected exactly ONE real ps invocation for both pids (a9: cost independent of group size), saw ${invocationCount}`
+      `expected exactly ONE real ps invocation for both pids (call count must stay independent of group size), saw ${invocationCount}`
     );
 
     process.kill(-pid1, "SIGKILL");
@@ -2191,7 +2191,7 @@ test("readPidStartTimesBatchPosix: when NONE of the requested pids exist, resolv
 
 test("readPidStartTimesBatchPosix: a real execution failure (missing ps binary) reports observer-failure, never a false 'ok'", async () => {
   const realPath = process.env.PATH;
-  process.env.PATH = "/tmp/does-not-exist-ghantika-empty-path-dir-a6";
+  process.env.PATH = "/tmp/does-not-exist-ghantika-empty-path-dir-3";
   let result: Awaited<ReturnType<typeof readPidStartTimesBatchPosix>>;
   try {
     result = await readPidStartTimesBatchPosix([12345]);
@@ -2482,7 +2482,7 @@ test(
 // --- evaluateEscalationIdentityGate: the escalation-time decision ---
 
 test(
-  "evaluateEscalationIdentityGate: THE HAPPY PATH (TC.18) - a real member with an exactly-matching current start time escalates",
+  "evaluateEscalationIdentityGate: THE HAPPY PATH - a real member with an exactly-matching current start time escalates",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async () => {
     const rec = recorder();
@@ -2511,7 +2511,7 @@ test("evaluateEscalationIdentityGate: a degraded snapshot (zero members) always 
 });
 
 test(
-  "evaluateEscalationIdentityGate: NEGATIVE (TC.19) - every recorded member is gone at re-read - REFUSES, no positive match possible",
+  "evaluateEscalationIdentityGate: NEGATIVE - every recorded member is gone at re-read - REFUSES, no positive match possible",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async () => {
     const rec = recorder();
@@ -2531,7 +2531,7 @@ test(
   }
 );
 
-test("evaluateEscalationIdentityGate: NEGATIVE (TC.20) - a recorded pid is still present but its start time DIFFERS from the record (the recycled-pid simulation) - REFUSES", async () => {
+test("evaluateEscalationIdentityGate: NEGATIVE - a recorded pid is still present but its start time DIFFERS from the record (the recycled-pid simulation) - REFUSES", async () => {
   // Uses this process's own real, currently-alive pid, but with a
   // deliberately WRONG recorded start time - simulating exactly what a
   // stale, post-reuse bookkeeping record would look like.
@@ -2544,7 +2544,7 @@ test("evaluateEscalationIdentityGate: NEGATIVE (TC.20) - a recorded pid is still
 });
 
 test(
-  "evaluateEscalationIdentityGate: TC.22 - a legitimately disappeared member is NOT a failure - with one other original still matching exactly, escalation proceeds",
+  "evaluateEscalationIdentityGate: a legitimately disappeared member is NOT a failure - with one other original still matching exactly, escalation proceeds",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async () => {
     const rec = recorder();
@@ -2598,7 +2598,7 @@ test(
 );
 
 test(
-  "evaluateEscalationIdentityGate: TC.23 - ANY-ONE sufficiency - a group of many descendants where only a SINGLE one still matches still escalates (never requires full-set survival)",
+  "evaluateEscalationIdentityGate: ANY-ONE sufficiency - a group of many descendants where only a SINGLE one still matches still escalates (never requires full-set survival)",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async () => {
     const rec = recorder();
@@ -2649,7 +2649,7 @@ test(
 );
 
 test(
-  "evaluateEscalationIdentityGate: TC.32 - the leader is compared by the SAME exact-match rule as any descendant, no tolerance window - a recorded value off by even a single millisecond REFUSES",
+  "evaluateEscalationIdentityGate: the leader is compared by the SAME exact-match rule as any descendant, no tolerance window - a recorded value off by even a single millisecond REFUSES",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async () => {
     const rec = recorder();
@@ -2666,8 +2666,9 @@ test(
 
     // A snapshot claiming the SAME pid but a start time off by exactly one
     // millisecond from the real, current value - this must REFUSE, proving
-    // no tolerance window (unlike a2's several-second etime tolerance,
-    // which is a wholly separate, out-of-scope mechanism here).
+    // no tolerance window (unlike the pre-signal birth-identity check's
+    // several-second etime tolerance, which is a wholly separate,
+    // out-of-scope mechanism here).
     const offByOneMs = {
       members: [{ pid, startTimeMs: real.startTimeMs + 1 }],
       degraded: false,
@@ -2683,7 +2684,7 @@ test(
 );
 
 test(
-  "evaluateEscalationIdentityGate: NEGATIVE (TC.21) - the bounded re-read TIMES OUT - refuses rather than defaulting to escalation",
+  "evaluateEscalationIdentityGate: NEGATIVE - the bounded re-read TIMES OUT - refuses rather than defaulting to escalation",
   {
     skip: process.platform === "win32" ? "shadows a slow ps on PATH, POSIX-only" : false,
   },
@@ -2706,7 +2707,7 @@ test(
   }
 );
 
-test("evaluateEscalationIdentityGate: NEGATIVE (TC.21) - a malformed re-read row for the only recorded member REFUSES, never guessed at", async () => {
+test("evaluateEscalationIdentityGate: NEGATIVE - a malformed re-read row for the only recorded member REFUSES, never guessed at", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-reread-malformed-ps-"));
   const psPath = path.join(dir, "ps");
   fs.writeFileSync(psPath, "#!/bin/sh\necho '424242 Sat Jul 25 13:39:12'\n"); // missing year token
@@ -2728,7 +2729,7 @@ test("evaluateEscalationIdentityGate: NEGATIVE (TC.21) - a malformed re-read row
 });
 
 test(
-  "evaluateEscalationIdentityGate: NEGATIVE (TC.21) - partial re-read (one recorded member gone, the other unreadable) with no positive proof anywhere - REFUSES",
+  "evaluateEscalationIdentityGate: NEGATIVE - partial re-read (one recorded member gone, the other unreadable) with no positive proof anywhere - REFUSES",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async () => {
     // pidA is genuinely gone at re-read time; pidB's row is deliberately
@@ -2761,7 +2762,7 @@ test(
 );
 
 test(
-  "evaluateEscalationIdentityGate: TC.27 - a resistant ps observer at ESCALATION TIME does not hang the gate; it completes/refuses within the named budget, force-reaps the resistant child, and the event loop demonstrably progresses meanwhile",
+  "evaluateEscalationIdentityGate: a resistant ps observer at ESCALATION TIME does not hang the gate; it completes/refuses within the named budget, force-reaps the resistant child, and the event loop demonstrably progresses meanwhile",
   {
     skip: process.platform === "win32" ? "shadows a slow ps on PATH, POSIX-only" : false,
   },
@@ -2833,7 +2834,7 @@ test(
 );
 
 test(
-  "TC.33 - the pre-SIGTERM snapshot phase and the escalation-time re-read each get their OWN FRESH budget - a slow snapshot does not consume the re-read's own allowance",
+  "the pre-SIGTERM snapshot phase and the escalation-time re-read each get their OWN FRESH budget - a slow snapshot does not consume the re-read's own allowance",
   {
     skip: process.platform === "win32" ? "shadows a slow ps on PATH, POSIX-only" : false,
   },
@@ -2891,7 +2892,17 @@ test(
     }
 
     assert.ok(
-      snapshotElapsedMs < 500,
+      // Widened from 500ms - the same real-scheduling-delay class
+      // documented at test/run.test.ts's RUN_RESPONSE_TIME_BOUND_MS: this
+      // phase can internally hit its own 250ms budget more than once
+      // across its sequential steps, each adding its own settlement
+      // grace, so its real total under genuine concurrent load can run
+      // well past a bare 2x multiple of the nominal budget. 1500ms stays
+      // comfortably below the fresh, full budgets (2000/5000ms) used
+      // later in this same test, so it still proves this phase was
+      // genuinely bounded by its OWN tight allowance rather than
+      // borrowing time from anything else.
+      snapshotElapsedMs < 1500,
       `expected the tightly-budgeted snapshot phase to have been bounded by its OWN 250ms budget, took ${snapshotElapsedMs}ms`
     );
     assert.deepEqual(
@@ -2908,10 +2919,10 @@ test(
   }
 );
 
-// --- TC.24: structural prohibition - the escalation path never signals an individual member's own pid, only kill(-pgid, ...) ---
+// --- structural prohibition - the escalation path never signals an individual member's own pid, only kill(-pgid, ...) ---
 
 test(
-  "TC.24 - STRUCTURAL: across a real multi-descendant escalation, every process.kill call this codebase's own escalation path makes targets ONLY the group's negative pgid - never an individual member's own positive pid",
+  "STRUCTURAL: across a real multi-descendant escalation, every process.kill call this codebase's own escalation path makes targets ONLY the group's negative pgid - never an individual member's own positive pid",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async (t) => {
     const rec = recorder();

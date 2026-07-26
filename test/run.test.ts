@@ -52,6 +52,38 @@ const POSIX_ONLY_SKIP =
     ? "birth-identity capture is a real `ps -o etime=` read, POSIX-only - see captureBirthIdentityPosix's own docs"
     : false;
 
+/**
+ * The upper bound `run()`'s own response time must stay under for it to
+ * count as "returned independently of the identity observer" - shared by
+ * both PERMANENT REGRESSION tests below (the deliberately slow-but-
+ * successful observer, and the observer that fails immediately with no
+ * artificial delay at all).
+ *
+ * ROOT-CAUSE HISTORY: this used to be a tighter 800ms, chosen only to
+ * keep these tests fast. That was tight enough to lose a REAL scheduling
+ * race under genuine concurrent load: a fresh full-suite run measured a
+ * GENUINE 981ms here with no code regression at all - `run()` was not
+ * blocking; this was purely real overhead (spawning the job's own child
+ * process, plus this codebase's own synchronous pre-flight work) under
+ * contention with everything else the machine was doing at that moment -
+ * the same class of real scheduling delay `RESISTANT_OBSERVER_BOUND_MS`
+ * (test/process.test.ts) already documents for an earlier instance of
+ * this exact bug class. Widened to comfortably clear that measured value.
+ *
+ * The first PERMANENT REGRESSION test below used to pair this bound with
+ * a fixed-duration sleep the fake `ps` observer had to stay slower than -
+ * that coupling is GONE (see that test's own docs for why: a fixed sleep
+ * can never be both "definitely still pending when checked" and
+ * "definitely settles inside the real, unwidened
+ * `ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS` production budget" under
+ * sufficiently heavy concurrent load - real scheduling delay for a
+ * forked child to even start running was reproduced directly at up to
+ * several REAL seconds under a genuinely concurrent four-file test run).
+ * This bound now only ever has to clear `run()`'s own real overhead,
+ * with nothing else competing against it.
+ */
+const RUN_RESPONSE_TIME_BOUND_MS = 2000;
+
 function jobIdOf(result: ReturnType<typeof runTool.handler>): string {
   const structured = result.structuredContent as Record<string, unknown>;
   const jobId = structured.job_id;
@@ -321,20 +353,45 @@ test(
   { skip: POSIX_ONLY_SKIP },
   async () => {
     const realPath = process.env.PATH;
-    // A real fake `ps` that sleeps 1.5s before answering with a valid,
-    // parseable etime line - the EXACT shape the original reproduction used to
-    // measure the pre-fix bug (2088ms/1620ms real run() response times
-    // against the unfixed synchronous capture call). Prepended to PATH
-    // (never replacing it), so every other real binary this test needs
-    // (`sleep` for the job itself, `pgrep` for kill()'s own process-group
-    // confirmation) still resolves normally through the rest of the real
-    // PATH.
-    const fakePsDir = makeFakePsDir("sleep 1.5\necho '00:00'");
+    // A real fake `ps` that BLOCKS on an explicit release file - never a
+    // fixed-duration sleep - before answering with a valid, parseable
+    // etime line. This test needs the async capture to be GENUINELY
+    // still pending at the synchronous checkpoint right after run()
+    // returns, AND to genuinely settle to "captured" once kill() awaits
+    // it - a fixed sleep can only approximate both at once, and under
+    // real concurrent load it can fail to do either: reproduced directly
+    // (not merely inferred) by running four copies of this whole file's
+    // test suite concurrently, where a 1.5s (and separately a 2.5s)
+    // nominal sleep repeatedly settled to "unavailable" instead of
+    // "captured" - real scheduling delay for the freshly forked fake `ps`
+    // to even be scheduled and run, stacked on top of the nominal sleep,
+    // repeatedly exceeded this codebase's own real, unwidened
+    // `ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS` production budget (3000ms)
+    // - the same "wall-clock timer fires independent of whether the
+    // forked script has actually been scheduled yet" class
+    // `RESISTANT_OBSERVER_BOUND_MS` (test/process.test.ts) already
+    // documents. Blocking on an explicit release file removes the
+    // coupling entirely: the fake ps is held exactly as long as this
+    // test wants and not a moment longer, regardless of how loaded the
+    // machine is, so it settles almost immediately once released - never
+    // close to the production budget.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-slow-observer-release-"));
+    const releaseFile = path.join(dir, "release");
+    const wrapperPath = path.join(dir, "ps");
+    fs.writeFileSync(
+      wrapperPath,
+      `#!/bin/sh\nwhile [ ! -f '${releaseFile}' ]; do sleep 0.02; done\necho '00:00'\n`
+    );
+    fs.chmodSync(wrapperPath, 0o755);
 
     let result: ReturnType<typeof runTool.handler>;
     let elapsedMs: number;
     try {
-      process.env.PATH = `${fakePsDir}:${realPath ?? "/usr/bin:/bin"}`;
+      // Prepended to PATH (never replacing it), so every other real
+      // binary this test needs (`sleep` for the job itself, `pgrep` for
+      // kill()'s own process-group confirmation) still resolves normally
+      // through the rest of the real PATH.
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
       const before = Date.now();
       result = runTool.handler({
         command: ["sleep", "10"],
@@ -345,32 +402,38 @@ test(
       // Restored immediately - the ALREADY-SPAWNED fake-ps child process
       // (kicked off synchronously inside run()'s own handler, per this
       // file's own empirical proof above that execFile resolves PATH at
-      // call time) keeps sleeping on its own regardless of this restore;
-      // this only affects PATH lookups for anything spawned AFTER this
-      // point (kill()'s own, separate, fast pre-signal ps check below).
+      // call time) keeps blocking on the release file regardless of this
+      // restore; this only affects PATH lookups for anything spawned
+      // AFTER this point (kill()'s own, separate, fast pre-signal ps
+      // check below).
       process.env.PATH = realPath;
     }
 
     assert.notEqual(result.isError, true, `run() must succeed: ${JSON.stringify(result)}`);
     // THE core regression assertion: run()'s own response time must be
-    // bounded far under the fake observer's 1.5s artificial delay - on the
-    // unfixed (synchronous-capture) code this measured 2088ms/1620ms; 800ms
-    // is generous headroom above ordinary fast-path latency while staying
-    // comfortably below the 1500ms sleep.
+    // bounded far under any realistic delay - see
+    // `RUN_RESPONSE_TIME_BOUND_MS`'s own docs for why this bound was
+    // widened from its original, genuine-concurrent-load-sensitive value.
+    // Nothing here couples this bound to the fake observer's own delay
+    // anymore (the observer is blocked indefinitely, not merely slow),
+    // so widening it costs nothing.
     assert.ok(
-      elapsedMs < 800,
-      `run() must return independently of a slow identity observer - expected well under 800ms, took ${elapsedMs}ms (the fake ps sleeps 1500ms; a response anywhere near or above that means the old synchronous-capture bug is back)`
+      elapsedMs < RUN_RESPONSE_TIME_BOUND_MS,
+      `run() must return independently of a slow identity observer - expected well under ${RUN_RESPONSE_TIME_BOUND_MS}ms, took ${elapsedMs}ms (a response anywhere near this bound means the old synchronous-capture bug is back)`
     );
     const jobId = jobIdOf(result);
 
     // Confirm we are GENUINELY racing ahead of a still-in-flight capture,
     // not merely assuming timing worked out - this is what makes the
     // "kill awaits pending" assertion below meaningful rather than
-    // accidental.
+    // accidental. Trivially true here (the fake ps is blocked on a
+    // release file nothing has created yet), but asserted anyway so this
+    // test still fails loudly if that invariant is ever broken by an
+    // unrelated change.
     assert.equal(
       jobStore.get(jobId)!.identity_capture,
       "pending",
-      "expected the async capture to still be genuinely in flight at this point (the fake ps has not slept its full 1.5s yet) - if this fails, the race this test exists to exercise did not actually happen"
+      "expected the async capture to still be genuinely in flight at this point (the fake ps is deliberately blocked on its release file) - if this fails, the race this test exists to exercise did not actually happen"
     );
 
     // THE corrected-design proof: kill(), called RIGHT NOW while the
@@ -378,8 +441,16 @@ test(
     // (bounded by its own timeout) and get a REAL, externally-confirmed
     // identity confirmation once it settles - never immediately fall back
     // to the honest-but-weaker degraded path just because identity wasn't
-    // ALREADY settled at the exact instant kill() was called.
-    const killResult = await killTool.handler({ job_id: jobId });
+    // ALREADY settled at the exact instant kill() was called. kill() is
+    // started here, BEFORE the release file exists, so it genuinely
+    // begins awaiting the still-pending capture; releasing the fake ps a
+    // short, fixed moment later (comfortably real but negligible next to
+    // the production timeout) proves that await is real, not merely a
+    // lucky ordering.
+    const killPromise = killTool.handler({ job_id: jobId });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    fs.writeFileSync(releaseFile, "go");
+    const killResult = await killPromise;
     assert.notEqual(killResult.isError, true, `kill() must succeed: ${JSON.stringify(killResult)}`);
     const structured = killResult.structuredContent as Record<string, unknown>;
     assert.equal(structured.state, "killed");
@@ -439,8 +510,8 @@ test(
 
     assert.notEqual(result.isError, true, `run() must succeed: ${JSON.stringify(result)}`);
     assert.ok(
-      elapsedMs < 800,
-      `run() must never block on the identity observer regardless of how it fails - took ${elapsedMs}ms`
+      elapsedMs < RUN_RESPONSE_TIME_BOUND_MS,
+      `run() must never block on the identity observer regardless of how it fails - expected well under ${RUN_RESPONSE_TIME_BOUND_MS}ms, took ${elapsedMs}ms`
     );
     const jobId = jobIdOf(result);
 

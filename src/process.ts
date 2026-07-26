@@ -1402,9 +1402,9 @@ export interface RecordedGroupMember {
  * `rows` may mean it has genuinely exited (the normal, expected "not
  * found" outcome - real `ps` silently omits a nonexistent pid from a
  * multi-pid query rather than erroring, confirmed empirically), or that
- * its own row was present but malformed and therefore discarded (a10:
- * "never guessed at"). Distinguishing those two would require attributing
- * a malformed row to a specific pid, which a10 explicitly forbids - so
+ * its own row was present but malformed and therefore discarded (never
+ * guessed at). Distinguishing those two would require attributing
+ * a malformed row to a specific pid, which this parser's own contract explicitly forbids - so
  * this deliberately does not attempt to; the caller's own "did any
  * ORIGINALLY-RECORDED pid still produce an exactly-matching row" question
  * never needs that distinction; it only needs to know a pid's own
@@ -1422,7 +1422,7 @@ function findRecordedStartTime(
   return rows.find((row) => row.pid === pid)?.startTimeMs;
 }
 
-/** `ps`'s ordinary weekday abbreviations under the `C` locale - part of a10's frozen six-token grammar's own sanity check, not merely a token-count check. */
+/** `ps`'s ordinary weekday abbreviations under the `C` locale - part of this module's own frozen six-token grammar's sanity check, not merely a token-count check. */
 const LSTART_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 /** `ps`'s ordinary month abbreviations under the `C` locale. */
 const LSTART_MONTHS = [
@@ -1441,8 +1441,8 @@ const LSTART_MONTHS = [
 ];
 
 /**
- * Parses ONE `ps -p <pid> -o pid=,lstart=` output ROW - a10's frozen
- * grammar: `pid weekday month day HH:MM:SS year`, produced under pinned
+ * Parses ONE `ps -p <pid> -o pid=,lstart=` output ROW - this module's own
+ * frozen grammar: `pid weekday month day HH:MM:SS year`, produced under pinned
  * `LC_ALL=C`/`TZ=UTC0` - into a real pid plus an epoch-millisecond instant.
  * Splits on any RUN of whitespace, never a single space: `ps` pads its
  * `lstart` column to a fixed width, so a single-digit day (`" 5"` rather
@@ -1461,9 +1461,9 @@ const LSTART_MONTHS = [
  * last check a row like `123 Mon Jul 25 15:00:00 2026` would parse
  * identically to the genuinely correct `123 Sat Jul 25 15:00:00 2026` (25
  * July 2026 is a real Saturday) even though the two rows contradict each
- * other - a10's own words: "a guard exactly right about which token is
+ * other - stated plainly: a guard exactly right about which token is
  * which and silently wrong by hours about what it means is worse than
- * one that fails to parse."
+ * one that fails to parse.
  *
  * The zone is FROZEN, not merely the layout: `lstart` itself carries no
  * zone token at all, so the pinned `TZ=UTC0` environment (see
@@ -1530,11 +1530,11 @@ function parseLstartBatchOutput(stdout: string): RecordedGroupMember[] {
 
 /**
  * Reads pid+lstart for a SET of pids in ONE real `ps -p <comma-list>` call
- * - a10's frozen six-token grammar, run under pinned `LC_ALL=C`/`TZ=UTC0`
+ * - this module's own frozen six-token grammar, run under pinned `LC_ALL=C`/`TZ=UTC0`
  * (never the server's own inherited locale/zone, which could vary the
  * output shape) - batched so this observer's cost is ONE real subprocess
- * call regardless of how many members the group has (a9: "an N-member
- * group cannot create N sequential timeout windows").
+ * call regardless of how many members the group has (an N-member
+ * group must never create N sequential timeout windows).
  *
  * Bounded and force-reaped exactly like this file's other async `ps`/`pgrep`
  * observers (`readProcessElapsedSecondsAsync`, `hasLiveProcessGroupMembersPosixAsync`):
@@ -1697,7 +1697,7 @@ function parsePgrepPidList(stdout: string): number[] | undefined {
 /**
  * The pre-SIGTERM membership snapshot the escalation identity gate is
  * built on: the leader's own pid plus every CURRENTLY-live descendant's
- * pid, each paired with its real, `ps`-read start time (a10's grammar) -
+ * pid, each paired with its real, `ps`-read start time (this module's own frozen grammar) -
  * captured BEFORE the first signal in this escalation is ever sent, never
  * re-derived later. `degraded: true` means this snapshot captured ZERO
  * usable records (every candidate pid was gone, unreadable, or the
@@ -1857,7 +1857,7 @@ export type EscalationIdentityGateResult =
  *   itself a failure);
  * - a recorded member is still present but its start time DIFFERS from
  *   the record (the recycled-pid case);
- * - a recorded member's row came back malformed (a10: discarded, never
+ * - a recorded member's row came back malformed (discarded, never
  *   guessed at - contributes no match, same as if it were absent).
  *
  * In every one of those, `matched` below is `false`, and this function
