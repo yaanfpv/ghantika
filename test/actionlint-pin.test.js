@@ -91,11 +91,19 @@ function locateActionlintSteps(workflow) {
 /**
  * Everything this file's static, text-only pass checks about the
  * actionlint recipe: the pinned URL, the saved filename, the recorded
- * checksum record's own well-formedness, and the canonical invoke step's
- * bare, PATH-resolved shape, plus the structural preconditions needed to
- * evaluate any of that at all (the job and the install step actually
- * existing). Deliberately does NOT scan install-step text for unbounded,
- * behavioral properties - "did curl actually download something," "did tar
+ * checksum record's own well-formedness, the canonical invoke step's
+ * bare, PATH-resolved shape, and the absence of any executable `uses:`
+ * step between verified extraction and the bare invocation - plus the
+ * structural preconditions needed to evaluate any of that at all (the job
+ * and the install step actually existing). The `uses:` fact is asserted
+ * here, statically, rather than by the hermetic drive further down,
+ * because the hermetic harness only ever runs shell `run:` text through a
+ * real shell - it cannot execute a GitHub Action at all, so it is
+ * structurally incapable of proving anything about what one does. A
+ * bounded, closed-form fact belongs in this static pass; only an unbounded
+ * behavioral property needs the hermetic drive. Deliberately does NOT scan
+ * install-step text for unbounded, behavioral properties - "did curl
+ * actually download something," "did tar
  * actually extract it," "did the checksum check get swallowed" - by
  * matching against a tool name or an enumerated pattern list; those are
  * asserted for real by the hermetic execution tests further down, which
@@ -128,6 +136,16 @@ function validateActionlintRecipe(workflow, hashRecordContent) {
     problems.push(
       'no later step runs the bare "actionlint -color" - it must resolve from PATH, not "./actionlint"'
     );
+  }
+
+  if (installIndex !== -1 && invokeIndex !== -1) {
+    for (let i = installIndex + 1; i < invokeIndex; i += 1) {
+      if (typeof steps[i]?.uses === "string") {
+        problems.push(
+          `an executable "uses:" step ("${steps[i].uses}") sits between the verified extraction and the bare invocation - the hermetic harness can only drive shell run: text, so it cannot prove anything about what an action does, and this window must stay free of executable steps entirely`
+        );
+      }
+    }
   }
 
   let savedAs = null;
@@ -295,9 +313,36 @@ test("negative: invoking ./actionlint instead of the bare PATH-resolved binary i
   assert.ok(problems.some((p) => /bare "actionlint -color"/.test(p)));
 });
 
+test("negative: an executable uses: step inserted between the verified extraction and the bare invocation is flagged - the hermetic drive cannot execute an action, so this fact is asserted statically instead", () => {
+  const workflow = structuredClone(loadWorkflow());
+  const { steps, installIndex, invokeIndex } = locateActionlintSteps(workflow);
+  assert.notEqual(installIndex, -1, "test setup: could not locate the real install step");
+  assert.notEqual(invokeIndex, -1, "test setup: could not locate the real invoke step");
+  steps.splice(installIndex + 1, 0, {
+    name: "a pinned action inserted between verify and invoke",
+    uses: "actions/checkout@v4",
+  });
+  const problems = validateActionlintRecipe(workflow, readFileSync(HASH_FILE_PATH, "utf8"));
+  assert.ok(problems.some((p) => /an executable "uses:" step/.test(p)));
+});
+
+test("positive: the real ci.yml has no uses: step between the verified extraction and the bare invocation", () => {
+  const workflow = loadWorkflow();
+  const { steps, installIndex, invokeIndex } = locateActionlintSteps(workflow);
+  assert.notEqual(installIndex, -1);
+  assert.notEqual(invokeIndex, -1);
+  const between = steps.slice(installIndex + 1, invokeIndex);
+  assert.ok(
+    between.every((step) => typeof step?.uses !== "string"),
+    "test setup: expected no uses: step in the real recipe's verify-to-invoke window"
+  );
+  const problems = validateActionlintRecipe(workflow, readFileSync(HASH_FILE_PATH, "utf8"));
+  assert.ok(!problems.some((p) => /an executable "uses:" step/.test(p)));
+});
+
 // ---------------------------------------------------------------------------
 // Audit control. Every static failure path that validateActionlintRecipe
-// can still produce must map to one of the four bounded facts this recipe
+// can still produce must map to one of the five bounded facts this recipe
 // asserts statically - (i) the pinned URL literal, (ii) the -o filename,
 // (iii) the checksum record being exactly one well-formed line whose hex
 // matches the verified release digest and whose filename agrees with the
@@ -398,6 +443,11 @@ const KNOWN_STATIC_CHECKS = [
   {
     mapsTo: "The checksum record's filename agrees with the -o target",
     pattern: /they must agree/,
+  },
+  {
+    mapsTo:
+      'No executable "uses:" step sits between the verified extraction and the bare invocation - a bounded, closed-form fact the hermetic drive is structurally incapable of proving, since it can only run shell run: text',
+    pattern: /an executable "uses:" step/,
   },
 ];
 
@@ -501,6 +551,21 @@ const AUDIT_SCENARIOS = [
     }),
     expect: [/the recorded checksum names "some-other-name\.tar\.gz"/, /they must agree/],
   },
+  {
+    name: "an executable uses: step is inserted between the verified extraction and the bare invocation",
+    build: () => {
+      const workflow = structuredClone(loadWorkflow());
+      const { steps, installIndex, invokeIndex } = locateActionlintSteps(workflow);
+      assert.notEqual(installIndex, -1, "test setup: could not locate the real install step");
+      assert.notEqual(invokeIndex, -1, "test setup: could not locate the real invoke step");
+      steps.splice(installIndex + 1, 0, {
+        name: "a pinned action inserted between verify and invoke",
+        uses: "actions/checkout@v4",
+      });
+      return { workflow, hashRecord: readFileSync(HASH_FILE_PATH, "utf8") };
+    },
+    expect: [/an executable "uses:" step/],
+  },
 ];
 
 test("every surviving static failure path in validateActionlintRecipe maps to a named bounded fact or structural precondition, and nothing else", () => {
@@ -551,6 +616,73 @@ test("every surviving static failure path in validateActionlintRecipe maps to a 
         "AUDIT_SCENARIOS entry - either add a scenario that exercises it or remove the stale mapping"
     );
   }
+});
+
+/**
+ * Counts `problems.push(` call sites in a function's own source text -
+ * structural, not behavioral: it counts how many places the function CAN
+ * report a problem from, regardless of whether any input ever reaches
+ * one of them. This is what closes the gap the scenario-based audit above
+ * cannot: a check gated on a condition no AUDIT_SCENARIOS entry ever puts
+ * the recipe into never produces a message, so a check that only inspects
+ * emitted messages is blind to it entirely - the scenario battery
+ * inventories what the function SAID, not what it CAN say. Counting
+ * `problems.push(` occurrences in the source itself inventories the
+ * latter directly, so an unmapped check gated on an unreachable state is
+ * caught by construction, not by hoping some scenario happens to trigger
+ * it.
+ *
+ * @param {Function} fn
+ * @returns {number}
+ */
+function countStaticCheckSites(fn) {
+  const source = fn.toString();
+  const matches = source.match(/problems\.push\(/g);
+  return matches ? matches.length : 0;
+}
+
+test("structural inventory: the number of problems.push(...) call sites in validateActionlintRecipe's own source exactly equals the number of registered KNOWN_STATIC_CHECKS entries", () => {
+  const siteCount = countStaticCheckSites(validateActionlintRecipe);
+  assert.equal(
+    siteCount,
+    KNOWN_STATIC_CHECKS.length,
+    `validateActionlintRecipe's source has ${siteCount} problems.push(...) call site(s) but ` +
+      `KNOWN_STATIC_CHECKS registers ${KNOWN_STATIC_CHECKS.length} - a check gated on a condition ` +
+      "no scenario reaches would still be invisible to the message-based audit above, so this " +
+      "inventories the source directly: add or remove a KNOWN_STATIC_CHECKS entry to match, " +
+      "regardless of whether any AUDIT_SCENARIOS entry currently exercises it"
+  );
+});
+
+test("negative control: countStaticCheckSites is sensitive to both an added and a removed problems.push(...) call site, proving the structural inventory is not vacuous", () => {
+  const baselineSource = `function f() {
+    const problems = [];
+    problems.push("a");
+    problems.push("b");
+    return problems;
+  }`;
+  assert.equal(
+    countStaticCheckSites({ toString: () => baselineSource }),
+    2,
+    "test setup: expected exactly 2 call sites in the hand-built baseline"
+  );
+
+  const withOneMore = baselineSource.replace(
+    'problems.push("b");',
+    'problems.push("b");\n    problems.push("c");'
+  );
+  assert.equal(
+    countStaticCheckSites({ toString: () => withOneMore }),
+    3,
+    "an added problems.push(...) call site must increment the count, even though nothing here ever runs it"
+  );
+
+  const withOneFewer = baselineSource.replace('problems.push("b");\n    ', "");
+  assert.equal(
+    countStaticCheckSites({ toString: () => withOneFewer }),
+    1,
+    "a removed problems.push(...) call site must decrement the count"
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -1227,13 +1359,19 @@ function mayExecute(step) {
 
 /**
  * Every `run:` step in the actionlint job, in order, as plain
- * {name, run, if?} objects. A `uses:` step (the checkout above them)
- * carries no shell text of its own and is skipped, since nothing about
- * actionlint ever depends on what that kind of step does. The step's own
- * `if:` field (when present) rides along unchanged - never synthesized
- * when absent from the source step - so downstream logic (classifyStepCondition,
- * isProvenAuthoritative, mayExecute) can tell a genuinely live step apart
- * from one whose text merely looks right but never actually executes.
+ * {name, run, if?} objects, for the hermetic drive below. A `uses:` step
+ * (the checkout above them) carries no shell text of its own and is
+ * skipped here, since the hermetic drive can only run shell `run:` text
+ * through a real shell - it cannot execute a GitHub Action at all, so
+ * filtering one out here is not a judgment that it is harmless. Whether a
+ * `uses:` step matters is instead answered statically: validateActionlintRecipe
+ * asserts no such step may appear between the verified extraction and the
+ * bare invocation, which is the one place in this job's structure where
+ * that would matter. The step's own `if:` field (when present) rides along
+ * unchanged - never synthesized when absent from the source step - so
+ * downstream logic (classifyStepCondition, isProvenAuthoritative,
+ * mayExecute) can tell a genuinely live step apart from one whose text
+ * merely looks right but never actually executes.
  *
  * @param {any} workflow
  * @returns {{ name: string, run: string, if?: unknown }[]}
@@ -1252,13 +1390,38 @@ function extractActionlintRunSteps(workflow) {
 }
 
 /**
+ * Strips shell line-comments before command-position detection runs: a
+ * `#` that starts a token (the line's own first non-blank character, or
+ * immediately after whitespace or a statement separator) begins a comment
+ * running to the end of that line, and every character after it - INCLUDING
+ * a `;`/`&`/`|` that would otherwise look like a real command separator -
+ * is just comment text, never live shell syntax. Without this, a line
+ * shaped as `# ; sha256sum --check ...` reads to a naive scan as "a real
+ * statement separator followed by the command," when the whole line is one
+ * comment and nothing after the `#` ever reaches a shell. A `#` that is not
+ * a token start (e.g. mid-word, as in `foo#bar`) is left alone, since that
+ * is never a comment opener in POSIX shell.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function stripShellLineComments(text) {
+  return text
+    .split("\n")
+    .map((line) => line.replace(/(^|[\s;&|])#.*$/, "$1"))
+    .join("\n");
+}
+
+/**
  * True when a step's own run text actually EXECUTES the checksum-verify
  * command - "sha256sum --check" in command position: right at the start of
  * the script, right after a newline, or right after a shell statement
  * separator (`;`, `&`, `|`) or command-substitution opener (`$(`, a
  * backtick) - as opposed to merely mentioning that phrase inside a comment
  * or an echo/printf argument. A shell command is defined by where it sits,
- * not by which characters happen to appear somewhere in the line. A step
+ * not by which characters happen to appear somewhere in the line, and a
+ * character that only LOOKS like a separator because it sits inside a
+ * comment is not a separator at all - see stripShellLineComments. A step
  * whose text only references the phrase, without ever running it, has
  * verified nothing, however convincing the surrounding text reads - a
  * decoy comment or echo that quotes "sha256sum --check
@@ -1270,7 +1433,8 @@ function extractActionlintRunSteps(workflow) {
  */
 function stepPerformsChecksumVerification(runText) {
   return (
-    typeof runText === "string" && /(?:^|\n|[;&|]|\$\(|`)\s*sha256sum\s+--check\b/.test(runText)
+    typeof runText === "string" &&
+    /(?:^|\n|[;&|]|\$\(|`)\s*sha256sum\s+--check\b/.test(stripShellLineComments(runText))
   );
 }
 
@@ -1343,11 +1507,17 @@ function withLinesInsertedBeforeVerification(runSteps, installIndex, ...mutantLi
 
 /**
  * Drives an ordered list of run steps inside one persistent scratch
- * directory and one accumulating environment, stopping at the first step
- * that exits non-zero - matching the default per-step `if: success()`
- * every real job step gets unless a workflow opts out, so a failed
- * verification step genuinely prevents everything after it from running,
- * not merely from being marked as passed.
+ * directory and one accumulating environment. A step classified "always"
+ * (classifyStepCondition) is skipped once an earlier step in the sequence
+ * has failed - matching the default per-step `if: success()` every real
+ * job step gets unless a workflow opts out, so a failed verification step
+ * genuinely prevents an ordinary later step from running, not merely from
+ * being marked as passed. A step classified "mayRun" is the deliberate
+ * exception: it is still driven regardless of prior failure, since its own
+ * unproven condition might specifically be written to run because an
+ * earlier step failed (`if: always()` or `if: failure()`), and skipping it
+ * here would let exactly that kind of competing installer hide behind an
+ * ordinary-looking condition nobody can evaluate.
  *
  * A step classified "never" (classifyStepCondition / mayExecute) is never
  * driven at all - its run text is never handed to a shell, in any form,
@@ -1796,6 +1966,53 @@ test("a step whose real checksum-verify command is replaced by a decoy comment m
   // clean.
   const { installIndex: revertedInstallIndex } = locateRunStepIndices(baselineSteps);
   assert.equal(revertedInstallIndex, baselineInstallIndex);
+});
+
+test('negative control: a comment-only line shaped as "# ; sha256sum --check ..." is never mistaken for command position - the semicolon inside a comment is not a statement separator', () => {
+  // Exercises the exact adversarial shape a naive "look for a separator
+  // right before the phrase" scan would miss: everything from the leading
+  // "#" to end of line is a shell comment, so the ";" here never separates
+  // two real statements - it is just a character inside comment text, and
+  // sha256sum --check never actually runs.
+  const commentOnlyLine = "# ; sha256sum --check config/actionlint-artifact.sha256";
+  assert.equal(
+    stepPerformsChecksumVerification(commentOnlyLine),
+    false,
+    "a comment-only line must never be accepted as running the checksum-verify command"
+  );
+
+  const baselineSteps = extractActionlintRunSteps(loadWorkflow());
+  const { installIndex: baselineInstallIndex } = locateRunStepIndices(baselineSteps);
+  assert.notEqual(baselineInstallIndex, -1, "test setup: could not locate the real install step");
+  const canonicalStep = baselineSteps[baselineInstallIndex];
+  const decoyRun = canonicalStep.run.replace(
+    /^sha256sum --check config\/actionlint-artifact\.sha256$/m,
+    commentOnlyLine
+  );
+  assert.notEqual(
+    decoyRun,
+    canonicalStep.run,
+    "test setup: the replacement must actually change something"
+  );
+  const mutatedSteps = baselineSteps.slice();
+  mutatedSteps[baselineInstallIndex] = { ...canonicalStep, run: decoyRun };
+  const { installIndex: mutatedInstallIndex } = locateRunStepIndices(mutatedSteps);
+  assert.equal(
+    mutatedInstallIndex,
+    -1,
+    "a comment-only decoy line must never be accepted as the canonical install step"
+  );
+});
+
+test('green control: a genuine "; sha256sum --check ..." after a real statement separator (no leading comment) is still accepted as command position', () => {
+  // The comment-stripping fix must not overcorrect into rejecting a real
+  // semicolon-separated command - only a "#" that actually starts a
+  // comment token neutralizes what follows it.
+  assert.equal(
+    stepPerformsChecksumVerification("true ; sha256sum --check config/actionlint-artifact.sha256"),
+    true,
+    "a real statement separator, with no comment involved, must still count as command position"
+  );
 });
 
 // ---------------------------------------------------------------------------
