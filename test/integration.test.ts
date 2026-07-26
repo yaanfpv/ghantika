@@ -1164,7 +1164,7 @@ test(
         assert.deepEqual(
           members,
           [],
-          `[${trigger}] job ${i} must have ZERO surviving process-group members after shutdown under full concurrent load, pgrep still saw: ${JSON.stringify(members)}`
+          `[${trigger}] job ${i} must have ZERO surviving process-group members after shutdown under full concurrent load, pgrep still saw: ${JSON.stringify(members)} (server stderr: ${server.stderrText()})`
         );
       });
     }
