@@ -471,6 +471,15 @@ export const IDENTITY_TOLERANCE_SECONDS = 5;
  * seconds old", which would make a genuinely long-lived, correctly-
  * identified process look suspiciously freshly-started and could wrongly
  * fail the identity check).
+ *
+ * `hh`, `mm`, and `ss` are each REQUIRED to be exactly two digits (verified
+ * empirically: a fresh process reads `00:01`, never `0:1` or `0:01`) - only
+ * the leading `dd` field, extracted separately above, is unbounded width.
+ * Accepting any-length digit runs in the other fields let a single
+ * corrupted or concatenated read parse as a syntactically-valid but
+ * physically-impossible elapsed time (a 14-digit "seconds" field silently
+ * producing a value on the order of a million years) instead of the
+ * `observer-failure` a malformed read actually is.
  */
 export function parseEtime(raw: string): number | undefined {
   const trimmed = raw.trim();
@@ -481,7 +490,7 @@ export function parseEtime(raw: string): number | undefined {
   if (
     parts.length < 2 ||
     parts.length > 3 ||
-    parts.some((part) => part.length === 0 || !/^\d+$/.test(part))
+    parts.some((part) => !/^\d{2}$/.test(part))
   ) {
     return undefined;
   }

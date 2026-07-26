@@ -916,6 +916,25 @@ test("parseEtime returns undefined for unrecognized shapes - defensive: never si
   assert.equal(parseEtime(":30"), undefined);
 });
 
+test("parseEtime rejects a non-2-digit mm/ss/hh field, even when every character is a digit - a malformed or concatenated read must fail closed, never parse as a syntactically-valid but physically-impossible elapsed time", () => {
+  // The exact shape a real CI failure produced: minutes="0" (unpadded,
+  // real ps never emits this - see this file's own mm:ss/hh:mm:ss cases
+  // above, all zero-padded), seconds a 14-digit run. Before this
+  // tightening this parsed as a "found" reading of 38,109,073,018,720
+  // seconds (~1.2 million years) instead of the observer-failure a
+  // malformed read actually is.
+  assert.equal(parseEtime("0:38109073018720"), undefined);
+  // Single-digit (unpadded) fields alone, the narrower case: real ps
+  // always zero-pads mm/ss/hh to two digits.
+  assert.equal(parseEtime("0:5"), undefined);
+  assert.equal(parseEtime("1:02:03"), undefined);
+  assert.equal(parseEtime("01:2:03"), undefined);
+  assert.equal(parseEtime("01:02:3"), undefined);
+  // Three-or-more-digit fields, the wider case the real corruption hit.
+  assert.equal(parseEtime("00:123"), undefined);
+  assert.equal(parseEtime("123:00:00"), undefined);
+});
+
 // --- identityElapsedTimesMatch (pure comparison, checkProcessIdentity's building block) ---
 
 test("identityElapsedTimesMatch: within tolerance is a match", () => {
@@ -2848,14 +2867,22 @@ test(
     await waitFor(() => rec.spawned > 0);
     const pid = child!.pid!;
 
-    // A ps that sleeps a REAL, substantial fraction of a budget (200ms)
-    // before answering normally - slow, but genuinely cooperative (never
-    // hangs past the bound) - real for BOTH the snapshot AND the re-read,
-    // since both phases go through the same real ps binary here.
+    // A ps that sleeps a REAL, deliberately generous multiple of the tight
+    // budget below (400ms against a 250ms budget) before answering normally
+    // - slow, but genuinely cooperative (never hangs past the bound; a
+    // plain `sleep` has no SIGTERM trap, so execFile's own internal timeout
+    // reaps it right at the budget). This does NOT depend on how many real
+    // ps invocations the snapshot phase happens to make: `sleep 5` (this
+    // test's spawned child) has no descendants, so the batched descendant
+    // read never runs at all, and only the single leader read pays this
+    // delay - a fixed-vs-fixed margin that stops relying on "how many steps
+    // ran" or "how fast the machine is" to make the phase degrade. Real
+    // for BOTH the snapshot AND the re-read, since both phases go through
+    // the same real ps binary here.
     const realPsPath = execFileSync("which", ["ps"], { encoding: "utf8" }).trim();
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-slow-cooperative-ps-"));
     const wrapperPath = path.join(dir, "ps");
-    fs.writeFileSync(wrapperPath, `#!/bin/sh\nsleep 0.2\nexec '${realPsPath}' "$@"\n`);
+    fs.writeFileSync(wrapperPath, `#!/bin/sh\nsleep 0.4\nexec '${realPsPath}' "$@"\n`);
     fs.chmodSync(wrapperPath, 0o755);
 
     const realPath = process.env.PATH;
@@ -2866,10 +2893,14 @@ test(
     try {
       process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
       const beforeSnapshot = Date.now();
-      // A tight overall phase budget (250ms) that the slow-but-cooperative
-      // ps (200ms leader read + 200ms descendant read, sequential) cannot
-      // fully complete within - proving the snapshot phase's OWN budget is
-      // independent and can genuinely degrade on its own.
+      // A tight overall phase budget (250ms) the slow-but-cooperative ps
+      // (400ms, a single leader read - this spawned child has no
+      // descendants, so the batched descendant read never executes) cannot
+      // complete within: execFile's own internal timeout SIGTERMs the
+      // wrapper at 250ms, deterministically, well before its 400ms sleep
+      // would otherwise finish on its own - proving the snapshot phase's
+      // own budget is independent and can genuinely degrade on its own,
+      // regardless of machine speed.
       snapshot = await captureEscalationIdentitySnapshot(pid, 250);
       snapshotElapsedMs = Date.now() - beforeSnapshot;
       assert.equal(
