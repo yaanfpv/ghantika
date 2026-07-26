@@ -28,7 +28,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { ESLint } from "eslint";
+import { ESLint, Linter } from "eslint";
 import { load as loadYaml } from "js-yaml";
 
 import eslintConfig from "../eslint.config.js";
@@ -37,6 +37,7 @@ const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const PACKAGE_URL = new URL("../package.json", import.meta.url);
 const CHANGELOG_URL = new URL("../CHANGELOG.md", import.meta.url);
 const CI_WORKFLOW_PATH = path.join(REPO_ROOT, ".github", "workflows", "ci.yml");
+const THIS_FILE_PATH = fileURLToPath(import.meta.url);
 
 // -----------------------------------------------------------------------
 // The frozen lint-command shape. Declared once, here, and used to build
@@ -306,6 +307,436 @@ test("`npm run lint`, run as a real child process, exits clean", () => {
 // encoded as a test here. The standing regression guard against a
 // revert is the exact-string check above, which does not depend on
 // tree state at all.
+
+// =============================================================================
+// The guard above only proves something asserted as `result.status`
+// exits clean - it says nothing about whether `result` actually came
+// from the canonical `spawnSync("npm", ["run", "lint"], ...)` call.
+// A file-level search for that call's syntax existing somewhere in this
+// file would also pass against a decoy sitting in dead code, or after
+// the live call had quietly drifted onto some other command while a
+// stale, canonical-looking one lingered nearby - ordinary refactoring
+// could cause either with no adversary involved. What actually matters
+// is which child process the exit-status assertion is fed by, so the
+// check below parses this file's own source, finds the identifier
+// compared against exit status `0`, resolves it back to its real
+// declaration, and confirms structurally that the declared expression is
+// the canonical call - never merely that matching text exists.
+// =============================================================================
+
+/**
+ * True for a call of the shape `assert.equal(<identifier>.status, 0, ...)`
+ * or `assert.strictEqual(<identifier>.status, 0, ...)` - the exact
+ * assertion the "exits clean" test above makes. Any other shape (a
+ * computed member, a non-identifier object, an expected value other than
+ * the literal `0`) is left alone rather than guessed at.
+ * @param {object} node a CallExpression AST node
+ */
+function isExitStatusZeroAssertion(node) {
+  if (node.callee.type !== "MemberExpression" || node.callee.computed) return false;
+  const { object, property } = node.callee;
+  if (object.type !== "Identifier" || object.name !== "assert") return false;
+  if (property.type !== "Identifier" || !["equal", "strictEqual"].includes(property.name)) {
+    return false;
+  }
+
+  const [actual, expected] = node.arguments;
+  if (!actual || actual.type !== "MemberExpression" || actual.computed) return false;
+  if (actual.object.type !== "Identifier") return false;
+  if (actual.property.type !== "Identifier" || actual.property.name !== "status") return false;
+  return Boolean(expected) && expected.type === "Literal" && expected.value === 0;
+}
+
+/**
+ * True when `node`'s arguments are exactly `("npm", ["run", "lint"], ...)`
+ * - the command literal and the two argv literals in order - checked
+ * structurally, never by rendering the call back to text and
+ * pattern-matching that. Says nothing about the callee: a callee spelled
+ * `spawnSync` satisfies this exactly as well as the real import does; see
+ * `classifySpawnSyncCallee` for the check that actually tells them apart.
+ * @param {object} node a CallExpression AST node
+ */
+function hasCanonicalNpmRunLintArguments(node) {
+  const [command, argv] = node.arguments;
+  if (!command || command.type !== "Literal" || command.value !== "npm") return false;
+  if (!argv || argv.type !== "ArrayExpression" || argv.elements.length !== 2) return false;
+
+  const [first, second] = argv.elements;
+  return (
+    first?.type === "Literal" &&
+    first.value === "run" &&
+    second?.type === "Literal" &&
+    second.value === "lint"
+  );
+}
+
+/**
+ * True when `node` is a CallExpression whose callee is a plain identifier
+ * and whose arguments are the canonical `("npm", ["run", "lint"], ...)`
+ * shape. This is the structural half only - it proves nothing about what
+ * the callee identifier actually resolves to, since a local declaration
+ * named `spawnSync` satisfies it exactly as well as the real import does.
+ * See `classifySpawnSyncCallee` for the binding check that tells them
+ * apart.
+ * @param {object | null} node an AST node, or null if nothing resolved
+ */
+function hasCanonicalNpmRunLintShape(node) {
+  if (!node || node.type !== "CallExpression") return false;
+  if (node.callee.type !== "Identifier") return false;
+  return hasCanonicalNpmRunLintArguments(node);
+}
+
+/**
+ * Classifies whether `node`'s callee identifier actually refers to the
+ * real `spawnSync` export of `node:child_process`, using ESLint's own
+ * real scope analysis (`context.sourceCode.getScope`, `reference.resolved`)
+ * - never a callee-name text match. A callee spelled `spawnSync` proves
+ * nothing on its own: a local declaration of that same name (a shadowing
+ * function, a reassigned variable, an unrelated import) satisfies a text
+ * match while never calling into `node:child_process` at all. Fails
+ * closed - naming what was actually found - on every binding shape other
+ * than a single, unambiguous import of `spawnSync` from
+ * `"node:child_process"`: an unresolved (global) reference, a variable
+ * with more than one declaration site, a locally-declared function or
+ * variable, and an import of some other name or from some other module
+ * are all rejected by name rather than risked against a text match.
+ * @param {import("eslint").Rule.RuleContext} context
+ * @param {object} node the CallExpression whose callee is being classified
+ * @returns {{ ok: true } | { ok: false, reason: string }}
+ */
+function classifySpawnSyncCallee(context, node) {
+  const { callee } = node;
+  if (callee.type !== "Identifier") {
+    return {
+      ok: false,
+      reason: `the callee is a ${callee.type}, not a plain identifier, so it cannot be verified as the real \`spawnSync\` import`,
+    };
+  }
+
+  const calleeName = callee.name;
+  const scope = context.sourceCode.getScope(node);
+  const reference = findReferenceForIdentifier(scope, callee);
+
+  if (!reference || !reference.resolved) {
+    return {
+      ok: false,
+      reason: `\`${calleeName}\` has no resolvable binding under ESLint's own scope analysis - it may be a global or otherwise unresolved reference, not the real \`spawnSync\` import from \`node:child_process\``,
+    };
+  }
+
+  const variable = reference.resolved;
+  if (variable.defs.length !== 1) {
+    return {
+      ok: false,
+      reason: `\`${calleeName}\` has ${variable.defs.length} distinct binding sites, which makes its real origin ambiguous`,
+    };
+  }
+
+  const [def] = variable.defs;
+  if (def.type !== "ImportBinding" || def.node.type !== "ImportSpecifier") {
+    return {
+      ok: false,
+      reason: `\`${calleeName}\` is bound as a ${def.type} binding, not an import of a named export, so it is not the real \`spawnSync\` from \`node:child_process\``,
+    };
+  }
+
+  if (def.node.imported.name !== "spawnSync") {
+    return {
+      ok: false,
+      reason: `\`${calleeName}\` is imported as \`${def.node.imported.name}\`, not \`spawnSync\``,
+    };
+  }
+
+  const importSource = def.parent.source.value;
+  if (importSource !== "node:child_process") {
+    return {
+      ok: false,
+      reason: `\`${calleeName}\` is imported from \`${importSource}\`, not \`node:child_process\``,
+    };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Finds the `Reference` object for `identifierNode` starting from
+ * `scope`, walking outward through `scope.upper` if it is not present in
+ * the immediate scope. In practice a reference always lives in the same
+ * scope as the read it represents, so this walk is a defensive fallback
+ * rather than something expected to run more than once - it is never
+ * used to look further outward once a reference itself IS found; that is
+ * `reference.resolved`'s job, and it already performs the real,
+ * closure-aware lookup all the way up the scope chain to whatever the
+ * identifier actually binds to.
+ * @param {import("eslint").Scope.Scope | null} scope
+ * @param {object} identifierNode
+ * @returns {import("eslint").Scope.Reference | null}
+ */
+function findReferenceForIdentifier(scope, identifierNode) {
+  let current = scope;
+  while (current) {
+    const found = current.references.find((ref) => ref.identifier === identifierNode);
+    if (found) return found;
+    current = current.upper;
+  }
+  return null;
+}
+
+/**
+ * Classifies what `identifierNode` (the object of the asserted
+ * `<identifier>.status`) actually refers to, using ESLint's own real
+ * scope analysis via `context.sourceCode.getScope` - never hand-rolled
+ * tree-walking. Fails closed on anything that is not a single,
+ * unambiguous plain `const`/`let`/`var` declarator with a plain
+ * `Identifier` id and a call-expression initializer: an unresolved
+ * (global) reference, a variable with more than one declaration site, a
+ * function parameter, a destructuring pattern, a catch-clause binding,
+ * an import binding, and a declarator with no initializer are all real,
+ * distinct binding shapes that a hand-rolled walker can mis-resolve - a
+ * walker that searches outward through enclosing block statements has no
+ * notion of a function boundary as a scope boundary, so a same-named
+ * function parameter shadowing an outer variable can be walked straight
+ * past, matching the unrelated outer declaration instead. Real scope
+ * data reports each of those shapes directly
+ * (`reference.resolved.defs[0].type`), so there is no need to enumerate
+ * them by hand, and no new binding shape ESLint's scope analyzer
+ * understands can slip past this the way a parameter shadowing an outer
+ * variable would slip past a hand-rolled walker.
+ * @param {import("eslint").Rule.RuleContext} context
+ * @param {object} assertionNode the `assert.equal(...)` CallExpression
+ * @param {object} identifierNode the `<identifier>` in `<identifier>.status`
+ * @returns {{ ok: true, initNode: object } | { ok: false, reason: string }}
+ */
+function classifyIdentifierBinding(context, assertionNode, identifierNode) {
+  const identifierName = identifierNode.name;
+  const scope = context.sourceCode.getScope(assertionNode);
+  const reference = findReferenceForIdentifier(scope, identifierNode);
+
+  if (!reference || !reference.resolved) {
+    return {
+      ok: false,
+      reason: `\`${identifierName}\` has no resolvable binding under ESLint's own scope analysis - it may be a global or otherwise unresolved reference`,
+    };
+  }
+
+  const variable = reference.resolved;
+  if (variable.defs.length !== 1) {
+    return {
+      ok: false,
+      reason: `\`${identifierName}\` has ${variable.defs.length} distinct binding sites, which makes the exercised binding ambiguous`,
+    };
+  }
+
+  const [def] = variable.defs;
+  if (def.type !== "Variable") {
+    return {
+      ok: false,
+      reason: `\`${identifierName}\` is bound as a ${def.type} binding, not a plain \`const\`/\`let\`/\`var\` declaration, so its real binding cannot be verified as the canonical call`,
+    };
+  }
+  if (def.node.id.type !== "Identifier") {
+    return {
+      ok: false,
+      reason: `\`${identifierName}\` is bound by a destructuring pattern rather than a plain identifier, so its real binding cannot be verified as the canonical call`,
+    };
+  }
+  if (!def.node.init) {
+    return {
+      ok: false,
+      reason: `\`${identifierName}\`'s declaration has no initializer, so its real binding cannot be verified as the canonical call`,
+    };
+  }
+
+  return { ok: true, initNode: def.node.init };
+}
+
+/**
+ * Renders `node` back to a single-line, whitespace-collapsed snippet of
+ * `source` - just enough to name what was actually found in a failure
+ * message, rather than reproducing a multi-line call verbatim.
+ * @param {string} source
+ * @param {{ range: [number, number] }} node
+ */
+function formatBoundCallSnippet(source, node) {
+  return source.slice(node.range[0], node.range[1]).replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Parses `source` (this file's own text) with ESLint's `Linter` - already
+ * a project dependency, so no separate parser package is needed - and
+ * locates the one call whose `.status` this file actually compares
+ * against `0`. Resolves that call's asserted identifier using ESLint's
+ * own real scope analysis (`classifyIdentifierBinding`, run live during
+ * traversal via `context.sourceCode.getScope`) rather than hand-rolled
+ * tree-walking, then confirms the resolved initializer is structurally
+ * the canonical `spawnSync("npm", ["run", "lint"], ...)` shape AND that
+ * its callee identifier itself resolves - via that same real scope
+ * analysis, never a name/text match - to the actual `spawnSync` import
+ * from `"node:child_process"` (`classifySpawnSyncCallee`). Fails closed -
+ * naming what was actually found rather than guessing further - in every
+ * one of these cases: zero or more than one status assertion exists in
+ * the file; the asserted identifier is an unresolved (global) reference;
+ * it has more than one distinct binding site; its one binding is not a
+ * plain `const`/`let`/`var` declarator (a parameter, a destructuring
+ * pattern, a catch-clause binding, an import binding, and so on all fail
+ * here); its declarator has no initializer; its declarator's initializer
+ * resolves but is some other call entirely, in which case the reason
+ * names that call exactly; or its callee, though spelled `spawnSync` and
+ * shaped exactly like the canonical call, resolves to something other
+ * than the real import - a locally-declared function or variable, or an
+ * import of another name or from another module - in which case the
+ * reason names that binding instead.
+ * @param {string} source
+ * @returns {{ bound: true } | { bound: false, reason: string }}
+ */
+function resolveAssertedLintInvocation(source) {
+  const linter = new Linter();
+  const statusAssertions = [];
+  let ruleContext = null;
+
+  linter.verify(
+    source,
+    {
+      languageOptions: { ecmaVersion: "latest", sourceType: "module" },
+      plugins: {
+        "lint-scope-self-check": {
+          rules: {
+            "collect-status-assertions": {
+              meta: { schema: [] },
+              create(context) {
+                ruleContext = context;
+                return {
+                  CallExpression(node) {
+                    if (!isExitStatusZeroAssertion(node)) return;
+                    const identifierNode = node.arguments[0].object;
+                    statusAssertions.push({
+                      identifierName: identifierNode.name,
+                      binding: classifyIdentifierBinding(context, node, identifierNode),
+                    });
+                  },
+                };
+              },
+            },
+          },
+        },
+      },
+      rules: { "lint-scope-self-check/collect-status-assertions": "error" },
+    },
+    { filename: "lint-scope-self-check.js" }
+  );
+
+  if (statusAssertions.length === 0) {
+    return {
+      bound: false,
+      reason:
+        "no assertion of the shape `<identifier>.status` compared against the literal `0` was found in this file - the exit-status check this guard relies on appears to have been removed or rewritten",
+    };
+  }
+  if (statusAssertions.length > 1) {
+    return {
+      bound: false,
+      reason: `found ${statusAssertions.length} assertions of an identifier's \`.status\` against \`0\`, which makes the exercised binding ambiguous - expected exactly one`,
+    };
+  }
+
+  const [{ identifierName, binding }] = statusAssertions;
+  if (!binding.ok) {
+    return { bound: false, reason: binding.reason };
+  }
+  if (!hasCanonicalNpmRunLintShape(binding.initNode)) {
+    return {
+      bound: false,
+      reason: `the child process bound to \`${identifierName}\` (the one whose \`.status\` this file actually asserts) is \`${formatBoundCallSnippet(source, binding.initNode)}\`, not the canonical \`spawnSync("npm", ["run", "lint"], ...)\` invocation`,
+    };
+  }
+
+  const calleeBinding = classifySpawnSyncCallee(ruleContext, binding.initNode);
+  if (!calleeBinding.ok) {
+    return {
+      bound: false,
+      reason: `the child process bound to \`${identifierName}\` (the one whose \`.status\` this file actually asserts) calls \`${formatBoundCallSnippet(source, binding.initNode)}\`, but ${calleeBinding.reason}`,
+    };
+  }
+
+  return { bound: true };
+}
+
+test('the exit-status assertion above is bound to a real, canonical `spawnSync("npm", ["run", "lint"])` call - not merely to matching text elsewhere in the file', () => {
+  const source = readFileSync(THIS_FILE_PATH, "utf8");
+  const result = resolveAssertedLintInvocation(source);
+  assert.ok(result.bound, result.reason);
+});
+
+// =============================================================================
+// A same-named function PARAMETER shadowing an outer variable must never
+// be resolved to that outer, unrelated declaration - a textual/lexical
+// walk that searches outward through enclosing blocks has no notion of a
+// function boundary as a scope boundary, so it could conflate the two.
+// Real scope analysis reports the parameter binding directly, so this
+// must fail closed instead of guessing.
+// =============================================================================
+
+test("resolveAssertedLintInvocation fails closed when the asserted identifier is a function parameter that shadows an outer variable of the same name", () => {
+  const source = `
+const result = spawnSync("npm", ["run", "lint"], { encoding: "utf8" });
+
+function assertLintExitsClean(result) {
+  assert.equal(result.status, 0, "lint should exit clean");
+}
+
+assertLintExitsClean(
+  spawnSync("eslint", ["src", "scripts", "test", "eslint.config.js"], { encoding: "utf8" })
+);
+`;
+
+  const outcome = resolveAssertedLintInvocation(source);
+  assert.equal(
+    outcome.bound,
+    false,
+    "a parameter that shadows an outer variable of the same name must never be reported as bound to that outer declaration"
+  );
+  assert.ok(
+    outcome.reason.includes("Parameter"),
+    `the failure must name the real binding shape (a function parameter) rather than a generic refusal; got: ${outcome.reason}`
+  );
+});
+
+// =============================================================================
+// A callee spelled `spawnSync` proves nothing on its own: the guard must
+// resolve it back to the real `node:child_process` export, never accept
+// it on name alone. A local declaration sharing that name - a shadowing
+// function, say - satisfies a text/name match while never calling into
+// `node:child_process` at all, so this must fail closed, naming the real
+// binding it found rather than the import it did not.
+// =============================================================================
+
+test("resolveAssertedLintInvocation fails closed when spawnSync is shadowed by a same-named local function, never actually calling node:child_process", () => {
+  const source = `
+import { execFileSync } from "node:child_process";
+
+function spawnSync() {
+  return { status: 0, stdout: "", stderr: "" };
+}
+
+const result = spawnSync("npm", ["run", "lint"], { encoding: "utf8" });
+assert.equal(result.status, 0, "lint should exit clean");
+`;
+
+  const outcome = resolveAssertedLintInvocation(source);
+  assert.equal(
+    outcome.bound,
+    false,
+    "a callee shadowed by a locally-declared function of the same name must never be reported as bound to the real spawnSync import"
+  );
+  assert.ok(
+    outcome.reason.includes("FunctionName"),
+    `the failure must name the real binding shape (a locally-declared function), not the real import; got: ${outcome.reason}`
+  );
+  assert.ok(
+    outcome.reason.includes("node:child_process"),
+    `the failure must name the real module the callee was expected to come from, not refuse silently; got: ${outcome.reason}`
+  );
+});
 
 // =============================================================================
 // Eligibility comes from ESLint's own live config, applied to the real
