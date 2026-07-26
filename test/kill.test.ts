@@ -2671,8 +2671,22 @@ function readChangelogText(): string {
   return fs.readFileSync(new URL("../CHANGELOG.md", import.meta.url), "utf8");
 }
 
+/**
+ * `local/pr-manifest.md` is gitignored on purpose (workspace AGENTS.md's
+ * public/private twin-repo split) - it exists only transiently on the SD's
+ * own machine while a PR manifest is being authored, and is never present
+ * in a fresh clone, a fresh worktree checkout, or CI. The two surface-S4
+ * tests below can only check its content when it happens to exist; where
+ * it does not, they report a named, sanctioned skip (test/skip-baseline.json)
+ * rather than either throwing ENOENT or vacuously passing without reading
+ * anything.
+ */
+const PR_MANIFEST_URL = new URL("../local/pr-manifest.md", import.meta.url);
+const PR_MANIFEST_ABSENT_SKIP_REASON =
+  "local/pr-manifest.md is gitignored and only exists transiently on the SD's own machine while authoring a PR manifest - absent here (a fresh checkout or CI), so surface S4 has nothing to check";
+
 function readPrManifestText(): string {
-  return fs.readFileSync(new URL("../local/pr-manifest.md", import.meta.url), "utf8");
+  return fs.readFileSync(PR_MANIFEST_URL, "utf8");
 }
 
 /**
@@ -2715,15 +2729,23 @@ test('no unqualified "never scales with group size" cost claim, surface S3 (CHAN
   assertNoUnqualifiedScaleClaim(bullet, "CHANGELOG.md's escalation-identity-gate bullet");
 });
 
-test('no "provably"/unqualified proof claim beside the escalation identity matcher, surface S4 (local/pr-manifest.md) - scoped to that mechanism\'s own bullet', () => {
-  const bullet = extractManifestEscalationBullet(readPrManifestText());
-  assertNoUnqualifiedProofClaim(bullet, "local/pr-manifest.md");
-});
+test(
+  'no "provably"/unqualified proof claim beside the escalation identity matcher, surface S4 (local/pr-manifest.md) - scoped to that mechanism\'s own bullet',
+  { skip: fs.existsSync(PR_MANIFEST_URL) ? false : PR_MANIFEST_ABSENT_SKIP_REASON },
+  () => {
+    const bullet = extractManifestEscalationBullet(readPrManifestText());
+    assertNoUnqualifiedProofClaim(bullet, "local/pr-manifest.md");
+  }
+);
 
-test('no unqualified "never scales with group size" cost claim, surface S4 (local/pr-manifest.md) - the real batched read still constructs/emits/parses O(N) data, only its call count is size-independent', () => {
-  const bullet = extractManifestEscalationBullet(readPrManifestText());
-  assertNoUnqualifiedScaleClaim(bullet, "local/pr-manifest.md's escalation-identity-gate bullet");
-});
+test(
+  'no unqualified "never scales with group size" cost claim, surface S4 (local/pr-manifest.md) - the real batched read still constructs/emits/parses O(N) data, only its call count is size-independent',
+  { skip: fs.existsSync(PR_MANIFEST_URL) ? false : PR_MANIFEST_ABSENT_SKIP_REASON },
+  () => {
+    const bullet = extractManifestEscalationBullet(readPrManifestText());
+    assertNoUnqualifiedScaleClaim(bullet, "local/pr-manifest.md's escalation-identity-gate bullet");
+  }
+);
 
 /**
  * Surface S5: this repo's OWN source comments, in both files whose docs
