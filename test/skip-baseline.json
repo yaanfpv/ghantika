@@ -90,14 +90,14 @@
     "test/shutdown.test.ts::stdin EOF reaps a REAL live job's WHOLE process group - zero survivors confirmed by a real external pgrep"
   ],
   "darwin": [
-    "test/kill.test.ts::no \"provably\"/unqualified proof claim beside the escalation identity matcher, surface S4 (local/pr-manifest.md) - scoped to that mechanism's own bullet",
-    "test/kill.test.ts::no unqualified \"never scales with group size\" cost claim, surface S4 (local/pr-manifest.md) - the real batched read still constructs/emits/parses O(N) data, only its call count is size-independent",
+    "test/kill.test.ts::no \"provably\"/unqualified proof claim beside the escalation identity matcher, (local/pr-manifest.md) - scoped to that mechanism's own bullet",
+    "test/kill.test.ts::no unqualified \"never scales with group size\" cost claim, (local/pr-manifest.md) - the real batched read still constructs/emits/parses O(N) data, only its call count is size-independent",
     "test/process.test.ts::captureBirthIdentityPosixAsync: on Windows, never even attempted - always resolves to undefined there",
     "test/run.test.ts::run(): on Windows, birth-identity capture is never even attempted - birthIdentity is always undefined there"
   ],
   "linux": [
-    "test/kill.test.ts::no \"provably\"/unqualified proof claim beside the escalation identity matcher, surface S4 (local/pr-manifest.md) - scoped to that mechanism's own bullet",
-    "test/kill.test.ts::no unqualified \"never scales with group size\" cost claim, surface S4 (local/pr-manifest.md) - the real batched read still constructs/emits/parses O(N) data, only its call count is size-independent",
+    "test/kill.test.ts::no \"provably\"/unqualified proof claim beside the escalation identity matcher, (local/pr-manifest.md) - scoped to that mechanism's own bullet",
+    "test/kill.test.ts::no unqualified \"never scales with group size\" cost claim, (local/pr-manifest.md) - the real batched read still constructs/emits/parses O(N) data, only its call count is size-independent",
     "test/process.test.ts::captureBirthIdentityPosixAsync: on Windows, never even attempted - always resolves to undefined there",
     "test/run.test.ts::run(): on Windows, birth-identity capture is never even attempted - birthIdentity is always undefined there"
   ]

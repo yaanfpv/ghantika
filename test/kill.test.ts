@@ -2373,8 +2373,8 @@ test(
 // neither signaled nor observed, and reparenting alone is NOT such an
 // escape) AND the CONSEQUENCE (the caller must track/terminate such a
 // process itself - this tool will not) - must be present on TWO
-// INDEPENDENT surfaces: README.md (S1) and the kill tool's own tools/list
-// description (S2). Separate from the permanent real-wire escape test
+// INDEPENDENT surfaces: README.md and the kill tool's own tools/list
+// description. Separate from the permanent real-wire escape test
 // above, which drives the actual stdio response and cannot prove README
 // semantics - this test never touches the wire, and that one never
 // asserts README content.
@@ -2407,7 +2407,7 @@ function readReadmeText(): string {
   return fs.readFileSync(new URL("../README.md", import.meta.url), "utf8");
 }
 
-test("escape-boundary prose guard, surface S1 (README.md): states the FACT and CONSEQUENCE, and never either forbidden claim", () => {
+test("escape-boundary prose guard, (README.md): states the FACT and CONSEQUENCE, and never either forbidden claim", () => {
   const readme = readReadmeText();
   assert.ok(
     readme.includes(ESCAPE_BOUNDARY_FACT_SUBSTRING),
@@ -2427,7 +2427,7 @@ test("escape-boundary prose guard, surface S1 (README.md): states the FACT and C
   );
 });
 
-test("escape-boundary prose guard, surface S2 (the kill tool's tools/list description): states the FACT and CONSEQUENCE, and never either forbidden claim", () => {
+test("escape-boundary prose guard, (the kill tool's tools/list description): states the FACT and CONSEQUENCE, and never either forbidden claim", () => {
   const description = killTool.description as string;
   assert.ok(
     description.includes(ESCAPE_BOUNDARY_FACT_SUBSTRING),
@@ -2493,7 +2493,7 @@ const FALSE_UNIVERSAL_SUBSTRING =
 const FALSE_EARLY_CONFIRMATION_FIELDS_SUBSTRING =
   "A terminating custom signal's `killed` state always carries `kill_confirmed` and `identity_confirmed` immediately, even before external confirmation resolves.";
 
-test("state-vs-fields prose guard, surface S1 (README.md): states the accurate distinction and never either retired false claim", () => {
+test("state-vs-fields prose guard, (README.md): states the accurate distinction and never either retired false claim", () => {
   const readme = readReadmeText();
   assert.ok(
     readme.includes(STATE_VS_FIELDS_README_SUBSTRING),
@@ -2509,7 +2509,7 @@ test("state-vs-fields prose guard, surface S1 (README.md): states the accurate d
   );
 });
 
-test("state-vs-fields prose guard, surface S2 (the kill tool's tools/list description): states the accurate distinction and never either retired false claim", () => {
+test("state-vs-fields prose guard, (the kill tool's tools/list description): states the accurate distinction and never either retired false claim", () => {
   const description = killTool.description as string;
   assert.ok(
     description.includes(STATE_VS_FIELDS_TOOLSLIST_SUBSTRING),
@@ -2555,7 +2555,7 @@ const FORBIDDEN_ESCALATION_CLOSED_CLAIM =
 const FORBIDDEN_ESCALATION_ELIMINATED_CLAIM =
   "the escalation identity gate eliminates the check-to-signal race entirely";
 
-test("narrowed-residual prose guard, surface S1 (README.md): states the residual is MATERIALLY NARROWED and never claims it is closed or eliminated", () => {
+test("narrowed-residual prose guard, (README.md): states the residual is MATERIALLY NARROWED and never claims it is closed or eliminated", () => {
   const readme = readReadmeText();
   assert.ok(
     readme.includes(NARROWED_RESIDUAL_REQUIRED_SUBSTRING),
@@ -2571,7 +2571,7 @@ test("narrowed-residual prose guard, surface S1 (README.md): states the residual
   );
 });
 
-test("narrowed-residual prose guard, surface S2 (the kill tool's tools/list description): states the residual is MATERIALLY NARROWED and never claims it is closed or eliminated", () => {
+test("narrowed-residual prose guard, (the kill tool's tools/list description): states the residual is MATERIALLY NARROWED and never claims it is closed or eliminated", () => {
   const description = killTool.description as string;
   assert.ok(
     description.includes(NARROWED_RESIDUAL_REQUIRED_SUBSTRING),
@@ -2590,16 +2590,16 @@ test("narrowed-residual prose guard, surface S2 (the kill tool's tools/list desc
 /**
  * The no-unqualified-proof-claim guard below is scoped specifically to the
  * escalation-identity-gate paragraph on each surface (delimited by these
- * two anchors, both real substrings this session's own additions
- * introduced), rather than the whole file: a PRE-EXISTING, unrelated
+ * two anchors, both real substrings the escalation identity gate's own
+ * prose introduced), rather than the whole file: a PRE-EXISTING, unrelated
  * "provably" usage already lives elsewhere in both README.md and kill.ts
  * (the reap-once continuity argument for a DIFFERENT mechanism entirely,
  * which is why that usage is out of scope for this rule), so a whole-file
  * ban would false-positive on an already-correct sentence. This function
  * extracts the identity-gate's OWN paragraph and checks only that slice.
- * The surface-S6 commit-message check further down uses the same
- * narrow-scoping idea, adapted for unstructured prose that has no such
- * paragraph to delimit - see `extractEscalationGateSentences`'s own docs.
+ * The commit-message check further down uses the same narrow-scoping
+ * idea, adapted for unstructured prose that has no such paragraph to
+ * delimit - see `extractEscalationGateSentences`'s own docs.
  */
 function extractEscalationGateParagraph(text: string): string {
   const start = text.indexOf("A further identity gate applies");
@@ -2613,7 +2613,7 @@ function extractEscalationGateParagraph(text: string): string {
  * The full class this guard checks for: an unqualified "prove"/"proves"/
  * "provably" claim beside the escalation identity matcher (a known
  * false-match path - same-second pid reuse - is admitted elsewhere in
- * this story, so an unqualified proof claim beside the matcher is a real
+ * this repository, so an unqualified proof claim beside the matcher is a real
  * overclaim), widened from checking only the bare word "provably" to the
  * whole verb family. Shared across every surface below so a paraphrase
  * using "prove"/"proves" instead of "provably" cannot slip past a
@@ -2622,12 +2622,12 @@ function extractEscalationGateParagraph(text: string): string {
 function assertNoUnqualifiedProofClaim(paragraph: string, surfaceLabel: string): void {
   assert.ok(
     !/\b(provably|proves|prove)\b/i.test(paragraph),
-    `expected ${surfaceLabel}'s own escalation-identity-gate text to never claim its matcher "proves"/"provably" identifies the group - a known false-match path (same-second pid reuse) is admitted elsewhere in this story, so an unqualified proof claim beside the matcher would be a real overclaim. Text: ${JSON.stringify(paragraph)}`
+    `expected ${surfaceLabel}'s own escalation-identity-gate text to never claim its matcher "proves"/"provably" identifies the group - a known false-match path (same-second pid reuse) is admitted elsewhere in this repository, so an unqualified proof claim beside the matcher would be a real overclaim. Text: ${JSON.stringify(paragraph)}`
   );
 }
 
 /**
- * The three EXACT pre-fix overclaim sentences this story's own disclosure
+ * The three EXACT pre-fix overclaim sentences an earlier disclosure
  * sweep found and narrowed (CHANGELOG.md and two source-comment sites in
  * `src/process.ts`) - each claimed the escalation matcher's real cost
  * "never scales with group size" with no qualification, when the real
@@ -2636,7 +2636,7 @@ function assertNoUnqualifiedProofClaim(paragraph: string, surfaceLabel: string):
  * work). Checked as exact forbidden substrings, matching this file's own
  * established narrowed-residual-guard pattern (`FORBIDDEN_ESCALATION_CLOSED_CLAIM`/
  * `FORBIDDEN_ESCALATION_ELIMINATED_CLAIM`), rather than a generic pattern
- * that would also flag this story's OWN corrected wording (which still
+ * that would also flag this repository's OWN corrected wording (which still
  * says a batched read's CALL COUNT never scales with group size, but now
  * explicitly alongside the acknowledgment that the read's own data cost
  * does) - a bare "never scales"/"scales with" ban would false-positive on
@@ -2657,12 +2657,12 @@ function assertNoUnqualifiedScaleClaim(text: string, surfaceLabel: string): void
   }
 }
 
-test("no \"provably\"/unqualified proof claim beside the escalation identity matcher, surface S1 (README.md) - scoped to that mechanism's own paragraph, not the file's unrelated pre-existing use of the word elsewhere", () => {
+test("no \"provably\"/unqualified proof claim beside the escalation identity matcher, (README.md) - scoped to that mechanism's own paragraph, not the file's unrelated pre-existing use of the word elsewhere", () => {
   const paragraph = extractEscalationGateParagraph(readReadmeText());
   assertNoUnqualifiedProofClaim(paragraph, "README.md");
 });
 
-test("no \"provably\"/unqualified proof claim beside the escalation identity matcher, surface S2 (the kill tool's tools/list description) - scoped to that mechanism's own paragraph", () => {
+test("no \"provably\"/unqualified proof claim beside the escalation identity matcher, (the kill tool's tools/list description) - scoped to that mechanism's own paragraph", () => {
   const paragraph = extractEscalationGateParagraph(killTool.description as string);
   assertNoUnqualifiedProofClaim(paragraph, "the kill tool's tools/list description");
 });
@@ -2672,18 +2672,17 @@ function readChangelogText(): string {
 }
 
 /**
- * `local/pr-manifest.md` is gitignored on purpose (workspace AGENTS.md's
- * public/private twin-repo split) - it exists only transiently on the SD's
- * own machine while a PR manifest is being authored, and is never present
- * in a fresh clone, a fresh worktree checkout, or CI. The two surface-S4
- * tests below can only check its content when it happens to exist; where
- * it does not, they report a named, sanctioned skip (test/skip-baseline.json)
- * rather than either throwing ENOENT or vacuously passing without reading
- * anything.
+ * `local/pr-manifest.md` is gitignored - it exists only transiently while a
+ * PR description is being drafted locally, and is never present in a fresh
+ * clone, a fresh worktree checkout, or CI. The two tests below that check
+ * this file's own bullet can only check its content when it happens to
+ * exist; where it does not, they report a named, accepted skip
+ * (test/skip-baseline.json) rather than either throwing ENOENT or
+ * vacuously passing without reading anything.
  */
 const PR_MANIFEST_URL = new URL("../local/pr-manifest.md", import.meta.url);
 const PR_MANIFEST_ABSENT_SKIP_REASON =
-  "local/pr-manifest.md is gitignored and only exists transiently on the SD's own machine while authoring a PR manifest - absent here (a fresh checkout or CI), so surface S4 has nothing to check";
+  "local/pr-manifest.md is gitignored and only exists transiently while a PR description is being drafted locally - absent here (a fresh checkout or CI), so this surface has nothing to check";
 
 function readPrManifestText(): string {
   return fs.readFileSync(PR_MANIFEST_URL, "utf8");
@@ -2719,18 +2718,18 @@ function extractManifestEscalationBullet(text: string): string {
   return end >= 0 ? text.slice(start, end) : text.slice(start);
 }
 
-test('no "provably"/unqualified proof claim beside the escalation identity matcher, surface S3 (CHANGELOG.md) - scoped to that mechanism\'s own bullet', () => {
+test('no "provably"/unqualified proof claim beside the escalation identity matcher, (CHANGELOG.md) - scoped to that mechanism\'s own bullet', () => {
   const bullet = extractChangelogEscalationBullet(readChangelogText());
   assertNoUnqualifiedProofClaim(bullet, "CHANGELOG.md");
 });
 
-test('no unqualified "never scales with group size" cost claim, surface S3 (CHANGELOG.md) - the real batched read still constructs/emits/parses O(N) data, only its call count is size-independent', () => {
+test('no unqualified "never scales with group size" cost claim, (CHANGELOG.md) - the real batched read still constructs/emits/parses O(N) data, only its call count is size-independent', () => {
   const bullet = extractChangelogEscalationBullet(readChangelogText());
   assertNoUnqualifiedScaleClaim(bullet, "CHANGELOG.md's escalation-identity-gate bullet");
 });
 
 test(
-  'no "provably"/unqualified proof claim beside the escalation identity matcher, surface S4 (local/pr-manifest.md) - scoped to that mechanism\'s own bullet',
+  'no "provably"/unqualified proof claim beside the escalation identity matcher, (local/pr-manifest.md) - scoped to that mechanism\'s own bullet',
   { skip: fs.existsSync(PR_MANIFEST_URL) ? false : PR_MANIFEST_ABSENT_SKIP_REASON },
   () => {
     const bullet = extractManifestEscalationBullet(readPrManifestText());
@@ -2739,7 +2738,7 @@ test(
 );
 
 test(
-  'no unqualified "never scales with group size" cost claim, surface S4 (local/pr-manifest.md) - the real batched read still constructs/emits/parses O(N) data, only its call count is size-independent',
+  'no unqualified "never scales with group size" cost claim, (local/pr-manifest.md) - the real batched read still constructs/emits/parses O(N) data, only its call count is size-independent',
   { skip: fs.existsSync(PR_MANIFEST_URL) ? false : PR_MANIFEST_ABSENT_SKIP_REASON },
   () => {
     const bullet = extractManifestEscalationBullet(readPrManifestText());
@@ -2748,7 +2747,7 @@ test(
 );
 
 /**
- * Surface S5: this repo's OWN source comments, in both files whose docs
+ * this repo's OWN source comments, in both files whose docs
  * describe the escalation identity gate - `src/tools/kill.ts`'s "##
  * Escalation identity gate" module-header section (bounded by the next
  * "##" header, `## Process-group confirmation, honestly disclosed`), and
@@ -2795,7 +2794,7 @@ function extractProcessSourceEscalationSection(text: string): string {
   return text.slice(start, end);
 }
 
-test("no \"provably\"/unqualified proof claim beside the escalation identity matcher, surface S5 (this repo's own source comments: src/tools/kill.ts + src/process.ts) - scoped to each file's own escalation-identity-gate section, not unrelated pre-existing uses elsewhere (e.g. process.ts's own Windows-kill-coverage \"proves nothing\" disclaimer, or kill.ts's eager-reap continuity argument)", () => {
+test("no \"provably\"/unqualified proof claim beside the escalation identity matcher, (this repo's own source comments: src/tools/kill.ts + src/process.ts) - scoped to each file's own escalation-identity-gate section, not unrelated pre-existing uses elsewhere (e.g. process.ts's own Windows-kill-coverage \"proves nothing\" disclaimer, or kill.ts's eager-reap continuity argument)", () => {
   const killSection = extractKillSourceEscalationSection(readKillSourceText());
   assertNoUnqualifiedProofClaim(
     killSection,
@@ -2808,7 +2807,7 @@ test("no \"provably\"/unqualified proof claim beside the escalation identity mat
   );
 });
 
-test('no unqualified "never scales with group size" cost claim, surface S5 (this repo\'s own source comments: src/tools/kill.ts + src/process.ts)', () => {
+test('no unqualified "never scales with group size" cost claim, (this repo\'s own source comments: src/tools/kill.ts + src/process.ts)', () => {
   const killSection = extractKillSourceEscalationSection(readKillSourceText());
   assertNoUnqualifiedScaleClaim(
     killSection,
@@ -2828,9 +2827,10 @@ test('no unqualified "never scales with group size" cost claim, surface S5 (this
  * fetches it, and a real clone tracking `origin` has it too), falling
  * back to a local `main` branch for a worktree/environment with no
  * `origin` remote configured at all. `undefined` when NEITHER resolves,
- * in which case the surface-S6 tests below skip with an explicit reason
- * rather than throwing - this guard exists to catch an overclaim, not to
- * assert this checkout's own git plumbing is configured a particular way.
+ * in which case the commit-history tests below skip with an explicit
+ * reason rather than throwing - this guard exists to catch an overclaim,
+ * not to assert this checkout's own git plumbing is configured a
+ * particular way.
  */
 function resolveCommitRangeBase(): string | undefined {
   for (const candidate of ["origin/main", "main"]) {
@@ -2894,7 +2894,7 @@ function readCommitRangeCommits(): RangeCommit[] {
 }
 
 /**
- * This story's own established vocabulary for the escalation identity
+ * This project's own established vocabulary for the escalation identity
  * gate specifically - used to scope the proof-claim check below to text
  * that is actually ABOUT that mechanism, exactly like this file's own
  * `extractEscalationGateParagraph` scopes README.md/kill.ts/process.ts to
@@ -2909,35 +2909,127 @@ function readCommitRangeCommits(): RangeCommit[] {
 const ESCALATION_GATE_SENTENCE_KEYWORDS =
   /escalation identity|identity gate|identity matcher|group is still ours|originally-recorded member/i;
 
-function extractEscalationGateSentences(text: string): string[] {
+/**
+ * Commit bodies are hard-wrapped at ~72 characters, so a single sentence
+ * routinely spans several source lines joined only by a lone `\n`. Splitting
+ * on `\n+` as if it always meant "end of sentence" made the guard's real
+ * unit a wrapped LINE rather than a sentence: a claim could straddle a wrap
+ * point and escape entirely, silently, whenever the proof-word landed on a
+ * different line than the keyword that scopes the check to it. A blank line
+ * (two or more consecutive newlines) is a real paragraph break and stays
+ * one; a single newline inside a paragraph is folded to a space first, so
+ * sentence-ending punctuation - not line position - is what actually
+ * delimits a sentence.
+ */
+function joinWrappedLines(text: string): string {
   return text
-    .split(/(?<=[.!?])\s+|\n+/)
-    .map((sentence) => sentence.trim())
-    .filter((sentence) => sentence.length > 0 && ESCALATION_GATE_SENTENCE_KEYWORDS.test(sentence));
+    .split(/\n{2,}/)
+    .map((paragraph) => paragraph.split("\n").join(" "))
+    .join("\n\n");
 }
 
 /**
- * Strips double-quoted spans before the proof-claim check runs on commit
- * text: a commit that narrates a PAST, already-corrected overclaim
- * legitimately quotes the retired wording (e.g. a claim that the matcher
- * "proves" the group is still ours) - that is historical narration
- * describing a fix, not a live assertion, and must never itself trip
- * this guard. Only an UNQUOTED "prove"/"proves"/"provably" is a direct,
- * live claim.
+ * Filtering to only the sentences that themselves mention the mechanism
+ * is blind to a claim carried by a pronoun in the very next sentence: a
+ * mechanism-naming sentence followed by an anaphoric one - "It proves
+ * ownership before SIGKILL." - never mentions the mechanism by name
+ * itself, so a filter that requires each sentence to pass the keyword
+ * test on its own drops the claim before the proof-word check ever runs
+ * on it. A sentence is in scope here if it mentions the mechanism
+ * directly, OR the sentence immediately before it does: a one-sentence
+ * forward window opened by a mechanism mention, not a per-sentence
+ * filter. This is a bounded window, not general pronoun resolution: a
+ * proof claim separated from the last mechanism mention by an
+ * intervening, unrelated sentence falls outside it and is not caught,
+ * and no fixed window size would make a genuine completeness claim here
+ * either - resolving what a pronoun refers to across arbitrary prose is
+ * an open problem this file does not attempt to close. A test below
+ * names that boundary explicitly rather than leaving it undisclosed.
  */
-function stripQuotedSpans(text: string): string {
-  return text.replace(/"[^"]*"/g, "");
+function extractEscalationGateSentences(text: string): string[] {
+  const sentences = joinWrappedLines(text)
+    .split(/(?<=[.!?])\s+/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length > 0);
+
+  const inScope: string[] = [];
+  for (let i = 0; i < sentences.length; i++) {
+    const sentence = sentences[i]!;
+    const mentionsMechanism = ESCALATION_GATE_SENTENCE_KEYWORDS.test(sentence);
+    const followsAMechanismSentence =
+      i > 0 && ESCALATION_GATE_SENTENCE_KEYWORDS.test(sentences[i - 1]!);
+    if (mentionsMechanism || followsAMechanismSentence) {
+      inScope.push(sentence);
+    }
+  }
+  return inScope;
+}
+
+/**
+ * Once quoted spans and parenthetical asides were blanket-stripped before
+ * this check ran, a sentence's proof-claim words could sit ENTIRELY inside
+ * one of those stripped regions and still describe a real, direct,
+ * currently-true claim about the matcher - stripping erased the words
+ * before the check ever saw them, regardless of whether the region was
+ * historical narration or a live assertion wearing quotes or parentheses.
+ * Two sentences that read the same either way expose this: `The escalation
+ * identity gate (proves the group is still ours) permits SIGKILL.` and the
+ * same claim in double quotes instead of parentheses. Neither is historical
+ * narration - both assert, in the present tense, exactly the capability
+ * the code disclaims - and both passed cleanly under stripping. A syntax
+ * region (quoted or parenthesized) is not a semantic signal for "this is
+ * reported speech about the past," so no regex over that shape can
+ * distinguish the two cases; this project's own actionlint-recipe checks
+ * apply the identical principle to an unrelated surface (an unbounded
+ * behavioral property can't be proven by pattern-matching shell text, only
+ * by execution). There is no execution equivalent for prose, so the fix
+ * here is the same one this file's own commit-history check already uses
+ * for its one truly unavoidable exception below: check the full, unstripped
+ * sentence, and handle the rare, real case of legitimate historical
+ * quotation through an enumerated, exact-match allowlist instead of a
+ * content-shape guess - the allowlist can't be fooled by rephrasing a live
+ * claim into looking like a retraction, because it does not look at shape
+ * at all.
+ */
+
+/**
+ * Exact (sha, sentence) pairs pre-dating this guard, exempted individually
+ * rather than by a blanket skip of the whole check - the same pattern
+ * test/skip-baseline.json already uses elsewhere in this file for a named
+ * skip. This repository's PRs squash-merge, so an individual commit's own
+ * message never becomes part of `main`'s history; only the squash commit's
+ * subject and body do, and those are checked without any exemption. A
+ * DIFFERENT violation in the same commit still reds (only this exact
+ * sentence is exempted, not the commit or the check), and this same
+ * sentence surviving under a DIFFERENT sha still reds too (the match is on
+ * the pair, not either half alone). An entry whose sha no longer appears in
+ * the range is dead weight to remove with it, never a standing exemption
+ * that outlives the commit it was written for.
+ */
+const LEGACY_PROOF_CLAIM_EXCEPTIONS: readonly { sha: string; sentence: string }[] = [
+  {
+    sha: "583c9b695cc8e991c86eb149485524974f27c440",
+    sentence:
+      "A single surviving, exactly-matching member is enough to prove the group is still ours, since POSIX forbids reusing a live group's numeric id; if none match, escalation is refused and no SIGKILL is sent.",
+  },
+];
+
+function isLegacyProofClaimException(sha: string, sentence: string): boolean {
+  return LEGACY_PROOF_CLAIM_EXCEPTIONS.some(
+    (entry) => entry.sha === sha && entry.sentence === sentence.trim()
+  );
 }
 
 test(
-  'no "provably"/unqualified proof claim beside the escalation identity matcher, surface S6 (every commit subject+body in the range) - scoped to sentences that actually mention the escalation identity gate by name, with quoted spans stripped so a commit narrating an already-fixed overclaim in quotes is never itself mistaken for a live one',
+  'no "provably"/unqualified proof claim beside the escalation identity matcher, (every commit subject+body in the range) - scoped to sentences that actually mention the escalation identity gate by name, checked as full, unstripped text so a claim cannot hide inside a quote or a parenthetical, except one enumerated, legacy exception',
   { skip: COMMIT_RANGE_SKIP },
   () => {
     for (const commit of readCommitRangeCommits()) {
       const text = `${commit.subject}\n\n${commit.body}`;
       for (const sentence of extractEscalationGateSentences(text)) {
+        if (isLegacyProofClaimException(commit.sha, sentence)) continue;
         assertNoUnqualifiedProofClaim(
-          stripQuotedSpans(sentence),
+          sentence,
           `commit ${commit.sha.slice(0, 12)} ("${commit.subject}")`
         );
       }
@@ -2945,8 +3037,156 @@ test(
   }
 );
 
+test("the legacy proof-claim exception is live: its sha is actually present in the real commit range, and its sentence is actually produced by the real extraction", () => {
+  const shasInRange = new Set(readCommitRangeCommits().map((commit) => commit.sha));
+  for (const entry of LEGACY_PROOF_CLAIM_EXCEPTIONS) {
+    assert.ok(
+      shasInRange.has(entry.sha),
+      `legacy exception for ${entry.sha} names a sha that is not in the real commit range - remove the dead entry`
+    );
+    const commit = readCommitRangeCommits().find((c) => c.sha === entry.sha);
+    assert.ok(commit, `test setup: could not re-find commit ${entry.sha}`);
+    const text = `${commit!.subject}\n\n${commit!.body}`;
+    const sentences = extractEscalationGateSentences(text);
+    assert.ok(
+      sentences.some((sentence) => sentence.trim() === entry.sentence),
+      `legacy exception's sentence was not found among ${commit!.sha.slice(0, 12)}'s own extracted sentences - the exception is stale (the commit's text changed, or the extraction logic changed) and must be re-derived, not assumed`
+    );
+  }
+});
+
+test("the legacy exception is an exact-pair match, not a fuzzy one: a near-identical sentence under the real sha, and the real sentence under a fake sha, are both refused", () => {
+  const realEntry = LEGACY_PROOF_CLAIM_EXCEPTIONS[0]!;
+  assert.equal(
+    isLegacyProofClaimException(realEntry.sha, realEntry.sentence),
+    true,
+    "test setup: the real (sha, sentence) pair must match"
+  );
+  assert.equal(
+    isLegacyProofClaimException(
+      realEntry.sha,
+      realEntry.sentence.replace("A single surviving", "One surviving")
+    ),
+    false,
+    "a paraphrase of the legacy-exception sentence under its own real sha must NOT match - the allowlist is exact text, not a rewritten claim carrying the same meaning"
+  );
+  assert.equal(
+    isLegacyProofClaimException("0".repeat(40), realEntry.sentence),
+    false,
+    "the real legacy-exception sentence under an unrelated sha must NOT match - the pair is what's exempted, never the sentence alone"
+  );
+});
+
+test("negative control: a live proof claim hidden inside a parenthetical aside is still caught now that stripping is gone (the exact evasion this guard used to miss)", () => {
+  const text = "The escalation identity gate (proves the group is still ours) permits SIGKILL.";
+  const sentences = extractEscalationGateSentences(text);
+  assert.equal(sentences.length, 1, "test setup: expected exactly one in-scope sentence");
+  assert.equal(
+    isLegacyProofClaimException("0".repeat(40), sentences[0]!),
+    false,
+    "test setup: this sentence must not be the legacy exception"
+  );
+  assert.throws(
+    () => assertNoUnqualifiedProofClaim(sentences[0]!, "negative-control text"),
+    /never claim/,
+    "a direct proof claim sitting inside a parenthetical must still be caught, not hidden by the parens around it"
+  );
+});
+
+test("negative control: a live proof claim hidden inside a double-quoted span is still caught now that stripping is gone (the exact evasion this guard used to miss)", () => {
+  const text = 'The escalation identity gate "proves the group is still ours" and permits SIGKILL.';
+  const sentences = extractEscalationGateSentences(text);
+  assert.equal(sentences.length, 1, "test setup: expected exactly one in-scope sentence");
+  assert.equal(
+    isLegacyProofClaimException("0".repeat(40), sentences[0]!),
+    false,
+    "test setup: this sentence must not be the legacy exception"
+  );
+  assert.throws(
+    () => assertNoUnqualifiedProofClaim(sentences[0]!, "negative-control text"),
+    /never claim/,
+    "a direct proof claim sitting inside a quoted span must still be caught, not hidden by the quotes around it"
+  );
+});
+
+test("green control: an in-scope sentence that narrates an already-fixed overclaim without repeating the banned word verbatim passes cleanly - legitimate historical narration needs no exemption because it never has to use the literal word", () => {
+  const text =
+    "Narrowed an overclaim: the escalation identity gate was described as an unqualified guarantee that the process group is still the one this server spawned.";
+  const sentences = extractEscalationGateSentences(text);
+  assert.equal(sentences.length, 1, "test setup: expected exactly one in-scope sentence");
+  assert.doesNotThrow(
+    () => assertNoUnqualifiedProofClaim(sentences[0]!, "green-control text"),
+    "a retraction that paraphrases the retired claim instead of quoting the banned word verbatim must pass without any stripping or exemption"
+  );
+});
+
+test("the adversarial specimen is caught: a mechanism-naming sentence followed immediately by a bare anaphoric proof sentence is in scope and throws", () => {
+  const text =
+    "The escalation identity gate records the original member set. It proves ownership before SIGKILL.";
+  const sentences = extractEscalationGateSentences(text);
+  assert.equal(
+    sentences.length,
+    2,
+    "test setup: both the mechanism-naming sentence and the immediately-following anaphoric sentence must be in scope"
+  );
+  assert.throws(
+    () =>
+      sentences.forEach((sentence) =>
+        assertNoUnqualifiedProofClaim(sentence, "adversarial-specimen text")
+      ),
+    /never claim/,
+    "the anaphoric second sentence must be caught even though it never mentions the mechanism by name itself - a per-sentence filter drops this exact sentence before the proof-word check ever runs on it, and this test reds against that filter"
+  );
+});
+
+test("alternate pronoun/subject rows immediately following a mechanism sentence are also caught by the one-sentence window, not only the exact specimen's wording", () => {
+  const rows = [
+    "The escalation identity gate records the original member set. It proves ownership before SIGKILL.",
+    "The escalation identity gate stores the original members. This proves the group hasn't been reused.",
+    "The escalation identity gate captured members at a point in time. The check proves this is the same set that started.",
+  ];
+  for (const text of rows) {
+    const sentences = extractEscalationGateSentences(text);
+    assert.equal(
+      sentences.length,
+      2,
+      `test setup: expected both sentences in scope for: ${JSON.stringify(text)}`
+    );
+    assert.throws(
+      () =>
+        sentences.forEach((sentence) =>
+          assertNoUnqualifiedProofClaim(sentence, "mutation-row text")
+        ),
+      /never claim/,
+      `expected the proof claim to be caught regardless of the pronoun or subject introducing it, for: ${JSON.stringify(text)}`
+    );
+  }
+});
+
+test("disclosed residual, NOT closed: a proof claim separated from the last mechanism mention by one intervening, unrelated sentence falls outside the one-sentence window and is not caught - general pronoun resolution across arbitrary distance is out of scope for this guard", () => {
+  const text =
+    "The escalation identity gate records the original member set. Nothing else happens here. It proves ownership before SIGKILL.";
+  const sentences = extractEscalationGateSentences(text);
+  assert.equal(
+    sentences.length,
+    2,
+    "test setup: the mechanism-naming sentence and the intervening sentence right after it are in scope (the window opens once, immediately after the mechanism mention) - the proof claim a second sentence later falls entirely outside it and is never even extracted"
+  );
+  assert.ok(
+    !sentences.some((sentence) => /\bproves\b/i.test(sentence)),
+    "test setup: the actual proof-claim sentence must not be among the extracted, in-scope sentences at all"
+  );
+  assert.doesNotThrow(
+    () =>
+      sentences.forEach((sentence) =>
+        assertNoUnqualifiedProofClaim(sentence, "residual-boundary text")
+      ),
+    "known, disclosed gap: a proof claim separated from the last mechanism mention by an intervening sentence is not caught here - widening the window by a fixed amount would not make this a general anaphora resolver either, so the boundary is named by this test rather than pretended closed"
+  );
+});
+
 test(
-  'no unqualified "never scales with group size" cost claim, surface S6 (every commit subject+body in the range)',
+  'no unqualified "never scales with group size" cost claim, (every commit subject+body in the range)',
   { skip: COMMIT_RANGE_SKIP },
   () => {
     for (const commit of readCommitRangeCommits()) {
@@ -3017,7 +3257,7 @@ test(
     // The escalation gate's OWN degraded cell: ps/pgrep unavailable for the WHOLE duration
     // of the kill() call, so the escalation identity gate's own
     // pre-SIGTERM snapshot also fails to capture anything usable.
-    process.env.PATH = "/tmp/does-not-exist-ghantika-empty-path-dir-tc35";
+    process.env.PATH = "/tmp/does-not-exist-ghantika-empty-path-dir-combined-degraded-cell";
     let result: Awaited<ReturnType<typeof killTool.handler>>;
     try {
       result = await killTool.handler({ job_id: record.job_id });
@@ -3036,7 +3276,7 @@ test(
     // "killed" via the existing, unmodified synchronous mark-on-SIGTERM
     // mechanism (see kill.ts's own "kill/exit race" docs) - this
     // assertion documents that EXISTING, untouched behavior, not a new
-    // claim this story introduces.
+    // claim being introduced here.
     assert.equal(structured.state, "killed");
     assert.equal(
       structured.identity_confirmed,
@@ -3190,7 +3430,7 @@ async function runStrandedRetryScenario(
     // restored again immediately after (BEFORE the second call below),
     // so the second call's own identity gate can genuinely observe the
     // real process table this time.
-    process.env.PATH = "/tmp/does-not-exist-ghantika-empty-path-dir-tc36";
+    process.env.PATH = "/tmp/does-not-exist-ghantika-empty-path-dir-stranded-retry";
     let firstResult: Awaited<ReturnType<typeof killTool.handler>>;
     try {
       firstResult = await killTool.handler({ job_id: record.job_id });
