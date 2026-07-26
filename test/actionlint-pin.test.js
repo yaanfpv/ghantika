@@ -16,16 +16,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { load as loadYaml } from "js-yaml";
 
-// This suite has three parts. The first parses .github/workflows/ci.yml as
+// This suite has two parts. The first parses .github/workflows/ci.yml as
 // data (never executes it) and checks the actionlint job's exact shape:
-// the pinned URL, the saved filename, the recorded checksum, and the
-// ordering that puts verification before extraction. Its early-invocation
-// scan is a fast, text-only first pass, not a proof - it recognizes a
-// handful of known ways a shell line can spell "run actionlint" (a bare
-// word, a path-qualified form, a couple of common wrappers), and a shell
-// script can always spell a command a way this kind of pattern list hasn't
-// thought of yet (a plain variable holding the name, a function, an alias,
-// `eval`, and more).
+// the pinned URL, the saved filename, the recorded checksum, the ordering
+// that puts verification before extraction, and the canonical invoke
+// step's bare, PATH-resolved shape.
 //
 // The second part actually drives the job's two real run steps, in order,
 // inside a scratch directory, with a fake curl (so nothing ever touches
@@ -33,15 +28,14 @@ import { load as loadYaml } from "js-yaml";
 // bytes are on disk, and a fake actionlint binary that only proves it was
 // reached. That is what tells the difference between "the text looks
 // right" and "a hash mismatch actually stops the job before extraction,"
-// which a parse-only check can't do on its own.
-//
-// The third part generalizes that same execution-based approach across an
-// arbitrary, mutated sequence of steps, so that no matter how a stray or
-// inserted line tries to invoke actionlint early - a whole extra step, a
-// line buried inside the install step's own block, a bare word, a
-// path-qualified path, a variable holding the name, or a wrapper command -
-// a real shell actually running that text is what decides whether an early
-// invocation gets through, never a guess about how the text is shaped.
+// which a parse-only check can't do on its own. It also generalizes that
+// same execution-based approach across an arbitrary, mutated sequence of
+// steps, so that no matter how a stray or inserted line tries to invoke
+// actionlint early - a whole extra step, a line buried inside the install
+// step's own block, a bare word, a path-qualified path, a variable holding
+// the name, or a wrapper command - a real shell actually running that text
+// is what decides whether an early invocation gets through, never a guess
+// about how the text is shaped.
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const WORKFLOW_PATH = path.join(REPO_ROOT, ".github", "workflows", "ci.yml");
@@ -61,42 +55,6 @@ const MOVING_REFERENCE_PATTERNS = [
   /\/(?:main|master|HEAD)\//,
   /@(?:main|master|HEAD)\b/,
 ];
-
-const SWALLOW_PATTERNS = [/\|\|\s*true\b/, /\|\|\s*:(\s|$)/, /;\s*true\s*$/];
-
-// Forms that make "actionlint" the thing actually being EXECUTED in a CI
-// `run:` block, as opposed to it merely appearing inside a larger token -
-// a versioned archive filename (actionlint_1.7.12_linux_amd64.tar.gz), the
-// checksum record's own filename (actionlint-artifact.sha256), a URL path
-// segment. Each pattern requires "actionlint" to sit in command position:
-// right at the start of a line, right after a shell command separator (`;`,
-// `&&`, `||`, a pipe), inside a command substitution (`$(...)` or
-// backticks), path-qualified (`./actionlint`, `$RUNNER_TEMP/bin/actionlint`),
-// or passed as the argument to a small set of pass-through wrappers real CI
-// scripts actually use (`exec`, `command`, `env`, `sudo`, `time`, `xargs`,
-// or a `bash -c` / `sh -c` string).
-//
-// This list can never be complete. A shell can indirect a command through
-// a plain variable (`tool=actionlint; "$tool" -color`), a function, an
-// alias, `eval`, and other forms this pattern set doesn't name, and every
-// one of those resolves "actionlint" exactly the way a bare invocation
-// does. Treat this as a fast, incomplete first pass, not the real guard -
-// the hermetic execution tests further down actually run the step text
-// through a real shell against a sentinel-writing stand-in, which is what
-// proves the property regardless of how the invocation is spelled.
-const ACTIONLINT_INVOCATION_PATTERNS = [
-  /(?:^|[;&|]|\$\(|`)\s*(?:\.{1,2}\/|\/[\w./-]*\/|\$\{?RUNNER_TEMP\}?\/(?:bin\/)?|\$\{?GITHUB_WORKSPACE\}?\/)?actionlint\b/,
-  /\b(?:exec|command|env|sudo|time|xargs)\s+(?:-\S+\s+)*actionlint\b/,
-  /\b(?:bash|sh|zsh)\s+-c\b.*\bactionlint\b/,
-];
-
-/**
- * @param {string} line
- * @returns {boolean}
- */
-function lineInvokesActionlint(line) {
-  return ACTIONLINT_INVOCATION_PATTERNS.some((pattern) => pattern.test(line));
-}
 
 /**
  * @param {string} [filePath]
@@ -131,45 +89,23 @@ function locateActionlintSteps(workflow) {
 }
 
 /**
- * Scans every step STRICTLY BEFORE installIndex - never installIndex
- * itself or later, since the recipe's own tar-extraction line legitimately
- * names "actionlint" as the member to extract, and that is not an
- * invocation - for anything matching one of the recognized invocation
- * forms above. It checks each step's own index against installIndex,
- * never a fixed position, so an inserted extra step shifts installIndex and
- * is still scanned correctly.
- *
- * This is a fast, text-only pass at this recipe's real security property
- * (nothing before verification may ever invoke actionlint, in any form) -
- * the pattern list above is necessarily incomplete, so the hermetic
- * execution tests further down are what actually establish the property,
- * by observing real shell behavior instead of matching text.
- *
- * @param {any[]} steps
- * @param {number} installIndex
- * @returns {{ index: number, name: string, line: string } | null}
- */
-function findEarlyActionlintInvocation(steps, installIndex) {
-  if (installIndex === -1) return null;
-  for (let index = 0; index < installIndex; index += 1) {
-    const step = steps[index];
-    if (typeof step?.run !== "string") continue;
-    for (const line of step.run.split("\n")) {
-      if (lineInvokesActionlint(line)) {
-        return { index, name: step.name ?? `step ${index}`, line: line.trim() };
-      }
-    }
-  }
-  return null;
-}
-
-/**
  * Everything this file's static, text-only pass checks about the
- * actionlint recipe, checked directly against the parsed workflow plus the
- * recorded checksum file's content
- * (passed in rather than read from disk, so a mutation test can hand it a
- * broken record without touching the real file). Returns a list of
- * problems; an empty list means the recipe is clean.
+ * actionlint recipe: the pinned URL, the saved filename, the recorded
+ * checksum record's own well-formedness, and the canonical invoke step's
+ * bare, PATH-resolved shape, plus the structural preconditions needed to
+ * evaluate any of that at all (the job and the install step actually
+ * existing). Deliberately does NOT scan install-step text for unbounded,
+ * behavioral properties - "did curl actually download something," "did tar
+ * actually extract it," "did the checksum check get swallowed" - by
+ * matching against a tool name or an enumerated pattern list; those are
+ * asserted for real by the hermetic execution tests further down, which
+ * run the actual step text through a real shell instead of guessing from
+ * its shape. The audit test further down keeps this file honest about
+ * which named fact or precondition every surviving check here maps to.
+ * Checked directly against the parsed workflow plus the recorded checksum
+ * file's content (passed in rather than read from disk, so a mutation test
+ * can hand it a broken record without touching the real file). Returns a
+ * list of problems; an empty list means the recipe is clean.
  *
  * @param {any} workflow
  * @param {string | null | undefined} hashRecordContent
@@ -194,18 +130,9 @@ function validateActionlintRecipe(workflow, hashRecordContent) {
     );
   }
 
-  const earlyInvocation = findEarlyActionlintInvocation(steps, installIndex);
-  if (earlyInvocation) {
-    problems.push(
-      `step ${earlyInvocation.index} ("${earlyInvocation.name}") invokes actionlint before the checksum verification/extraction step - this must never happen: "${earlyInvocation.line}"`
-    );
-  }
-
   let savedAs = null;
   if (installIndex !== -1) {
     const runText = steps[installIndex].run;
-    const lines = runText.split("\n");
-    const lineIndexOf = (pattern) => lines.findIndex((line) => pattern.test(line));
 
     if (!runText.includes(PINNED_URL)) {
       problems.push(`install step does not fetch the exact pinned URL ${PINNED_URL}`);
@@ -226,28 +153,6 @@ function validateActionlintRecipe(workflow, hashRecordContent) {
 
     if (!runText.includes(`sha256sum --check ${HASH_FILE_RELATIVE_PATH}`)) {
       problems.push(`install step does not run "sha256sum --check ${HASH_FILE_RELATIVE_PATH}"`);
-    }
-
-    const shaLineIndex = lineIndexOf(/sha256sum --check/);
-    if (shaLineIndex !== -1) {
-      const shaLine = lines[shaLineIndex];
-      for (const pattern of SWALLOW_PATTERNS) {
-        if (pattern.test(shaLine)) {
-          problems.push(
-            `the checksum-verification line swallows a nonzero exit (matched ${pattern}): "${shaLine.trim()}"`
-          );
-        }
-      }
-    }
-
-    const curlLineIndex = lineIndexOf(/curl\b/);
-    const tarLineIndex = lineIndexOf(/tar -xzf/);
-    const pathAppendLineIndex = lineIndexOf(/>>\s*"\$GITHUB_PATH"/);
-
-    if (curlLineIndex === -1) problems.push("install step never downloads with curl");
-    if (tarLineIndex === -1) problems.push("install step never extracts with tar -xzf");
-    if (pathAppendLineIndex === -1) {
-      problems.push('install step never appends the extraction directory to "$GITHUB_PATH"');
     }
   }
 
@@ -381,17 +286,6 @@ test("negative: more than one line in the recorded checksum file is flagged", ()
   assert.ok(problems.some((p) => /exactly one line/.test(p)));
 });
 
-test("negative: swallowing a hash-check failure with a trailing || true is flagged", () => {
-  const workflow = withMutatedInstallRun((run) =>
-    run.replace(
-      `sha256sum --check ${HASH_FILE_RELATIVE_PATH}`,
-      `sha256sum --check ${HASH_FILE_RELATIVE_PATH} || true`
-    )
-  );
-  const problems = validateActionlintRecipe(workflow, readFileSync(HASH_FILE_PATH, "utf8"));
-  assert.ok(problems.some((p) => /swallows a nonzero exit/.test(p)));
-});
-
 test("negative: invoking ./actionlint instead of the bare PATH-resolved binary is flagged", () => {
   const workflow = structuredClone(loadWorkflow());
   const { steps, invokeIndex } = locateActionlintSteps(workflow);
@@ -401,118 +295,262 @@ test("negative: invoking ./actionlint instead of the bare PATH-resolved binary i
   assert.ok(problems.some((p) => /bare "actionlint -color"/.test(p)));
 });
 
-test("negative: an early, unverified actionlint invocation before the checksum-verify step is flagged, and reverting the insertion restores a clean result", () => {
-  const workflow = structuredClone(loadWorkflow());
-  const hashRecord = readFileSync(HASH_FILE_PATH, "utf8");
-  const { steps, installIndex: baselineInstallIndex } = locateActionlintSteps(workflow);
-  assert.notEqual(baselineInstallIndex, -1, "test setup: could not locate the real install step");
+// ---------------------------------------------------------------------------
+// Audit control. Every static failure path that validateActionlintRecipe
+// can still produce must map to one of the four bounded facts this recipe
+// asserts statically - (i) the pinned URL literal, (ii) the -o filename,
+// (iii) the checksum record being exactly one well-formed line whose hex
+// matches the verified release digest and whose filename agrees with the
+// -o target, (iv) the bare, PATH-resolved invocation - or to a named
+// structural precondition (something that has to hold before (i)-(iv) can
+// even be evaluated, such as the job or the install step existing at all).
+// Anything checking an unbounded/behavioral property by scanning shell
+// text belongs to neither bucket and must be removed once it is proven
+// redundant with existing hermetic coverage (this is what removed the
+// former swallow/curl/tar/GITHUB_PATH-append checks).
+//
+// This is not a comment-only audit. AUDIT_SCENARIOS below constructs a
+// real, minimal mutation of the actual workflow and/or hash record for
+// each surviving check, actually calls validateActionlintRecipe, and
+// asserts (a) the check's own mapped message fires, (b) every message the
+// mutation produced - not just the expected one - matches some entry in
+// KNOWN_STATIC_CHECKS, and (c) the total problem count matches exactly
+// what the scenario's own analysis predicts. (b) is what makes this
+// falsifiable against the future: if someone adds a new problems.push(...)
+// to validateActionlintRecipe under a condition that also happens to hold
+// in one of these constructed scenarios (a very likely case for anything
+// added to the same install-step or hash-record blocks these scenarios
+// already exercise on every axis), that new message will not match any
+// registered pattern and this test reds - exactly the property that keeps
+// an unmapped or removed check from silently surviving unnoticed. A
+// completeness pass below also confirms every registered mapping is
+// actually exercised by at least one scenario, so the registry itself can
+// never silently rot into force-fit entries nobody triggers.
+//
+// Honest scope limit: this cannot catch a hypothetically-future check gated
+// on a condition NONE of these scenarios ever puts the recipe into (e.g. a
+// brand new fact about a step this file doesn't yet model at all) - no
+// mutation battery can be complete against a check that does not exist
+// yet. What it does guarantee is coverage of every branch the function
+// currently has, on every axis the current install step and hash record
+// vary along.
+// ---------------------------------------------------------------------------
 
-  // Baseline, before any mutation: the untouched clone is clean, same as
-  // the positive check above - this is the "confirm green again" half done up front too,
-  // so the red in the middle is provably caused by the insertion and
-  // nothing else.
-  assert.deepEqual(validateActionlintRecipe(workflow, hashRecord), []);
-
-  // Apply the mutation for real: splice a brand-new step running a bare,
-  // unverified `actionlint -color` in immediately before the checksum-verify
-  // step. Nothing else in the recipe changes, so this isolates exactly the
-  // one property under test - the exact gap in the old
-  // `index > installIndex`-only search, which never looked here at all.
-  const earlyStep = { name: "premature actionlint (must be rejected)", run: "actionlint -color" };
-  steps.splice(baselineInstallIndex, 0, earlyStep);
-  const { installIndex: mutatedInstallIndex } = locateActionlintSteps(workflow);
-  assert.equal(
-    mutatedInstallIndex,
-    baselineInstallIndex + 1,
-    "test setup: the insertion should shift the install step forward by exactly one"
-  );
-
-  const problemsWithMutation = validateActionlintRecipe(workflow, hashRecord);
-  assert.ok(problemsWithMutation.length > 0, "the early invocation must be flagged");
-  assert.ok(
-    problemsWithMutation.some(
-      (p) => /invokes actionlint before/.test(p) && /premature actionlint/.test(p)
-    ),
-    `expected a problem naming the early step, got: ${JSON.stringify(problemsWithMutation)}`
-  );
-
-  // Revert: remove exactly the step just inserted, nothing else, and
-  // confirm the recipe reads clean again - proving the mutation itself is
-  // what made it red, and that removing it (not some other side effect)
-  // is what makes it green again.
-  const removed = steps.splice(baselineInstallIndex, 1);
-  assert.equal(
-    removed[0],
-    earlyStep,
-    "test cleanup: removed a different step than the one inserted"
-  );
-  assert.deepEqual(validateActionlintRecipe(workflow, hashRecord), []);
-});
-
-// findEarlyActionlintInvocation states, in its own doc comment, that it is a
-// fast, text-only pre-filter over a documented set of recognized invocation
-// shapes - never the actual guarantee, which the hermetic execution tests
-// further down establish by really running the step text through a shell.
-// The two checks below confirm exactly that division of labor with real
-// constructed mutants rather than trusting the comment: a path-qualified
-// and a wrapper-command early invocation - both forms ACTIONLINT_INVOCATION_PATTERNS
-// explicitly documents as recognized - are caught by this static check
-// alone, while a shell-variable indirection - a form the same doc comment
-// explicitly says this pattern list cannot name - passes it clean, exactly
-// as documented, with the suite's own hermetic mutation test further down
-// ("actionlint invoked through a shell variable that holds its name is
-// caught by real execution...") the one that actually needs to catch it.
-test("findEarlyActionlintInvocation catches every documented invocation shape - path-qualified and wrapper forms - and honestly passes a shell-variable indirection clean, exactly as its own incompleteness is documented to allow", () => {
-  const hashRecord = readFileSync(HASH_FILE_PATH, "utf8");
-
-  const pathQualifiedWorkflow = structuredClone(loadWorkflow());
+const KNOWN_STATIC_CHECKS = [
   {
-    const { steps, installIndex } = locateActionlintSteps(pathQualifiedWorkflow);
-    assert.notEqual(installIndex, -1, "test setup: could not locate the real install step");
-    steps.splice(installIndex, 0, {
-      name: "premature path-qualified invocation (must be rejected)",
-      run: "$RUNNER_TEMP/bin/actionlint -color",
-    });
-  }
-  const pathQualifiedProblems = validateActionlintRecipe(pathQualifiedWorkflow, hashRecord);
-  assert.ok(
-    pathQualifiedProblems.some(
-      (p) => /invokes actionlint before/.test(p) && /premature path-qualified invocation/.test(p)
-    ),
-    `expected the path-qualified early invocation to be flagged, got: ${JSON.stringify(pathQualifiedProblems)}`
-  );
-
-  const wrapperWorkflow = structuredClone(loadWorkflow());
+    mapsTo:
+      "structural precondition: no actionlint job found (none of (i)-(iv) can be evaluated without a job)",
+    pattern: /no "actionlint" job found in the workflow/,
+  },
   {
-    const { steps, installIndex } = locateActionlintSteps(wrapperWorkflow);
-    assert.notEqual(installIndex, -1, "test setup: could not locate the real install step");
-    steps.splice(installIndex, 0, {
-      name: "premature exec-wrapped invocation (must be rejected)",
-      run: "exec actionlint -color",
-    });
-  }
-  const wrapperProblems = validateActionlintRecipe(wrapperWorkflow, hashRecord);
-  assert.ok(
-    wrapperProblems.some(
-      (p) => /invokes actionlint before/.test(p) && /premature exec-wrapped invocation/.test(p)
-    ),
-    `expected the exec-wrapped early invocation to be flagged, got: ${JSON.stringify(wrapperProblems)}`
-  );
-
-  const indirectedWorkflow = structuredClone(loadWorkflow());
+    mapsTo:
+      "structural precondition: no install/verify step found ((i), (ii), (iii) are all read off the install step's own run text)",
+    pattern: /the install\/verify step is missing/,
+  },
   {
-    const { steps, installIndex } = locateActionlintSteps(indirectedWorkflow);
-    assert.notEqual(installIndex, -1, "test setup: could not locate the real install step");
-    steps.splice(installIndex, 0, {
-      name: "premature variable-indirected invocation (this static check cannot see it)",
-      run: 'tool=actionlint\n"$tool" -color',
-    });
+    mapsTo:
+      "The invocation is a bare, PATH-resolved actionlint, not ./actionlint or any path-qualified form",
+    pattern: /bare "actionlint -color"/,
+  },
+  {
+    mapsTo: "The install step fetches the exact pinned URL literal",
+    pattern: /does not fetch the exact pinned URL/,
+  },
+  {
+    mapsTo:
+      "The install step does not fetch from a moving reference (the same pinned-vs-moving fact, the other direction)",
+    pattern: /fetches from a moving reference/,
+  },
+  {
+    mapsTo: "The -o filename is exactly the pinned archive name",
+    pattern: /saves the download as/,
+  },
+  {
+    mapsTo:
+      "The verify command targets the tracked checksum-record file (a precondition for the record's own content to be the thing actually enforced)",
+    pattern: /does not run "sha256sum --check/,
+  },
+  {
+    mapsTo: "The checksum record is present and non-empty",
+    pattern: /missing or empty/,
+  },
+  {
+    mapsTo: "The checksum record is exactly one line",
+    pattern: /exactly one line/,
+  },
+  {
+    mapsTo: "The checksum record's one line is well-formed (<64-hex>  <filename>)",
+    pattern: /malformed/,
+  },
+  {
+    mapsTo: "The checksum record's hex matches the independently verified release digest",
+    pattern: /does not match the independently verified release digest/,
+  },
+  {
+    // Anchored to the start of the string: "the archive is saved as ... but
+    // the recorded checksum names ... - they must agree" also contains the
+    // substring "the recorded checksum names" (it names both filenames),
+    // so an unanchored pattern here would swallow that message too and the
+    // "they must agree" mapping below would never register as triggered.
+    mapsTo: "The checksum record's filename matches the pinned archive name",
+    pattern: /^the recorded checksum names/,
+  },
+  {
+    mapsTo: "The checksum record's filename agrees with the -o target",
+    pattern: /they must agree/,
+  },
+];
+
+const AUDIT_SCENARIOS = [
+  {
+    name: "no actionlint job found",
+    build: () => ({ workflow: { jobs: {} }, hashRecord: readFileSync(HASH_FILE_PATH, "utf8") }),
+    expect: [/no "actionlint" job found in the workflow/],
+  },
+  {
+    name: "install/verify step missing (no step's run text mentions sha256sum --check at all)",
+    build: () => ({
+      workflow: withMutatedInstallRun(() => "echo this step never verifies a checksum at all"),
+      hashRecord: readFileSync(HASH_FILE_PATH, "utf8"),
+    }),
+    expect: [/the install\/verify step is missing/],
+  },
+  {
+    name: "invoke step is ./actionlint instead of the bare PATH-resolved form",
+    build: () => {
+      const workflow = structuredClone(loadWorkflow());
+      const { steps, invokeIndex } = locateActionlintSteps(workflow);
+      assert.notEqual(invokeIndex, -1, "test setup: could not locate the real invoke step");
+      steps[invokeIndex] = { ...steps[invokeIndex], run: "./actionlint -color" };
+      return { workflow, hashRecord: readFileSync(HASH_FILE_PATH, "utf8") };
+    },
+    expect: [/bare "actionlint -color"/],
+  },
+  {
+    name: "install step fetches a URL that is neither the pin nor a moving reference",
+    build: () => ({
+      workflow: withMutatedInstallRun((run) =>
+        run.replace(PINNED_URL, "https://example.com/not-the-pinned-archive.tar.gz")
+      ),
+      hashRecord: readFileSync(HASH_FILE_PATH, "utf8"),
+    }),
+    expect: [/does not fetch the exact pinned URL/],
+  },
+  {
+    name: "install step's text matches a moving-reference pattern while the pinned URL itself stays untouched",
+    build: () => ({
+      workflow: withMutatedInstallRun((run) => `${run}\n# see rhysd/actionlint@main for context`),
+      hashRecord: readFileSync(HASH_FILE_PATH, "utf8"),
+    }),
+    expect: [/fetches from a moving reference/],
+  },
+  {
+    name: "install step saves the archive under a different filename than the pin",
+    build: () => ({
+      workflow: withMutatedInstallRun((run) =>
+        run.replace(`-o ${PINNED_ARCHIVE_FILENAME}`, "-o actionlint.tar.gz")
+      ),
+      hashRecord: readFileSync(HASH_FILE_PATH, "utf8"),
+    }),
+    expect: [/saves the download as "actionlint\.tar\.gz"/, /they must agree/],
+  },
+  {
+    name: "install step runs sha256sum --check against a file other than the tracked checksum record",
+    build: () => ({
+      workflow: withMutatedInstallRun((run) =>
+        run.replace(
+          `sha256sum --check ${HASH_FILE_RELATIVE_PATH}`,
+          "sha256sum --check some/other/file.sha256"
+        )
+      ),
+      hashRecord: readFileSync(HASH_FILE_PATH, "utf8"),
+    }),
+    expect: [/does not run "sha256sum --check/],
+  },
+  {
+    name: "checksum record is empty",
+    build: () => ({ workflow: loadWorkflow(), hashRecord: "" }),
+    expect: [/missing or empty/],
+  },
+  {
+    name: "checksum record has more than one line",
+    build: () => ({
+      workflow: loadWorkflow(),
+      hashRecord: `${VERIFIED_PINNED_SHA256}  ${PINNED_ARCHIVE_FILENAME}\n${VERIFIED_PINNED_SHA256}  extra-file\n`,
+    }),
+    expect: [/exactly one line/],
+  },
+  {
+    name: "checksum record's single line is malformed",
+    build: () => ({ workflow: loadWorkflow(), hashRecord: "not-a-real-hash-line\n" }),
+    expect: [/malformed/],
+  },
+  {
+    name: "checksum record's hex does not match the verified digest",
+    build: () => ({
+      workflow: loadWorkflow(),
+      hashRecord: `${"0".repeat(64)}  ${PINNED_ARCHIVE_FILENAME}\n`,
+    }),
+    expect: [/does not match the independently verified release digest/],
+  },
+  {
+    name: "checksum record names a different filename than the pin",
+    build: () => ({
+      workflow: loadWorkflow(),
+      hashRecord: `${VERIFIED_PINNED_SHA256}  some-other-name.tar.gz\n`,
+    }),
+    expect: [/the recorded checksum names "some-other-name\.tar\.gz"/, /they must agree/],
+  },
+];
+
+test("every surviving static failure path in validateActionlintRecipe maps to a named bounded fact or structural precondition, and nothing else", () => {
+  const triggeredMappings = new Set();
+
+  for (const scenario of AUDIT_SCENARIOS) {
+    const { workflow, hashRecord } = scenario.build();
+    const problems = validateActionlintRecipe(workflow, hashRecord);
+
+    assert.ok(
+      problems.length > 0,
+      `scenario "${scenario.name}": test setup produced no problems at all - the mutation did not take effect`
+    );
+
+    for (const expectedPattern of scenario.expect) {
+      assert.ok(
+        problems.some((p) => expectedPattern.test(p)),
+        `scenario "${scenario.name}": expected a problem matching ${expectedPattern}, got: ${JSON.stringify(problems)}`
+      );
+    }
+
+    assert.equal(
+      problems.length,
+      scenario.expect.length,
+      `scenario "${scenario.name}": expected exactly ${scenario.expect.length} problem(s) (${scenario.expect.join(", ")}), got ${problems.length}: ${JSON.stringify(problems)}`
+    );
+
+    for (const problem of problems) {
+      const match = KNOWN_STATIC_CHECKS.find((entry) => entry.pattern.test(problem));
+      assert.ok(
+        match,
+        `scenario "${scenario.name}" surfaced an UNMAPPED static check: "${problem}" - every static ` +
+          "failure path in validateActionlintRecipe must map to a named bounded fact or a " +
+          "named structural precondition; either add this check to KNOWN_STATIC_CHECKS " +
+          "with an honest mapping, or remove it once proven redundant with existing hermetic coverage"
+      );
+      triggeredMappings.add(match.mapsTo);
+    }
   }
-  const indirectedProblems = validateActionlintRecipe(indirectedWorkflow, hashRecord);
-  assert.ok(
-    !indirectedProblems.some((p) => /invokes actionlint before/.test(p)),
-    `test assumption: this static check is documented not to catch variable indirection, but it did: ${JSON.stringify(indirectedProblems)}`
-  );
+
+  // Completeness the other way: a registered mapping that no scenario ever
+  // triggers is dead weight the audit itself would never have caught - the
+  // exact force-fit-mapping failure this whole exercise exists to prevent.
+  for (const entry of KNOWN_STATIC_CHECKS) {
+    assert.ok(
+      triggeredMappings.has(entry.mapsTo),
+      `registered mapping "${entry.mapsTo}" (pattern ${entry.pattern}) was never triggered by any ` +
+        "AUDIT_SCENARIOS entry - either add a scenario that exercises it or remove the stale mapping"
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1219,14 +1257,13 @@ function extractActionlintRunSteps(workflow) {
  * the script, right after a newline, or right after a shell statement
  * separator (`;`, `&`, `|`) or command-substitution opener (`$(`, a
  * backtick) - as opposed to merely mentioning that phrase inside a comment
- * or an echo/printf argument. Mirrors the same command-position idea
- * ACTIONLINT_INVOCATION_PATTERNS already uses for detecting a real
- * actionlint invocation: a shell command is defined by where it sits, not
- * by which characters happen to appear somewhere in the line. A step whose
- * text only references the phrase, without ever running it, has verified
- * nothing, however convincing the surrounding text reads - a decoy comment
- * or echo that quotes "sha256sum --check config/actionlint-artifact.sha256"
- * must never be mistaken for a step that ran it.
+ * or an echo/printf argument. A shell command is defined by where it sits,
+ * not by which characters happen to appear somewhere in the line. A step
+ * whose text only references the phrase, without ever running it, has
+ * verified nothing, however convincing the surrounding text reads - a
+ * decoy comment or echo that quotes "sha256sum --check
+ * config/actionlint-artifact.sha256" must never be mistaken for a step
+ * that ran it.
  *
  * @param {string} runText
  * @returns {boolean}
