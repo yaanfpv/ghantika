@@ -85,22 +85,28 @@ export const BIRTH_IDENTITY_CAPTURE_RETRY_POLL_INTERVAL_MS = 20;
  * (`captureBirthIdentityPosixAsync`) is raced against a timer bounded by
  * whatever real time remains before `deadline`, rather than merely
  * `await`ed and checked afterward: an unbounded `await` on the attempt
- * itself would let a single slow or genuinely hung attempt run past
- * `boundMs` before this function ever got a chance to notice, since the
- * deadline check can only run once the `await` returns control. Racing
- * closes that gap - whichever settles first, the attempt or the timer,
- * decides what happens next, so an attempt can never personally outlive
- * the bound it was given, however long it eventually takes to settle.
+ * itself would let this function's own wait run past `boundMs` before it
+ * ever got a chance to notice, since the deadline check can only run once
+ * the `await` returns control. Racing closes that gap - whichever settles
+ * first, the attempt or the timer, decides what happens next, so THIS
+ * FUNCTION's own wait, and its willingness to accept a late answer, can
+ * never outlive the bound it was given. That bound is on the wrapper's
+ * wait and acceptance window, not on the attempt itself - the underlying
+ * capture (a real `ps`-backed observation) is never cancelled and can
+ * genuinely keep running past `boundMs`; only this function's own
+ * decision to wait for or accept its answer is what stops at the bound.
  *
  * A losing attempt (the timer wins the race) is abandoned, never awaited
- * further - but it is not forgotten. Its promise keeps running in the
- * background exactly as any real `ps`-backed capture would, and it can
- * still settle - successfully, to `undefined`, or by throwing - well
- * after this function has already thrown its own failure and returned
- * control to the caller. A no-op rejection handler is attached to every
- * Promise-shaped attempt up front, before it is ever raced, so a later
- * rejection from an abandoned attempt can never surface as a
- * process-level unhandled rejection.
+ * further - but it is not forgotten, and it is not cancelled. Its promise
+ * keeps running in the background exactly as any real `ps`-backed capture
+ * would, entirely outside this function's own bound, and it can still
+ * settle - successfully, to `undefined`, or by throwing - well after this
+ * function has already thrown its own failure and returned control to the
+ * caller. A no-op rejection handler is attached to every Promise-shaped
+ * attempt up front, before it is ever raced, so a later rejection from an
+ * abandoned attempt can never surface as a process-level unhandled
+ * rejection - it is safely observed and discarded, not prevented from
+ * happening.
  *
  * NEVER weakens a caller's own assertion - the opposite: a caller's
  * `assert.notEqual(result, undefined, ...)` immediately after this call
