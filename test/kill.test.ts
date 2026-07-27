@@ -29,6 +29,9 @@ import { parsesAsPgid, waitForFile } from "./harness.ts";
 // Shared with test/kill-slow-paths.test.ts - see that helper's own header
 // for why this can't just live in either *.test.ts file.
 import { runStrandedRetryScenario } from "./helpers/killScenarios.ts";
+// Bounded retry absorbing the real fork-visibility race a test's own
+// immediate capture-then-assert can hit - see this helper's own header.
+import { retryBirthIdentityCapture } from "./helpers/birthIdentityRetry.ts";
 
 // ---------------------------------------------------------------------------
 // kill: unit-level handler tests (against the real dist/tools/kill.js, but
@@ -359,7 +362,10 @@ test(
         onStderrEnd: () => {},
       }
     );
-    const birthIdentity = captureBirthIdentityPosix(child!.pid!);
+    const birthIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosix(child!.pid!),
+      "captureBirthIdentityPosix"
+    );
     assert.notEqual(birthIdentity, undefined, "expected a real, successful capture to poke");
     jobStore.attachChild(record.job_id, child!, birthIdentity);
     await new Promise((resolve) => setTimeout(resolve, 50)); // let the spawn event actually land

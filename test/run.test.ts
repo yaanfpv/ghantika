@@ -46,6 +46,9 @@ import { jobStore } from "../dist/jobStore.js";
 import { captureBirthIdentityPosix, isProcessAlive } from "../dist/process.js";
 import * as killTool from "../dist/tools/kill.js";
 import * as runTool from "../dist/tools/run.js";
+// Bounded retry absorbing the real fork-visibility race a test's own
+// immediate capture-then-assert can hit - see this helper's own header.
+import { retryBirthIdentityCapture } from "./helpers/birthIdentityRetry.ts";
 
 const POSIX_ONLY_SKIP =
   process.platform === "win32"
@@ -207,7 +210,10 @@ test(
     // plus this test's own scheduling jitter), proving run()'s own
     // capture is a genuine external observation, not internal bookkeeping
     // dressed up to look like one.
-    const laterIdentity = captureBirthIdentityPosix(handle!.pid);
+    const laterIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosix(handle!.pid),
+      "captureBirthIdentityPosix"
+    );
     assert.notEqual(
       laterIdentity,
       undefined,

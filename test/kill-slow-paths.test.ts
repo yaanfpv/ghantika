@@ -34,6 +34,9 @@ import { makeTempDir, parsesAsPgid, waitForFile, waitForPgrepGroupMembers } from
 // *.test.ts module re-runs and re-registers all of its own test() calls.
 // See that helper's own header for the full explanation.
 import { runStrandedRetryScenario, waitForStdout } from "./helpers/killScenarios.ts";
+// Bounded retry absorbing the real fork-visibility race a test's own
+// immediate capture-then-assert can hit - see this helper's own header.
+import { retryBirthIdentityCapture } from "./helpers/birthIdentityRetry.ts";
 
 // Not shared via import from test/kill.test.ts (see the header comment
 // above for why) - duplicated here verbatim rather than moved, since
@@ -380,7 +383,10 @@ test(
     // run()'s own real spawn-time capture - this test targets the
     // KILL-TIME observer breaking, not the spawn-time capture (that is
     // test/run.test.ts's own concern).
-    const birthIdentity = captureBirthIdentityPosix(child!.pid!);
+    const birthIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosix(child!.pid!),
+      "captureBirthIdentityPosix"
+    );
     assert.notEqual(birthIdentity, undefined, "expected a real, successful spawn-time capture");
     jobStore.attachChild(record.job_id, child!, birthIdentity);
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -469,7 +475,10 @@ test(
         onStderrEnd: () => {},
       }
     );
-    const birthIdentity = captureBirthIdentityPosix(child!.pid!);
+    const birthIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosix(child!.pid!),
+      "captureBirthIdentityPosix"
+    );
     assert.notEqual(birthIdentity, undefined);
     jobStore.attachChild(record.job_id, child!, birthIdentity);
     await new Promise((resolve) => setTimeout(resolve, 50));

@@ -42,6 +42,15 @@ import {
   waitForProcessDeath,
 } from "../dist/process.js";
 
+// Explicit ".ts" extension - this helper has no relative imports of its
+// own, so Node's native TypeScript support can load it directly without a
+// build step - see test/kill.test.ts's identical comment on the same
+// pattern for a sibling helper.
+import {
+  retryBirthIdentityCapture,
+  BIRTH_IDENTITY_CAPTURE_RETRY_BOUND_MS,
+} from "./helpers/birthIdentityRetry.ts";
+
 // A handful of tests below exercise real POSIX process-GROUP primitives
 // this codebase's own code never asks Windows to perform (real `ps`/`pgrep`
 // invocations, `process.kill(-pid, ...)`'s negative-pid group form, and
@@ -667,7 +676,10 @@ test(
       { argv: ["sleep", "2"], cwd: process.cwd(), env: buildChildEnv("merge", {}) },
       callbacksFor(recorder())
     );
-    const identity = await captureBirthIdentityPosixAsync(child!.pid!);
+    const identity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosixAsync(child!.pid!),
+      "captureBirthIdentityPosixAsync"
+    );
     assert.notEqual(identity, undefined, "expected a real captured identity");
     assert.equal(typeof identity!.capturedAtMs, "number");
     assert.ok(
@@ -686,9 +698,15 @@ test(
       { argv: ["sleep", "2"], cwd: process.cwd(), env: buildChildEnv("merge", {}) },
       callbacksFor(recorder())
     );
-    const asyncIdentity = await captureBirthIdentityPosixAsync(child!.pid!);
+    const asyncIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosixAsync(child!.pid!),
+      "captureBirthIdentityPosixAsync"
+    );
     assert.notEqual(asyncIdentity, undefined);
-    const syncIdentity = captureBirthIdentityPosix(child!.pid!);
+    const syncIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosix(child!.pid!),
+      "captureBirthIdentityPosix"
+    );
     assert.notEqual(syncIdentity, undefined);
     const projected =
       asyncIdentity!.elapsedSecondsAtCapture +
@@ -748,6 +766,106 @@ test(
     assert.equal(await captureBirthIdentityPosixAsync(process.pid), undefined);
   }
 );
+
+// --- retryBirthIdentityCapture (test/helpers/birthIdentityRetry.ts - the
+// bounded retry every immediate-capture-then-assert test call site below
+// and elsewhere now uses to absorb the real fork-visibility race, per this
+// story's own ACs). Proven here with pure, injected fake captures - no
+// real spawn or `ps` needed at all - since this is a proof about the
+// RETRY LOOP's own logic, not about the real OS-level capture functions
+// (those are already covered exhaustively by the real-process tests
+// throughout this file). Both directions (eventually succeeds / never
+// succeeds), for both call shapes (sync-returning / Promise-returning),
+// as separate tests - they exercise genuinely different code inside the
+// retry loop's `await attemptCapture()` (a no-op await vs a real one), not
+// just the same path with different fixtures. ---
+
+test("retryBirthIdentityCapture: a SYNC-shaped capture that returns undefined for its first attempts and succeeds on the Nth still resolves - proves the loop genuinely RETRIES rather than merely succeeding by luck on the first call", async () => {
+  const successOnAttempt = 4;
+  const fakeIdentity = { capturedAtMs: Date.now(), elapsedSecondsAtCapture: 0 };
+  let calls = 0;
+  const result = await retryBirthIdentityCapture(() => {
+    calls += 1;
+    return calls >= successOnAttempt ? fakeIdentity : undefined;
+  }, "captureBirthIdentityPosix (fake, sync)");
+  assert.equal(result, fakeIdentity);
+  assert.notEqual(result, undefined);
+  assert.equal(
+    calls,
+    successOnAttempt,
+    "expected exactly the Nth attempt to succeed, not the first - a loop that returned early on attempt 1 (or kept going past a real success) would fail this count"
+  );
+});
+
+test("retryBirthIdentityCapture: a SYNC-shaped capture that ALWAYS returns undefined still FAILS at the bound - a diagnostic naming the capture function, never a silent resolve to undefined and never an unbounded retry", async () => {
+  let calls = 0;
+  const before = Date.now();
+  await assert.rejects(
+    () =>
+      retryBirthIdentityCapture(() => {
+        calls += 1;
+        return undefined;
+      }, "captureBirthIdentityPosix (fake, sync, always-undefined)"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(
+        error.message,
+        /captureBirthIdentityPosix \(fake, sync, always-undefined\)/,
+        "the thrown diagnostic must name the capture function, never a generic timeout message"
+      );
+      assert.match(error.message, /attempt/);
+      return true;
+    }
+  );
+  const elapsedMs = Date.now() - before;
+  assert.ok(
+    calls > 1,
+    `expected more than one attempt before giving up (proves a genuine bounded RETRY, not a single try) - got ${calls}`
+  );
+  assert.ok(
+    elapsedMs >= BIRTH_IDENTITY_CAPTURE_RETRY_BOUND_MS,
+    `expected the loop to actually spend the full bound retrying before giving up, got ${elapsedMs}ms`
+  );
+  assert.ok(
+    elapsedMs < BIRTH_IDENTITY_CAPTURE_RETRY_BOUND_MS + 500,
+    `expected the bound to actually be enforced (never drift far past it), got ${elapsedMs}ms`
+  );
+});
+
+test("retryBirthIdentityCapture: an ASYNC-shaped capture (a real Promise that resolves after a real delay on each attempt) that fails for its first attempts and succeeds on the Nth still resolves - a genuinely separate code path from the sync-shaped case above (a real await, not a no-op one)", async () => {
+  const successOnAttempt = 3;
+  const fakeIdentity = { capturedAtMs: Date.now(), elapsedSecondsAtCapture: 0 };
+  let calls = 0;
+  const result = await retryBirthIdentityCapture(async () => {
+    calls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return calls >= successOnAttempt ? fakeIdentity : undefined;
+  }, "captureBirthIdentityPosixAsync (fake, async)");
+  assert.equal(result, fakeIdentity);
+  assert.notEqual(result, undefined);
+  assert.equal(calls, successOnAttempt);
+});
+
+test("retryBirthIdentityCapture: an ASYNC-shaped capture that ALWAYS resolves undefined still FAILS at the bound, with a diagnostic naming the capture function", async () => {
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      retryBirthIdentityCapture(async () => {
+        calls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return undefined;
+      }, "captureBirthIdentityPosixAsync (fake, async, always-undefined)"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(
+        error.message,
+        /captureBirthIdentityPosixAsync \(fake, async, always-undefined\)/
+      );
+      return true;
+    }
+  );
+  assert.ok(calls > 1, `expected more than one attempt before giving up - got ${calls}`);
+});
 
 // --- parseEtime (pure, no real process needed) ---
 
@@ -853,7 +971,10 @@ test(
       callbacksFor(rec)
     );
     await waitFor(() => rec.spawned > 0);
-    const birthIdentity = captureBirthIdentityPosix(child!.pid!);
+    const birthIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosix(child!.pid!),
+      "captureBirthIdentityPosix"
+    );
     assert.notEqual(birthIdentity, undefined, "expected a real, successful capture");
     const result = await checkProcessIdentity(child!.pid!, birthIdentity!);
     assert.equal(result.status, "alive-confirmed");
@@ -911,7 +1032,10 @@ test(
       callbacksFor(rec)
     );
     await waitFor(() => rec.spawned > 0);
-    const birthIdentity = captureBirthIdentityPosix(child!.pid!);
+    const birthIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosix(child!.pid!),
+      "captureBirthIdentityPosix"
+    );
     assert.notEqual(birthIdentity, undefined);
     const gate = await evaluatePreSignalIdentityGate(child!.pid!, birthIdentity);
     assert.deepEqual(gate, { action: "proceed", identityConfirmed: true });
