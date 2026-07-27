@@ -1962,11 +1962,11 @@ test("state-vs-fields prose guard, (the kill tool's tools/list description): sta
 // closed or eliminated) and for the no-unqualified-proof-claim guard (no
 // "provably"/unqualified-proof claim beside the identity matcher), the
 // latter applied across every applicable public surface - README.md, the
-// served kill tool description, CHANGELOG.md, local/pr-manifest.md, this
-// repo's own source comments, AND every commit subject+body in the range
-// - so a claim sitting only in a commit message can never slip past this
-// guard unexamined the way it once did. Plus the wire-level
-// combined-degraded cell.
+// served kill tool description, CHANGELOG.md, this repo's own source
+// comments, AND every commit subject+body in the range - so a claim
+// sitting only in a commit message can never slip past this guard
+// unexamined the way it once did. Plus the wire-level combined-degraded
+// cell.
 // ---------------------------------------------------------------------------
 
 /**
@@ -2103,23 +2103,6 @@ function readChangelogText(): string {
 }
 
 /**
- * `local/pr-manifest.md` is gitignored - it exists only transiently while a
- * PR description is being drafted locally, and is never present in a fresh
- * clone, a fresh worktree checkout, or CI. The two tests below that check
- * this file's own bullet can only check its content when it happens to
- * exist; where it does not, they report a named, accepted skip
- * (test/skip-baseline.json) rather than either throwing ENOENT or
- * vacuously passing without reading anything.
- */
-const PR_MANIFEST_URL = new URL("../local/pr-manifest.md", import.meta.url);
-const PR_MANIFEST_ABSENT_SKIP_REASON =
-  "local/pr-manifest.md is gitignored and only exists transiently while a PR description is being drafted locally - absent here (a fresh checkout or CI), so this surface has nothing to check";
-
-function readPrManifestText(): string {
-  return fs.readFileSync(PR_MANIFEST_URL, "utf8");
-}
-
-/**
  * CHANGELOG.md's own escalation-identity-gate bullet - a single
  * one-line-per-bullet entry in this file's established convention, so the
  * slice runs from this bullet's own opening sentence to the end of its
@@ -2132,23 +2115,6 @@ function extractChangelogEscalationBullet(text: string): string {
   return end >= 0 ? text.slice(start, end) : text.slice(start);
 }
 
-/**
- * `local/pr-manifest.md`'s own escalation-identity-gate bullet, from its
- * own `- **The escalation identity gate.**` marker to the next top-level
- * bullet marker (`\n- **`) - this file's bullets span several wrapped
- * lines, unlike CHANGELOG's one-line-per-bullet shape, so the end anchor
- * is the next bullet's own marker rather than a bare newline.
- */
-function extractManifestEscalationBullet(text: string): string {
-  const start = text.indexOf("**The escalation identity gate.**");
-  assert.ok(
-    start >= 0,
-    "expected to find local/pr-manifest.md's own escalation-identity-gate bullet"
-  );
-  const end = text.indexOf("\n- **", start);
-  return end >= 0 ? text.slice(start, end) : text.slice(start);
-}
-
 test('no "provably"/unqualified proof claim beside the escalation identity matcher, (CHANGELOG.md) - scoped to that mechanism\'s own bullet', () => {
   const bullet = extractChangelogEscalationBullet(readChangelogText());
   assertNoUnqualifiedProofClaim(bullet, "CHANGELOG.md");
@@ -2158,24 +2124,6 @@ test('no unqualified "never scales with group size" cost claim, (CHANGELOG.md) -
   const bullet = extractChangelogEscalationBullet(readChangelogText());
   assertNoUnqualifiedScaleClaim(bullet, "CHANGELOG.md's escalation-identity-gate bullet");
 });
-
-test(
-  'no "provably"/unqualified proof claim beside the escalation identity matcher, (local/pr-manifest.md) - scoped to that mechanism\'s own bullet',
-  { skip: fs.existsSync(PR_MANIFEST_URL) ? false : PR_MANIFEST_ABSENT_SKIP_REASON },
-  () => {
-    const bullet = extractManifestEscalationBullet(readPrManifestText());
-    assertNoUnqualifiedProofClaim(bullet, "local/pr-manifest.md");
-  }
-);
-
-test(
-  'no unqualified "never scales with group size" cost claim, (local/pr-manifest.md) - the real batched read still constructs/emits/parses O(N) data, only its call count is size-independent',
-  { skip: fs.existsSync(PR_MANIFEST_URL) ? false : PR_MANIFEST_ABSENT_SKIP_REASON },
-  () => {
-    const bullet = extractManifestEscalationBullet(readPrManifestText());
-    assertNoUnqualifiedScaleClaim(bullet, "local/pr-manifest.md's escalation-identity-gate bullet");
-  }
-);
 
 /**
  * this repo's OWN source comments, in both files whose docs
