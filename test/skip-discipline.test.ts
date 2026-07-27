@@ -887,6 +887,25 @@ test("the real supervisor still fails a genuinely hung test fast, at whatever --
       "hang.test.mjs": [
         'import { test } from "node:test";',
         'test("a deliberately hung test that never resolves", async () => {',
+        // A bare `await new Promise(() => {})` with nothing else scheduled
+        // lets node:test take a DIFFERENT, faster exit on some Node
+        // versions - confirmed empirically, not assumed: Node 22 on CI
+        // cancels this shape in a few milliseconds via its own "Promise
+        // resolution is still pending but the event loop has already
+        // resolved" diagnostic, never reaching the configured
+        // --test-timeout at all, while a version tested locally instead
+        // waits out the real bound. The bounded setTimeout below keeps
+        // the event loop genuinely busy across that window - the same
+        // shape a real hung test in this codebase's own suite has (a
+        // spawned process, a pending signal) - so neither Node version
+        // can take that early exit and the assertion below actually
+        // proves the configured bound, not whichever mechanism happens
+        // to fire first. Bounded (not setInterval) so nothing lingers
+        // past its own 2s expiry if the test-level cancellation above it
+        // somehow left this file's own process running - comfortably
+        // longer than the 500ms this fixture configures, comfortably
+        // shorter than run-tests.mjs's own 60s idle watchdog.
+        "  setTimeout(() => {}, 2000);",
         "  await new Promise(() => {});",
         "});",
         "",
