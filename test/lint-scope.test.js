@@ -50,6 +50,14 @@ const LINT_TARGET_DIRS = Object.freeze(["src", "scripts", "test"]);
 const LINT_TARGET_FILE = "eslint.config.js";
 const FROZEN_LINT_SCRIPT = `eslint ${[...LINT_TARGET_DIRS, LINT_TARGET_FILE].join(" ")}`;
 
+// The frozen title of the one real, registered `test(...)` callback that
+// actually runs `npm run lint` as a child process. Declared once, here, and
+// used both to name that real test below AND to let the guard's own
+// traversal identify the real callback by exact title match - never
+// re-typed at the call site, which could silently desync the two and let a
+// rename break the guard's ability to find the real test at all.
+const REAL_LINT_EXIT_CLEAN_TEST_TITLE = "`npm run lint`, run as a real child process, exits clean";
+
 function loadPackageJson() {
   return JSON.parse(readFileSync(PACKAGE_URL, "utf8"));
 }
@@ -286,7 +294,7 @@ test("the frozen shape admits no shell operator and no bypass/ignore flag", () =
 // exits clean.
 // =============================================================================
 
-test("`npm run lint`, run as a real child process, exits clean", () => {
+test(REAL_LINT_EXIT_CLEAN_TEST_TITLE, () => {
   const result = spawnSync("npm", ["run", "lint"], {
     cwd: REPO_ROOT,
     encoding: "utf8",
@@ -459,6 +467,67 @@ function classifySpawnSyncCallee(context, node) {
 }
 
 /**
+ * Classifies whether an `assert.equal(...)`/`assert.strictEqual(...)`
+ * call's `assert` object identifier actually refers to the real default
+ * import of `node:assert/strict`, using ESLint's own real scope analysis -
+ * never a callee-name text match. `isExitStatusZeroAssertion` only checks
+ * that the object is spelled `assert`; a locally-declared `assert` (an
+ * object literal, a reassigned variable, an unrelated import) satisfies
+ * that spelling exactly as well as the real import does, while its
+ * `.equal`/`.strictEqual` could be a silent no-op that never actually
+ * throws - so a recognized assertion SHAPE proves nothing about whether
+ * the assertion actually asserts anything. Fails closed - naming what was
+ * actually found - on every binding shape other than a single,
+ * unambiguous default import of `node:assert/strict`: an unresolved
+ * (global) reference, a variable with more than one declaration site, a
+ * locally-declared function or variable, and an import of some other kind
+ * or from some other module are all rejected by name rather than risked
+ * against a text match.
+ * @param {import("eslint").Rule.RuleContext} context
+ * @param {object} node the `assert.equal(...)`/`assert.strictEqual(...)` CallExpression
+ * @returns {{ ok: true } | { ok: false, reason: string }}
+ */
+function classifyAssertCalleeBinding(context, node) {
+  const identifierNode = node.callee.object;
+  const identifierName = identifierNode.name;
+  const scope = context.sourceCode.getScope(node);
+  const reference = findReferenceForIdentifier(scope, identifierNode);
+
+  if (!reference || !reference.resolved) {
+    return {
+      ok: false,
+      reason: `\`${identifierName}\` has no resolvable binding under ESLint's own scope analysis - it may be a global or otherwise unresolved reference, not the real \`assert\` import from \`node:assert/strict\``,
+    };
+  }
+
+  const variable = reference.resolved;
+  if (variable.defs.length !== 1) {
+    return {
+      ok: false,
+      reason: `\`${identifierName}\` has ${variable.defs.length} distinct binding sites, which makes its real origin ambiguous`,
+    };
+  }
+
+  const [def] = variable.defs;
+  if (def.type !== "ImportBinding" || def.node.type !== "ImportDefaultSpecifier") {
+    return {
+      ok: false,
+      reason: `\`${identifierName}\` is bound as a ${def.type} binding, not the default import of \`node:assert/strict\`, so \`${identifierName}.equal\`/\`${identifierName}.strictEqual\` is not proven to be the real, throwing assertion function`,
+    };
+  }
+
+  const importSource = def.parent.source.value;
+  if (importSource !== "node:assert/strict") {
+    return {
+      ok: false,
+      reason: `\`${identifierName}\` is imported from \`${importSource}\`, not \`node:assert/strict\``,
+    };
+  }
+
+  return { ok: true };
+}
+
+/**
  * Finds the `Reference` object for `identifierNode` starting from
  * `scope`, walking outward through `scope.upper` if it is not present in
  * the immediate scope. In practice a reference always lives in the same
@@ -483,6 +552,32 @@ function findReferenceForIdentifier(scope, identifierNode) {
 }
 
 /**
+ * Walks `scope.upper` from `context.sourceCode.getScope(node)` until it
+ * reaches a scope whose `.type` is `"function"`, and returns that scope's
+ * `.block` - the real AST node of the nearest enclosing function around
+ * `node`, per ESLint's own scope analysis. `getScope` itself commonly
+ * returns a `"block"` scope first (every `{ ... }` creates one under
+ * modern `ecmaVersion`), so the immediate scope is not reliably the
+ * function scope - this walk is what actually finds it, never a
+ * hand-rolled walk up `node.parent` counting braces, which has no notion
+ * of a function boundary as a scope boundary (identical to why
+ * `classifyIdentifierBinding` below never hand-walks parents either). At
+ * the top level, outside any function, no scope has `.type === "function"`
+ * and this returns `null`.
+ * @param {import("eslint").Rule.RuleContext} context
+ * @param {object} node any AST node
+ * @returns {object | null} the nearest enclosing function's AST node, or `null` at the top level
+ */
+function getNearestEnclosingFunctionNode(context, node) {
+  let scope = context.sourceCode.getScope(node);
+  while (scope) {
+    if (scope.type === "function") return scope.block;
+    scope = scope.upper;
+  }
+  return null;
+}
+
+/**
  * Classifies what `identifierNode` (the object of the asserted
  * `<identifier>.status`) actually refers to, using ESLint's own real
  * scope analysis via `context.sourceCode.getScope` - never hand-rolled
@@ -502,10 +597,17 @@ function findReferenceForIdentifier(scope, identifierNode) {
  * them by hand, and no new binding shape ESLint's scope analyzer
  * understands can slip past this the way a parameter shadowing an outer
  * variable would slip past a hand-rolled walker.
+ * Also returns the resolved `variable` itself (not just its initializer) so
+ * a caller can separately inspect its full reference list for a write that
+ * happens AFTER this declaration - see `findDisqualifyingWriteReference`,
+ * which is what actually catches a `let`/`var` reassigned between its
+ * canonical initializer and the assertion that reads it; this function's
+ * own checks say nothing about reassignment, only about the shape of the
+ * one declaration site.
  * @param {import("eslint").Rule.RuleContext} context
  * @param {object} assertionNode the `assert.equal(...)` CallExpression
  * @param {object} identifierNode the `<identifier>` in `<identifier>.status`
- * @returns {{ ok: true, initNode: object } | { ok: false, reason: string }}
+ * @returns {{ ok: true, initNode: object, variable: import("eslint").Scope.Variable } | { ok: false, reason: string }}
  */
 function classifyIdentifierBinding(context, assertionNode, identifierNode) {
   const identifierName = identifierNode.name;
@@ -547,7 +649,39 @@ function classifyIdentifierBinding(context, assertionNode, identifierNode) {
     };
   }
 
-  return { ok: true, initNode: def.node.init };
+  return { ok: true, initNode: def.node.init, variable };
+}
+
+/**
+ * Inspects `variable`'s full reference list (`variable.references`, from
+ * ESLint's own scope analysis - never a hand-rolled count of `=`
+ * occurrences) for a write to it - other than its own initializing
+ * declaration (`reference.init === true`) - positioned before
+ * `assertionIdentifierNode` (the `<identifier>` actually read inside
+ * `<identifier>.status`). A `let`/`var` binding can be reassigned after
+ * its canonical `spawnSync(...)` initializer and before the exit-status
+ * assertion reads it, in which case the value the assertion actually
+ * observes is whatever that later write produced - not the canonical
+ * call's real result - so this must be checked independently of whether
+ * the declaration's OWN initializer looks canonical; `classifyIdentifierBinding`
+ * above only ever inspects the declarator's initializer and has no notion
+ * of what happens to the binding afterward. Returns the earliest such
+ * disqualifying write reference, or `null` if the variable is never
+ * written again between its own declaration and the read the assertion
+ * performs.
+ * @param {import("eslint").Scope.Variable} variable
+ * @param {object} assertionIdentifierNode the `<identifier>` node read inside `<identifier>.status`
+ * @returns {import("eslint").Scope.Reference | null}
+ */
+function findDisqualifyingWriteReference(variable, assertionIdentifierNode) {
+  const assertionPosition = assertionIdentifierNode.range[0];
+  const disqualifyingWrites = variable.references.filter(
+    (reference) =>
+      reference.isWrite() && !reference.init && reference.identifier.range[0] < assertionPosition
+  );
+  if (disqualifyingWrites.length === 0) return null;
+  disqualifyingWrites.sort((a, b) => a.identifier.range[0] - b.identifier.range[0]);
+  return disqualifyingWrites[0];
 }
 
 /**
@@ -562,36 +696,260 @@ function formatBoundCallSnippet(source, node) {
 }
 
 /**
+ * True when at least one segment in `segments` (the code path segments
+ * ESLint's own code path analysis reports as current at a given point in
+ * the traversal) is reachable. Mirrors the exact `segment.reachable`
+ * property ESLint's own built-in `no-unreachable` rule keys off - never a
+ * hand-rolled count of enclosing `return`/`throw` statements, which has no
+ * notion of branching (an `if`/`else` where only one branch returns) or of
+ * loop/label control flow the way ESLint's real code path analysis does.
+ * @param {Set<object>} segments
+ * @returns {boolean}
+ */
+function isAnySegmentReachable(segments) {
+  for (const segment of segments) {
+    if (segment.reachable) return true;
+  }
+  return false;
+}
+
+/**
+ * True when `node` is a CallExpression whose callee is a plain `test`
+ * identifier AND the call sits directly at the top level of the module -
+ * its parent is an `ExpressionStatement` whose own parent is the `Program`
+ * node itself, verified via `context.sourceCode.getAncestors` (ESLint's
+ * real ancestor chain) rather than a nesting-depth guess. This excludes a
+ * same-shaped `test(...)` call sitting inside some other function: such a
+ * call would never actually register with the `node:test` runner unless
+ * that enclosing function happens to run at module load time, which an
+ * arbitrary function is not, in general - so only a genuine top-level
+ * registration is even considered a candidate.
+ * @param {import("eslint").Rule.RuleContext} context
+ * @param {object} node a CallExpression AST node
+ * @returns {boolean}
+ */
+function isTopLevelTestRegistrationCall(context, node) {
+  if (node.callee.type !== "Identifier" || node.callee.name !== "test") return false;
+  const ancestors = context.sourceCode.getAncestors(node);
+  if (ancestors.length < 2) return false;
+  const parent = ancestors[ancestors.length - 1];
+  const grandparent = ancestors[ancestors.length - 2];
+  return parent.type === "ExpressionStatement" && grandparent.type === "Program";
+}
+
+/**
+ * Classifies whether `node`'s callee identifier (`test`) actually refers
+ * to the real named import of `test` from `"node:test"`, using ESLint's
+ * own real scope analysis - never a callee-name text match. A callee
+ * spelled `test` proves nothing on its own: a local declaration of that
+ * same name (a shadowing function, a locally-declared variable) satisfies
+ * the structural top-level-call shape exactly as well as the real import
+ * does, while never actually registering with the `node:test` runner at
+ * all - such a call would look exactly like a real, executed test to any
+ * check that only inspects its title and callback shape. Fails closed -
+ * naming what was actually found - on every binding shape other than a
+ * single, unambiguous named import of `test` from `"node:test"`.
+ * @param {import("eslint").Rule.RuleContext} context
+ * @param {object} node the CallExpression whose `test` callee is being classified
+ * @returns {{ ok: true } | { ok: false, reason: string }}
+ */
+function classifyTestCalleeBinding(context, node) {
+  const { callee } = node;
+  const calleeName = callee.name;
+  const scope = context.sourceCode.getScope(node);
+  const reference = findReferenceForIdentifier(scope, callee);
+
+  if (!reference || !reference.resolved) {
+    return {
+      ok: false,
+      reason: `\`${calleeName}\` has no resolvable binding under ESLint's own scope analysis - it may be a global or otherwise unresolved reference, not the real \`test\` import from \`node:test\``,
+    };
+  }
+
+  const variable = reference.resolved;
+  if (variable.defs.length !== 1) {
+    return {
+      ok: false,
+      reason: `\`${calleeName}\` has ${variable.defs.length} distinct binding sites, which makes its real origin ambiguous`,
+    };
+  }
+
+  const [def] = variable.defs;
+  if (def.type !== "ImportBinding" || def.node.type !== "ImportSpecifier") {
+    return {
+      ok: false,
+      reason: `\`${calleeName}\` is bound as a ${def.type} binding, not an import of a named export, so it is not the real \`test\` from \`node:test\``,
+    };
+  }
+
+  if (def.node.imported.name !== "test") {
+    return {
+      ok: false,
+      reason: `\`${calleeName}\` is imported as \`${def.node.imported.name}\`, not \`test\``,
+    };
+  }
+
+  const importSource = def.parent.source.value;
+  if (importSource !== "node:test") {
+    return {
+      ok: false,
+      reason: `\`${calleeName}\` is imported from \`${importSource}\`, not \`node:test\``,
+    };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Resolves `node` (a `test(...)` call's first argument) to a real string
+ * value, if the file provably evaluates it to one - either `node` is
+ * itself a string `Literal`, or it is an `Identifier` that resolves - via
+ * ESLint's own real scope analysis, never a name/text match - to a
+ * single, unambiguous `const`/`let`/`var` declarator whose own initializer
+ * is itself a plain string `Literal`. The second form is what lets the
+ * real production test below name itself via the frozen
+ * `REAL_LINT_EXIT_CLEAN_TEST_TITLE` constant (so the title can never
+ * silently desync between where it is declared and where it is asserted)
+ * without this guard falling back to a text/name match to recognize it:
+ * the identifier's ACTUAL bound value is resolved through real scope data
+ * and re-inspected as an AST node, never assumed from its spelling.
+ * Returns `null` for anything else (a template literal, a concatenation, a
+ * reference to something that is not a single string-literal-initialized
+ * declarator, and so on) rather than guessing further.
+ * @param {import("eslint").Rule.RuleContext} context
+ * @param {object | undefined} node
+ * @returns {string | null}
+ */
+function resolveStaticStringLiteralArgument(context, node) {
+  if (!node) return null;
+  if (node.type === "Literal" && typeof node.value === "string") return node.value;
+  if (node.type !== "Identifier") return null;
+
+  const scope = context.sourceCode.getScope(node);
+  const reference = findReferenceForIdentifier(scope, node);
+  if (!reference || !reference.resolved) return null;
+
+  const variable = reference.resolved;
+  if (variable.defs.length !== 1) return null;
+
+  const [def] = variable.defs;
+  if (def.type !== "Variable" || def.node.id.type !== "Identifier" || !def.node.init) return null;
+
+  const { init } = def.node;
+  return init.type === "Literal" && typeof init.value === "string" ? init.value : null;
+}
+
+/**
+ * Locates the ONE top-level `test(...)` call that registers the real,
+ * executed "npm run lint exits clean" test, confirmed both structurally
+ * AND via real scope analysis: its first argument statically resolves
+ * (`resolveStaticStringLiteralArgument`) to a real string value exactly
+ * equal to `REAL_LINT_EXIT_CLEAN_TEST_TITLE`, its second argument is
+ * directly a function node (never a reference to a callback declared
+ * elsewhere - this guard refuses to follow that indirection), and its
+ * `test` callee resolves - via ESLint's own scope analysis, never a name
+ * match - to the real named import of `test` from `"node:test"`
+ * (`classifyTestCalleeBinding`). Fails closed - naming what was actually
+ * found - when: no top-level call with the frozen title exists among
+ * `candidates` (the real test may have been removed, renamed, or moved
+ * somewhere it would never actually run); more than one such call exists;
+ * the second argument is not directly a function node; or the callee -
+ * though spelled `test` and titled correctly - resolves to something
+ * other than the real import (a locally-declared function or variable
+ * shadowing the name).
+ * @param {import("eslint").Rule.RuleContext} context
+ * @param {object[]} candidates every top-level `test(...)` CallExpression found in the file
+ * @returns {{ ok: true, callbackNode: object } | { ok: false, reason: string }}
+ */
+function resolveRealLintTestCallback(context, candidates) {
+  const titleMatches = candidates.filter(
+    (node) =>
+      resolveStaticStringLiteralArgument(context, node.arguments[0]) ===
+      REAL_LINT_EXIT_CLEAN_TEST_TITLE
+  );
+
+  if (titleMatches.length === 0) {
+    return {
+      ok: false,
+      reason: `no top-level \`test(...)\` registration exists with the exact title ${JSON.stringify(REAL_LINT_EXIT_CLEAN_TEST_TITLE)} - the real, executed lint-exit-status test appears to have been removed, renamed, or moved somewhere it would never actually run`,
+    };
+  }
+  if (titleMatches.length > 1) {
+    return {
+      ok: false,
+      reason: `found ${titleMatches.length} top-level \`test(...)\` registrations with the exact title ${JSON.stringify(REAL_LINT_EXIT_CLEAN_TEST_TITLE)}, which makes the real callback ambiguous - expected exactly one`,
+    };
+  }
+
+  const [target] = titleMatches;
+  const [, callbackArg] = target.arguments;
+  if (
+    !callbackArg ||
+    (callbackArg.type !== "ArrowFunctionExpression" && callbackArg.type !== "FunctionExpression")
+  ) {
+    return {
+      ok: false,
+      reason: `the real \`test(...)\` registration's second argument is a ${callbackArg ? callbackArg.type : "missing value"}, not directly a function - it may be a reference to a callback declared elsewhere, which this guard refuses to follow`,
+    };
+  }
+
+  const calleeBinding = classifyTestCalleeBinding(context, target);
+  if (!calleeBinding.ok) {
+    return {
+      ok: false,
+      reason: `the real-titled \`test(...)\` registration's callee ${calleeBinding.reason}`,
+    };
+  }
+
+  return { ok: true, callbackNode: callbackArg };
+}
+
+/**
  * Parses `source` (this file's own text) with ESLint's `Linter` - already
  * a project dependency, so no separate parser package is needed - and
  * locates the one call whose `.status` this file actually compares
- * against `0`. Resolves that call's asserted identifier using ESLint's
- * own real scope analysis (`classifyIdentifierBinding`, run live during
- * traversal via `context.sourceCode.getScope`) rather than hand-rolled
- * tree-walking, then confirms the resolved initializer is structurally
- * the canonical `spawnSync("npm", ["run", "lint"], ...)` shape AND that
- * its callee identifier itself resolves - via that same real scope
- * analysis, never a name/text match - to the actual `spawnSync` import
- * from `"node:child_process"` (`classifySpawnSyncCallee`). Fails closed -
- * naming what was actually found rather than guessing further - in every
- * one of these cases: zero or more than one status assertion exists in
- * the file; the asserted identifier is an unresolved (global) reference;
- * it has more than one distinct binding site; its one binding is not a
- * plain `const`/`let`/`var` declarator (a parameter, a destructuring
- * pattern, a catch-clause binding, an import binding, and so on all fail
- * here); its declarator has no initializer; its declarator's initializer
- * resolves but is some other call entirely, in which case the reason
- * names that call exactly; or its callee, though spelled `spawnSync` and
- * shaped exactly like the canonical call, resolves to something other
- * than the real import - a locally-declared function or variable, or an
- * import of another name or from another module - in which case the
- * reason names that binding instead.
+ * against `0`, SCOPED to the real, executed
+ * `test(REAL_LINT_EXIT_CLEAN_TEST_TITLE, ...)` callback
+ * (`resolveRealLintTestCallback`) rather than to matching text anywhere in
+ * the file. An assertion is only ever considered "the one this file
+ * actually asserts" when its nearest enclosing function - found via
+ * ESLint's own scope analysis (`getNearestEnclosingFunctionNode`), never a
+ * hand-rolled nesting-depth count - is EXACTLY that real callback (never a
+ * nested function/arrow declared or expressed inside it, invoked or not),
+ * AND it is reachable within that callback's own code path (never dead
+ * code sitting after a `return`, via real ESLint code path analysis, never
+ * hand-rolled reachability). This is what makes a decoy anywhere else in
+ * the file - a dead top-level function, an unreferenced arrow, a decoy
+ * nested inside the real callback but itself never invoked, a second,
+ * differently-titled `test(...)` call, or code after an unconditional
+ * `return` inside the real callback itself - invisible to this guard: it
+ * is simply never treated as "inside" the executed callback, and the
+ * guard fails closed rather than falling back to a match found outside it.
+ *
+ * Having found the (at most one) in-scope assertion, this further
+ * confirms: the `assert` object itself resolves to the real default import
+ * of `node:assert/strict`, never a locally-declared shadow whose
+ * `.equal`/`.strictEqual` could be a silent no-op
+ * (`classifyAssertCalleeBinding`); the asserted identifier resolves, via
+ * that same real scope analysis, to a single, unambiguous `const`/`let`/
+ * `var` declarator with an initializer (`classifyIdentifierBinding`); that
+ * binding is never reassigned, nor read through an alias whose own
+ * initializer is not itself the canonical call, between its declaration
+ * and the assertion that reads it (`findDisqualifyingWriteReference`); its
+ * initializer is structurally the canonical
+ * `spawnSync("npm", ["run", "lint"], ...)` shape
+ * (`hasCanonicalNpmRunLintShape`); and that call's own callee identifier
+ * resolves to the real `spawnSync` import from `"node:child_process"`
+ * (`classifySpawnSyncCallee`). Fails closed - naming what was actually
+ * found rather than guessing further - at whichever of these is the first
+ * to not hold.
  * @param {string} source
  * @returns {{ bound: true } | { bound: false, reason: string }}
  */
 function resolveAssertedLintInvocation(source) {
   const linter = new Linter();
   const statusAssertions = [];
+  const testCallCandidates = [];
   let ruleContext = null;
 
   linter.verify(
@@ -605,12 +963,49 @@ function resolveAssertedLintInvocation(source) {
               meta: { schema: [] },
               create(context) {
                 ruleContext = context;
+
+                // Real ESLint code path analysis, mirroring the exact
+                // hooks ESLint's own built-in `no-unreachable` rule uses
+                // (never a hand-rolled return/throw count) - tracked here
+                // so every visited CallExpression can be checked for
+                // reachability at the moment it is visited.
+                const codePathSegmentsStack = [];
+                let currentSegments = new Set();
+
                 return {
+                  onCodePathStart() {
+                    codePathSegmentsStack.push(currentSegments);
+                    currentSegments = new Set();
+                  },
+                  onCodePathEnd() {
+                    currentSegments = codePathSegmentsStack.pop();
+                  },
+                  onCodePathSegmentStart(segment) {
+                    currentSegments.add(segment);
+                  },
+                  onCodePathSegmentEnd(segment) {
+                    currentSegments.delete(segment);
+                  },
+                  onUnreachableCodePathSegmentStart(segment) {
+                    currentSegments.add(segment);
+                  },
+                  onUnreachableCodePathSegmentEnd(segment) {
+                    currentSegments.delete(segment);
+                  },
+
                   CallExpression(node) {
+                    if (isTopLevelTestRegistrationCall(context, node)) {
+                      testCallCandidates.push(node);
+                    }
+
                     if (!isExitStatusZeroAssertion(node)) return;
                     const identifierNode = node.arguments[0].object;
                     statusAssertions.push({
+                      node,
                       identifierName: identifierNode.name,
+                      identifierNode,
+                      reachable: isAnySegmentReachable(currentSegments),
+                      assertBinding: classifyAssertCalleeBinding(context, node),
                       binding: classifyIdentifierBinding(context, node, identifierNode),
                     });
                   },
@@ -625,28 +1020,56 @@ function resolveAssertedLintInvocation(source) {
     { filename: "lint-scope-self-check.js" }
   );
 
-  if (statusAssertions.length === 0) {
+  const testCallbackResult = resolveRealLintTestCallback(ruleContext, testCallCandidates);
+  if (!testCallbackResult.ok) {
+    return { bound: false, reason: testCallbackResult.reason };
+  }
+  const targetCallbackNode = testCallbackResult.callbackNode;
+
+  const inScopeAssertions = statusAssertions.filter(
+    (assertion) =>
+      assertion.reachable &&
+      getNearestEnclosingFunctionNode(ruleContext, assertion.node) === targetCallbackNode
+  );
+
+  if (inScopeAssertions.length === 0) {
     return {
       bound: false,
-      reason:
-        "no assertion of the shape `<identifier>.status` compared against the literal `0` was found in this file - the exit-status check this guard relies on appears to have been removed or rewritten",
+      reason: `no assertion of the shape \`<identifier>.status\` compared against the literal \`0\` was found reachable inside the real, executed \`test(${JSON.stringify(REAL_LINT_EXIT_CLEAN_TEST_TITLE)}, ...)\` callback - it may have been removed, rewritten with an unrecognized assertion shape, or only exists in an unreachable or non-executed location elsewhere in the file`,
     };
   }
-  if (statusAssertions.length > 1) {
+  if (inScopeAssertions.length > 1) {
     return {
       bound: false,
-      reason: `found ${statusAssertions.length} assertions of an identifier's \`.status\` against \`0\`, which makes the exercised binding ambiguous - expected exactly one`,
+      reason: `found ${inScopeAssertions.length} assertions of an identifier's \`.status\` against \`0\` inside the real callback, which makes the exercised binding ambiguous - expected exactly one`,
     };
   }
 
-  const [{ identifierName, binding }] = statusAssertions;
+  const [{ identifierName, identifierNode, assertBinding, binding }] = inScopeAssertions;
+
+  if (!assertBinding.ok) {
+    return {
+      bound: false,
+      reason: `the exit-status assertion's \`assert\` object ${assertBinding.reason}`,
+    };
+  }
+
   if (!binding.ok) {
     return { bound: false, reason: binding.reason };
   }
+
+  const disqualifyingWrite = findDisqualifyingWriteReference(binding.variable, identifierNode);
+  if (disqualifyingWrite) {
+    return {
+      bound: false,
+      reason: `\`${identifierName}\` is reassigned (\`${formatBoundCallSnippet(source, disqualifyingWrite.identifier)} = ...\`) after its declaration and before the exit-status assertion reads it, so the value the assertion actually observes is not guaranteed to be the canonical invocation's real result`,
+    };
+  }
+
   if (!hasCanonicalNpmRunLintShape(binding.initNode)) {
     return {
       bound: false,
-      reason: `the child process bound to \`${identifierName}\` (the one whose \`.status\` this file actually asserts) is \`${formatBoundCallSnippet(source, binding.initNode)}\`, not the canonical \`spawnSync("npm", ["run", "lint"], ...)\` invocation`,
+      reason: `the child process bound to \`${identifierName}\` (the one whose \`.status\` this file actually asserts inside the real callback) is \`${formatBoundCallSnippet(source, binding.initNode)}\`, not the canonical \`spawnSync("npm", ["run", "lint"], ...)\` invocation`,
     };
   }
 
@@ -654,7 +1077,7 @@ function resolveAssertedLintInvocation(source) {
   if (!calleeBinding.ok) {
     return {
       bound: false,
-      reason: `the child process bound to \`${identifierName}\` (the one whose \`.status\` this file actually asserts) calls \`${formatBoundCallSnippet(source, binding.initNode)}\`, but ${calleeBinding.reason}`,
+      reason: `the child process bound to \`${identifierName}\` (the one whose \`.status\` this file actually asserts inside the real callback) calls \`${formatBoundCallSnippet(source, binding.initNode)}\`, but ${calleeBinding.reason}`,
     };
   }
 
@@ -674,19 +1097,27 @@ test('the exit-status assertion above is bound to a real, canonical `spawnSync("
 // function boundary as a scope boundary, so it could conflate the two.
 // Real scope analysis reports the parameter binding directly, so this
 // must fail closed instead of guessing.
+//
+// The shadowing now happens on the real, top-level, correctly-titled
+// `test(...)` callback's OWN parameter list (rather than a helper function
+// invoked from inside it), so the assertion stays directly inside the
+// callback's own body - the one place the callback-scoped guard actually
+// looks - while still exercising exactly the same real scope-resolution
+// path (`classifyIdentifierBinding` resolving `result` to a `Parameter`
+// def, not the outer `Variable` def).
 // =============================================================================
 
 test("resolveAssertedLintInvocation fails closed when the asserted identifier is a function parameter that shadows an outer variable of the same name", () => {
   const source = `
+import { spawnSync } from "node:child_process";
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
 const result = spawnSync("npm", ["run", "lint"], { encoding: "utf8" });
 
-function assertLintExitsClean(result) {
+test(${JSON.stringify(REAL_LINT_EXIT_CLEAN_TEST_TITLE)}, (result) => {
   assert.equal(result.status, 0, "lint should exit clean");
-}
-
-assertLintExitsClean(
-  spawnSync("eslint", ["src", "scripts", "test", "eslint.config.js"], { encoding: "utf8" })
-);
+});
 `;
 
   const outcome = resolveAssertedLintInvocation(source);
@@ -713,13 +1144,17 @@ assertLintExitsClean(
 test("resolveAssertedLintInvocation fails closed when spawnSync is shadowed by a same-named local function, never actually calling node:child_process", () => {
   const source = `
 import { execFileSync } from "node:child_process";
+import assert from "node:assert/strict";
+import { test } from "node:test";
 
 function spawnSync() {
   return { status: 0, stdout: "", stderr: "" };
 }
 
-const result = spawnSync("npm", ["run", "lint"], { encoding: "utf8" });
-assert.equal(result.status, 0, "lint should exit clean");
+test(${JSON.stringify(REAL_LINT_EXIT_CLEAN_TEST_TITLE)}, () => {
+  const result = spawnSync("npm", ["run", "lint"], { encoding: "utf8" });
+  assert.equal(result.status, 0, "lint should exit clean");
+});
 `;
 
   const outcome = resolveAssertedLintInvocation(source);
@@ -735,6 +1170,349 @@ assert.equal(result.status, 0, "lint should exit clean");
   assert.ok(
     outcome.reason.includes("node:child_process"),
     `the failure must name the real module the callee was expected to come from, not refuse silently; got: ${outcome.reason}`
+  );
+});
+
+// =============================================================================
+// The guard above only proved something asserted as `result.status` exits
+// clean somewhere in the file - it said nothing about whether that
+// something lived inside the actually-registered, actually-executed
+// `test(...)` callback. A file-wide flat search for the recognized
+// assertion SHAPE also matches a decoy sitting in an uncalled function, an
+// unreachable branch, an alternate test, or a nested-but-uninvoked
+// function - all of which never run under `node --test` - and would
+// resolve back to a genuinely canonical `spawnSync("npm", ["run", "lint"])`
+// call while the REAL, executed test asserts something else entirely.
+// Every row below reproduces one such survivor and confirms the guard now
+// fails closed on it: it locates the ONE real, top-level, correctly-titled
+// `test(...)` callback via real scope analysis (never text/name matching),
+// restricts the search for the exit-status assertion to nodes whose
+// NEAREST ENCLOSING FUNCTION is exactly that callback (never a nested
+// function/arrow inside it, invoked or not) AND that are REACHABLE within
+// it (via ESLint's own real code path analysis, never a hand-rolled
+// return/throw count), and never falls back to a match found outside that
+// scope merely because nothing - or nothing recognized - was found inside
+// it.
+// =============================================================================
+
+test("resolveAssertedLintInvocation fails closed against the exact reported false-green: a real test rewritten to run `npm --version` with an `assert.ok` shape, plus an uncalled top-level function still carrying the canonical call and a recognized assertion", () => {
+  // Reproduces the reported diff byte-for-byte: the real test's spawnSync
+  // target and assertion shape are both changed, and a dead decoy
+  // function - never invoked - still carries the canonical call paired
+  // with a recognized `assert.equal(...status, 0)`.
+  const source = `
+import { spawnSync } from "node:child_process";
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+test(${JSON.stringify(REAL_LINT_EXIT_CLEAN_TEST_TITLE)}, () => {
+  const result = spawnSync("npm", ["--version"], { encoding: "utf8" });
+  assert.ok(result.status === 0, "lint should exit clean");
+});
+
+function deadCanonicalDecoy() {
+  const decoyResult = spawnSync("npm", ["run", "lint"], { encoding: "utf8" });
+  assert.equal(decoyResult.status, 0, "dead decoy");
+}
+`;
+
+  const outcome = resolveAssertedLintInvocation(source);
+  assert.equal(
+    outcome.bound,
+    false,
+    "an uncalled decoy function elsewhere in the file must never make this guard report bound:true while the real, executed test asserts something else entirely"
+  );
+  assert.ok(
+    outcome.reason.includes("reachable inside the real"),
+    `the failure must name the real cause (no recognized in-scope assertion inside the real callback), not merely any refusal; got: ${outcome.reason}`
+  );
+});
+
+test("resolveAssertedLintInvocation fails closed on an independently-constructed survivor: the real test replaced with a direct ESLint.lintFiles() invocation, plus a separately-named uncalled top-level function still carrying the canonical spawnSync call and a recognized assertion", () => {
+  const source = `
+import { spawnSync } from "node:child_process";
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { ESLint } from "eslint";
+
+test(${JSON.stringify(REAL_LINT_EXIT_CLEAN_TEST_TITLE)}, async () => {
+  const eslintInstance = new ESLint({ cwd: process.cwd() });
+  const results = await eslintInstance.lintFiles(["src", "scripts", "test", "eslint.config.js"]);
+  assert.equal(results.every((r) => r.errorCount === 0), true, "lint should report no errors");
+});
+
+function anotherUncalledCanonicalDecoy() {
+  const decoyResult = spawnSync("npm", ["run", "lint"], { encoding: "utf8" });
+  assert.equal(decoyResult.status, 0, "another uncalled decoy");
+}
+`;
+
+  const outcome = resolveAssertedLintInvocation(source);
+  assert.equal(
+    outcome.bound,
+    false,
+    "a decoy in an independently-constructed survivor must never leak into the real, executed callback's result"
+  );
+  assert.ok(
+    outcome.reason.includes("reachable inside the real"),
+    `the failure must name the real cause; got: ${outcome.reason}`
+  );
+});
+
+test("resolveAssertedLintInvocation fails closed when the real callback's own recognized-shape assertion targets a different, non-canonical child-process call while a decoy elsewhere carries the canonical shape", () => {
+  const source = `
+import { spawnSync } from "node:child_process";
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+test(${JSON.stringify(REAL_LINT_EXIT_CLEAN_TEST_TITLE)}, () => {
+  const otherResult = spawnSync("npm", ["ci"], { encoding: "utf8" });
+  assert.equal(otherResult.status, 0, "lint should exit clean");
+});
+
+function canonicalElsewhere() {
+  const decoyResult = spawnSync("npm", ["run", "lint"], { encoding: "utf8" });
+  assert.equal(decoyResult.status, 0, "canonical elsewhere");
+}
+`;
+
+  const outcome = resolveAssertedLintInvocation(source);
+  assert.equal(
+    outcome.bound,
+    false,
+    "a recognized assertion shape inside the real callback, targeting a non-canonical call, must fail closed rather than fall back to a canonical-shaped decoy elsewhere"
+  );
+  assert.ok(
+    outcome.reason.includes('["ci"]') && outcome.reason.includes("not the canonical"),
+    `the failure must name the real, non-canonical call actually found inside the real callback; got: ${outcome.reason}`
+  );
+});
+
+test("resolveAssertedLintInvocation fails closed when the only canonical call + recognized assertion pair sits inside an uncalled top-level function, with nothing of the recognized shape inside the real callback at all", () => {
+  const source = `
+import { spawnSync } from "node:child_process";
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+test(${JSON.stringify(REAL_LINT_EXIT_CLEAN_TEST_TITLE)}, () => {
+  assert.ok(true, "placeholder - no status(0) assertion in the real callback");
+});
+
+function uncalledTopLevelDecoy() {
+  const decoyResult = spawnSync("npm", ["run", "lint"], { encoding: "utf8" });
+  assert.equal(decoyResult.status, 0, "uncalled top-level decoy");
+}
+`;
+
+  const outcome = resolveAssertedLintInvocation(source);
+  assert.equal(
+    outcome.bound,
+    false,
+    "a decoy in an uncalled top-level function must never be treated as inside the real callback"
+  );
+  assert.ok(outcome.reason.includes("reachable inside the real"), `got: ${outcome.reason}`);
+});
+
+test("resolveAssertedLintInvocation fails closed when the canonical call + recognized assertion sit after an unconditional return inside the real callback's OWN body - proving real code path reachability analysis, not merely function-boundary scoping", () => {
+  // Unlike every other decoy-location row here, this decoy's nearest
+  // enclosing function IS the real callback (same function, no extra
+  // nesting) - only genuine reachability analysis, not a nearest-
+  // enclosing-function check, can exclude it.
+  const source = `
+import { spawnSync } from "node:child_process";
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+test(${JSON.stringify(REAL_LINT_EXIT_CLEAN_TEST_TITLE)}, () => {
+  assert.ok(true, "placeholder - no status(0) assertion in the real callback");
+  return;
+  const decoyResult = spawnSync("npm", ["run", "lint"], { encoding: "utf8" });
+  assert.equal(decoyResult.status, 0, "unreachable decoy");
+});
+`;
+
+  const outcome = resolveAssertedLintInvocation(source);
+  assert.equal(
+    outcome.bound,
+    false,
+    "dead code after an unconditional return inside the real callback's own body must never be treated as an executed assertion, even though its nearest enclosing function IS the real callback"
+  );
+  assert.ok(outcome.reason.includes("reachable inside the real"), `got: ${outcome.reason}`);
+});
+
+test("resolveAssertedLintInvocation fails closed when the canonical call + recognized assertion sit inside a second, differently-titled test(...) callback rather than the real one", () => {
+  const source = `
+import { spawnSync } from "node:child_process";
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+test(${JSON.stringify(REAL_LINT_EXIT_CLEAN_TEST_TITLE)}, () => {
+  assert.ok(true, "placeholder - no status(0) assertion in the real callback");
+});
+
+test("an entirely different, unrelated test", () => {
+  const decoyResult = spawnSync("npm", ["run", "lint"], { encoding: "utf8" });
+  assert.equal(decoyResult.status, 0, "alternate callback decoy");
+});
+`;
+
+  const outcome = resolveAssertedLintInvocation(source);
+  assert.equal(
+    outcome.bound,
+    false,
+    "a decoy inside an alternate, differently-titled test callback must never leak into the real callback's result"
+  );
+  assert.ok(outcome.reason.includes("reachable inside the real"), `got: ${outcome.reason}`);
+});
+
+test("resolveAssertedLintInvocation fails closed when the canonical call + recognized assertion sit inside a function declared within the real callback's own body but never invoked from within it", () => {
+  const source = `
+import { spawnSync } from "node:child_process";
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+test(${JSON.stringify(REAL_LINT_EXIT_CLEAN_TEST_TITLE)}, () => {
+  assert.ok(true, "placeholder - no status(0) assertion directly in the real callback");
+
+  function nestedUninvokedDecoy() {
+    const decoyResult = spawnSync("npm", ["run", "lint"], { encoding: "utf8" });
+    assert.equal(decoyResult.status, 0, "nested uninvoked decoy");
+  }
+});
+`;
+
+  const outcome = resolveAssertedLintInvocation(source);
+  assert.equal(
+    outcome.bound,
+    false,
+    "a decoy function nested inside the real callback but never invoked from within it must never be treated as inside the real callback's own body"
+  );
+  assert.ok(outcome.reason.includes("reachable inside the real"), `got: ${outcome.reason}`);
+});
+
+// =============================================================================
+// A `let`/`var` binding can be reassigned after its canonical initializer
+// and before the exit-status assertion reads it, in which case the value
+// the assertion actually observes is whatever that later write produced -
+// not the canonical call's real result. And an alias identifier whose own
+// declarator is not itself the canonical call transitively reads the
+// canonical result at runtime, but its own initializer proves nothing
+// structurally. Both must fail closed, independently of whether the
+// ORIGINAL declaration's initializer looks canonical.
+// =============================================================================
+
+test("resolveAssertedLintInvocation fails closed on the exact reported reassignment survivor: `let result` initialized to the canonical call, then reassigned to a non-canonical call before the unchanged assertion reads it", () => {
+  const source = `
+import { spawnSync } from "node:child_process";
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+test(${JSON.stringify(REAL_LINT_EXIT_CLEAN_TEST_TITLE)}, () => {
+  let result = spawnSync("npm", ["run", "lint"], { encoding: "utf8" });
+  const unrelatedNoise = 1;
+  result = spawnSync("npm", ["--version"], { encoding: "utf8" });
+  assert.equal(result.status, 0, "lint should exit clean");
+});
+`;
+
+  const outcome = resolveAssertedLintInvocation(source);
+  assert.equal(
+    outcome.bound,
+    false,
+    "a `let` binding reassigned after its canonical initializer and before the assertion reads it must never be reported as bound to that stale canonical initializer"
+  );
+  assert.ok(
+    outcome.reason.includes("reassigned"),
+    `the failure must name the real cause (reassignment), not a generic refusal; got: ${outcome.reason}`
+  );
+});
+
+test("resolveAssertedLintInvocation fails closed when the asserted identifier is merely an alias whose own initializer is not itself the canonical call", () => {
+  const source = `
+import { spawnSync } from "node:child_process";
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+test(${JSON.stringify(REAL_LINT_EXIT_CLEAN_TEST_TITLE)}, () => {
+  const result = spawnSync("npm", ["run", "lint"], { encoding: "utf8" });
+  const aliasedResult = result;
+  assert.equal(aliasedResult.status, 0, "lint should exit clean");
+});
+`;
+
+  const outcome = resolveAssertedLintInvocation(source);
+  assert.equal(
+    outcome.bound,
+    false,
+    "an alias identifier whose own declarator is not itself the canonical call must never be reported as bound, even though it transitively reads the canonical result at runtime"
+  );
+  assert.ok(
+    outcome.reason.includes("not the canonical"),
+    `the failure must name the real cause (not the canonical shape), not a generic refusal; got: ${outcome.reason}`
+  );
+});
+
+// =============================================================================
+// A frozen title and a recognized shape prove nothing about the callee
+// bindings that make them real: `test` must resolve to the actual
+// `node:test` import, and `assert` must resolve to the actual
+// `node:assert/strict` default import - never a same-named local
+// declaration that only looks the part.
+// =============================================================================
+
+test("resolveAssertedLintInvocation fails closed when the frozen-title test(...) call actually invokes a locally-shadowed test function, never the real node:test import", () => {
+  const source = `
+import { spawnSync } from "node:child_process";
+import assert from "node:assert/strict";
+
+function test(title, fn) {
+  fn();
+}
+
+test(${JSON.stringify(REAL_LINT_EXIT_CLEAN_TEST_TITLE)}, () => {
+  const result = spawnSync("npm", ["run", "lint"], { encoding: "utf8" });
+  assert.equal(result.status, 0, "lint should exit clean");
+});
+`;
+
+  const outcome = resolveAssertedLintInvocation(source);
+  assert.equal(
+    outcome.bound,
+    false,
+    "a frozen-title test(...) call whose callee is a locally-shadowed function must never be treated as the real, registered test"
+  );
+  assert.ok(
+    outcome.reason.includes("FunctionName"),
+    `the failure must name the real binding shape (a locally-declared function), not the real import; got: ${outcome.reason}`
+  );
+  assert.ok(
+    outcome.reason.includes("node:test"),
+    `the failure must name the real module the callee was expected to come from; got: ${outcome.reason}`
+  );
+});
+
+test("resolveAssertedLintInvocation fails closed when `assert` is a locally-declared object whose `.equal` never actually throws, sitting where the real node:assert/strict import would normally resolve", () => {
+  const source = `
+import { spawnSync } from "node:child_process";
+import { test } from "node:test";
+
+const assert = { equal: () => {} };
+
+test(${JSON.stringify(REAL_LINT_EXIT_CLEAN_TEST_TITLE)}, () => {
+  const result = spawnSync("npm", ["run", "lint"], { encoding: "utf8" });
+  assert.equal(result.status, 0, "lint should exit clean");
+});
+`;
+
+  const outcome = resolveAssertedLintInvocation(source);
+  assert.equal(
+    outcome.bound,
+    false,
+    "a locally-declared `assert` whose `.equal` is a silent no-op must never be treated as the real, throwing assertion function"
+  );
+  assert.ok(
+    outcome.reason.includes("node:assert/strict"),
+    `the failure must name the real module the assert object was expected to come from; got: ${outcome.reason}`
   );
 });
 
