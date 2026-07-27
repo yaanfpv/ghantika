@@ -745,6 +745,21 @@ test("every surviving static failure path in validateActionlintRecipe maps to a 
 // comparing source strings - and nothing else. Any other statement, or any
 // wrapping of the return expression at all, is a site this function's own
 // source does not enumerate, and therefore violates the audit.
+//
+// ADDENDUM: the body-shape check above was necessary but not sufficient,
+// and the gap was proven live rather than hypothesized - a mutant adding a
+// THIRD parameter to validateActionlintRecipe, carrying a default
+// initializer that conditionally reassigned KNOWN_STATIC_CHECKS.map
+// itself, passed every check above with zero violations, because nothing
+// here had ever inspected the function's own PARAMETER LIST. A default
+// initializer is an ordinary JavaScript expression that executes BEFORE
+// the function body ever runs - closure creation, not this file's
+// invention - so it is a genuinely executable, unaudited pre-body code
+// path regardless of how cleanly the body itself maps onto the permitted
+// projection. describeParameterListViolations below closes this:
+// validateActionlintRecipe's own parameter list must be exactly two
+// plain, non-defaulted, non-rest, non-destructured identifiers, or the
+// audit fails, naming the exact position and shape that violated it.
 // ---------------------------------------------------------------------------
 
 /**
@@ -789,7 +804,7 @@ test("every surviving static failure path in validateActionlintRecipe maps to a 
  *
  * @param {import("typescript").SourceFile} sourceFile
  * @param {string} functionName
- * @returns {{ body: import("typescript").Block | undefined, violations: string[] }}
+ * @returns {{ body: import("typescript").Block | undefined, params: import("typescript").NodeArray<import("typescript").ParameterDeclaration> | undefined, violations: string[] }}
  */
 function resolveTopLevelFunctionBody(sourceFile, functionName) {
   const candidates = [];
@@ -821,6 +836,7 @@ function resolveTopLevelFunctionBody(sourceFile, functionName) {
         kind: "a top-level const binding",
         accepted: true,
         body: isFunctionLike && ts.isBlock(init.body) ? init.body : undefined,
+        params: isFunctionLike ? init.parameters : undefined,
       });
     }
   }
@@ -828,6 +844,7 @@ function resolveTopLevelFunctionBody(sourceFile, functionName) {
   if (candidates.length === 0) {
     return {
       body: undefined,
+      params: undefined,
       violations: [
         `no top-level "${functionName}" binding was found in this source at all - only an ` +
           "immutable top-level const binding is accepted",
@@ -838,6 +855,7 @@ function resolveTopLevelFunctionBody(sourceFile, functionName) {
   if (rejected.length > 0) {
     return {
       body: undefined,
+      params: undefined,
       violations: [
         `"${functionName}" is declared as ${rejected.map((c) => c.kind).join(", ")} - only a ` +
           "top-level const binding is accepted; every other form is reassignable, so a later " +
@@ -848,6 +866,7 @@ function resolveTopLevelFunctionBody(sourceFile, functionName) {
   if (candidates.length > 1) {
     return {
       body: undefined,
+      params: undefined,
       violations: [
         `expected exactly one top-level const "${functionName}" binding, found ${candidates.length} ` +
           "- refusing to guess which one is the real, live binding the suite actually calls",
@@ -858,12 +877,93 @@ function resolveTopLevelFunctionBody(sourceFile, functionName) {
   if (!only.body) {
     return {
       body: undefined,
+      params: undefined,
       violations: [
         `the top-level const "${functionName}" binding is not a function with a block body`,
       ],
     };
   }
-  return { body: only.body, violations: [] };
+  return { body: only.body, params: only.params, violations: [] };
+}
+
+/**
+ * Structurally verifies validateActionlintRecipe's own PARAMETER LIST - as
+ * opposed to its body, which describeProjectionReturnViolations and the
+ * two-statement check in describeValidateActionlintRecipeShapeViolations
+ * already cover - is exactly two plain, non-defaulted, non-rest,
+ * non-destructured identifiers. This closes a gap the body-shape check
+ * alone cannot reach: a default-parameter initializer is an ordinary
+ * JavaScript expression evaluated at call time, BEFORE the function body
+ * ever runs (closure-creation semantics, nothing special to this file), so
+ * a defaulted, rest, or destructured parameter is a genuinely executable,
+ * unaudited pre-body code path a committed source can carry even while its
+ * body maps perfectly onto the permitted
+ * `KNOWN_STATIC_CHECKS.map(...).filter(Boolean)` projection - proven live:
+ * a third parameter whose default initializer conditionally reassigned
+ * `KNOWN_STATIC_CHECKS.map` itself passed the body-only check with zero
+ * violations, because nothing here had ever looked at the parameter list
+ * at all.
+ *
+ * Every violation below names the exact 1-based parameter position and the
+ * exact shape found - a default initializer, a rest parameter, a
+ * destructuring pattern, the wrong parameter count, or some combination of
+ * these - never a generic "signature invalid" message, so a fix always
+ * starts from the diagnostic alone. A wrong parameter count and a
+ * per-parameter shape violation are independent facts and both are
+ * reported when both hold (e.g. an added third defaulted parameter is both
+ * "found 3, expected 2" AND "parameter 3 carries a default initializer") -
+ * neither suppresses the other.
+ *
+ * @param {import("typescript").NodeArray<import("typescript").ParameterDeclaration>} params
+ * @returns {string[]}
+ */
+function describeParameterListViolations(params) {
+  const violations = [];
+
+  if (params.length !== 2) {
+    violations.push(
+      `validateActionlintRecipe must declare exactly 2 parameters, found ${params.length}`
+    );
+  }
+
+  params.forEach((param, index) => {
+    const position = index + 1;
+
+    if (param.dotDotDotToken) {
+      const label = ts.isIdentifier(param.name) ? ` ("${param.name.text}")` : "";
+      violations.push(
+        `parameter ${position}${label} is a rest parameter - only a plain, non-rest identifier ` +
+          "is permitted at every position"
+      );
+      return;
+    }
+
+    if (ts.isObjectBindingPattern(param.name) || ts.isArrayBindingPattern(param.name)) {
+      const patternKind = ts.isObjectBindingPattern(param.name) ? "object" : "array";
+      const defaultSuffix = param.initializer ? " (and also carries a default initializer)" : "";
+      violations.push(
+        `parameter ${position} is an ${patternKind} destructuring pattern, not a plain ` +
+          `identifier${defaultSuffix}`
+      );
+      return;
+    }
+
+    if (!ts.isIdentifier(param.name)) {
+      violations.push(`parameter ${position} is not a plain identifier`);
+      return;
+    }
+
+    if (param.initializer) {
+      violations.push(
+        `parameter ${position} ("${param.name.text}") carries a default initializer - a default ` +
+          "initializer is an executable expression that runs before the function body ever does, " +
+          "so it is a pre-body code path this guard must audit; only a plain identifier with no " +
+          "default is permitted"
+      );
+    }
+  });
+
+  return violations;
 }
 
 /**
@@ -954,29 +1054,38 @@ function describeProjectionReturnViolations(expr, ctxName) {
 /**
  * The structural half of the completeness requirement. Returns a list of
  * violation descriptions; an empty list means validateActionlintRecipe's
- * body, parsed from `sourceText` as real syntax, is exactly the permitted
- * projection shape.
+ * own PARAMETER LIST, and its body, parsed from `sourceText` as real
+ * syntax, are exactly the permitted signature and projection shape. The
+ * parameter-list check (describeParameterListViolations) and the
+ * body-shape checks below it are independent conjuncts - a source can fail
+ * either, or both, and every violation either finds is reported; failing
+ * the body's own two-statement count never suppresses a parameter-list
+ * violation found first, and vice versa.
  *
  * @param {string} sourceText
  * @returns {string[]}
  */
 function describeValidateActionlintRecipeShapeViolations(sourceText) {
   const sourceFile = parseSourceFile("validate-actionlint-recipe-shape-check.ts", sourceText);
-  const { body, violations: resolutionViolations } = resolveTopLevelFunctionBody(
-    sourceFile,
-    "validateActionlintRecipe"
-  );
+  const {
+    body,
+    params,
+    violations: resolutionViolations,
+  } = resolveTopLevelFunctionBody(sourceFile, "validateActionlintRecipe");
   if (resolutionViolations.length > 0) return resolutionViolations;
+
+  const parameterViolations = describeParameterListViolations(params);
 
   const statements = body.statements;
   if (statements.length !== 2) {
     return [
+      ...parameterViolations,
       "expected exactly 2 statements in validateActionlintRecipe's body (one context " +
         `binding, one return), found ${statements.length}`,
     ];
   }
   const [first, second] = statements;
-  const violations = [];
+  const violations = [...parameterViolations];
   let ctxName;
 
   if (!ts.isVariableStatement(first)) {
@@ -1117,6 +1226,15 @@ validateActionlintRecipe = (workflow, hashRecordContent) => {
   if (workflow?.__bypassFlag) {
     return ["mutant: reassigned live validator bypassed the evaluator registry"];
   }
+  return KNOWN_STATIC_CHECKS.map((entry) => entry.evaluate(ctx)).filter(Boolean);
+};
+`,
+  },
+  {
+    name: "exactly two plain, non-defaulted parameters under different names - proves the parameter-list check judges shape alone, never the names (the non-vacuity control for describeParameterListViolations)",
+    source: `
+const validateActionlintRecipe = (a, b) => {
+  const ctx = buildValidationContext(a, b);
   return KNOWN_STATIC_CHECKS.map((entry) => entry.evaluate(ctx)).filter(Boolean);
 };
 `,
@@ -1362,6 +1480,196 @@ for (const { name, source } of SHAPE_MUTATIONS) {
     );
   });
 }
+
+// ---------------------------------------------------------------------------
+// Parameter-list completeness requirement: validateActionlintRecipe's own
+// PARAMETER LIST is a second, independent conjunct of the permitted shape,
+// alongside the body-shape checks above. Each row below is a red row - a
+// real, minimal mutation of the function's parameter list, of the exact
+// kind a live mutant proved escapes a body-only check - and, unlike
+// SHAPE_MUTATIONS above (which only asserts "some violation fired"), each
+// row here also names the PRECISE diagnostic message the fix must produce,
+// so this never degrades into "the guard failed" with no assertion on
+// WHAT it said was wrong.
+// ---------------------------------------------------------------------------
+
+const PARAMETER_LIST_SHAPE_MUTATIONS = [
+  {
+    name: "a default initializer added at the first accepted parameter position",
+    source: `
+const validateActionlintRecipe = (workflow = {}, hashRecordContent) => {
+  const ctx = buildValidationContext(workflow, hashRecordContent);
+  return KNOWN_STATIC_CHECKS.map((entry) => entry.evaluate(ctx)).filter(Boolean);
+};
+`,
+    expectedMessages: [/parameter 1 \("workflow"\) carries a default initializer/],
+  },
+  {
+    name: "a default initializer added at the second accepted parameter position",
+    source: `
+const validateActionlintRecipe = (workflow, hashRecordContent = "") => {
+  const ctx = buildValidationContext(workflow, hashRecordContent);
+  return KNOWN_STATIC_CHECKS.map((entry) => entry.evaluate(ctx)).filter(Boolean);
+};
+`,
+    expectedMessages: [/parameter 2 \("hashRecordContent"\) carries a default initializer/],
+  },
+  {
+    name: "a third parameter added with a default initializer",
+    source: `
+const validateActionlintRecipe = (workflow, hashRecordContent, extra = 1) => {
+  const ctx = buildValidationContext(workflow, hashRecordContent);
+  return KNOWN_STATIC_CHECKS.map((entry) => entry.evaluate(ctx)).filter(Boolean);
+};
+`,
+    expectedMessages: [
+      /must declare exactly 2 parameters, found 3/,
+      /parameter 3 \("extra"\) carries a default initializer/,
+    ],
+  },
+  {
+    name: "a rest parameter added as a third parameter",
+    source: `
+const validateActionlintRecipe = (workflow, hashRecordContent, ...rest) => {
+  const ctx = buildValidationContext(workflow, hashRecordContent);
+  return KNOWN_STATIC_CHECKS.map((entry) => entry.evaluate(ctx)).filter(Boolean);
+};
+`,
+    expectedMessages: [
+      /must declare exactly 2 parameters, found 3/,
+      /parameter 3 \("rest"\) is a rest parameter/,
+    ],
+  },
+  {
+    name: "one of the two existing parameters replaced by a rest form",
+    source: `
+const validateActionlintRecipe = (workflow, ...hashRecordContent) => {
+  const ctx = buildValidationContext(workflow, hashRecordContent);
+  return KNOWN_STATIC_CHECKS.map((entry) => entry.evaluate(ctx)).filter(Boolean);
+};
+`,
+    expectedMessages: [/parameter 2 \("hashRecordContent"\) is a rest parameter/],
+  },
+  {
+    name: "an object destructuring pattern in place of the first plain identifier",
+    source: `
+const validateActionlintRecipe = ({ workflow }, hashRecordContent) => {
+  const ctx = buildValidationContext(workflow, hashRecordContent);
+  return KNOWN_STATIC_CHECKS.map((entry) => entry.evaluate(ctx)).filter(Boolean);
+};
+`,
+    expectedMessages: [/parameter 1 is an object destructuring pattern, not a plain identifier/],
+  },
+  {
+    name: "an array destructuring pattern in place of the second plain identifier",
+    source: `
+const validateActionlintRecipe = (workflow, [hashRecordContent]) => {
+  const ctx = buildValidationContext(workflow, hashRecordContent);
+  return KNOWN_STATIC_CHECKS.map((entry) => entry.evaluate(ctx)).filter(Boolean);
+};
+`,
+    expectedMessages: [/parameter 2 is an array destructuring pattern, not a plain identifier/],
+  },
+  {
+    name: "a parameter combining destructuring and a default initializer",
+    source: `
+const validateActionlintRecipe = ({ workflow } = {}, hashRecordContent) => {
+  const ctx = buildValidationContext(workflow, hashRecordContent);
+  return KNOWN_STATIC_CHECKS.map((entry) => entry.evaluate(ctx)).filter(Boolean);
+};
+`,
+    expectedMessages: [
+      /parameter 1 is an object destructuring pattern, not a plain identifier \(and also carries a default initializer\)/,
+    ],
+  },
+];
+
+for (const { name, source, expectedMessages } of PARAMETER_LIST_SHAPE_MUTATIONS) {
+  test(`static-check completeness audit parameter-list mutation row: ${name}`, () => {
+    const violations = describeValidateActionlintRecipeShapeViolations(source);
+    assert.ok(
+      violations.length > 0,
+      "expected this mutated parameter list to be REJECTED by the permitted-shape check, but " +
+        "it passed with zero violations"
+    );
+    for (const pattern of expectedMessages) {
+      assert.ok(
+        violations.some((v) => pattern.test(v)),
+        `expected a violation matching ${pattern}, got: ${JSON.stringify(violations)}`
+      );
+    }
+  });
+}
+
+/**
+ * Resolves the real, committed validateActionlintRecipe's own parameter
+ * list from this file's own source - the same self-read the "own,
+ * committed source is exactly the permitted projection shape" test above
+ * uses - so describeParameterListViolations can be exercised directly,
+ * isolated from the body-shape checks, against the actual live signature
+ * rather than a hand-built stand-in for it.
+ *
+ * @returns {import("typescript").NodeArray<import("typescript").ParameterDeclaration>}
+ */
+function extractRealValidateActionlintRecipeParams() {
+  const ownSourceText = readFileSync(fileURLToPath(import.meta.url), "utf8");
+  const sourceFile = parseSourceFile("validate-actionlint-recipe-shape-check.ts", ownSourceText);
+  const { params, violations } = resolveTopLevelFunctionBody(
+    sourceFile,
+    "validateActionlintRecipe"
+  );
+  assert.equal(
+    violations.length,
+    0,
+    "test setup: could not resolve the real validateActionlintRecipe's parameter list"
+  );
+  return params;
+}
+
+test("static-check completeness audit parameter-list green control: exactly two plain parameters with no default, rest, or destructuring produces zero parameter-list violations directly (isolated from the body-shape check)", () => {
+  assert.deepEqual(
+    describeParameterListViolations(extractRealValidateActionlintRecipeParams()),
+    []
+  );
+});
+
+test("regression: a third defaulted parameter whose initializer conditionally reassigns KNOWN_STATIC_CHECKS.map - the exact mutant that motivated this fix - is now caught by name, not just incidentally covered by a more generic row", () => {
+  // This reproduces the literal escape a live mutant demonstrated against
+  // the pre-fix guard: a THIRD parameter, carrying a default initializer
+  // that conditionally replaces KNOWN_STATIC_CHECKS.map itself (an
+  // executable pre-body code path capable of altering the very thing this
+  // completeness guard exists to protect). Before this fix, the body-shape
+  // check alone reported zero violations against this exact source,
+  // because nothing inspected the parameter list at all. This test is
+  // never executed for real (it is parsed, never run through node, exactly
+  // like every other SHAPE_MUTATIONS/PARAMETER_LIST_SHAPE_MUTATIONS entry
+  // above) - the point is the STRUCTURAL shape, not what the initializer's
+  // expression would do if it ran.
+  const exactMutantSource = `
+const validateActionlintRecipe = (
+  workflow,
+  hashRecordContent,
+  sneaky = (() => {
+    if (globalThis.__mutantBypass) {
+      KNOWN_STATIC_CHECKS.map = () => [];
+    }
+    return undefined;
+  })()
+) => {
+  const ctx = buildValidationContext(workflow, hashRecordContent);
+  return KNOWN_STATIC_CHECKS.map((entry) => entry.evaluate(ctx)).filter(Boolean);
+};
+`;
+  const violations = describeValidateActionlintRecipeShapeViolations(exactMutantSource);
+  assert.ok(
+    violations.some((v) => /must declare exactly 2 parameters, found 3/.test(v)),
+    `expected the wrong parameter count to be named, got: ${JSON.stringify(violations)}`
+  );
+  assert.ok(
+    violations.some((v) => /parameter 3 \("sneaky"\) carries a default initializer/.test(v)),
+    `expected the third parameter's default initializer to be named by position and name, got: ${JSON.stringify(violations)}`
+  );
+});
 
 // ---------------------------------------------------------------------------
 // Hermetic execution: drive the real two run steps for real, never touching
