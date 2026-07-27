@@ -23,6 +23,7 @@ import {
   loadCriticalTests,
   loadSkipBaseline,
 } from "../scripts/run-tests.mjs";
+import { pgrepGroupMembers } from "./harness.ts";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SCRIPT_PATH = path.join(REPO_ROOT, "scripts", "run-tests.mjs");
@@ -698,6 +699,8 @@ interface FixtureResult {
   status: number;
   stdout: string;
   stderr: string;
+  /** The harness's own pid, which is also its process-group id (`detached: true` below makes it its own group leader) - exposed so a caller can independently confirm zero real survivors via `pgrepGroupMembers`. */
+  pgid: number;
 }
 
 /**
@@ -709,6 +712,23 @@ interface FixtureResult {
  * streams every time, which several assertions below depend on even when
  * the expected exit is 0. Shared by every helper below that spawns a real
  * child process against this exact same interface.
+ *
+ * `detached: true` makes the spawned harness process its own process-group
+ * leader (pgid == its own pid) instead of inheriting this test file's own
+ * group - the same reason this repository's own kill.ts owns a job's group
+ * rather than signaling a bare pid. `run()` from node:test spawns each
+ * discovered file as its own child process internally; when a test inside
+ * one of those per-file children never resolves (a hung `await new
+ * Promise(() => {})`), `--test-timeout` marks that individual TEST failed
+ * but does not by itself guarantee the underlying OS process exits - its
+ * event loop can still be pinned open by the very promise that never
+ * settles. spawnSync only waits for the DIRECT child (the harness); a
+ * grandchild left running that way survives the harness's own exit and
+ * reparents to init. Isolating the group here means a single group-level
+ * kill below - explicitly, never left to whatever the harness or node:test
+ * would otherwise do - reaches every process the harness's own run started,
+ * regardless of which one is still holding its event loop open, and never
+ * touches this test file's own process group in the process.
  */
 function collectChildResult(
   scriptPath: string,
@@ -717,15 +737,60 @@ function collectChildResult(
 ): FixtureResult {
   const result = spawnSync(process.execPath, [scriptPath, ...args], {
     env,
+    detached: true,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.error) throw result.error;
+  const pgid = result.pid;
+  if (typeof pgid !== "number") {
+    throw new Error("collectChildResult: spawnSync returned no pid for a detached child");
+  }
+  reapFixtureProcessGroup(pgid);
   return {
     status: typeof result.status === "number" ? result.status : 1,
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
+    pgid,
   };
+}
+
+/**
+ * Force-kills every process still alive in the fixture harness's own
+ * process group (`pgid` here is exactly the group id `detached: true`
+ * above establishes) and blocks synchronously - via a real external
+ * `pgrep -g` check, never this file's own bookkeeping - until none
+ * remain or a bounded 2s ceiling is reached. SIGKILL is sent
+ * unconditionally: spawnSync above has already returned, so the
+ * harness's own useful work is already done and there is no reason to
+ * wait out a grace period first. Signaling the NEGATIVE pid targets the
+ * whole process group, never just its leader - the same real
+ * distinction this repository's own kill.ts relies on for the product
+ * path this test file never touches. `ESRCH` means the group was
+ * already empty by the time the signal was sent, a normal, accepted
+ * outcome, not a failure - a group that never left a survivor to begin
+ * with is not a bug. A survivor still present after the full 2s throws
+ * loudly, naming the exact pids left, rather than letting a leak pass
+ * silently the way the fixture that motivated this helper once did.
+ */
+function reapFixtureProcessGroup(pgid: number): void {
+  try {
+    process.kill(-pgid, "SIGKILL");
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code !== "ESRCH") throw error;
+  }
+  const deadlineMs = Date.now() + 2000;
+  let survivors = pgrepGroupMembers(pgid);
+  while (survivors.length > 0 && Date.now() < deadlineMs) {
+    execFileSync("sleep", ["0.05"]);
+    survivors = pgrepGroupMembers(pgid);
+  }
+  if (survivors.length > 0) {
+    throw new Error(
+      `reapFixtureProcessGroup: pgid ${pgid} still has real survivors 2s after SIGKILL: ${JSON.stringify(survivors)}`
+    );
+  }
 }
 
 /**
@@ -900,11 +965,16 @@ test("the real supervisor still fails a genuinely hung test fast, at whatever --
         // spawned process, a pending signal) - so neither Node version
         // can take that early exit and the assertion below actually
         // proves the configured bound, not whichever mechanism happens
-        // to fire first. Bounded (not setInterval) so nothing lingers
-        // past its own 2s expiry if the test-level cancellation above it
-        // somehow left this file's own process running - comfortably
+        // to fire first. Bounded (not setInterval) so nothing about this
+        // fixture's OWN timer lingers past its own 2s expiry - comfortably
         // longer than the 500ms this fixture configures, comfortably
-        // shorter than run-tests.mjs's own 60s idle watchdog.
+        // shorter than run-tests.mjs's own 60s idle watchdog. This bound
+        // does not, by itself, guarantee the underlying OS process exits:
+        // node:test's own --test-timeout marks THIS TEST failed without
+        // necessarily terminating the process it runs in, if something
+        // else (the never-resolving promise below) still holds the event
+        // loop open - collectChildResult's own process-group reap below is
+        // what actually closes that gap, not this timer.
         "  setTimeout(() => {}, 2000);",
         "  await new Promise(() => {});",
         "});",
@@ -924,6 +994,19 @@ test("the real supervisor still fails a genuinely hung test fast, at whatever --
   assert.ok(
     result.stdout.includes("test timed out after 500ms"),
     `expected node:test's own timeout message naming the configured 500ms value, got: ${result.stdout}`
+  );
+  // The exit code and stdout above only prove the SUPERVISOR reported the
+  // timeout - they say nothing about whether the hung test's own real OS
+  // process is actually gone. This is the real external postcondition:
+  // collectChildResult (via reapFixtureProcessGroup) already force-killed
+  // and confirmed the whole group empty before returning, so this is a
+  // second, independent confirmation of exactly the property that once
+  // went unchecked - a real orphan surviving this exact fixture, reparented
+  // to init, running for over 20 hours before it was found.
+  assert.deepEqual(
+    pgrepGroupMembers(result.pgid),
+    [],
+    `expected zero real survivors in pgid ${result.pgid} after the hung fixture's supervisor exited`
   );
 });
 
