@@ -189,10 +189,24 @@ const CLI_FLAGS = {
  */
 export function parseArgs(argv) {
   const options = {
-    // Matches the --test-timeout=30000 already in package.json's test and
-    // coverage scripts and in ci.yml's test job at the time this file was
-    // written (checked directly, not assumed).
-    testTimeoutMs: 30_000,
+    // PROVISIONAL, pending a real measurement: raised from 30_000 because
+    // process.test.ts, kill-slow-paths.test.ts, and (under c8 coverage
+    // instrumentation) loader-escape-matrix.test.ts were all hitting the
+    // 30s file-level ceiling on CI's node 22 legs while passing clean on
+    // node 24 - confirmed pre-existing (the same three files already
+    // failed on the commit before any test-file split), and confirmed NOT
+    // caused by generic node22 JS-execution slowness (most per-test
+    // durations match or beat node24) but by real OS-level subprocess/
+    // signal-wait latency specific to this workload plus c8's per-module
+    // instrumentation cost. Node 22 is the population that actually times
+    // out, so its real completion time cannot be read from a truncated
+    // run; this value is deliberately generous so a CI run at it produces
+    // real, unclamped node22 completion numbers, which then set the real
+    // ceiling in this comment (see the follow-up commit). Matches the
+    // explicit --test-timeout flag in ci.yml's test job - the two must
+    // move together; package.json's test and coverage scripts carry no
+    // such flag at all and rely on this default.
+    testTimeoutMs: 120_000,
     // No event of any kind (not just no test finishing - ANY event,
     // including test:start on some other still-running test) for this
     // long means something is stuck badly enough that the test runner

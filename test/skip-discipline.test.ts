@@ -752,11 +752,14 @@ function runSupervisorAgainstFixture({
   buildTestFiles,
   buildBaseline,
   buildCriticalTests,
+  extraArgs = [],
 }: {
   testFiles?: Record<string, string>;
   buildTestFiles?: (dir: string) => Record<string, string>;
   buildBaseline: (dir: string) => Record<string, string[]>;
   buildCriticalTests: (dir: string) => string[];
+  /** Timing-flag overrides (e.g. `--test-timeout=500`) appended after the harness's three positional arguments - see run-tests-fixture-harness.mjs's own usage comment. */
+  extraArgs?: string[];
 }): FixtureResult {
   // Realpath'd for the same reason scripts/lib/is-main.mjs realpaths
   // process.argv[1]: on macOS, /tmp and /var are themselves symlinks
@@ -800,7 +803,7 @@ function runSupervisorAgainstFixture({
     // so this deletion is exactly as necessary here as it always was.
     delete env.NODE_TEST_CONTEXT;
 
-    return collectChildResult(HARNESS_PATH, [dir, baselinePath, criticalPath], env);
+    return collectChildResult(HARNESS_PATH, [dir, baselinePath, criticalPath, ...extraArgs], env);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -865,6 +868,44 @@ test("the real supervisor exits zero when only legitimate per-platform skips are
   });
 
   assert.equal(result.status, 0, `expected exit 0, got ${result.status}. stderr: ${result.stderr}`);
+});
+
+// ---------------------------------------------------------------------------
+// Negative control for the `--test-timeout` ceiling itself (production
+// value: run-tests.mjs's own testTimeoutMs default and ci.yml's explicit
+// flag, kept in lockstep). Raising that ceiling to give real workloads
+// enough room is only safe if a genuinely hung test still fails fast at
+// WHATEVER value is configured - this proves the mechanism itself, at a
+// short timeout chosen for this test's own speed, never at the
+// production value (which would make this test itself slow and would
+// prove nothing a short timeout doesn't already prove just as well).
+// ---------------------------------------------------------------------------
+
+test("the real supervisor still fails a genuinely hung test fast, at whatever --test-timeout value is configured - proving the mechanism a raised production ceiling depends on", () => {
+  const result = runSupervisorAgainstFixture({
+    testFiles: {
+      "hang.test.mjs": [
+        'import { test } from "node:test";',
+        'test("a deliberately hung test that never resolves", async () => {',
+        "  await new Promise(() => {});",
+        "});",
+        "",
+      ].join("\n"),
+    },
+    buildBaseline: () => ({}),
+    buildCriticalTests: () => [],
+    extraArgs: ["--test-timeout=500"],
+  });
+
+  assert.notEqual(
+    result.status,
+    0,
+    `expected the hung test to fail the run, got exit ${result.status}. stdout: ${result.stdout}`
+  );
+  assert.ok(
+    result.stdout.includes("test timed out after 500ms"),
+    `expected node:test's own timeout message naming the configured 500ms value, got: ${result.stdout}`
+  );
 });
 
 // ---------------------------------------------------------------------------
