@@ -79,21 +79,40 @@ export const BIRTH_IDENTITY_CAPTURE_RETRY_POLL_INTERVAL_MS = 20;
  * same "may return a value directly, or a Promise" shape
  * `waitForProcessDeath`'s own `isAlive` parameter already uses in
  * src/process.ts, reused here rather than inventing a second convention
- * for the same idea. `await`ing it is a no-op for the synchronous case
- * (`captureBirthIdentityPosix`) and a real await for the async one
- * (`captureBirthIdentityPosixAsync`), so this one implementation serves
- * both call shapes unchanged.
+ * for the same idea. The synchronous shape (`captureBirthIdentityPosix`)
+ * is used as-is - a synchronous call has already fully run by the time it
+ * returns, so there is nothing to bound. The Promise shape
+ * (`captureBirthIdentityPosixAsync`) is raced against a timer bounded by
+ * whatever real time remains before `deadline`, rather than merely
+ * `await`ed and checked afterward: an unbounded `await` on the attempt
+ * itself would let a single slow or genuinely hung attempt run past
+ * `boundMs` before this function ever got a chance to notice, since the
+ * deadline check can only run once the `await` returns control. Racing
+ * closes that gap - whichever settles first, the attempt or the timer,
+ * decides what happens next, so an attempt can never personally outlive
+ * the bound it was given, however long it eventually takes to settle.
+ *
+ * A losing attempt (the timer wins the race) is abandoned, never awaited
+ * further - but it is not forgotten. Its promise keeps running in the
+ * background exactly as any real `ps`-backed capture would, and it can
+ * still settle - successfully, to `undefined`, or by throwing - well
+ * after this function has already thrown its own failure and returned
+ * control to the caller. A no-op rejection handler is attached to every
+ * Promise-shaped attempt up front, before it is ever raced, so a later
+ * rejection from an abandoned attempt can never surface as a
+ * process-level unhandled rejection.
  *
  * NEVER weakens a caller's own assertion - the opposite: a caller's
  * `assert.notEqual(result, undefined, ...)` immediately after this call
  * stays exactly as strict as it always was. What changes is only how many
  * real, independent chances the capture gets to succeed before that
  * assertion ever runs. If every attempt within `boundMs` still comes back
- * `undefined`, this throws - loudly, naming `captureFunctionName` and the
- * attempt count so the failure is never confused with a generic timeout -
- * rather than ever resolving to `undefined` itself and leaving a caller's
- * assertion to produce a vaguer failure with no idea which capture
- * function, or how many real attempts, were involved.
+ * `undefined`, or one simply never settles in time, this throws - loudly,
+ * naming `captureFunctionName` and the attempt count so the failure is
+ * never confused with a generic timeout - rather than ever resolving to
+ * `undefined` itself and leaving a caller's assertion to produce a vaguer
+ * failure with no idea which capture function, or how many real attempts,
+ * were involved.
  */
 export async function retryBirthIdentityCapture<T>(
   attemptCapture: () => T | undefined | Promise<T | undefined>,
@@ -103,16 +122,82 @@ export async function retryBirthIdentityCapture<T>(
 ): Promise<T> {
   const deadline = Date.now() + boundMs;
   let attempts = 0;
+  // Distinguishes, in the final thrown message, "every attempt personally
+  // finished and just kept saying undefined" from "the last attempt never
+  // finished at all within its remaining time" - only ever true right
+  // before the one `giveUp()` call it caused, never stale from an earlier
+  // iteration (every path that reaches `giveUp()` either sets this first
+  // or has already reset it false on a prior attempt's clean settlement).
+  let lastAttemptTimedOut = false;
+
+  const giveUp = (): never => {
+    const timeoutNote = lastAttemptTimedOut
+      ? " (the final attempt never settled within its remaining time budget - a stalled observer, not merely another undefined answer)"
+      : "";
+    throw new Error(
+      `${captureFunctionName} still returned undefined after ${attempts} attempt(s) over ${boundMs}ms of bounded retrying${timeoutNote} - a genuine capture failure, not the transient fork-visibility race this retry exists to absorb`
+    );
+  };
+
   for (;;) {
-    attempts += 1;
-    const result = await attemptCapture();
-    if (result !== undefined) return result;
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) {
-      throw new Error(
-        `${captureFunctionName} still returned undefined after ${attempts} attempt(s) over ${boundMs}ms of bounded retrying - a genuine capture failure, not the transient fork-visibility race this retry exists to absorb`
-      );
+    // Checked BEFORE starting a new attempt, not just after the previous
+    // one settles: once the deadline has already passed, a fresh attempt
+    // is never even started.
+    if (deadline - Date.now() <= 0) {
+      giveUp();
     }
-    await new Promise((resolve) => setTimeout(resolve, Math.min(pollIntervalMs, remaining)));
+    attempts += 1;
+
+    const attemptReturn = attemptCapture();
+    let result: T | undefined;
+
+    if (attemptReturn instanceof Promise) {
+      const attemptPromise = attemptReturn as Promise<T | undefined>;
+      // Attach a no-op rejection handler on the REAL attempt promise
+      // immediately, before racing it against anything below. If this
+      // attempt loses the race (the timer fires first), its eventual
+      // settlement - success, undefined, or a thrown error, arriving at
+      // any point after this function has already thrown and returned
+      // control to its caller - must never become an unhandled rejection
+      // just because nothing else is still listening for it by the time
+      // it finally happens.
+      attemptPromise.catch(() => {});
+
+      const remainingForThisAttempt = deadline - Date.now();
+      const TIMED_OUT = Symbol("retryBirthIdentityCapture: attempt exceeded its remaining budget");
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timedOut = new Promise<typeof TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => resolve(TIMED_OUT), Math.max(remainingForThisAttempt, 0));
+      });
+
+      const raced = await Promise.race([attemptPromise, timedOut]);
+      clearTimeout(timer);
+
+      if (raced === TIMED_OUT) {
+        // The timer won: treat this exactly like the deadline having
+        // passed. Do NOT wait for the losing attempt to ever resolve -
+        // its `.catch` above already guarantees it can settle safely
+        // without us.
+        lastAttemptTimedOut = true;
+        giveUp();
+      }
+      lastAttemptTimedOut = false;
+      result = raced as T | undefined;
+    } else {
+      // Already a plain value - a synchronous call has nothing to race,
+      // and forcing it through Promise.race would be harmless but is
+      // unneeded indirection for the shape this retry serves fastest.
+      result = attemptReturn;
+    }
+
+    if (result !== undefined) return result;
+
+    const remainingAfterAttempt = deadline - Date.now();
+    if (remainingAfterAttempt <= 0) {
+      giveUp();
+    }
+    await new Promise((resolve) =>
+      setTimeout(resolve, Math.min(pollIntervalMs, remainingAfterAttempt))
+    );
   }
 }

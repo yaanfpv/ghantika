@@ -867,6 +867,147 @@ test("retryBirthIdentityCapture: an ASYNC-shaped capture that ALWAYS resolves un
   assert.ok(calls > 1, `expected more than one attempt before giving up - got ${calls}`);
 });
 
+// --- retryBirthIdentityCapture: per-attempt deadline enforcement (the
+// race, not just a post-await check). The four tests above prove the
+// retry LOOP's own logic (does it retry, does it eventually give up); the
+// four below prove the DEADLINE is enforced around each individual
+// attempt rather than only checked once an attempt has already settled
+// on its own schedule - a slow or hung attempt must never be able to run
+// past its own configured bound. ---
+
+test("retryBirthIdentityCapture: an async capture that eventually resolves to a REAL value, but only after its own configured bound has already elapsed, must NOT have that late success accepted - a value arriving after its own deadline is exactly what this retry exists to reject, not a free pass for eventually succeeding", async () => {
+  const boundMs = 30;
+  const lateResolveDelayMs = 200;
+  const fakeIdentity = { capturedAtMs: Date.now(), elapsedSecondsAtCapture: 0 };
+  const before = Date.now();
+  await assert.rejects(
+    () =>
+      retryBirthIdentityCapture(
+        async () => {
+          await new Promise((resolve) => setTimeout(resolve, lateResolveDelayMs));
+          return fakeIdentity;
+        },
+        "captureBirthIdentityPosixAsync (fake, async, late-success)",
+        boundMs
+      ),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(
+        error.message,
+        /captureBirthIdentityPosixAsync \(fake, async, late-success\)/,
+        "the thrown diagnostic must still name the capture function even when the reason is a per-attempt race timeout, not merely an undefined answer"
+      );
+      return true;
+    }
+  );
+  const elapsedMs = Date.now() - before;
+  assert.ok(
+    elapsedMs < lateResolveDelayMs,
+    `expected the retry to give up around its own ${boundMs}ms bound rather than wait out the attempt's full ${lateResolveDelayMs}ms settlement time before deciding - got ${elapsedMs}ms, which would mean the late success was allowed to race to completion instead of being cut off`
+  );
+});
+
+test("retryBirthIdentityCapture: an async capture that resolves to undefined, but only after its own configured bound has already elapsed, makes the retry throw PROMPTLY at that bound - it must never wait out the slow attempt's own settlement time before giving up", async () => {
+  const boundMs = 30;
+  const lateUndefinedDelayMs = 200;
+  const before = Date.now();
+  await assert.rejects(
+    () =>
+      retryBirthIdentityCapture(
+        async () => {
+          await new Promise((resolve) => setTimeout(resolve, lateUndefinedDelayMs));
+          return undefined;
+        },
+        "captureBirthIdentityPosixAsync (fake, async, slow-undefined)",
+        boundMs
+      ),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /captureBirthIdentityPosixAsync \(fake, async, slow-undefined\)/);
+      return true;
+    }
+  );
+  const elapsedMs = Date.now() - before;
+  assert.ok(
+    elapsedMs < lateUndefinedDelayMs,
+    `expected the retry to give up around its own ${boundMs}ms bound instead of waiting for this attempt's own ${lateUndefinedDelayMs}ms settlement - got ${elapsedMs}ms`
+  );
+  assert.ok(
+    elapsedMs < boundMs + 250,
+    `expected the bound to actually be enforced close to its configured value, not merely eventually - got ${elapsedMs}ms for a ${boundMs}ms bound`
+  );
+});
+
+test("retryBirthIdentityCapture: an async capture whose promise NEVER settles at all (never resolves, never rejects) still fails at, or very near, the configured bound rather than hanging forever - the exact hang this fix exists to close, since the original `await attemptCapture()` at the top of the loop would never return and the deadline check below it would never run", async () => {
+  const boundMs = 30;
+  let calls = 0;
+  const before = Date.now();
+  await assert.rejects(
+    () =>
+      retryBirthIdentityCapture(
+        () => {
+          calls += 1;
+          return new Promise<undefined>(() => {
+            // Deliberately never resolves or rejects - models a
+            // genuinely hung observer, not merely a slow one.
+          });
+        },
+        "captureBirthIdentityPosixAsync (fake, async, never-settles)",
+        boundMs
+      ),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /captureBirthIdentityPosixAsync \(fake, async, never-settles\)/);
+      return true;
+    }
+  );
+  const elapsedMs = Date.now() - before;
+  assert.ok(
+    elapsedMs < boundMs + 250,
+    `expected the retry to give up close to its own ${boundMs}ms bound rather than hang indefinitely on an attempt that will never settle - got ${elapsedMs}ms`
+  );
+  assert.ok(calls >= 1, "expected at least one real attempt to have been made before giving up");
+});
+
+test("retryBirthIdentityCapture: a losing attempt that times out and THEN, some time after the retry has already thrown its own failure, rejects with a real error - that later rejection must never surface as a process-level unhandledRejection", async () => {
+  const boundMs = 30;
+  const lateRejectDelayMs = 150;
+  let unhandled: unknown;
+  const onUnhandledRejection = (reason: unknown): void => {
+    unhandled = reason;
+  };
+  // Same pattern this project already uses for the identical concern in
+  // test/integration.test.ts (search that file for "unhandledRejection"):
+  // listen for the real process-level event directly around the
+  // scenario, rather than trusting "the test didn't crash" as proof.
+  process.on("unhandledRejection", onUnhandledRejection);
+  try {
+    await assert.rejects(() =>
+      retryBirthIdentityCapture(
+        () =>
+          new Promise<undefined>((_resolve, reject) => {
+            setTimeout(
+              () => reject(new Error("late rejection from a losing, already-abandoned attempt")),
+              lateRejectDelayMs
+            );
+          }),
+        "captureBirthIdentityPosixAsync (fake, async, loses-then-rejects)",
+        boundMs
+      )
+    );
+    // Give the event loop a real, bounded grace window past when the
+    // losing attempt's own rejection actually fires.
+    await new Promise((resolve) => setTimeout(resolve, lateRejectDelayMs + 200));
+  } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
+  }
+  assert.equal(
+    unhandled,
+    undefined,
+    `expected no unhandled rejection to surface once the losing attempt's promise eventually rejects, got: ${String(unhandled)}`
+  );
+});
+
 // --- parseEtime (pure, no real process needed) ---
 
 test("parseEtime parses mm:ss", () => {
