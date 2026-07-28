@@ -23,6 +23,7 @@ import {
   loadCriticalTests,
   loadSkipBaseline,
 } from "../scripts/run-tests.mjs";
+import { pgrepGroupMembers } from "./harness.ts";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SCRIPT_PATH = path.join(REPO_ROOT, "scripts", "run-tests.mjs");
@@ -698,6 +699,8 @@ interface FixtureResult {
   status: number;
   stdout: string;
   stderr: string;
+  /** The harness's own pid, which is also its process-group id (`detached: true` below makes it its own group leader) - exposed so a caller can independently confirm zero real survivors via `pgrepGroupMembers`. */
+  pgid: number;
 }
 
 /**
@@ -709,6 +712,23 @@ interface FixtureResult {
  * streams every time, which several assertions below depend on even when
  * the expected exit is 0. Shared by every helper below that spawns a real
  * child process against this exact same interface.
+ *
+ * `detached: true` makes the spawned harness process its own process-group
+ * leader (pgid == its own pid) instead of inheriting this test file's own
+ * group - the same reason this repository's own kill.ts owns a job's group
+ * rather than signaling a bare pid. `run()` from node:test spawns each
+ * discovered file as its own child process internally; when a test inside
+ * one of those per-file children never resolves (a hung `await new
+ * Promise(() => {})`), `--test-timeout` marks that individual TEST failed
+ * but does not by itself guarantee the underlying OS process exits - its
+ * event loop can still be pinned open by the very promise that never
+ * settles. spawnSync only waits for the DIRECT child (the harness); a
+ * grandchild left running that way survives the harness's own exit and
+ * reparents to init. Isolating the group here means a single group-level
+ * kill below - explicitly, never left to whatever the harness or node:test
+ * would otherwise do - reaches every process the harness's own run started,
+ * regardless of which one is still holding its event loop open, and never
+ * touches this test file's own process group in the process.
  */
 function collectChildResult(
   scriptPath: string,
@@ -717,15 +737,71 @@ function collectChildResult(
 ): FixtureResult {
   const result = spawnSync(process.execPath, [scriptPath, ...args], {
     env,
+    detached: true,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.error) throw result.error;
+  const pgid = result.pid;
+  if (typeof pgid !== "number") {
+    throw new Error("collectChildResult: spawnSync returned no pid for a detached child");
+  }
+  reapFixtureProcessGroup(pgid);
   return {
     status: typeof result.status === "number" ? result.status : 1,
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
+    pgid,
   };
+}
+
+/**
+ * Force-kills every process still alive in the fixture harness's own
+ * process group (`pgid` here is exactly the group id `detached: true`
+ * above establishes) and blocks synchronously - via a real external
+ * `pgrep -g` check, never this file's own bookkeeping - until none
+ * remain or a bounded 2s ceiling is reached. SIGKILL is sent
+ * unconditionally: spawnSync above has already returned, so the
+ * harness's own useful work is already done and there is no reason to
+ * wait out a grace period first. Signaling the NEGATIVE pid targets the
+ * whole process group, never just its leader - the same real
+ * distinction this repository's own kill.ts relies on for the product
+ * path this test file never touches. `ESRCH` means the group was
+ * already empty by the time the signal was sent, a normal, accepted
+ * outcome, not a failure - a group that never left a survivor to begin
+ * with is not a bug. A survivor still present after the full 2s throws
+ * loudly, naming the exact pids left, rather than letting a leak pass
+ * silently the way the fixture that motivated this helper once did.
+ *
+ * A no-op on win32: `process.kill` with a negative pid and `pgrep -g`
+ * are both POSIX-only primitives with no Windows equivalent used here.
+ * This is a disclosed test-harness gap, not a claim that the underlying
+ * leak this guards against cannot happen on Windows - it means this
+ * repository's suite does not yet verify it there, matching this same
+ * PR's own production kill.ts, which already discloses no process-group
+ * confirmation on Windows today. Every one of `collectChildResult`'s
+ * callers keeps working on win32 exactly as it did before this reap
+ * existed; only the extra protection is unavailable there.
+ */
+function reapFixtureProcessGroup(pgid: number): void {
+  if (process.platform === "win32") return;
+  try {
+    process.kill(-pgid, "SIGKILL");
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code !== "ESRCH") throw error;
+  }
+  const deadlineMs = Date.now() + 2000;
+  let survivors = pgrepGroupMembers(pgid);
+  while (survivors.length > 0 && Date.now() < deadlineMs) {
+    execFileSync("sleep", ["0.05"]);
+    survivors = pgrepGroupMembers(pgid);
+  }
+  if (survivors.length > 0) {
+    throw new Error(
+      `reapFixtureProcessGroup: pgid ${pgid} still has real survivors 2s after SIGKILL: ${JSON.stringify(survivors)}`
+    );
+  }
 }
 
 /**
@@ -752,11 +828,14 @@ function runSupervisorAgainstFixture({
   buildTestFiles,
   buildBaseline,
   buildCriticalTests,
+  extraArgs = [],
 }: {
   testFiles?: Record<string, string>;
   buildTestFiles?: (dir: string) => Record<string, string>;
   buildBaseline: (dir: string) => Record<string, string[]>;
   buildCriticalTests: (dir: string) => string[];
+  /** Timing-flag overrides (e.g. `--test-timeout=500`) appended after the harness's three positional arguments - see run-tests-fixture-harness.mjs's own usage comment. */
+  extraArgs?: string[];
 }): FixtureResult {
   // Realpath'd for the same reason scripts/lib/is-main.mjs realpaths
   // process.argv[1]: on macOS, /tmp and /var are themselves symlinks
@@ -800,7 +879,7 @@ function runSupervisorAgainstFixture({
     // so this deletion is exactly as necessary here as it always was.
     delete env.NODE_TEST_CONTEXT;
 
-    return collectChildResult(HARNESS_PATH, [dir, baselinePath, criticalPath], env);
+    return collectChildResult(HARNESS_PATH, [dir, baselinePath, criticalPath, ...extraArgs], env);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -865,6 +944,114 @@ test("the real supervisor exits zero when only legitimate per-platform skips are
   });
 
   assert.equal(result.status, 0, `expected exit 0, got ${result.status}. stderr: ${result.stderr}`);
+});
+
+// ---------------------------------------------------------------------------
+// Negative control for the `--test-timeout` ceiling itself (production
+// value: run-tests.mjs's own testTimeoutMs default and ci.yml's explicit
+// flag, kept in lockstep). Raising that ceiling to give real workloads
+// enough room is only safe if a genuinely hung test still fails fast at
+// WHATEVER value is configured - this proves the mechanism itself, at a
+// short timeout chosen for this test's own speed, never at the
+// production value (which would make this test itself slow and would
+// prove nothing a short timeout doesn't already prove just as well).
+// ---------------------------------------------------------------------------
+
+/**
+ * The hung fixture shared by both the cross-platform timeout test below
+ * and its POSIX-only survivor-check companion. A bare
+ * `await new Promise(() => {})` with nothing else scheduled lets
+ * node:test take a DIFFERENT, faster exit on some Node versions -
+ * confirmed empirically, not assumed: Node 22 on CI cancels this shape
+ * in a few milliseconds via its own "Promise resolution is still
+ * pending but the event loop has already resolved" diagnostic, never
+ * reaching the configured `--test-timeout` at all, while a version
+ * tested locally instead waits out the real bound. The bounded
+ * `setTimeout` below keeps the event loop genuinely busy across that
+ * window - the same shape a real hung test in this codebase's own suite
+ * has (a spawned process, a pending signal) - so neither Node version
+ * can take that early exit and the assertions built on this fixture
+ * actually prove the configured bound, not whichever mechanism happens
+ * to fire first. Bounded (not setInterval) so nothing about this
+ * fixture's OWN timer lingers past its own 2s expiry - comfortably
+ * longer than the 500ms both tests below configure, comfortably shorter
+ * than run-tests.mjs's own 60s idle watchdog. This bound does not, by
+ * itself, guarantee the underlying OS process exits: node:test's own
+ * `--test-timeout` marks THIS TEST failed without necessarily
+ * terminating the process it runs in, if something else (the
+ * never-resolving promise below) still holds the event loop open -
+ * `collectChildResult`'s own process-group reap is what actually closes
+ * that gap on POSIX, not this timer.
+ */
+function buildHungTestFixtureFiles(): Record<string, string> {
+  return {
+    "hang.test.mjs": [
+      'import { test } from "node:test";',
+      'test("a deliberately hung test that never resolves", async () => {',
+      "  setTimeout(() => {}, 2000);",
+      "  await new Promise(() => {});",
+      "});",
+      "",
+    ].join("\n"),
+  };
+}
+
+test("the real supervisor still fails a genuinely hung test fast, at whatever --test-timeout value is configured - proving the mechanism a raised production ceiling depends on", () => {
+  const result = runSupervisorAgainstFixture({
+    testFiles: buildHungTestFixtureFiles(),
+    buildBaseline: () => ({}),
+    buildCriticalTests: () => [],
+    extraArgs: ["--test-timeout=500"],
+  });
+
+  assert.notEqual(
+    result.status,
+    0,
+    `expected the hung test to fail the run, got exit ${result.status}. stdout: ${result.stdout}`
+  );
+  assert.ok(
+    result.stdout.includes("test timed out after 500ms"),
+    `expected node:test's own timeout message naming the configured 500ms value, got: ${result.stdout}`
+  );
+
+  // The exit code and stdout above only prove the SUPERVISOR reported the
+  // timeout - they say nothing about whether the hung test's own real OS
+  // process is actually gone. On POSIX, collectChildResult (via
+  // reapFixtureProcessGroup) already force-killed and confirmed the whole
+  // group empty before returning; this is a second, independent
+  // confirmation of exactly the property that once went unchecked - a real
+  // orphan surviving this exact fixture, reparented to init, running for
+  // over 20 hours before it was found. On win32, reapFixtureProcessGroup
+  // is a no-op (see below), so neither this nor the earlier reap makes
+  // any claim there.
+  //
+  // Deliberately a plain runtime conditional rather than a node:test
+  // `{skip}` option: this file's own "seed denominator" test above scans
+  // every other test/*.test.ts file for win32-conditional skips and
+  // excludes THIS file from that scan (its own source text contains the
+  // scanner's regex as a string, plus fixture-building code with literal
+  // `skip:`/`process.platform === "win32"` substrings that would
+  // false-positive the scanner if it read itself). A `{skip}` here could
+  // never be matched by that derived side, so any matching baseline entry
+  // would be a permanent, unfixable parity mismatch. A plain conditional
+  // sidesteps that architecture entirely - node:test always reports this
+  // test as fully passed, nothing is "skipped", so there is nothing for
+  // the seed-denominator scan to derive or disagree with - while still
+  // unconditionally enforcing the real POSIX postcondition on every
+  // platform this suite's CI actually runs today (macOS/Linux; Windows
+  // carries no CI presence for this repo, per CHANGELOG history). No
+  // Windows-equivalent path exists here yet, matching every other
+  // identity/process-group test in this codebase (see
+  // test/process.test.ts's own POSIX_PROCESS_GROUP_SKIP for the identical
+  // rationale) and this repository's own production kill.ts, which
+  // discloses no process-group confirmation on Windows either.
+  if (process.platform !== "win32") {
+    assert.deepEqual(
+      pgrepGroupMembers(result.pgid),
+      [],
+      `expected zero real survivors in pgid ${result.pgid} after the hung fixture's supervisor exited`
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------
