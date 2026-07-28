@@ -637,7 +637,7 @@ type ExecFileCallbackError = Error & { readonly code?: string | number | null };
  * issue; it is not slack for a resistant child, which the external bound
  * catches regardless.
  */
-const ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS = 250;
+export const ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS = 250;
 
 /**
  * The ASYNC counterpart of `readProcessElapsedSeconds` above - the same
@@ -807,27 +807,118 @@ export function captureBirthIdentityPosix(pid: number): ProcessBirthIdentity | u
 export const ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS = 3000;
 
 /**
+ * How long a `not-found` observation is given to resolve into `found`
+ * before `captureBirthIdentityPosixAsync` schedules no further retry.
+ * Absorbs the fork-visibility race where a just-forked child is not yet
+ * visible to `ps` at the exact instant a capture call runs immediately
+ * after `spawnManaged()` returns. This is a RETRY-SCHEDULING budget, not a
+ * total capture window: the first observation always runs regardless of
+ * this value (even zero), and the deadline it produces starts only once
+ * that first observation actually returns `not-found` - never at function
+ * entry, never reset by a later `not-found`. `observer-failure` is never
+ * retried: that status has already consumed its own
+ * `ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS` budget, so retrying it would
+ * silently widen the real timeout under a different name.
+ */
+export const BIRTH_IDENTITY_NOT_FOUND_RETRY_BOUND_MS = 1000;
+
+/**
+ * How long `captureBirthIdentityPosixAsync` waits before each `not-found`
+ * retry attempt - a real, honored delay, not merely a ceiling: no retry
+ * ever starts before this wait (or the remaining retry/aggregate budget,
+ * whichever is shorter) has actually elapsed.
+ */
+export const BIRTH_IDENTITY_NOT_FOUND_RETRY_POLL_INTERVAL_MS = 20;
+
+/**
+ * The clock/sleeper `captureBirthIdentityPosixAsync` schedules its retries
+ * against. Defaults to the real wall clock; tests inject a fake one so the
+ * retry-budget and aggregate-cap bookkeeping can be driven deterministically
+ * without waiting on real time or on a real slow `ps`.
+ */
+export interface CaptureRetryClock {
+  now(): number;
+  sleep(ms: number): Promise<void>;
+}
+
+const REAL_CAPTURE_RETRY_CLOCK: CaptureRetryClock = {
+  now: () => Date.now(),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
+/**
  * The ASYNC counterpart of `captureBirthIdentityPosix` above - the one
  * `run()`'s real production handler actually calls (see
- * `src/tools/run.ts`'s handler): the identical real observation and the
- * identical nullable-by-design contract, but built on
- * `readProcessElapsedSecondsAsync` (a bounded, non-blocking `execFile`
- * rather than a blocking `execFileSync`) so a slow or hung `ps` can never
- * hold up `run()`'s own response. `run()` fires this off WITHOUT ever
- * awaiting it - see `src/jobStore.ts`'s `attachPendingIdentityCapture`,
- * which is what tracks the returned promise and updates the job's
- * bookkeeping once it actually settles, strictly after `run()` has already
- * returned. POSIX only, matching the synchronous version (see its own docs
- * for why).
+ * `src/tools/run.ts`'s handler): the identical real observation and
+ * nullable-by-design contract, but built on `readProcessElapsedSecondsAsync`
+ * (a bounded, non-blocking `execFile`) so a slow or hung `ps` can never
+ * hold up `run()`'s own response. `run()` fires this off without ever
+ * awaiting it - see `src/jobStore.ts`'s `attachPendingIdentityCapture`.
+ * POSIX only, matching the synchronous version.
+ *
+ * Two independent bounds, never collapsed into one:
+ *
+ * - The AGGREGATE cap, `timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS`
+ *   from function entry, moved by nothing below it. This is the pre-existing
+ *   published bound `kill()`/the shutdown reaper already document
+ *   (`src/jobStore.ts`'s `resolveBirthIdentityForKill`, `src/tools/kill.ts`'s
+ *   own docs): the whole capture - first observation plus every retry -
+ *   settles by this deadline, full stop. Each attempt's own effective
+ *   observer timeout is capped to whatever remains of this budget (minus
+ *   `ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS`, since
+ *   `readProcessElapsedSecondsAsync` adds that grace on top of whatever
+ *   timeout it is given), so a retry can never itself run past this
+ *   deadline - `readProcessElapsedSecondsAsync`'s own force-SIGKILL is what
+ *   actually reaps a still-running observer at that point, surfacing as an
+ *   ordinary `observer-failure`. This is what keeps the retry addition from
+ *   silently widening a latency bound other code already relies on.
+ * - The RETRY budget, `BIRTH_IDENTITY_NOT_FOUND_RETRY_BOUND_MS` starting
+ *   from the first `not-found`, governs only whether ANOTHER retry is
+ *   allowed to START. It never gates whether an already-started attempt's
+ *   `found` result is accepted - a retry that began while budget remained
+ *   may resolve `found` after that budget has technically expired, and it
+ *   is honored, because a valid, already-obtained observation is worth more
+ *   than the schedule that produced it (the aggregate cap above is what
+ *   still bounds how late "late" can be).
  */
 export async function captureBirthIdentityPosixAsync(
   pid: number,
-  timeoutMs: number = ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS
+  timeoutMs: number = ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS,
+  notFoundRetryBoundMs: number = BIRTH_IDENTITY_NOT_FOUND_RETRY_BOUND_MS,
+  notFoundRetryPollIntervalMs: number = BIRTH_IDENTITY_NOT_FOUND_RETRY_POLL_INTERVAL_MS,
+  clock: CaptureRetryClock = REAL_CAPTURE_RETRY_CLOCK
 ): Promise<ProcessBirthIdentity | undefined> {
   if (process.platform === "win32") return undefined;
-  const observed = await readProcessElapsedSecondsAsync(pid, timeoutMs);
-  if (observed.status !== "found") return undefined;
-  return { capturedAtMs: Date.now(), elapsedSecondsAtCapture: observed.elapsedSeconds };
+  const aggregateDeadline = clock.now() + timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS;
+  let retryDeadline: number | undefined;
+
+  for (;;) {
+    const remainingAggregate = aggregateDeadline - clock.now();
+    if (remainingAggregate <= ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS) return undefined;
+    if (retryDeadline !== undefined && clock.now() >= retryDeadline) return undefined;
+
+    const effectiveTimeoutMs = Math.min(
+      timeoutMs,
+      remainingAggregate - ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS
+    );
+    const observed = await readProcessElapsedSecondsAsync(pid, effectiveTimeoutMs);
+
+    if (observed.status === "found") {
+      return { capturedAtMs: Date.now(), elapsedSecondsAtCapture: observed.elapsedSeconds };
+    }
+    if (observed.status !== "not-found") return undefined;
+
+    if (retryDeadline === undefined) retryDeadline = clock.now() + notFoundRetryBoundMs;
+    const remainingRetry = retryDeadline - clock.now();
+    if (remainingRetry <= 0) return undefined;
+
+    const remainingAggregateForSleep = aggregateDeadline - clock.now();
+    if (remainingAggregateForSleep <= 0) return undefined;
+
+    await clock.sleep(
+      Math.min(notFoundRetryPollIntervalMs, remainingRetry, remainingAggregateForSleep)
+    );
+  }
 }
 
 /**

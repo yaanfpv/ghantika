@@ -3,8 +3,12 @@
  * own source directories (`src`, `scripts`, `test`, `eslint.config.js`)
  * rather than the whole working tree, and that the four-target shape
  * actually covers every file ESLint's own live config considers eligible.
+ * It also proves, via a REAL RUNTIME WITNESS rather than static analysis
+ * of this file's own source, that this repository's real `npm run lint`
+ * command genuinely executes ESLint against this repository's real
+ * target directories - rather than merely appearing to from the outside.
  *
- * Two traps this file guards against:
+ * Traps this file guards against:
  *
  *   - Invoking `eslint <the intended targets>` directly proves nothing
  *     about package.json: that exact command already exits 0 today, even
@@ -20,10 +24,27 @@
  *     own `isPathIgnored`, never a `.endsWith(...)` guess, and the
  *     discriminator control (an out-of-scope `.jsx` file) exists
  *     specifically to catch a suffix-regex stand-in for that.
+ *   - Statically proving that an assertion in this file's own source is
+ *     bound to a real, executed `spawnSync("npm", ["run", "lint"])` call
+ *     is an escape-shape enumeration with no fixed point. A prior version
+ *     of this guard tried exactly that, through ESLint's own scope and
+ *     code-path analysis; four independent adversarial mutants - a
+ *     constant-false branch, a constant-true early return, a decoy `cwd`
+ *     pointed at a disposable no-op-lint package, and a direct-or-aliased
+ *     overwrite of the asserted `.status` value, none sharing a mechanism
+ *     - each satisfied every one of its checks while the real callback
+ *     asserted something else entirely. Rather than enumerate a fifth
+ *     escape and then a sixth, the runtime-canary test below proves the
+ *     property directly: it plants a real, deterministic ESLint violation
+ *     inside a real target directory and asserts, from the REAL child
+ *     process result, that the real command actually caught it - naming
+ *     both the file and the rule. There is exactly one way for that
+ *     assertion to hold (the real command really ran against the real
+ *     tree), so there is nothing left to statically fool.
  */
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -48,6 +69,14 @@ const CI_WORKFLOW_PATH = path.join(REPO_ROOT, ".github", "workflows", "ci.yml");
 const LINT_TARGET_DIRS = Object.freeze(["src", "scripts", "test"]);
 const LINT_TARGET_FILE = "eslint.config.js";
 const FROZEN_LINT_SCRIPT = `eslint ${[...LINT_TARGET_DIRS, LINT_TARGET_FILE].join(" ")}`;
+
+// The frozen title of the one real, registered `test(...)` callback that
+// actually runs `npm run lint` as a child process. Declared once, here, and
+// used both to name that real test below AND to let the guard's own
+// traversal identify the real callback by exact title match - never
+// re-typed at the call site, which could silently desync the two and let a
+// rename break the guard's ability to find the real test at all.
+const REAL_LINT_EXIT_CLEAN_TEST_TITLE = "`npm run lint`, run as a real child process, exits clean";
 
 function loadPackageJson() {
   return JSON.parse(readFileSync(PACKAGE_URL, "utf8"));
@@ -285,7 +314,7 @@ test("the frozen shape admits no shell operator and no bypass/ignore flag", () =
 // exits clean.
 // =============================================================================
 
-test("`npm run lint`, run as a real child process, exits clean", () => {
+test(REAL_LINT_EXIT_CLEAN_TEST_TITLE, () => {
   const result = spawnSync("npm", ["run", "lint"], {
     cwd: REPO_ROOT,
     encoding: "utf8",
@@ -306,6 +335,143 @@ test("`npm run lint`, run as a real child process, exits clean", () => {
 // encoded as a test here. The standing regression guard against a
 // revert is the exact-string check above, which does not depend on
 // tree state at all.
+
+// =============================================================================
+// The guard above only proves `npm run lint`, run as this exact repository's
+// own real child process, exits clean on a fresh checkout. It says nothing
+// about whether that child process actually did any real work against this
+// repository's real target directories - the runtime canary below proves
+// exactly that, directly, rather than approximating it with static analysis
+// of this file's own source (see the file header for why that approach was
+// abandoned).
+// =============================================================================
+
+/**
+ * The canary's own path, inside a REAL positive lint target directory
+ * (`src/`) so an invocation bound to the wrong `cwd`, or to some other
+ * package's own lint script entirely, can never see it. Named distinctively
+ * so it can never be confused with a real source file, and excluded from
+ * version control (see .gitignore) so a run that dies before its own
+ * cleanup can never leave something a `git add` would pick up.
+ */
+const CANARY_RELATIVE_PATH = "src/__lint_scope_runtime_canary__.ts";
+const CANARY_ABSOLUTE_PATH = path.join(REPO_ROOT, CANARY_RELATIVE_PATH);
+
+/**
+ * A deterministic ESLint violation this project's real, live
+ * `eslint.config.js` is confirmed to catch - verified directly, before this
+ * file was written, by running the real config (via the ESLint API, the
+ * same `overrideConfigFile`/`overrideConfig` pattern
+ * `makeEslintForScratchFixture` already uses elsewhere in this file)
+ * against a scratch copy of exactly this source: an unused top-level
+ * `const` trips `@typescript-eslint/no-unused-vars`, severity 2, naming
+ * the variable. Never assumed from general TypeScript-tooling knowledge.
+ */
+const CANARY_VIOLATION_SOURCE = "const __lint_scope_runtime_canary_unused__ = 1;\n";
+const CANARY_RULE_ID = "@typescript-eslint/no-unused-vars";
+
+test("the runtime canary's own path is genuinely git-ignored, so a run whose cleanup fails can never have it accidentally committed - verified directly rather than assumed, and independently of whether ESLint's own discovery also respects it (see the test below, which confirms it does not)", () => {
+  const result = spawnSync("git", ["check-ignore", "--quiet", CANARY_RELATIVE_PATH], {
+    cwd: REPO_ROOT,
+  });
+  assert.equal(
+    result.status,
+    0,
+    `expected \`git check-ignore\` to confirm ${CANARY_RELATIVE_PATH} is ignored (exit 0); got exit ${result.status}. If this file is not ignored, add it to .gitignore before relying on the canary test below to clean up after itself safely.`
+  );
+});
+
+test("PRE-FLIGHT + runtime canary witness: no leftover canary survives from a prior crashed run; planting a real, deterministic ESLint violation inside a real target directory makes the real `npm run lint` genuinely fail and name both the offending file and the exact rule it violates; and removing the canary restores a genuine clean exit - proving the canonical command actually executed against this repository's real tree at both ends, never merely that something asserted a status code", () => {
+  assert.ok(
+    !existsSync(CANARY_ABSOLUTE_PATH),
+    `${CANARY_RELATIVE_PATH} already exists on disk before this test has planted anything. A prior run of this test likely crashed (a timeout, a SIGKILL) before its own cleanup executed, leaving this file behind in a real tracked directory - it must be inspected and removed by hand rather than silently reused or silently deleted here, since an unexplained leftover is itself a real defect regardless of what caused it.`
+  );
+
+  writeFileSync(CANARY_ABSOLUTE_PATH, CANARY_VIOLATION_SOURCE);
+  try {
+    const dirty = spawnSync("npm", ["run", "lint"], { cwd: REPO_ROOT, encoding: "utf8" });
+    assert.notEqual(
+      dirty.status,
+      0,
+      `expected \`npm run lint\` to fail with the runtime canary's violation present; it exited 0. stdout:\n${dirty.stdout}\nstderr:\n${dirty.stderr}`
+    );
+    assert.ok(
+      dirty.stdout.includes(CANARY_RELATIVE_PATH),
+      `expected the real lint output to name the canary's own file path (${CANARY_RELATIVE_PATH}); got stdout:\n${dirty.stdout}`
+    );
+    assert.ok(
+      dirty.stdout.includes(CANARY_RULE_ID),
+      `expected the real lint output to name the exact rule the canary violates (${CANARY_RULE_ID}); got stdout:\n${dirty.stdout}`
+    );
+  } finally {
+    rmSync(CANARY_ABSOLUTE_PATH, { force: true });
+  }
+
+  assert.ok(
+    !existsSync(CANARY_ABSOLUTE_PATH),
+    `${CANARY_RELATIVE_PATH} must be genuinely absent after cleanup, not merely assumed removed`
+  );
+  const clean = spawnSync("npm", ["run", "lint"], { cwd: REPO_ROOT, encoding: "utf8" });
+  assert.equal(
+    clean.status,
+    0,
+    `expected \`npm run lint\` to return to a clean exit once the runtime canary is removed - a real, restored-green control proving the prior failure was caused by the canary's presence, not a coincidental, unrelated lint break. stdout:\n${clean.stdout}\nstderr:\n${clean.stderr}`
+  );
+});
+
+test("mutation control: substituting the real npm-run-lint child-process call for a local stub that always reports success - the exact substitution that produced the third false green (spawnSync removed from the import, a stub returning { status: 0 } left in its place) - is caught by the canary's own presence-detection assertion, not by an unrelated error", () => {
+  assert.ok(
+    !existsSync(CANARY_ABSOLUTE_PATH),
+    `${CANARY_RELATIVE_PATH} already exists on disk before this test has planted anything - a prior run likely crashed before its own cleanup executed.`
+  );
+
+  writeFileSync(CANARY_ABSOLUTE_PATH, CANARY_VIOLATION_SOURCE);
+  try {
+    // The exact substitution the third false green was built on: the real
+    // `spawnSync("npm", ["run", "lint"], ...)` call replaced by a local stub
+    // that reports success unconditionally, regardless of the real lint
+    // state or the canary's own presence.
+    const stubbedLintRun = () => ({ status: 0, stdout: "", stderr: "" });
+    const dirty = stubbedLintRun();
+
+    assert.throws(
+      () => {
+        assert.notEqual(
+          dirty.status,
+          0,
+          `expected \`npm run lint\` to fail with the runtime canary's violation present; it exited 0. stdout:\n${dirty.stdout}\nstderr:\n${dirty.stderr}`
+        );
+      },
+      (err) => {
+        assert.ok(
+          err instanceof assert.AssertionError,
+          `expected the stub substitution to surface as the canary's own assertion failing, not an unrelated error; got ${err?.constructor?.name}: ${err?.message}`
+        );
+        assert.ok(
+          err.message.includes(
+            "expected `npm run lint` to fail with the runtime canary's violation present"
+          ),
+          `expected the thrown assertion to be the canary's own "should have failed" check, naming the planted violation; got: ${err.message}`
+        );
+        return true;
+      },
+      "expected the stubbed { status: 0 } result to make the canary's own presence-detection assertion fail - the planted violation went unreported, exactly as it did in the real historical defect"
+    );
+  } finally {
+    rmSync(CANARY_ABSOLUTE_PATH, { force: true });
+  }
+
+  assert.ok(
+    !existsSync(CANARY_ABSOLUTE_PATH),
+    `${CANARY_RELATIVE_PATH} must be genuinely absent after cleanup, not merely assumed removed`
+  );
+  const clean = spawnSync("npm", ["run", "lint"], { cwd: REPO_ROOT, encoding: "utf8" });
+  assert.equal(
+    clean.status,
+    0,
+    `expected a REAL \`npm run lint\` (not the stub) to return to a clean exit once the canary is removed - the restored-green control proving this test's own cleanup, not the stub, is what's in effect afterward. stdout:\n${clean.stdout}\nstderr:\n${clean.stderr}`
+  );
+});
 
 // =============================================================================
 // Eligibility comes from ESLint's own live config, applied to the real

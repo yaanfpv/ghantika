@@ -560,3 +560,102 @@ test(
     }
   }
 );
+
+test(
+  "OWNER 8 - shutdown's real caller (resolveBirthIdentityForKill) settles a genuinely still-pending capture by the aggregate cap, never hanging past it",
+  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  async () => {
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const instance = createServer(serverTransport);
+    await instance.server.connect(instance.transport);
+
+    const client = new Client({
+      name: "ghantika-shutdown-aggregate-cap-test",
+      version: "0.0.0",
+    });
+    await client.connect(clientTransport);
+
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-shutdown-aggregate-cap-ps-"));
+    const invocationMarker = path.join(dir, "invocations.txt");
+    const psPath = path.join(dir, "ps");
+    // First invocation: fast not-found. Second invocation (the retry): a
+    // real, SIGTERM-resistant ps that sleeps far longer than the real
+    // aggregate cap `run()`'s own default-configured capture is given -
+    // proving shutdown's own real caller (resolveBirthIdentityForKill) does
+    // not hang past that cap, even though shutdown may have MANY jobs to
+    // reap.
+    fs.writeFileSync(
+      psPath,
+      `#!/bin/sh\ntrap '' TERM\ncount=$(wc -l < '${invocationMarker}' 2>/dev/null || echo 0)\necho x >> '${invocationMarker}'\nif [ "$count" -eq 0 ]; then\n  exit 1\nfi\nsleep 10\necho '00:01'\n`
+    );
+    fs.chmodSync(psPath, 0o755);
+
+    let realPid: number | undefined;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+
+      // The real `run()` handler fires its own captureBirthIdentityPosixAsync
+      // call with the shipped defaults - our fake ps on PATH is what forces
+      // that real, unmodified production call toward its own aggregate cap.
+      const callResult = (await client.callTool({
+        name: "run",
+        arguments: { command: ["sleep", "30"], label: "shutdown-aggregate-cap-check" },
+      })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
+      assert.notEqual(
+        callResult.isError,
+        true,
+        `run() must succeed: ${JSON.stringify(callResult)}`
+      );
+      const jobId = callResult.structuredContent?.job_id as string;
+      assert.equal(typeof jobId, "string");
+
+      const handle = jobStore.getChildHandle(jobId);
+      assert.notEqual(handle, undefined, "expected a real attached child for this job");
+      realPid = handle!.pid;
+
+      await client.close();
+      const before = Date.now();
+      await instance.shutdown("test cleanup - aggregate cap");
+      const elapsedMs = Date.now() - before;
+
+      // At least 2: the capture's own not-found-then-retry pair. This real
+      // end-to-end path may add more (shutdown's own pre-signal identity
+      // re-check also shells out to ps against the same shadowed PATH), so
+      // this only asserts the retry itself genuinely started - it does not
+      // pin the exact incidental total the way the isolated jobStore-level
+      // owner does.
+      const invocationCount = fs
+        .readFileSync(invocationMarker, "utf8")
+        .split("\n")
+        .filter((line) => line.trim().length > 0).length;
+      assert.ok(
+        invocationCount >= 2,
+        `expected the retry to genuinely start (at least 2 attempts observed) before the aggregate cap force-reaps it - saw ${invocationCount} invocations`
+      );
+      assert.ok(
+        elapsedMs < 6000,
+        `expected shutdown's own reap (which awaits resolveBirthIdentityForKill) to settle well before the resistant observer's own 10s sleep - took ${elapsedMs}ms`
+      );
+      // The proof that "the job... reaped" (not just that shutdown
+      // returned): a real, external isProcessAlive check, never our own
+      // internal bookkeeping. A genuinely successful reap already killed
+      // this job as part of shutdown, so no explicit cleanup kill follows.
+      assert.equal(
+        isProcessAlive(realPid),
+        false,
+        "shutdown's own reap must have actually killed the job's real process, not merely settled the capture and moved on"
+      );
+      realPid = undefined;
+    } finally {
+      process.env.PATH = realPath;
+      if (realPid !== undefined) {
+        try {
+          process.kill(-realPid, "SIGKILL");
+        } catch {
+          // already gone - nothing to do
+        }
+      }
+    }
+  }
+);
