@@ -2410,12 +2410,12 @@ function isLegacyProofClaimException(sha: string, sentence: string): boolean {
 
 /**
  * The exact (sha, sentence) pair once held in LEGACY_PROOF_CLAIM_EXCEPTIONS,
- * before this story's fix removed it. It exists only so the empty-list
- * tests below have a real, non-arbitrary negative control: an empty
- * allowlist must refuse this pair specifically, since it is the input a
- * buggy "empty list matches everything" (or short-circuited-true)
- * implementation would be most likely to still wrongly accept. It names no
- * live commit and asserts nothing about the current range.
+ * now removed. It exists only so the empty-list tests below have a real,
+ * non-arbitrary negative control: an empty allowlist must refuse this pair
+ * specifically, since it is the input a buggy "empty list matches
+ * everything" (or short-circuited-true) implementation would be most
+ * likely to still wrongly accept. It names no live commit and asserts
+ * nothing about the current range.
  */
 const REMOVED_LEGACY_EXCEPTION_EXAMPLE = {
   sha: "583c9b695cc8e991c86eb149485524974f27c440",
