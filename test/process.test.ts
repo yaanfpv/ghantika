@@ -17,6 +17,8 @@ import {
   spawnManaged,
 } from "../dist/process.js";
 import {
+  ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS,
+  ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS,
   IDENTITY_TOLERANCE_SECONDS,
   GROUP_CONFIRMATION_TIMEOUT_MS,
   POSIX_KILL_GRACE_PERIOD_MS,
@@ -764,6 +766,493 @@ test(
   { skip: process.platform !== "win32" ? "Windows-only assertion" : false },
   async () => {
     assert.equal(await captureBirthIdentityPosixAsync(process.pid), undefined);
+  }
+);
+
+// --- captureBirthIdentityPosixAsync's own retry semantics, exercised
+// directly against the PRODUCTION function via a fake `ps` shadowed onto
+// PATH (the same seam the hung-observer test above uses) - never through
+// test/helpers/birthIdentityRetry.ts, which has different failure
+// semantics and proves nothing about this function's own retry bound. ---
+
+test(
+  "captureBirthIdentityPosixAsync: an initial not-found observation retries and succeeds once ps starts answering",
+  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  async () => {
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-notfound-then-found-ps-"));
+    const invocationMarker = path.join(dir, "invocations.txt");
+    const psPath = path.join(dir, "ps");
+    // First invocation reports not-found (exit 1, ps's own documented "no
+    // such pid" code); every invocation after that reports found with a
+    // real-shaped etime.
+    fs.writeFileSync(
+      psPath,
+      `#!/bin/sh\ncount=$(wc -l < '${invocationMarker}' 2>/dev/null || echo 0)\necho x >> '${invocationMarker}'\nif [ "$count" -eq 0 ]; then\n  exit 1\nfi\necho '00:01'\n`
+    );
+    fs.chmodSync(psPath, 0o755);
+
+    // A wider bound than the shipped default absorbs real shell fork/exec
+    // latency under host contention without flaking; the shipped default
+    // itself is exercised separately below.
+    let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      identity = await captureBirthIdentityPosixAsync(
+        process.pid,
+        ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS,
+        3000,
+        20
+      );
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    const invocationCount = fs
+      .readFileSync(invocationMarker, "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0).length;
+
+    assert.notEqual(
+      identity,
+      undefined,
+      "a not-found observation that later succeeds must retry through to a real captured identity, never give up on the first attempt"
+    );
+    assert.ok(
+      invocationCount >= 2,
+      `expected at least 2 real ps invocations (the initial not-found plus the retry that found it), saw ${invocationCount}`
+    );
+  }
+);
+
+test(
+  "captureBirthIdentityPosixAsync: the SHIPPED DEFAULT not-found retry bound - called with no bound arguments at all - still retries through to a real captured identity",
+  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  async () => {
+    // Takes NO bound argument at all, so the shipped
+    // BIRTH_IDENTITY_NOT_FOUND_RETRY_BOUND_MS default has to be generous
+    // enough for this not-found-then-found scenario to succeed.
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-default-bound-ps-"));
+    const invocationMarker = path.join(dir, "invocations.txt");
+    const psPath = path.join(dir, "ps");
+    fs.writeFileSync(
+      psPath,
+      `#!/bin/sh\ncount=$(wc -l < '${invocationMarker}' 2>/dev/null || echo 0)\necho x >> '${invocationMarker}'\nif [ "$count" -eq 0 ]; then\n  exit 1\nfi\necho '00:01'\n`
+    );
+    fs.chmodSync(psPath, 0o755);
+
+    let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      identity = await captureBirthIdentityPosixAsync(process.pid);
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    const invocationCount = fs
+      .readFileSync(invocationMarker, "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0).length;
+
+    assert.notEqual(
+      identity,
+      undefined,
+      "using the real shipped default bound, a not-found observation that later succeeds must still retry through to a real captured identity"
+    );
+    assert.ok(
+      invocationCount >= 2,
+      `expected at least 2 real ps invocations (the initial not-found plus the retry that found it), saw ${invocationCount}`
+    );
+  }
+);
+
+// --- The two-bound model: a RETRY budget (governs whether another retry
+// may START, never whether an already-started one's `found` is accepted)
+// and an AGGREGATE cap (the pre-existing, published total-settlement bound
+// kill()/the shutdown reaper already document, moved by nothing below it).
+// Owners 1/2/3 exercise the retry budget in isolation with a generous
+// aggregate budget; owners 5/6 exercise the aggregate cap. ---
+
+test(
+  "captureBirthIdentityPosixAsync: OWNER 1 - a zero retry budget still performs exactly the initial observation, never a retry",
+  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  async () => {
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-zero-budget-ps-"));
+    const invocationMarker = path.join(dir, "invocations.txt");
+    const psPath = path.join(dir, "ps");
+    fs.writeFileSync(psPath, `#!/bin/sh\necho x >> '${invocationMarker}'\nexit 1\n`);
+    fs.chmodSync(psPath, 0o755);
+
+    let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      identity = await captureBirthIdentityPosixAsync(
+        process.pid,
+        ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS,
+        0,
+        20
+      );
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    const invocationCount = fs
+      .readFileSync(invocationMarker, "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0).length;
+
+    assert.equal(
+      identity,
+      undefined,
+      "a zero retry budget with a persistent not-found must resolve to undefined"
+    );
+    assert.equal(
+      invocationCount,
+      1,
+      `a zero retry budget must still perform the initial observation exactly once, never a retry - saw ${invocationCount} invocations`
+    );
+  }
+);
+
+test(
+  "captureBirthIdentityPosixAsync: OWNER 2 - a retry started before its retry deadline may settle found after that deadline, and is accepted",
+  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  async () => {
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-late-found-ps-"));
+    const invocationMarker = path.join(dir, "invocations.txt");
+    const psPath = path.join(dir, "ps");
+    // First invocation: fast not-found (starts the retry deadline). Second
+    // invocation (the retry): starts well before that deadline expires,
+    // but only reports found after sleeping past it - a real observer call
+    // that resolves late, not a synthetic clock manipulation.
+    fs.writeFileSync(
+      psPath,
+      `#!/bin/sh\ncount=$(wc -l < '${invocationMarker}' 2>/dev/null || echo 0)\necho x >> '${invocationMarker}'\nif [ "$count" -eq 0 ]; then\n  exit 1\nfi\nsleep 0.5\necho '00:01'\n`
+    );
+    fs.chmodSync(psPath, 0o755);
+
+    const notFoundRetryBoundMs = 200;
+    let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      identity = await captureBirthIdentityPosixAsync(
+        process.pid,
+        ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS,
+        notFoundRetryBoundMs,
+        20
+      );
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    assert.notEqual(
+      identity,
+      undefined,
+      "a retry that started while retry budget remained must have its late-but-valid found result accepted, not discarded for settling after the retry deadline - the aggregate cap, not the retry budget, is what still bounds how late is acceptable"
+    );
+  }
+);
+
+test(
+  "captureBirthIdentityPosixAsync: OWNER 3 - a retry whose earliest permitted start is at or after the retry deadline never starts",
+  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  async () => {
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-retry-never-starts-ps-"));
+    const invocationMarker = path.join(dir, "invocations.txt");
+    const psPath = path.join(dir, "ps");
+    fs.writeFileSync(psPath, `#!/bin/sh\necho x >> '${invocationMarker}'\nexit 1\n`);
+    fs.chmodSync(psPath, 0o755);
+
+    // A fully synthetic clock (no real Date.now() component, so no wall-clock
+    // jitter) whose sleep() advances `now()` to land EXACTLY on the retry
+    // deadline (200ms) after the first sleep - the precise ">= retryDeadline"
+    // boundary this owner targets, not merely somewhere past it. Landing
+    // exactly on the boundary is deliberate: an overshoot would trip the
+    // check regardless of whether it uses ">=" or ">", masking an off-by-one
+    // weakening of the comparison. Staying at 200 (not near the 3250ms
+    // aggregate cap) also keeps the unrelated aggregate check from firing
+    // first and masking this owner's own check.
+    const retryBoundMs = 200;
+    let jumped = false;
+    const clock = {
+      now: () => (jumped ? retryBoundMs : 0),
+      sleep: async (ms: number) => {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(ms, 5)));
+        jumped = true;
+      },
+    };
+
+    let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      identity = await captureBirthIdentityPosixAsync(
+        process.pid,
+        ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS,
+        retryBoundMs,
+        20,
+        clock
+      );
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    const invocationCount = fs
+      .readFileSync(invocationMarker, "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0).length;
+
+    assert.equal(
+      identity,
+      undefined,
+      "a retry deadline already past at the earliest permitted start must resolve to undefined"
+    );
+    assert.equal(
+      invocationCount,
+      1,
+      `a retry whose start is at/after the retry deadline must never actually start - expected exactly 1 (the initial) invocation, saw ${invocationCount}`
+    );
+  }
+);
+
+test(
+  "captureBirthIdentityPosixAsync: an observer-failure makes exactly ONE attempt and is never retried",
+  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  async () => {
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-observer-failure-ps-"));
+    const invocationMarker = path.join(dir, "invocations.txt");
+    const psPath = path.join(dir, "ps");
+    // Exit code 2 (never ps's documented not-found code 1) is a genuine
+    // observer failure on every single invocation.
+    fs.writeFileSync(psPath, `#!/bin/sh\necho x >> '${invocationMarker}'\nexit 2\n`);
+    fs.chmodSync(psPath, 0o755);
+
+    let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      identity = await captureBirthIdentityPosixAsync(process.pid);
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    const invocationCount = fs
+      .readFileSync(invocationMarker, "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0).length;
+
+    assert.equal(identity, undefined, "a genuine observer failure must resolve to undefined");
+    assert.equal(
+      invocationCount,
+      1,
+      `an observer-failure must never be retried. Expected exactly 1 invocation, saw ${invocationCount}`
+    );
+  }
+);
+
+test(
+  "captureBirthIdentityPosixAsync: repeated not-found outcomes stop at the bounded deadline, never retrying forever",
+  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  async () => {
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-always-notfound-ps-"));
+    const invocationMarker = path.join(dir, "invocations.txt");
+    const psPath = path.join(dir, "ps");
+    // Always reports not-found (exit 1) - never once succeeds. A bound
+    // wider than the shipped default absorbs real host contention without
+    // flaking.
+    fs.writeFileSync(psPath, `#!/bin/sh\necho x >> '${invocationMarker}'\nexit 1\n`);
+    fs.chmodSync(psPath, 0o755);
+
+    const boundMs = 3000;
+    const pollIntervalMs = 20;
+    let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
+    let elapsedMs: number;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      const before = Date.now();
+      identity = await captureBirthIdentityPosixAsync(
+        process.pid,
+        ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS,
+        boundMs,
+        pollIntervalMs
+      );
+      elapsedMs = Date.now() - before;
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    const invocationCount = fs
+      .readFileSync(invocationMarker, "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0).length;
+
+    assert.equal(
+      identity,
+      undefined,
+      "a capture that never once observes 'found' before the bound elapses must resolve to undefined, never hang or fabricate a value"
+    );
+    assert.ok(
+      invocationCount >= 2,
+      `expected multiple real retry attempts within the bound (not a single try), saw ${invocationCount}`
+    );
+    // At most one more real ps invocation can run past the deadline check
+    // (see captureBirthIdentityPosixAsync's own doc comment), so the
+    // surplus above boundMs is bounded by one invocation's own latency,
+    // not an open-ended margin.
+    const perInvocationHostSlownessMarginMs = 1200;
+    assert.ok(
+      elapsedMs < boundMs + perInvocationHostSlownessMarginMs,
+      `expected termination within ~${perInvocationHostSlownessMarginMs}ms of the bound (${boundMs}ms) - took ${elapsedMs}ms`
+    );
+    // Pacing guard: without this, a busy-spin loop that ignores
+    // pollIntervalMs entirely would still satisfy "terminates near the
+    // bound" above, just via many more unpaced attempts.
+    const maxPlausibleInvocations = Math.ceil(boundMs / pollIntervalMs) * 2;
+    assert.ok(
+      invocationCount <= maxPlausibleInvocations,
+      `expected roughly ${Math.ceil(boundMs / pollIntervalMs)} paced attempts (generously doubled to ${maxPlausibleInvocations} to absorb host slowness), saw ${invocationCount} - a count this high means the ${pollIntervalMs}ms poll interval was not actually honored between attempts`
+    );
+  }
+);
+
+// --- The AGGREGATE cap: the pre-existing, published total-settlement
+// bound (kill()/the shutdown reaper's own docs) that the retry addition
+// above must never widen. Two distinct expiry states, each with its own
+// owner per the frozen contract: an observer actually running when the cap
+// hits (OWNER 5, force-reaped), and the scheduler asleep between attempts
+// when the cap hits (OWNER 6, no new observer ever starts). ---
+
+test(
+  "captureBirthIdentityPosixAsync: OWNER 5 - the aggregate cap force-reaps an observer that is still active when it expires",
+  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  async () => {
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-aggregate-active-observer-ps-"));
+    const invocationMarker = path.join(dir, "invocations.txt");
+    const psPath = path.join(dir, "ps");
+    // First invocation: writes the marker, then fast not-found. Second
+    // invocation (the retry): a real, SIGTERM-resistant ps that sleeps far
+    // longer than any bound this test grants it - the aggregate cap, not
+    // the observer's own nominal timeout, must be what actually reaps it.
+    fs.writeFileSync(
+      psPath,
+      `#!/bin/sh\ntrap '' TERM\ncount=$(wc -l < '${invocationMarker}' 2>/dev/null || echo 0)\necho x >> '${invocationMarker}'\nif [ "$count" -eq 0 ]; then\n  exit 1\nfi\nsleep 5\necho '00:01'\n`
+    );
+    fs.chmodSync(psPath, 0o755);
+
+    // A generous real timeoutMs (matching production's own default) gives
+    // attempt 1's real fork/exec all the headroom this suite's other tests
+    // rely on. The injected clock, not a tiny real bound, is what makes the
+    // aggregate window nearly exhausted by the time the retry starts: once
+    // the marker file exists (attempt 1 has genuinely completed), `now()`
+    // jumps forward so only ~100ms of aggregate budget remains - enough for
+    // the retry to be legitimately started, but too little for the
+    // resistant observer's own 5s sleep to ever complete voluntarily.
+    const timeoutMs = ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS;
+    const aggregateDeadline = timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS;
+    const clock = {
+      now: () => (fs.existsSync(invocationMarker) ? aggregateDeadline - 350 : 0),
+      sleep: async (ms: number) => {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(ms, 20)));
+      },
+    };
+
+    let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
+    let elapsedMs: number;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      const before = Date.now();
+      identity = await captureBirthIdentityPosixAsync(process.pid, timeoutMs, 3000, 20, clock);
+      elapsedMs = Date.now() - before;
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    const invocationCount = fs
+      .readFileSync(invocationMarker, "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0).length;
+
+    assert.equal(
+      invocationCount,
+      2,
+      `expected the retry to genuinely start (both attempts observed) before the aggregate cap force-reaps it - saw ${invocationCount} invocations`
+    );
+    assert.equal(
+      identity,
+      undefined,
+      "an observer still active when the aggregate cap expires must be force-reaped and the capture must settle unavailable, never hang or fabricate a value"
+    );
+    assert.ok(
+      elapsedMs < 3000,
+      `expected the aggregate cap to force settlement well before the resistant observer's own 5s sleep - took ${elapsedMs}ms`
+    );
+  }
+);
+
+test(
+  "captureBirthIdentityPosixAsync: OWNER 6 - the aggregate cap expiring between attempts (no observer active) settles immediately, with no new observer started",
+  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  async () => {
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-aggregate-scheduler-wait-ps-"));
+    const invocationMarker = path.join(dir, "invocations.txt");
+    const psPath = path.join(dir, "ps");
+    fs.writeFileSync(psPath, `#!/bin/sh\necho x >> '${invocationMarker}'\nexit 1\n`);
+    fs.chmodSync(psPath, 0o755);
+
+    // A generous real timeoutMs gives attempt 1's real fork/exec the same
+    // headroom production uses. The injected clock - not a tiny real bound
+    // - is what makes the aggregate window nearly exhausted the moment
+    // attempt 1's not-found registers (once the marker file exists,
+    // `now()` jumps forward to leave only 10ms of aggregate budget). The
+    // declared retry-poll delay (500ms) is deliberately far longer than
+    // that remaining budget, so the sleep must be capped short of the
+    // aggregate deadline - and the very next loop iteration must then
+    // settle without ever starting a second observer.
+    const timeoutMs = ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS;
+    const aggregateDeadline = timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS;
+    const declaredRetryDelayMs = 500;
+    const clock = {
+      now: () => (fs.existsSync(invocationMarker) ? aggregateDeadline - 10 : 0),
+      sleep: async (ms: number) => {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(ms, 20)));
+      },
+    };
+
+    let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      identity = await captureBirthIdentityPosixAsync(
+        process.pid,
+        timeoutMs,
+        3000,
+        declaredRetryDelayMs,
+        clock
+      );
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    const invocationCount = fs
+      .readFileSync(invocationMarker, "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0).length;
+
+    assert.equal(
+      identity,
+      undefined,
+      "the aggregate cap expiring while the scheduler is asleep between attempts (no observer active) must settle unavailable"
+    );
+    assert.equal(
+      invocationCount,
+      1,
+      `no new observer may start once the aggregate cap has expired between attempts - expected exactly 1 (the initial) invocation, saw ${invocationCount}`
+    );
   }
 );
 

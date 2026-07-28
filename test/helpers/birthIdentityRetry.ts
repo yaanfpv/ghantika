@@ -10,17 +10,23 @@
  * sequence can occasionally observe `undefined` even though the process
  * is, in fact, alive and about to become visible a few milliseconds later.
  *
- * This is not a defect in the capture functions themselves, and it is not
- * a defect `run()`'s own production path can ever hit: `run()` fires
+ * `run()`'s own production path CAN hit this same race: it fires
  * `captureBirthIdentityPosixAsync` off UNAWAITED rather than capturing
  * synchronously-in-sequence right after spawn (see src/tools/run.ts's own
- * docs), specifically so a slow or racing `ps` can never block or corrupt
- * its response. This helper exists only for the many test call sites that
- * deliberately DO capture immediately in sequence, in order to prove
- * things about the capture functions themselves - it gives exactly those
- * call sites more real, independent chances to observe a child the OS has
- * not finished registering yet, never a reason to trust the result any
- * less once it succeeds.
+ * docs), but that only protects the RESPONSE from ever blocking on a slow
+ * or racing `ps` - it does nothing about the capture itself observing
+ * `not-found` on a child the OS has not finished registering yet.
+ * `captureBirthIdentityPosixAsync` (src/process.ts) now retries a
+ * `not-found` observation internally, bounded by
+ * `BIRTH_IDENTITY_NOT_FOUND_RETRY_BOUND_MS`, precisely to absorb this race
+ * in production. This helper is a SEPARATE layer, for test call sites
+ * that deliberately capture-then-assert immediately in sequence to prove
+ * things about the capture functions themselves: it gives those call
+ * sites additional real, independent retry chances on top of whatever
+ * retry the capture function itself already performs (none, for the sync
+ * `captureBirthIdentityPosix`; its own internal bound, for the async one)
+ * - never a reason to trust a successful result any less once it
+ * succeeds.
  *
  * Modeled on this codebase's own two existing bounded-wait idioms, not a
  * third invented shape:
