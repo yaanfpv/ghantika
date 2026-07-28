@@ -248,6 +248,26 @@ export function createServer(transport: Transport = createStdioTransport()): Gha
   const isInitializedForToolCalls = (): boolean =>
     initializeNegotiationSucceeded && receivedInitializedNotification;
 
+  // The one thing tasksAdapter.ts's output-driven wake needs from THIS
+  // connection's real `Server` instance - see maybeAugmentRunResult's own
+  // docs for why the adapter itself never imports `Server`. A thin,
+  // fire-and-forget wrapper: a wake is a best-effort accelerator (the poll
+  // floor stays authoritative regardless - see tasksAdapter.ts's own
+  // header on the notification being optional), so a failed send is
+  // logged to stderr and never allowed to propagate into the tool-call
+  // response path that triggered it.
+  const sendTaskWakeNotification = (params: Record<string, unknown>): void => {
+    server
+      .notification({ method: tasksAdapter.TASKS_STATUS_NOTIFICATION_METHOD, params })
+      .catch((error: unknown) => {
+        console.error(
+          "[ghantika] error sending",
+          tasksAdapter.TASKS_STATUS_NOTIFICATION_METHOD,
+          error
+        );
+      });
+  };
+
   server.setRequestHandler("tools/list", async () => ({
     tools: listToolDefinitions(),
   }));
@@ -277,7 +297,7 @@ export function createServer(transport: Transport = createStdioTransport()): Gha
     // connection-level rather than per-request.
     if (request.params.name === "run") {
       const capable = tasksAdapter.isConnectionTasksCapable(server.getClientCapabilities());
-      return tasksAdapter.maybeAugmentRunResult(result, capable);
+      return tasksAdapter.maybeAugmentRunResult(result, capable, sendTaskWakeNotification);
     }
     return result;
   });
