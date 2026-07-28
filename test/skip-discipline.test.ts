@@ -1016,12 +1016,14 @@ test("the real supervisor still fails a genuinely hung test fast, at whatever --
 
   // The exit code and stdout above only prove the SUPERVISOR reported the
   // timeout - they say nothing about whether the hung test's own real OS
-  // process is actually gone. collectChildResult (via
+  // process is actually gone. On POSIX, collectChildResult (via
   // reapFixtureProcessGroup) already force-killed and confirmed the whole
   // group empty before returning; this is a second, independent
   // confirmation of exactly the property that once went unchecked - a real
   // orphan surviving this exact fixture, reparented to init, running for
-  // over 20 hours before it was found.
+  // over 20 hours before it was found. On win32, reapFixtureProcessGroup
+  // is a no-op (see below), so neither this nor the earlier reap makes
+  // any claim there.
   //
   // Deliberately a plain runtime conditional rather than a node:test
   // `{skip}` option: this file's own "seed denominator" test above scans
