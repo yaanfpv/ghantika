@@ -2362,13 +2362,14 @@ function extractEscalationGateSentences(text: string): string[] {
  * apply the identical principle to an unrelated surface (an unbounded
  * behavioral property can't be proven by pattern-matching shell text, only
  * by execution). There is no execution equivalent for prose, so the fix
- * here is the same one this file's own commit-history check already uses
- * for its one truly unavoidable exception below: check the full, unstripped
- * sentence, and handle the rare, real case of legitimate historical
- * quotation through an enumerated, exact-match allowlist instead of a
- * content-shape guess - the allowlist can't be fooled by rephrasing a live
- * claim into looking like a retraction, because it does not look at shape
- * at all.
+ * is the same one this file's own commit-history check below is built to
+ * apply: check the full, unstripped sentence, and handle the rare, real
+ * case of legitimate historical quotation through an enumerated, exact-
+ * match allowlist instead of a content-shape guess - the allowlist can't
+ * be fooled by rephrasing a live claim into looking like a retraction,
+ * because it does not look at shape at all. The allowlist below is
+ * currently empty, but the mechanism exists to hold future entries of
+ * exactly this kind.
  */
 
 /**
@@ -2384,14 +2385,14 @@ function extractEscalationGateSentences(text: string): string[] {
  * the pair, not either half alone). An entry whose sha no longer appears in
  * the range is dead weight to remove with it, never a standing exemption
  * that outlives the commit it was written for.
+ *
+ * An entry keyed to a pre-squash branch commit sha cannot survive this
+ * repository's squash strategy: the merge strategy replaces every one of a
+ * PR's internal commits with a single new commit on `main`, so an
+ * exception pinned to one of those internal shas is guaranteed dead the
+ * moment that PR lands, not merely at risk of going dead.
  */
-const LEGACY_PROOF_CLAIM_EXCEPTIONS: readonly { sha: string; sentence: string }[] = [
-  {
-    sha: "583c9b695cc8e991c86eb149485524974f27c440",
-    sentence:
-      "A single surviving, exactly-matching member is enough to prove the group is still ours, since POSIX forbids reusing a live group's numeric id; if none match, escalation is refused and no SIGKILL is sent.",
-  },
-];
+const LEGACY_PROOF_CLAIM_EXCEPTIONS: readonly { sha: string; sentence: string }[] = [];
 
 function isLegacyProofClaimException(sha: string, sentence: string): boolean {
   return LEGACY_PROOF_CLAIM_EXCEPTIONS.some(
@@ -2399,8 +2400,21 @@ function isLegacyProofClaimException(sha: string, sentence: string): boolean {
   );
 }
 
+/**
+ * The exact (sha, sentence) pair once held in LEGACY_PROOF_CLAIM_EXCEPTIONS,
+ * now removed. The empty-list tests below use it as their negative control:
+ * an empty allowlist must refuse this pair. The sha names a real, reachable
+ * commit; it is simply outside `main`'s live `${COMMIT_RANGE_BASE}..HEAD`
+ * guard range.
+ */
+const REMOVED_LEGACY_EXCEPTION_EXAMPLE = {
+  sha: "583c9b695cc8e991c86eb149485524974f27c440",
+  sentence:
+    "A single surviving, exactly-matching member is enough to prove the group is still ours, since POSIX forbids reusing a live group's numeric id; if none match, escalation is refused and no SIGKILL is sent.",
+} as const;
+
 test(
-  'no "provably"/unqualified proof claim beside the escalation identity matcher, (every commit subject+body in the range) - scoped to sentences that actually mention the escalation identity gate by name, checked as full, unstripped text so a claim cannot hide inside a quote or a parenthetical, except one enumerated, legacy exception',
+  'no "provably"/unqualified proof claim beside the escalation identity matcher, (every commit subject+body in the range) - scoped to sentences that actually mention the escalation identity gate by name, checked as full, unstripped text so a claim cannot hide inside a quote or a parenthetical, except any enumerated, legacy exceptions',
   { skip: COMMIT_RANGE_SKIP },
   () => {
     for (const commit of readCommitRangeCommits()) {
@@ -2416,45 +2430,90 @@ test(
   }
 );
 
-test("the legacy proof-claim exception is live: its sha is actually present in the real commit range, and its sentence is actually produced by the real extraction", () => {
-  const shasInRange = new Set(readCommitRangeCommits().map((commit) => commit.sha));
-  for (const entry of LEGACY_PROOF_CLAIM_EXCEPTIONS) {
-    assert.ok(
-      shasInRange.has(entry.sha),
-      `legacy exception for ${entry.sha} names a sha that is not in the real commit range - remove the dead entry`
-    );
-    const commit = readCommitRangeCommits().find((c) => c.sha === entry.sha);
-    assert.ok(commit, `test setup: could not re-find commit ${entry.sha}`);
-    const text = `${commit!.subject}\n\n${commit!.body}`;
-    const sentences = extractEscalationGateSentences(text);
-    assert.ok(
-      sentences.some((sentence) => sentence.trim() === entry.sentence),
-      `legacy exception's sentence was not found among ${commit!.sha.slice(0, 12)}'s own extracted sentences - the exception is stale (the commit's text changed, or the extraction logic changed) and must be re-derived, not assumed`
-    );
-  }
-});
+test(
+  LEGACY_PROOF_CLAIM_EXCEPTIONS.length === 0
+    ? "the legacy proof-claim exception list is empty: the lookup still refuses its own historical (sha, sentence) pair"
+    : "the legacy proof-claim exception is live: its sha is actually present in the real commit range, and its sentence is actually produced by the real extraction",
+  LEGACY_PROOF_CLAIM_EXCEPTIONS.length === 0
+    ? () => {
+        assert.equal(
+          isLegacyProofClaimException(
+            REMOVED_LEGACY_EXCEPTION_EXAMPLE.sha,
+            REMOVED_LEGACY_EXCEPTION_EXAMPLE.sentence
+          ),
+          false,
+          "the allowlist is empty, so it must refuse even the exact (sha, sentence) pair that used to be exempted here"
+        );
+      }
+    : () => {
+        const shasInRange = new Set(readCommitRangeCommits().map((commit) => commit.sha));
+        for (const entry of LEGACY_PROOF_CLAIM_EXCEPTIONS) {
+          assert.ok(
+            shasInRange.has(entry.sha),
+            `legacy exception for ${entry.sha} names a sha that is not in the real commit range - remove the dead entry`
+          );
+          const commit = readCommitRangeCommits().find((c) => c.sha === entry.sha);
+          assert.ok(commit, `test setup: could not re-find commit ${entry.sha}`);
+          const text = `${commit!.subject}\n\n${commit!.body}`;
+          const sentences = extractEscalationGateSentences(text);
+          assert.ok(
+            sentences.some((sentence) => sentence.trim() === entry.sentence),
+            `legacy exception's sentence was not found among ${commit!.sha.slice(0, 12)}'s own extracted sentences - the exception is stale (the commit's text changed, or the extraction logic changed) and must be re-derived, not assumed`
+          );
+        }
+      }
+);
 
-test("the legacy exception is an exact-pair match, not a fuzzy one: a near-identical sentence under the real sha, and the real sentence under a fake sha, are both refused", () => {
-  const realEntry = LEGACY_PROOF_CLAIM_EXCEPTIONS[0]!;
-  assert.equal(
-    isLegacyProofClaimException(realEntry.sha, realEntry.sentence),
-    true,
-    "test setup: the real (sha, sentence) pair must match"
-  );
-  assert.equal(
-    isLegacyProofClaimException(
-      realEntry.sha,
-      realEntry.sentence.replace("A single surviving", "One surviving")
-    ),
-    false,
-    "a paraphrase of the legacy-exception sentence under its own real sha must NOT match - the allowlist is exact text, not a rewritten claim carrying the same meaning"
-  );
-  assert.equal(
-    isLegacyProofClaimException("0".repeat(40), realEntry.sentence),
-    false,
-    "the real legacy-exception sentence under an unrelated sha must NOT match - the pair is what's exempted, never the sentence alone"
-  );
-});
+test(
+  LEGACY_PROOF_CLAIM_EXCEPTIONS.length === 0
+    ? "the legacy proof-claim exception list is empty: no exact, paraphrased, or mismatched-sha variant of its historical pair is wrongly accepted"
+    : "the legacy exception is an exact-pair match, not a fuzzy one: a near-identical sentence under the real sha, and the real sentence under a fake sha, are both refused",
+  LEGACY_PROOF_CLAIM_EXCEPTIONS.length === 0
+    ? () => {
+        assert.equal(
+          isLegacyProofClaimException(
+            REMOVED_LEGACY_EXCEPTION_EXAMPLE.sha,
+            REMOVED_LEGACY_EXCEPTION_EXAMPLE.sentence
+          ),
+          false,
+          "the exact historical pair must be refused against an empty list"
+        );
+        assert.equal(
+          isLegacyProofClaimException(
+            REMOVED_LEGACY_EXCEPTION_EXAMPLE.sha,
+            REMOVED_LEGACY_EXCEPTION_EXAMPLE.sentence.replace("A single surviving", "One surviving")
+          ),
+          false,
+          "a paraphrase of the historical sentence under its historical sha must also be refused against an empty list"
+        );
+        assert.equal(
+          isLegacyProofClaimException("0".repeat(40), REMOVED_LEGACY_EXCEPTION_EXAMPLE.sentence),
+          false,
+          "the historical sentence under an unrelated sha must also be refused against an empty list"
+        );
+      }
+    : () => {
+        const realEntry = LEGACY_PROOF_CLAIM_EXCEPTIONS[0]!;
+        assert.equal(
+          isLegacyProofClaimException(realEntry.sha, realEntry.sentence),
+          true,
+          "test setup: the real (sha, sentence) pair must match"
+        );
+        assert.equal(
+          isLegacyProofClaimException(
+            realEntry.sha,
+            realEntry.sentence.replace("A single surviving", "One surviving")
+          ),
+          false,
+          "a paraphrase of the legacy-exception sentence under its own real sha must NOT match - the allowlist is exact text, not a rewritten claim carrying the same meaning"
+        );
+        assert.equal(
+          isLegacyProofClaimException("0".repeat(40), realEntry.sentence),
+          false,
+          "the real legacy-exception sentence under an unrelated sha must NOT match - the pair is what's exempted, never the sentence alone"
+        );
+      }
+);
 
 test("negative control: a live proof claim hidden inside a parenthetical aside is still caught now that stripping is gone (the exact evasion this guard used to miss)", () => {
   const text = "The escalation identity gate (proves the group is still ours) permits SIGKILL.";
