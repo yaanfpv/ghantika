@@ -9,7 +9,7 @@
       "const": "io.modelcontextprotocol/tasks"
     },
     "taskStatus": {
-      "description": "The closed status enum this adapter ever produces. Deliberately four values, not the five the (deprecated, 2025-11-25, no-SDK-runtime) upstream TaskStatus vocabulary carries: this adapter never produces 'input_required' (a job-backed task has no client-input step), so it is not pinned here - a narrower, honestly-reachable set rather than an unreachable value copied for parity. 'expired' is never a member: this adapter has no mechanism today that removes a completed/terminal task record on its own schedule, and a task that no longer resolves to a job simply reads as task_not_found rather than surfacing its own terminal status.",
+      "description": "The closed status enum this adapter ever produces. Deliberately four values, not the five the (deprecated, 2025-11-25, no-SDK-runtime) upstream TaskStatus vocabulary carries: this adapter never produces 'input_required' (a job-backed task has no client-input step), so it is not pinned here - a narrower, honestly-reachable set rather than an unreachable value copied for parity. 'expired' is never a member: a task past its TTL is REMOVED (task_not_found on the next read), never transitioned into a fifth status - see watchStopped below for the SEPARATE, still-working-compatible concept of the wake accelerator itself stopping early.",
       "enum": ["working", "completed", "failed", "cancelled"]
     },
     "taskOutputCounts": {
@@ -24,6 +24,16 @@
       "required": ["stdout_lines", "stdout_bytes", "stderr_lines", "stderr_bytes"],
       "additionalProperties": false
     },
+    "watchStopped": {
+      "type": "object",
+      "description": "Present once this adapter's own output-driven notification WATCH (the wake accelerator - see notifications/tasks/status) has auto-stopped early - currently only ever for a sustained firehose rate. Never means the backing job stopped: the job stays alive and pollable via output/tail regardless, and status can still legitimately read 'working' while this is present. Absent for the ordinary lifetime of a task that never triggered it.",
+      "properties": {
+        "reason": { "const": "firehose" },
+        "stoppedAt": { "type": "string", "minLength": 1 }
+      },
+      "required": ["reason", "stoppedAt"],
+      "additionalProperties": false
+    },
     "taskResult": {
       "type": "object",
       "description": "A live snapshot of a task bound to a real backing job. taskId is always the job's own randomUUID() job_id (one handle namespace, no separate task table).",
@@ -34,7 +44,8 @@
         "createdAt": { "type": "string", "minLength": 1 },
         "pollIntervalMs": { "type": "integer", "exclusiveMinimum": 0 },
         "exitCode": { "type": "integer" },
-        "output": { "$ref": "#/$defs/taskOutputCounts" }
+        "output": { "$ref": "#/$defs/taskOutputCounts" },
+        "watchStopped": { "$ref": "#/$defs/watchStopped" }
       },
       "required": ["extension", "taskId", "status", "createdAt"],
       "additionalProperties": false

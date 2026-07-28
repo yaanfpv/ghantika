@@ -724,13 +724,22 @@ function evictOldestLine(state: StreamBufferState): StreamLineEntry | undefined 
 function materializeLine(
   state: StreamBufferState,
   text: string,
-  terminator: StreamLineTerminator
+  terminator: StreamLineTerminator,
+  onLine?: (line: StreamLineEntry) => void
 ): void {
   const seq = state.seqCounter.next();
   state.linesEverMaterialized += 1;
   state.highestSeqAssigned = seq;
-  state.lines.push({ text, terminator, seq });
+  const entry: StreamLineEntry = { text, terminator, seq };
+  state.lines.push(entry);
   state.totalBytes += Buffer.byteLength(text, "utf8");
+  // Fired BEFORE the eviction loop below, with the freshly-materialized
+  // entry itself - a caller (JobStore.appendOutput/finalizeStream, see
+  // their own docs) retains its own reference regardless of whether
+  // eviction later drops this entry from `state.lines`, so a real-time
+  // arrival observer never misses a line merely because it was later
+  // evicted from the retained buffer window.
+  onLine?.(entry);
   // `> 1`, not `> 0`: "retain the newest data" must guarantee the single
   // most-recent entry always survives, even if IT ALONE exceeds the byte
   // cap. This is not just a hypothetical edge case: an `oversized-split`
@@ -870,7 +879,11 @@ function evictToFitBudget(state: StreamBufferState, materializedALineThisCall: b
  * distinction, not `state.pending.length` alone, is what its single-entry
  * exception needs).
  */
-export function appendChunkToBuffer(state: StreamBufferState, chunk: Buffer): void {
+export function appendChunkToBuffer(
+  state: StreamBufferState,
+  chunk: Buffer,
+  onLine?: (line: StreamLineEntry) => void
+): void {
   state.bytesEverReceived += chunk.length;
   const linesMaterializedBeforeThisCall = state.linesEverMaterialized;
   const working = state.pending.length > 0 ? Buffer.concat([state.pending, chunk]) : chunk;
@@ -899,7 +912,7 @@ export function appendChunkToBuffer(state: StreamBufferState, chunk: Buffer): vo
         segmentEnd -= 1; // strip a CRLF's '\r'
       }
       const segment = working.subarray(position, segmentEnd);
-      materializeLine(state, segment.toString("utf8"), "newline");
+      materializeLine(state, segment.toString("utf8"), "newline", onLine);
       position = newlineIndex + 1;
       continue;
     }
@@ -911,7 +924,12 @@ export function appendChunkToBuffer(state: StreamBufferState, chunk: Buffer): vo
       const cutPoint = findUtf8SafeCutPoint(working.subarray(position), MAX_LINE_BYTES);
       const cut = cutPoint > 0 ? cutPoint : MAX_LINE_BYTES; // pathological-input fallback, see findUtf8SafeCutPoint's docs
       const piece = working.subarray(position, position + cut);
-      materializeLine(state, piece.toString("utf8") + OVERSIZED_LINE_MARKER, "oversized-split");
+      materializeLine(
+        state,
+        piece.toString("utf8") + OVERSIZED_LINE_MARKER,
+        "oversized-split",
+        onLine
+      );
       position += piece.length;
       continue;
     }
@@ -941,11 +959,14 @@ export function appendChunkToBuffer(state: StreamBufferState, chunk: Buffer): vo
  * text preserved exactly, unmarked, flagged only via `terminator`.
  * Idempotent: a second call is a no-op.
  */
-export function finalizeStreamBuffer(state: StreamBufferState): void {
+export function finalizeStreamBuffer(
+  state: StreamBufferState,
+  onLine?: (line: StreamLineEntry) => void
+): void {
   if (state.finalized) return;
   state.finalized = true;
   if (state.pending.length > 0) {
-    materializeLine(state, state.pending.toString("utf8"), "stream-end");
+    materializeLine(state, state.pending.toString("utf8"), "stream-end", onLine);
     state.pending = Buffer.alloc(0);
   }
 }
@@ -964,6 +985,42 @@ export function snapshotStreamBuffer(state: StreamBufferState): StreamBufferSnap
 // ---------------------------------------------------------------------------
 
 export type ManagedStream = "stdout" | "stderr";
+
+// ---------------------------------------------------------------------------
+// The generic output-arrival + job-terminal observation seams. Neither
+// concept here is Tasks-shaped, or shaped for any other single consumer -
+// they are plain core hooks over facts this store already tracks (a line
+// was just materialized on one of a job's streams; a job's state just
+// transitioned into a terminal one), so ANY future consumer could register
+// on them the same way `src/tasksAdapter.ts` does today. This store still
+// holds every listener itself (below, in `JobStore`'s own fields) - a
+// consumer only ever gets a subscribe call and the unsubscribe function it
+// returns, never a container of its own to manage.
+// ---------------------------------------------------------------------------
+
+/** One materialized line, on one of a job's two streams, the instant it was appended - see `JobStore.onOutputArrival`. */
+export interface OutputArrivalEvent {
+  readonly stream: ManagedStream;
+  readonly line: StreamLineEntry;
+}
+
+export type OutputArrivalListener = (event: OutputArrivalEvent) => void;
+
+/** Fires once, the moment `jobId`'s OWN state transitions into a terminal one - see `JobStore.onJobTerminal`. */
+export type JobTerminalListener = (jobId: string) => void;
+
+/**
+ * A generic, opaque annotation a consumer of `onOutputArrival` can record
+ * against a job to say why it stopped watching that job's output - never
+ * interpreted by this store (the `reason` string carries whatever meaning
+ * the recording consumer gives it; `src/tasksAdapter.ts` is the one real
+ * consumer today, recording `"firehose"`, but this store neither knows nor
+ * cares). See `JobStore.recordOutputWatchStopped`/`getOutputWatchStopInfo`.
+ */
+export interface OutputWatchStopInfo {
+  readonly reason: string;
+  readonly stoppedAt: string;
+}
 
 interface CreateJobInput {
   readonly argv: readonly string[];
@@ -1032,6 +1089,9 @@ export class JobStore {
   private readonly jobs = new Map<string, JobRecord>();
   private readonly children = new Map<string, TrackedChild>();
   private readonly buffers = new Map<string, Record<ManagedStream, StreamBufferState>>();
+  private readonly outputArrivalListeners = new Map<string, Set<OutputArrivalListener>>();
+  private readonly jobTerminalListeners = new Map<string, Set<JobTerminalListener>>();
+  private readonly outputWatchStops = new Map<string, OutputWatchStopInfo>();
   /**
    * Job ids whose process group has already had a real CLEANUP-REAP
    * attempt against a TERMINAL record - not a record of every signal this
@@ -1352,6 +1412,7 @@ export class JobStore {
     record.state = "failed";
     record.diagnostic = { reason: "spawn-error", message };
     record.ended_at = new Date().toISOString();
+    this.fireJobTerminal(jobId);
   }
 
   /**
@@ -1402,6 +1463,7 @@ export class JobStore {
       record.exit_code = exitCode ?? undefined;
     }
     record.ended_at = new Date().toISOString();
+    this.fireJobTerminal(jobId);
   }
 
   /**
@@ -1424,6 +1486,7 @@ export class JobStore {
     record.state = "killed";
     record.signal = signal;
     record.ended_at = new Date().toISOString();
+    this.fireJobTerminal(jobId);
   }
 
   /**
@@ -1639,18 +1702,129 @@ export class JobStore {
     this.setKillConfirmation(jobId, result.confirmed);
   }
 
-  /** Appends one raw data chunk from a job's stdout or stderr to that stream's independent buffer. */
+  /** Appends one raw data chunk from a job's stdout or stderr to that stream's independent buffer, firing any registered `onOutputArrival` listeners for `jobId` once per line materialized (see that method's own docs). */
   appendOutput(jobId: string, stream: ManagedStream, chunk: Buffer): void {
     const buffers = this.buffers.get(jobId);
     if (!buffers) return;
-    appendChunkToBuffer(buffers[stream], chunk);
+    appendChunkToBuffer(buffers[stream], chunk, this.arrivalNotifier(jobId, stream));
   }
 
-  /** Call when a job's stdout or stderr stream has ended, to flush any pending partial final line. */
+  /** Call when a job's stdout or stderr stream has ended, to flush any pending partial final line - this too fires `onOutputArrival` listeners if that flush materializes a line (see `finalizeStreamBuffer`'s own docs on the `stream-end` case). */
   finalizeStream(jobId: string, stream: ManagedStream): void {
     const buffers = this.buffers.get(jobId);
     if (!buffers) return;
-    finalizeStreamBuffer(buffers[stream]);
+    finalizeStreamBuffer(buffers[stream], this.arrivalNotifier(jobId, stream));
+  }
+
+  /** Built fresh per call rather than cached - cheap (a closure over two primitives plus one live Map read), and it always reflects whoever is subscribed AT THE MOMENT a line actually materializes, never a stale membership snapshot taken earlier. `undefined` when nobody is subscribed, so `appendChunkToBuffer`/`finalizeStreamBuffer` skip the per-line callback entirely for the (overwhelmingly common) case of no subscriber. */
+  private arrivalNotifier(
+    jobId: string,
+    stream: ManagedStream
+  ): ((line: StreamLineEntry) => void) | undefined {
+    const listeners = this.outputArrivalListeners.get(jobId);
+    if (!listeners || listeners.size === 0) return undefined;
+    return (line: StreamLineEntry) => {
+      for (const listener of listeners) listener({ stream, line });
+    };
+  }
+
+  /**
+   * Subscribes `listener` to fire, synchronously and in materialization
+   * order, for EVERY stdout/stderr line `jobId` ever materializes from
+   * this call onward - a real-time observation seam over the SAME
+   * `appendChunkToBuffer`/`finalizeStreamBuffer` machinery every stream
+   * read already goes through, never a second/derived buffer. Generic:
+   * carries no meaning about WHICH stream matters, WHY a line matters, or
+   * what a subscriber does with it - `src/tasksAdapter.ts` is the one real
+   * consumer today (its output-driven wake), but nothing here is Tasks-
+   * shaped. Returns an unsubscribe function; calling it stops further
+   * delivery to `listener` but never affects the underlying buffer or any
+   * OTHER subscriber on the same job.
+   */
+  onOutputArrival(jobId: string, listener: OutputArrivalListener): () => void {
+    let listeners = this.outputArrivalListeners.get(jobId);
+    if (!listeners) {
+      listeners = new Set();
+      this.outputArrivalListeners.set(jobId, listeners);
+    }
+    const registered = listeners;
+    registered.add(listener);
+    return () => {
+      registered.delete(listener);
+    };
+  }
+
+  /**
+   * Subscribes `listener` to fire EXACTLY ONCE, the moment `jobId`'s state
+   * transitions into a terminal one (`markExited`/`markKilled`/
+   * `markSpawnFailed` - see each of their own docs; all three call
+   * `fireJobTerminal` as their last step, only when they themselves
+   * actually performed the transition, never on a no-op call against an
+   * already-terminal job). A job that is ALREADY terminal at subscribe
+   * time never fires this listener at all - it already had its one
+   * transition before anyone was listening; a caller that cares should
+   * check `get`/`has` itself first, matching this store's other reads.
+   * Generic - carries no Tasks-specific meaning, just "this job's state
+   * just became terminal"; the caller decides what that means. Returns an
+   * unsubscribe function.
+   */
+  onJobTerminal(jobId: string, listener: JobTerminalListener): () => void {
+    let listeners = this.jobTerminalListeners.get(jobId);
+    if (!listeners) {
+      listeners = new Set();
+      this.jobTerminalListeners.set(jobId, listeners);
+    }
+    const registered = listeners;
+    registered.add(listener);
+    return () => {
+      registered.delete(listener);
+    };
+  }
+
+  private fireJobTerminal(jobId: string): void {
+    const listeners = this.jobTerminalListeners.get(jobId);
+    if (!listeners || listeners.size === 0) return;
+    // Copy before iterating: a listener is free to call its own
+    // unsubscribe function (or another listener's) from inside itself,
+    // which would otherwise mutate this Set mid-iteration.
+    for (const listener of [...listeners]) listener(jobId);
+  }
+
+  /** Records why a consumer of `onOutputArrival` stopped watching `jobId` - see `OutputWatchStopInfo`'s own docs for why this store never interprets `reason`. Overwrites any prior recording for the same job (there is only ever one "why did the watch stop" fact worth keeping). */
+  recordOutputWatchStopped(jobId: string, reason: string, stoppedAt: string): void {
+    this.outputWatchStops.set(jobId, { reason, stoppedAt });
+  }
+
+  /** The watch-stop annotation previously recorded for `jobId` via `recordOutputWatchStopped`, or `undefined` if none was ever recorded (the overwhelmingly common case - most jobs' output watches, if any existed at all, simply run to the job's own terminal without ever needing to stop early). */
+  getOutputWatchStopInfo(jobId: string): OutputWatchStopInfo | undefined {
+    return this.outputWatchStops.get(jobId);
+  }
+
+  /** The number of listeners currently registered via `onJobTerminal` for `jobId` - 0 if none, or if `jobId` is unknown. A real oracle for a subscriber's own cleanup: a consumer that unsubscribes correctly leaves this at 0 once it is done with the job, regardless of which code path triggered that cleanup. */
+  getJobTerminalListenerCount(jobId: string): number {
+    return this.jobTerminalListeners.get(jobId)?.size ?? 0;
+  }
+
+  /**
+   * Permanently removes EVERY piece of state this store holds for `jobId`
+   * - the job record itself, its tracked child handle (if any), both
+   * stream buffers, every registered output-arrival/job-terminal
+   * listener, and any recorded output-watch-stop annotation. A one-way
+   * reclamation primitive: after this call, `has`/`get`/`getStreamSnapshot`/
+   * `getOutputCounts` all behave EXACTLY as if `jobId` had never existed.
+   * Generic - this store has no opinion on WHY a caller reclaims a job (a
+   * task-layer TTL purge is the one real caller today, see
+   * `src/tasksAdapter.ts`'s `getTask`, but nothing here is Tasks-specific).
+   * Returns whether a job actually existed to remove.
+   */
+  deleteJob(jobId: string): boolean {
+    const existed = this.jobs.delete(jobId);
+    this.children.delete(jobId);
+    this.buffers.delete(jobId);
+    this.outputArrivalListeners.delete(jobId);
+    this.jobTerminalListeners.delete(jobId);
+    this.outputWatchStops.delete(jobId);
+    return existed;
   }
 
   /** A snapshot of a job's stream buffer (lines + truncated flag), or `undefined` if the job/stream isn't tracked. Exposed for `status`/`output`/`tail` and for this module's own tests. */

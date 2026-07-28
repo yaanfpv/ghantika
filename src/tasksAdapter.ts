@@ -102,7 +102,10 @@
  * invariant (neither method may alter the backing job or the
  * tasks/get-observable state) true by construction rather than by a
  * runtime check: there is no mutating call in this file for either method
- * to reach.
+ * to reach. (Real cooperative cancellation is tracked as separate,
+ * follow-on work - this adapter's own `getTask`/`buildTaskResult` already
+ * carry the output-driven wake, TTL purge, and firehose-guard machinery
+ * below regardless of that follow-on's timing.)
  */
 import type {
   CallToolResult,
@@ -111,7 +114,14 @@ import type {
   StandardSchemaV1,
 } from "@modelcontextprotocol/server";
 
-import { type JobRecord, type JobState, isTerminalJobState, jobStore } from "./jobStore.js";
+import {
+  type JobRecord,
+  type JobState,
+  type StreamLineEntry,
+  type StreamLineTerminator,
+  isTerminalJobState,
+  jobStore,
+} from "./jobStore.js";
 
 // ---------------------------------------------------------------------------
 // The extension identity and the vendored, digest-verified schema
@@ -174,11 +184,12 @@ function hasTasksExtensionKey(bag: Record<string, unknown> | undefined): boolean
 
 // ---------------------------------------------------------------------------
 // Task status - a closed, four-value set matching the vendored schema's own
-// status enum EXACTLY, by set-equality. 'expired' is never a member: this
-// adapter has no mechanism today that removes a completed/terminal task
-// record on its own schedule, and a task that no longer resolves to a job
-// simply reads as task_not_found rather than surfacing its own terminal
-// status.
+// status enum EXACTLY, by set-equality. 'expired' is never a member: a task
+// past its TTL is REMOVED (see getTask's own docs on the frozen
+// TTL-vs-timeout separation), not transitioned into some fifth status - a
+// task that no longer resolves to a job (whether it never existed, or a TTL
+// purge just reclaimed it) simply reads as task_not_found rather than
+// surfacing its own terminal status.
 // ---------------------------------------------------------------------------
 
 /**
@@ -254,6 +265,12 @@ export interface TaskOutputCounts {
   readonly stderr_bytes: number;
 }
 
+/** Present once this adapter's own output-driven notification WATCH auto-stopped early (currently only ever for a sustained firehose rate - see `WATCH_STOP_REASON_FIREHOSE`) - never means the backing job stopped. The job stays alive/pollable regardless; only the wake accelerator itself stopped. Absent for the ordinary lifetime of a task that never firehosed. */
+export interface WatchStoppedInfo {
+  readonly reason: string;
+  readonly stoppedAt: string;
+}
+
 export interface TaskResult {
   readonly [key: string]: unknown;
   readonly extension: typeof TASKS_EXTENSION_URI;
@@ -263,6 +280,7 @@ export interface TaskResult {
   readonly pollIntervalMs?: number;
   readonly exitCode?: number;
   readonly output?: TaskOutputCounts;
+  readonly watchStopped?: WatchStoppedInfo;
 }
 
 export interface TaskNotFound {
@@ -277,22 +295,27 @@ export const DEFAULT_POLL_INTERVAL_MS = 500;
 
 /**
  * Projects a real `JobRecord` into this adapter's `TaskResult` shape. Pure:
- * reads `jobStore.getOutputCounts` (already-existing, real, ever-
- * cumulative counts - see `src/jobStore.ts`'s own docs on why those
- * survive retention eviction) and the record's own fields, writes nothing.
+ * reads `jobStore.getOutputCounts`/`jobStore.getOutputWatchStopInfo`
+ * (already-existing, real state this adapter drives elsewhere in this
+ * file - never invented here) and the record's own fields, writes nothing.
  * `exitCode`/`output` are included only once the task is terminal
  * (mirroring `PublicJobProjection`'s own optional-field pattern for
  * `exit_code`), so a still-working task never carries a stale/zeroed
- * placeholder for either.
+ * placeholder for either. `watchStopped`, by contrast, is checked
+ * REGARDLESS of terminal state: a firehose can auto-stop the watch while
+ * the task is still genuinely `working` - the auto-stop only silences
+ * the notification wake, it never changes `task.status` itself.
  */
 function buildTaskResult(record: JobRecord): TaskResult {
   const terminal = isTerminalJobState(record.state);
+  const watchStop = jobStore.getOutputWatchStopInfo(record.job_id);
   const base: TaskResult = {
     extension: TASKS_EXTENSION_URI,
     taskId: record.job_id,
     status: mapJobStateToTaskStatus(record.state),
     createdAt: record.started_at,
     pollIntervalMs: DEFAULT_POLL_INTERVAL_MS,
+    ...(watchStop !== undefined ? { watchStopped: watchStop } : {}),
   };
   if (!terminal) return base;
 
@@ -309,15 +332,65 @@ function taskNotFound(taskId: string): TaskNotFound {
 }
 
 /**
+ * How long a TERMINAL task's record is retained before a task-layer TTL
+ * purge REMOVES it from `jobStore` entirely - a completely SEPARATE
+ * concept from a job's own execution timeout (this codebase has no such
+ * timeout today; if one is added later, it kills the JOB, transitioning it
+ * to `failed`, which is an entirely different effect than this purge's
+ * "remove the now-stale completed record"). NEVER an 'expired' task
+ * status: a still-`working` task is NEVER purged regardless of age (see
+ * `isExpiredTerminalRecord`'s own terminal-only guard, which is what makes
+ * that true) - only a genuinely completed/terminal record is reclaimed,
+ * and only once it is actually READ again past this age (a lazy, read-time
+ * purge - see `getTask`'s own docs for why this needs no separate
+ * scheduled sweep).
+ */
+export const TASK_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * True when `record` is BOTH terminal AND has been terminal for at least
+ * `TASK_TTL_MS`, as observed from `now` - the one, load-bearing guard that
+ * keeps TTL purge and job-execution-timeout frozen apart (see
+ * `TASK_TTL_MS`'s own docs): a non-terminal record (still `working`,
+ * however old `record.started_at` is) NEVER qualifies, unconditionally,
+ * before age is even considered.
+ */
+function isExpiredTerminalRecord(record: JobRecord, now: number): boolean {
+  if (!isTerminalJobState(record.state)) return false;
+  if (record.ended_at === undefined) return false; // defensive only - every real terminal record sets this
+  const endedAtMs = Date.parse(record.ended_at);
+  if (Number.isNaN(endedAtMs)) return false; // defensive only - ended_at is always a real toISOString() value
+  return now - endedAtMs >= TASK_TTL_MS;
+}
+
+/**
  * The one live-read entry point every tasks/* handler in `src/server.ts`
  * calls, directly or (for tasks/update and tasks/cancel) as their WHOLE
  * interim implementation - see this file's header on why that sharing is
- * what makes the state-preservation invariant true by construction. Never
- * writes to `jobStore`.
+ * what makes the state-preservation invariant true by construction. A PURE
+ * read with one deliberate side effect: the lazy TTL purge (see
+ * `TASK_TTL_MS`'s own docs) - once a terminal record is read PAST its TTL,
+ * this call both reports `task_not_found` AND reclaims the record via
+ * `jobStore.deleteJob`, so the SAME expired record is never "found, but
+ * reported not-found" more than once; a caller that never reads it again
+ * simply leaves it in `jobStore` until the next read (or never, which is
+ * an accepted, honest trade-off of a lazy-on-read design over a scheduled
+ * sweep - no separate timer is needed per terminal task).
+ *
+ * `now` defaults to the real `Date.now()`; a caller never overrides it in
+ * production - it exists as a parameter (mirroring
+ * `src/process.ts`'s own `checkProcessIdentity`) purely so a test can
+ * drive TTL expiry deterministically by mocking the GLOBAL `Date` (via
+ * `node:test`'s `mock.timers`) rather than waiting out `TASK_TTL_MS` in
+ * real wall-clock time.
  */
-export function getTask(taskId: string): TaskResult | TaskNotFound {
+export function getTask(taskId: string, now: number = Date.now()): TaskResult | TaskNotFound {
   const record = jobStore.get(taskId);
   if (record === undefined) return taskNotFound(taskId);
+  if (isExpiredTerminalRecord(record, now)) {
+    jobStore.deleteJob(taskId);
+    return taskNotFound(taskId);
+  }
   return buildTaskResult(record);
 }
 
@@ -370,6 +443,224 @@ export function taskIdParamsSchema(): StandardSchemaV1<unknown, TaskIdParams> {
 }
 
 // ---------------------------------------------------------------------------
+// The output-driven wake - a coalesced, rate-bounded, firehose-guarded,
+// terminal-flush-ordered accelerator built entirely on jobStore.ts's two
+// generic hooks (`onOutputArrival`/`onJobTerminal`) plus its generic
+// watch-stop annotation. Every named constant below is EXPORTED so a test
+// can assert against it directly, never a magic literal.
+//
+// `startTaskWatch` is deliberately the ONLY place in this file that holds
+// any per-task MUTABLE state, and even there it is pure closure state (a
+// handful of local `let`s/plain arrays, never a `new Map`/`new Set`/
+// `new WeakMap`/`new WeakSet`/`Array(...)`/`new Array(...)`/`Object(...)`/
+// `new Object(...)` construction) - this file is scanned by
+// `scripts/check-module-boundaries.mjs`'s persistent-state check exactly
+// like every other frozen module (see this file's own header), so it may
+// never grow a Map/Set of its own. Anything that needs to persist ACROSS
+// separate calls into this file (not just across lines within one job's
+// watch) lives in `jobStore.ts` instead - the watch-stop annotation is
+// exactly that: `getTask` (elsewhere in this file) reads it back on a
+// totally separate invocation, long after `startTaskWatch`'s own closure
+// for that job may never run again.
+// ---------------------------------------------------------------------------
+
+/** Stdout lines arriving within this many ms of each other collapse into ONE wake - the sole batching mechanism (never lifecycle-based: a long-running command gets one wake per closed window, for its whole life, not a single end-of-run wake). */
+export const WAKE_COALESCE_WINDOW_MS = 200;
+
+/** The wake-emission rate this adapter never exceeds - implied by construction (1000 / WAKE_COALESCE_WINDOW_MS = 5): at most one wake fires per coalescing window, so at most one every 200ms. Named separately because it is independently pinned and asserted against. */
+export const WAKE_MAX_RATE_PER_SEC = 5;
+
+/** A sustained stdout line-arrival rate above this many lines/sec is a "firehose". */
+export const FIREHOSE_LINES_PER_SEC = 5000;
+
+/** How long a firehose-rate stream must sustain before the notification WATCH (never the job) auto-stops. */
+export const FIREHOSE_SUSTAINED_MS = 2000;
+
+/** The exact `watchStopped.reason` literal this adapter ever produces. */
+export const WATCH_STOP_REASON_FIREHOSE = "firehose";
+
+/** The extension's real notification method name - exact-string wire identity, never a substring/prefix a client should match against. Optional: a client MUST NOT rely on receiving it and continues to poll `tasks/get`/`output`/`tail` regardless (see this section's own docs on the poll floor). */
+export const TASKS_STATUS_NOTIFICATION_METHOD = "notifications/tasks/status";
+
+/** One stdout line as carried in a wake notification's payload - the SAME shape (seq/text/partial) `src/tools/output.ts`'s own `OutputEvent` uses for stdout, so the wake never carries state the poll floor can't independently surface. */
+export interface TaskWakeLine {
+  readonly seq: number;
+  readonly text: string;
+  readonly partial?: true;
+}
+
+/**
+ * The one thing `maybeAugmentRunResult` needs from `src/server.ts` to
+ * actually deliver a wake: a thin function wrapping the real connected
+ * `Server`'s own `notification()` call. Keeping this a plain function type
+ * (rather than importing the `Server` class itself) is what lets this file
+ * stay unaware of the SDK's server wiring beyond the generic types it
+ * already imports.
+ */
+export type TaskWakeNotifier = (params: Record<string, unknown>) => void;
+
+function isPartialTerminator(terminator: StreamLineTerminator): boolean {
+  return terminator === "stream-end" || terminator === "oversized-split";
+}
+
+function toWakeLine(line: StreamLineEntry): TaskWakeLine {
+  return isPartialTerminator(line.terminator)
+    ? { seq: line.seq, text: line.text, partial: true }
+    : { seq: line.seq, text: line.text };
+}
+
+function buildWakeParams(
+  taskId: string,
+  lines: readonly StreamLineEntry[]
+): Record<string, unknown> {
+  return {
+    extension: TASKS_EXTENSION_URI,
+    taskId,
+    stdout: lines.map(toWakeLine),
+  };
+}
+
+/**
+ * Starts the output-driven wake watch for a freshly-minted task - called
+ * only from `maybeAugmentRunResult`, and only when the backing job is not
+ * ALREADY terminal (a job that's already done has no "life" left to wake
+ * about - see that function's own call site). Subscribes to jobStore's two
+ * generic hooks and drives, for the life of the watch:
+ *
+ * - stdout-only, time-window batching. stderr lines are ignored
+ *   by this watch entirely (captured elsewhere, via the ordinary output
+ *   buffer - this watch never touches that). Every stdout line pushes
+ *   onto the CURRENT open window's pending batch and (re-)arms a single
+ *   `WAKE_COALESCE_WINDOW_MS` timer if one isn't already armed; the timer
+ *   firing is what flushes the batch as one wake.
+ * - firehose detection - `checkFirehose` (below) tracks a rolling
+ *   "since when has the sustained rate held at/above FIREHOSE_LINES_PER_SEC"
+ *   window; once that span reaches FIREHOSE_SUSTAINED_MS, the watch
+ *   auto-stops (unsubscribes, records the stop reason) - the job itself is
+ *   NEVER touched.
+ * - terminal flush ordering - `onJobTerminal` flushes any
+ *   pending open-window lines as one final wake BEFORE marking the watch
+ *   stopped, so no line is lost to the window merely closing, and nothing
+ *   wakes after (the watch is unsubscribed synchronously, in the SAME
+ *   terminal callback, before returning).
+ *
+ * TTL scheduling is NOT handled here - it's read-time, in `getTask`,
+ * entirely independent of whether a watch was ever started for a job (a
+ * non-capable connection's job never gets a watch at all, but its
+ * terminal record is still subject to the same TTL purge on read).
+ */
+function startTaskWatch(taskId: string, notifier: TaskWakeNotifier): void {
+  let pendingLines: StreamLineEntry[] = [];
+  let windowTimer: NodeJS.Timeout | undefined;
+  let stopped = false;
+  let totalLinesSeen = 0;
+  let firehoseWindowStartMs: number | undefined;
+  let firehoseWindowStartCount = 0;
+
+  const clearWindowTimer = (): void => {
+    if (windowTimer !== undefined) {
+      clearTimeout(windowTimer);
+      windowTimer = undefined;
+    }
+  };
+
+  const flush = (): void => {
+    clearWindowTimer();
+    if (pendingLines.length === 0) return;
+    const lines = pendingLines;
+    pendingLines = [];
+    notifier(buildWakeParams(taskId, lines));
+  };
+
+  const scheduleWindow = (): void => {
+    if (windowTimer !== undefined) return; // a window is already open - this line joins it
+    windowTimer = setTimeout(flush, WAKE_COALESCE_WINDOW_MS);
+  };
+
+  // `stopWatch` references `unsubscribeOutput`/`unsubscribeTerminal` before
+  // their own `const` declarations appear textually below - safe, because
+  // `stopWatch` is only ever CALLED from inside a listener, and a listener
+  // can only run AFTER `jobStore.onOutputArrival`/`onJobTerminal` (both
+  // synchronous calls) have already returned and assigned them. No
+  // temporal-dead-zone hazard: the references are resolved at CALL time,
+  // not definition time.
+  //
+  // Tears down BOTH subscriptions, not just the output one: a firehose
+  // auto-stop previously left the terminal listener registered forever
+  // (its own `if (stopped) return` guard made it inert, but never removed
+  // it from JobStore), which leaked one listener per firehose-stopped job
+  // for the job's whole remaining life. Calling `unsubscribeTerminal` here
+  // too closes that regardless of which path stops the watch first.
+  const stopWatch = (): void => {
+    if (stopped) return;
+    stopped = true;
+    clearWindowTimer();
+    unsubscribeOutput();
+    unsubscribeTerminal();
+  };
+
+  /**
+   * True once the CURRENT sustained-high-rate streak (tracked by
+   * `firehoseWindowStartMs`/`firehoseWindowStartCount`) has held at/above
+   * `FIREHOSE_LINES_PER_SEC` for at least `FIREHOSE_SUSTAINED_MS`. A
+   * streak starts the moment a computed rate first reaches the threshold
+   * and resets (restarts fresh at the CURRENT line) the moment it drops
+   * below - so a genuinely bursty-then-quiet stream never accumulates
+   * elapsed time across separate bursts, only a truly CONTINUOUS
+   * high-rate span counts.
+   */
+  const checkFirehose = (now: number): boolean => {
+    if (firehoseWindowStartMs === undefined) {
+      firehoseWindowStartMs = now;
+      firehoseWindowStartCount = totalLinesSeen;
+      return false;
+    }
+    const elapsedMs = now - firehoseWindowStartMs;
+    const linesInWindow = totalLinesSeen - firehoseWindowStartCount;
+    const rate = elapsedMs > 0 ? (linesInWindow * 1000) / elapsedMs : Infinity;
+    if (rate < FIREHOSE_LINES_PER_SEC) {
+      firehoseWindowStartMs = now;
+      firehoseWindowStartCount = totalLinesSeen;
+      return false;
+    }
+    return elapsedMs >= FIREHOSE_SUSTAINED_MS;
+  };
+
+  const unsubscribeOutput = jobStore.onOutputArrival(taskId, (event) => {
+    if (stopped) return;
+    if (event.stream !== "stdout") return; // stderr is captured elsewhere, never wakes
+    totalLinesSeen += 1;
+    if (checkFirehose(Date.now())) {
+      // The WATCH auto-stops; the job is never killed by this - it
+      // stays alive/pollable via output/tail, and the pending batch is
+      // simply dropped (a firehose has already produced far more than any
+      // wake could usefully carry - the poll floor remains the honest way
+      // to read it all back).
+      pendingLines = [];
+      stopWatch();
+      jobStore.recordOutputWatchStopped(
+        taskId,
+        WATCH_STOP_REASON_FIREHOSE,
+        new Date().toISOString()
+      );
+      return;
+    }
+    pendingLines.push(event.line);
+    scheduleWindow();
+  });
+
+  const unsubscribeTerminal = jobStore.onJobTerminal(taskId, () => {
+    if (stopped) return;
+    flush(); // any pending open-window lines flush BEFORE the terminal close
+    stopWatch(); // also unsubscribes this same terminal listener - see its own docs
+    // No wake fires for the terminal transition itself - the terminal
+    // status is observable via tasks/get / the poll floor; this
+    // watch's whole job is the stdout-delta accelerator, not a
+    // status announcement of its own.
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Minting - the six-tool mint rule: ONLY run(), ONLY on a capable
 // connection, and ONLY by wrapping a job_id this call itself just produced
 // (never inventing a handle for a job this call didn't create)
@@ -400,16 +691,30 @@ function extractJobId(result: CallToolResult): string | undefined {
  * named. Never mints for any job other than the one `result` itself is
  * about, and never touches `jobStore` beyond the SAME kind of read
  * `getTask` performs.
+ *
+ * Also starts the output-driven wake watch (see `startTaskWatch`'s own
+ * docs) for that SAME job, through `notifier` - but only when the backing
+ * job is not ALREADY terminal at mint time (a job that started already-
+ * failed, e.g. a bad cwd caught before ever spawning, has no "life" left
+ * to wake about; see `src/jobStore.ts`'s `createFailedJob`). `notifier` is
+ * always passed by `server.ts` regardless of capability - it is simply
+ * never invoked when this function returns early above, so passing it
+ * unconditionally costs nothing.
  */
 export function maybeAugmentRunResult(
   result: CallToolResult,
-  isCapableConnection: boolean
+  isCapableConnection: boolean,
+  notifier: TaskWakeNotifier
 ): CallToolResult {
   if (!isCapableConnection) return result;
   const jobId = extractJobId(result);
   if (jobId === undefined) return result;
   const record = jobStore.get(jobId);
   if (record === undefined) return result; // defensive only - run() always creates the record before returning
+
+  if (!isTerminalJobState(record.state)) {
+    startTaskWatch(jobId, notifier);
+  }
 
   const task = buildTaskResult(record);
   return {
