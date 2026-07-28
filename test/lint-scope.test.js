@@ -419,6 +419,60 @@ test("PRE-FLIGHT + runtime canary witness: no leftover canary survives from a pr
   );
 });
 
+test("mutation control: substituting the real npm-run-lint child-process call for a local stub that always reports success - the exact substitution that produced the third false green (spawnSync removed from the import, a stub returning { status: 0 } left in its place) - is caught by the canary's own presence-detection assertion, not by an unrelated error", () => {
+  assert.ok(
+    !existsSync(CANARY_ABSOLUTE_PATH),
+    `${CANARY_RELATIVE_PATH} already exists on disk before this test has planted anything - a prior run likely crashed before its own cleanup executed.`
+  );
+
+  writeFileSync(CANARY_ABSOLUTE_PATH, CANARY_VIOLATION_SOURCE);
+  try {
+    // The exact substitution the third false green was built on: the real
+    // `spawnSync("npm", ["run", "lint"], ...)` call replaced by a local stub
+    // that reports success unconditionally, regardless of the real lint
+    // state or the canary's own presence.
+    const stubbedLintRun = () => ({ status: 0, stdout: "", stderr: "" });
+    const dirty = stubbedLintRun();
+
+    assert.throws(
+      () => {
+        assert.notEqual(
+          dirty.status,
+          0,
+          `expected \`npm run lint\` to fail with the runtime canary's violation present; it exited 0. stdout:\n${dirty.stdout}\nstderr:\n${dirty.stderr}`
+        );
+      },
+      (err) => {
+        assert.ok(
+          err instanceof assert.AssertionError,
+          `expected the stub substitution to surface as the canary's own assertion failing, not an unrelated error; got ${err?.constructor?.name}: ${err?.message}`
+        );
+        assert.ok(
+          err.message.includes(
+            "expected `npm run lint` to fail with the runtime canary's violation present"
+          ),
+          `expected the thrown assertion to be the canary's own "should have failed" check, naming the planted violation; got: ${err.message}`
+        );
+        return true;
+      },
+      "expected the stubbed { status: 0 } result to make the canary's own presence-detection assertion fail - the planted violation went unreported, exactly as it did in the real historical defect"
+    );
+  } finally {
+    rmSync(CANARY_ABSOLUTE_PATH, { force: true });
+  }
+
+  assert.ok(
+    !existsSync(CANARY_ABSOLUTE_PATH),
+    `${CANARY_RELATIVE_PATH} must be genuinely absent after cleanup, not merely assumed removed`
+  );
+  const clean = spawnSync("npm", ["run", "lint"], { cwd: REPO_ROOT, encoding: "utf8" });
+  assert.equal(
+    clean.status,
+    0,
+    `expected a REAL \`npm run lint\` (not the stub) to return to a clean exit once the canary is removed - the restored-green control proving this test's own cleanup, not the stub, is what's in effect afterward. stdout:\n${clean.stdout}\nstderr:\n${clean.stderr}`
+  );
+});
+
 // =============================================================================
 // Eligibility comes from ESLint's own live config, applied to the real
 // project tree: zero coverage gaps, zero unresolved paths, and a live
