@@ -20,6 +20,15 @@ const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
 export const SERVER_ENTRY = path.join(REPO_ROOT, "dist", "index.js");
 
 /**
+ * Mirrors `src/process.ts`'s own `CONTAIN_IN_OWN_PROCESS_GROUP`: the
+ * spawned server-under-test gets its own process group, the same
+ * containment every real job spawn already has, so a group-scoped
+ * termination aimed at it cannot land on whatever group its caller
+ * belongs to.
+ */
+const CONTAIN_TEST_SERVER_IN_OWN_PROCESS_GROUP = process.platform !== "win32";
+
+/**
  * The per-line wait `nextLine` defaults to, as a pure function of the
  * environment it's given - not read from `process.env` at module load -
  * so a test can assert on both branches directly (see
@@ -90,7 +99,11 @@ export interface SpawnedServer {
  * delimited JSON-RPC messages).
  */
 export function spawnServer(): SpawnedServer {
-  const child = spawn(process.execPath, [SERVER_ENTRY], { stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn(process.execPath, [SERVER_ENTRY], {
+    stdio: ["pipe", "pipe", "pipe"],
+    detached: CONTAIN_TEST_SERVER_IN_OWN_PROCESS_GROUP,
+    windowsHide: true,
+  });
 
   // `allLines` is the full historical log (what `allLines()` returns).
   // `unconsumed` is a genuine PULL queue: a line a burst delivered before
