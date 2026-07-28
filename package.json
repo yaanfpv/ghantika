@@ -43,6 +43,8 @@
     "guard:no-tasks-import": "node scripts/check-no-tasks-import.mjs",
     "guard:stdio-purity": "node scripts/check-stdio-purity.mjs",
     "guard:sha-parity": "node scripts/check-sha-parity.mjs",
+    "guard:typescript-peer-range": "node scripts/check-typescript-peer-range.mjs",
+    "guard:typescript-tracking-signal": "node scripts/check-typescript-tracking-signal.mjs",
     "verify:install-repro": "node scripts/verify-install-reproducibility.mjs",
     "verify:workflow-topology": "node scripts/verify-workflow-topology.mjs",
     "lint:workflow-jobs": "node scripts/lint-workflow-jobs.mjs",
@@ -61,7 +63,7 @@
     "globals": "17.7.0",
     "js-yaml": "5.2.1",
     "prettier": "3.9.5",
-    "typescript": "5.9.3",
+    "typescript": "6.0.3",
     "typescript-eslint": "8.65.0"
   }
 }

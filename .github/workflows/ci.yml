@@ -214,7 +214,7 @@ jobs:
       # Pinned to the exact version everything else in this project's
       # toolchain is pinned to, so a local run and this job see the same
       # rule engine and the same findings.
-      - run: pip install semgrep==1.170.0
+      - run: pip install semgrep==1.171.0
       - run: semgrep --config auto --error
 
   zizmor:
@@ -230,7 +230,7 @@ jobs:
       # zizmor lints the workflow files themselves for security issues
       # (excess permissions, unpinned actions, injectable expressions and
       # the like), so it runs against this repo's own .github/workflows.
-      - run: pip install zizmor==1.27.0
+      - run: pip install zizmor==1.28.0
       - run: zizmor .
 
   actionlint:
@@ -240,8 +240,27 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - run: bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
-      - run: ./actionlint -color
+      # This used to be `bash <(curl -fsSL .../actionlint/main/scripts/download-actionlint.bash)`,
+      # a script pulled straight from upstream's moving main branch with
+      # nothing in this repository pinning what that branch actually
+      # contains at fetch time. What this job runs could change with no
+      # change here at all. This installs the exact v1.7.12 release archive
+      # instead, checks its SHA-256 against the value recorded in
+      # config/actionlint-artifact.sha256 before anything is extracted, and
+      # only unpacks the verified archive onto PATH once that check passes.
+      # A hash mismatch has to stop the job before the archive is ever
+      # unpacked, since an extracted binary's own hash can't establish that
+      # the archive it came from was safe to unpack in the first place.
+      - name: install the pinned, checksum-verified actionlint
+        run: |
+          curl --fail --silent --show-error --location --max-time 120 --retry 3 \
+            -o actionlint_1.7.12_linux_amd64.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
+          sha256sum --check config/actionlint-artifact.sha256
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf actionlint_1.7.12_linux_amd64.tar.gz -C "$RUNNER_TEMP/bin" actionlint
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: actionlint -color
 
   changelog-presence:
     name: changelog-presence
