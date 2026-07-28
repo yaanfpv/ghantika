@@ -13,7 +13,7 @@
  * The one piece of this load-bearing on stdio purity is
  * `MANAGED_CHILD_STDIO`, defined below.
  */
-import { type ChildProcess, execFileSync, spawn } from "node:child_process";
+import { type ChildProcess, execFile, execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { StdioOptions } from "node:child_process";
@@ -433,7 +433,17 @@ export function spawnManaged(
 export type IdentityCheckResult =
   | { readonly status: "alive-confirmed" }
   | { readonly status: "not-found" }
-  | { readonly status: "identity-mismatch"; readonly reason: string };
+  | { readonly status: "identity-mismatch"; readonly reason: string }
+  /**
+   * The identity OBSERVER itself (the `ps` shell-out) failed to execute or
+   * produced output this codebase could not parse - genuinely different
+   * from `not-found` (which means `ps` ran fine and confirmed there is no
+   * such pid): here, `ps` never gave a usable answer at all, so this
+   * codebase has no basis for either "confirmed alive" or "confirmed
+   * gone." Collapsing this into `not-found` is exactly the bug this
+   * variant exists to close - see `readProcessElapsedSeconds`'s own docs.
+   */
+  | { readonly status: "observer-failure"; readonly reason: string };
 
 /**
  * How many seconds of drift between a process's REAL elapsed time (as
@@ -450,6 +460,17 @@ export type IdentityCheckResult =
 export const IDENTITY_TOLERANCE_SECONDS = 5;
 
 /**
+ * The widest `dd` (leading days) value `parseEtime` will accept, chosen to
+ * be far larger than any real process this codebase could ever observe
+ * (a freshly spawned job, or - at the far end - an unrelated long-lived
+ * system process a reused pid happens to point at) while still rejecting
+ * a malformed or corrupted read several orders of magnitude past any real
+ * machine's uptime. No documented real-world uptime approaches even a
+ * small fraction of this.
+ */
+const MAX_PLAUSIBLE_ETIME_DAYS = 36_500; // 100 years
+
+/**
  * Parses `ps -o etime=`'s output - `[[dd-]hh:]mm:ss` (verified empirically
  * against the installed macOS/BSD `ps`; GNU/procps `ps` on Linux formats
  * `etime` compatibly per its own documented man page - `etime` was chosen
@@ -461,18 +482,33 @@ export const IDENTITY_TOLERANCE_SECONDS = 5;
  * seconds old", which would make a genuinely long-lived, correctly-
  * identified process look suspiciously freshly-started and could wrongly
  * fail the identity check).
+ *
+ * `hh`, `mm`, and `ss` are each REQUIRED to be exactly two digits (verified
+ * empirically: a fresh process reads `00:01`, never `0:1` or `0:01`).
+ * Accepting any-length digit runs in these fields let a single corrupted
+ * or concatenated read parse as a syntactically-valid but physically-
+ * impossible elapsed time (a 14-digit "seconds" field silently producing a
+ * value on the order of a million years) instead of the `observer-failure`
+ * a malformed read actually is.
+ *
+ * The leading `dd` field has no fixed width in real `ps` output (a
+ * genuinely long-lived process can show any number of days), so it cannot
+ * be digit-width-bounded the way the other three fields are - but it is
+ * still bounded to `MAX_PLAUSIBLE_ETIME_DAYS`: the same corrupted-value
+ * class the digit-width check closes for `hh`/`mm`/`ss` can equally
+ * produce an absurd `dd` value (observed directly: a malformed real read
+ * that parsed, before this bound existed, as ~441 million days), and an
+ * unbounded leading field would let that same class of corruption straight
+ * back through this parser's other side.
  */
 export function parseEtime(raw: string): number | undefined {
   const trimmed = raw.trim();
   const dayMatch = trimmed.match(/^(\d+)-(.+)$/);
   const days = dayMatch ? Number(dayMatch[1]) : 0;
+  if (days > MAX_PLAUSIBLE_ETIME_DAYS) return undefined;
   const rest = dayMatch ? dayMatch[2]! : trimmed;
   const parts = rest.split(":");
-  if (
-    parts.length < 2 ||
-    parts.length > 3 ||
-    parts.some((part) => part.length === 0 || !/^\d+$/.test(part))
-  ) {
+  if (parts.length < 2 || parts.length > 3 || parts.some((part) => !/^\d{2}$/.test(part))) {
     return undefined;
   }
   const numbers = parts.map(Number);
@@ -497,32 +533,316 @@ export function identityElapsedTimesMatch(
   return Math.abs(actualElapsedSeconds - expectedElapsedSeconds) <= toleranceSeconds;
 }
 
+/** The real outcome of one `ps -p <pid> -o etime=` read - see `readProcessElapsedSeconds`'s own docs for why this is a three-way discrimination, not the `number | undefined` shape this used to return. */
+export type ElapsedSecondsReadResult =
+  | { readonly status: "found"; readonly elapsedSeconds: number }
+  | { readonly status: "not-found" }
+  | { readonly status: "observer-failure"; readonly reason: string };
+
 /**
  * Reads `pid`'s real elapsed wall-clock time from the OS via a real `ps`
- * invocation - `undefined` if `ps` reports nothing for this pid (it isn't
- * alive) or produces output this codebase can't parse.
+ * invocation - and, critically, distinguishes WHY no usable reading came
+ * back, rather than collapsing every failure into one `undefined`:
+ *
+ * - `not-found`: `ps` ran successfully and reported, via its own
+ *   documented "no such pid" exit code (verified empirically: status 1,
+ *   no output), that this pid genuinely isn't alive. A confident,
+ *   positive result.
+ * - `observer-failure`: `ps` itself failed to execute (a missing binary -
+ *   `ENOENT`; a permission failure; any other execution error) or
+ *   produced output this codebase couldn't parse. This is NOT a claim
+ *   that the pid is alive or dead - it's a claim that the OBSERVER is
+ *   broken/unavailable right now, so this codebase has no basis for
+ *   either answer. Every caller of this function (`checkProcessIdentity`
+ *   below) must treat this differently from `not-found`: silently
+ *   collapsing the two let an observer failure masquerade as "nothing
+ *   left to signal" and produce a FALSE SUCCESS while the real process
+ *   group stayed completely unsignaled and alive - the exact bug this
+ *   type exists to close.
  */
-function readProcessElapsedSeconds(pid: number): number | undefined {
+/**
+ * Interprets a `ps -p <pid> -o etime=` invocation's real STDOUT, once it has
+ * actually exited zero (a successful lookup) - the one piece of parsing
+ * logic BOTH the sync (`readProcessElapsedSeconds`, via `execFileSync`) and
+ * async (`readProcessElapsedSecondsAsync`, via `execFile`) observers share,
+ * factored out here so a change to how empty/unparseable output is
+ * classified can never drift between the two call paths. See
+ * `ElapsedSecondsReadResult`'s own docs for what each outcome means.
+ */
+function interpretPsOutput(output: string): ElapsedSecondsReadResult {
+  if (output.trim().length === 0) {
+    // ps exited 0 (success) but printed nothing at all - never actually
+    // observed against a real `ps` in this codebase's own testing, but
+    // this is still an unusable/ambiguous result, not a confident
+    // "not-found" - treated the same as unparseable output below.
+    return { status: "observer-failure", reason: "ps produced no output" };
+  }
+  const elapsedSeconds = parseEtime(output);
+  if (elapsedSeconds === undefined) {
+    return {
+      status: "observer-failure",
+      reason: `ps produced output this codebase could not parse: ${JSON.stringify(output)}`,
+    };
+  }
+  return { status: "found", elapsedSeconds };
+}
+
+function readProcessElapsedSeconds(pid: number): ElapsedSecondsReadResult {
   let output: string;
   try {
     output = execFileSync("ps", ["-p", String(pid), "-o", "etime="], { encoding: "utf8" });
-  } catch {
-    return undefined; // ps exits non-zero when there is no such pid
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException & { status?: number | null };
+    if (err.status === 1) {
+      // ps's own documented "no such pid" exit code - a real, confident
+      // "genuinely not alive" result, never itself an observer failure.
+      return { status: "not-found" };
+    }
+    return {
+      status: "observer-failure",
+      reason:
+        err.code !== undefined
+          ? `ps failed to execute (${err.code})`
+          : `ps failed unexpectedly: ${err.message ?? String(error)}`,
+    };
   }
-  if (output.trim().length === 0) return undefined;
-  return parseEtime(output);
+  return interpretPsOutput(output);
+}
+
+/**
+ * `execFile`'s callback-form error carries its exit code / spawn-error code
+ * on the SAME `code` property, typed by Node's own `child_process.d.ts` as
+ * `ExecFileException["code"]: number | string` - genuinely different from
+ * `NodeJS.ErrnoException.code`'s `string`-only type (`execFileSync`'s
+ * thrown-error shape), which is why this needs its own local type rather
+ * than reusing `NodeJS.ErrnoException` here (intersecting the two would
+ * collapse `code`'s type back down to `string`, silently losing the
+ * numeric exit-code case entirely).
+ */
+type ExecFileCallbackError = Error & { readonly code?: string | number | null };
+
+/**
+ * How much longer than the caller's own `timeoutMs` this function waits,
+ * on top of `execFile`'s own internal `timeout`, before giving up on the
+ * child regardless of whether it has actually exited. `execFile`'s
+ * `timeout` option only SENDS a signal (SIGTERM by default) once
+ * `timeoutMs` elapses - it does not, and cannot, guarantee the child
+ * actually dies from it, so a settlement bound built entirely on that
+ * option is not a hard bound at all (see this function's own docs for the
+ * real, reproduced case: an observer that installs a SIGTERM handler and
+ * ignores it). This grace exists only to give an ORDINARY, cooperative
+ * child - one that actually does die from SIGTERM, which is the common
+ * case - a brief real window to have its exit observed and reported
+ * through the normal callback before the external bound below forces the
+ * issue; it is not slack for a resistant child, which the external bound
+ * catches regardless.
+ */
+const ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS = 250;
+
+/**
+ * The ASYNC counterpart of `readProcessElapsedSeconds` above - the same
+ * real observation (`ps -p <pid> -o etime=`) and the same three-way result
+ * shape (shared via `interpretPsOutput` for the success path), but through
+ * Node's callback-based `execFile` instead of the blocking `execFileSync`.
+ *
+ * The settlement bound is CALLER-SIDE, independent of the child's own
+ * cooperation - not `execFile`'s own `timeout` option alone. `execFile`'s
+ * `timeout` sends `killSignal` (SIGTERM by default) once `timeoutMs`
+ * elapses, but that is a request, not a guarantee: a child that installs
+ * its own SIGTERM handler and ignores it (reproduced directly against this
+ * function: a fake `ps` that does exactly that resolves over 2.5 real
+ * seconds past a configured 1-second bound) leaves `execFile`'s own
+ * callback genuinely unfired, and a promise built on that callback alone
+ * stays pending for as long as the child does - which can be indefinitely.
+ * `kill()` and the shutdown reaper both await this same promise through
+ * `JobStore.resolveBirthIdentityForKill`, so an unbounded promise here
+ * means either can hang past every timeout this codebase claims. A second,
+ * independent timer (`setTimeout`, not tied to the child at all) forces
+ * this promise to settle at `timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS`
+ * regardless of what the child does, and additionally SIGKILLs the child
+ * directly at that point - the OS-level force `execFile`'s own SIGTERM-only
+ * request cannot provide - so a resistant observer is not left running
+ * merely because it chose not to cooperate with the first signal.
+ *
+ * `execFile`'s callback-form error shape differs from `execFileSync`'s
+ * thrown-error shape in exactly the one place this function has to account
+ * for: a real nonzero exit (the `not-found` case, `ps`'s documented exit
+ * code 1) surfaces on the callback error's `code` property as a NUMBER
+ * (there is no separate `status` field on this error shape, unlike
+ * `execFileSync`'s), while a genuine spawn failure (`ps` itself missing,
+ * `ENOENT`) surfaces on that SAME `code` property as a STRING. A
+ * timeout-triggered kill reports NEITHER shape: `code` is `null` and
+ * `signal`/`killed` are set instead (the child died from a signal, not a
+ * normal exit) - correctly falling through to the generic
+ * `observer-failure` branch below, never mistaken for `not-found` (`ps`
+ * itself never actually answered).
+ */
+function readProcessElapsedSecondsAsync(
+  pid: number,
+  timeoutMs: number
+): Promise<ElapsedSecondsReadResult> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const child = execFile(
+      "ps",
+      ["-p", String(pid), "-o", "etime="],
+      { encoding: "utf8", timeout: timeoutMs },
+      (error, stdout) => {
+        if (settled) return; // the external bound below already resolved this promise
+        settled = true;
+        clearTimeout(externalBound);
+        if (error === null) {
+          resolve(interpretPsOutput(stdout));
+          return;
+        }
+        const err = error as ExecFileCallbackError;
+        if (err.code === 1) {
+          // ps's own documented "no such pid" exit code, surfaced as a
+          // NUMBER on this callback-error shape (see this function's own
+          // docs) - a real, confident "genuinely not alive" result.
+          resolve({ status: "not-found" });
+          return;
+        }
+        resolve({
+          status: "observer-failure",
+          reason:
+            typeof err.code === "string"
+              ? `ps failed to execute (${err.code})`
+              : `ps failed unexpectedly: ${err.message ?? String(error)}`,
+        });
+      }
+    );
+    const externalBound = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // `execFile`'s own timeout already sent SIGTERM at this point (its
+      // internal timer and this one both start from the same call); if
+      // the observer ignored it, SIGKILL directly - uncatchable/
+      // unblockable, so this genuinely ends it rather than sending yet
+      // another request the observer could also ignore.
+      child.kill("SIGKILL");
+      resolve({
+        status: "observer-failure",
+        reason: `ps did not settle within ${timeoutMs}ms (observer unresponsive to SIGTERM)`,
+      });
+    }, timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS);
+  });
+}
+
+/**
+ * A managed job leader's real, OS-readable birth identity, captured once
+ * via a real `ps -o etime=` read as close to the actual OS-level spawn as
+ * this codebase can get (see `captureBirthIdentityPosix`'s own docs) -
+ * NOT a fresh `Date.now()`-derived guess, and never re-derived later.
+ * `elapsedSecondsAtCapture` is the real, `ps`-observed elapsed age at the
+ * moment of capture (typically ~0s, but never assumed to be exactly 0);
+ * `capturedAtMs` is this codebase's own wall-clock reading of when that
+ * capture happened, which is what lets a LATER identity check compute how
+ * much more time should have elapsed since then and compare it against a
+ * fresh real `ps` reading - see `checkProcessIdentity`'s own docs.
+ */
+export interface ProcessBirthIdentity {
+  readonly capturedAtMs: number;
+  readonly elapsedSecondsAtCapture: number;
+}
+
+/**
+ * Captures a freshly spawned leader's real birth identity via a BLOCKING
+ * `ps` read (`execFileSync`). NULLABLE by design, matching this repo's own
+ * established principle that `run()` does NOT fail on a capture failure: a
+ * job must still be created and remain killable even when this capture
+ * itself fails (`ps` unavailable, unparseable output, or the process
+ * already gone by the time this runs - genuinely possible for an extremely
+ * short-lived command). `undefined` here is the signal every downstream
+ * kill/shutdown caller must treat as "identity was never established for
+ * this job" and take the honest, disclosed DEGRADED path (pgid-only
+ * signaling, no identity confirmation attempted) rather than silently
+ * proceeding as if identity had been confirmed - see
+ * `evaluatePreSignalIdentityGate`'s own docs for exactly how.
+ *
+ * NOT what `run()`'s own production handler calls - a synchronous `ps`
+ * shell-out on `run()`'s response path blocks the whole MCP call on
+ * however long that one invocation takes, with no bound at all, which
+ * defeats `run()`'s own documented "returns immediately, no blocking"
+ * contract the instant `ps` is slow or hung (see `src/tools/run.ts`'s own
+ * docs). `run()` calls `captureBirthIdentityPosixAsync` below instead,
+ * fired off without ever being awaited. This synchronous primitive is kept
+ * because it's still directly useful wherever a real, immediately-available
+ * birth identity is needed to compare against or seed a fixture with, and
+ * because `captureBirthIdentityPosixAsync`'s own success path is built by
+ * awaiting the identical `ps -o etime=` observation this function makes
+ * synchronously - the two are the same real read, just via `execFileSync`
+ * vs. a bounded `execFile`.
+ *
+ * POSIX only, matching every other identity-check primitive in this file:
+ * Windows has no equivalent birth-identity model today (see
+ * `killProcessTreeWindows`'s own docs), so this always returns `undefined`
+ * there rather than attempting a `ps` call that doesn't exist on that
+ * platform.
+ */
+export function captureBirthIdentityPosix(pid: number): ProcessBirthIdentity | undefined {
+  if (process.platform === "win32") return undefined;
+  const observed = readProcessElapsedSeconds(pid);
+  if (observed.status !== "found") return undefined;
+  return { capturedAtMs: Date.now(), elapsedSecondsAtCapture: observed.elapsedSeconds };
+}
+
+/**
+ * How long the ASYNC birth-identity capture's own `ps` invocation is given
+ * to answer before this codebase forcibly kills it (`execFile`'s own
+ * `timeout` option sends SIGTERM to the child once this elapses) and
+ * treats the attempt as a genuine observer failure - a few real seconds,
+ * generous enough that an ordinarily-slow `ps` still succeeds, but bounded
+ * so a truly hung one can never leave a capture unsettled indefinitely.
+ * This bound is what makes `captureBirthIdentityPosixAsync` safe to fire
+ * off from `run()`'s handler WITHOUT ever being awaited there (see
+ * `src/tools/run.ts`'s own docs), and it's the same bound that caps how
+ * long `kill()`/the shutdown reaper can ever wait when they find a capture
+ * still genuinely PENDING at the moment they need it (see
+ * `src/jobStore.ts`'s `resolveBirthIdentityForKill` and
+ * `src/tools/kill.ts`'s own docs) - awaiting an in-flight capture can never
+ * take longer than this, however slow or hung the real `ps` process
+ * actually is.
+ */
+export const ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS = 3000;
+
+/**
+ * The ASYNC counterpart of `captureBirthIdentityPosix` above - the one
+ * `run()`'s real production handler actually calls (see
+ * `src/tools/run.ts`'s handler): the identical real observation and the
+ * identical nullable-by-design contract, but built on
+ * `readProcessElapsedSecondsAsync` (a bounded, non-blocking `execFile`
+ * rather than a blocking `execFileSync`) so a slow or hung `ps` can never
+ * hold up `run()`'s own response. `run()` fires this off WITHOUT ever
+ * awaiting it - see `src/jobStore.ts`'s `attachPendingIdentityCapture`,
+ * which is what tracks the returned promise and updates the job's
+ * bookkeeping once it actually settles, strictly after `run()` has already
+ * returned. POSIX only, matching the synchronous version (see its own docs
+ * for why).
+ */
+export async function captureBirthIdentityPosixAsync(
+  pid: number,
+  timeoutMs: number = ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS
+): Promise<ProcessBirthIdentity | undefined> {
+  if (process.platform === "win32") return undefined;
+  const observed = await readProcessElapsedSecondsAsync(pid, timeoutMs);
+  if (observed.status !== "found") return undefined;
+  return { capturedAtMs: Date.now(), elapsedSecondsAtCapture: observed.elapsedSeconds };
 }
 
 /**
  * The real, external-to-our-own-bookkeeping identity check `kill` runs
  * before ever signaling a tracked pid: confirms `pid` is both alive right
- * now AND was actually started at approximately
- * `expectedSpawnedAtMs` - i.e. that it is genuinely still the SAME process
- * this codebase spawned, not an unrelated process that happens to have
- * been assigned the same (recycled) pid after the original child already
- * exited. Never trusts this codebase's own internal bookkeeping alone -
- * shells out to the real `ps` utility (present on both macOS and Linux)
- * for an independent, external read of the OS's own process table.
+ * now AND was actually started at approximately the moment `birthIdentity`
+ * (captured once, at spawn time - see `captureBirthIdentityPosix`) says it
+ * was - i.e. that it is genuinely still the SAME process this codebase
+ * spawned, not an unrelated process that happens to have been assigned the
+ * same (recycled) pid after the original child already exited. Never
+ * trusts this codebase's own internal bookkeeping alone - shells out to
+ * the real `ps` utility (present on both macOS and Linux) for an
+ * independent, external read of the OS's own process table, and compares
+ * it against a REAL prior `ps` observation (`birthIdentity`), never a
+ * value derived purely from this codebase's own `Date.now()` math.
  *
  * Honest limitation, stated plainly rather than overclaimed: this is a
  * best-effort, probabilistic defense (a seconds-resolution comparison via
@@ -533,22 +853,93 @@ function readProcessElapsedSeconds(pid: number): number | undefined {
  * Windows). It closes the realistic, common case (a long-dead job's pid
  * recycled by an unrelated later process) without pretending to close
  * every theoretical one.
+ *
+ * `birthIdentity` is required (non-nullable) here on purpose: a caller
+ * with no captured identity at all has nothing to compare against and
+ * must not call this function - see `evaluatePreSignalIdentityGate`,
+ * every real caller's actual entry point, for how that "no identity
+ * captured" case is handled (the same DEGRADED path an `observer-failure`
+ * result from THIS function leads to).
  */
-export function checkProcessIdentity(
+export async function checkProcessIdentity(
   pid: number,
-  expectedSpawnedAtMs: number,
+  birthIdentity: ProcessBirthIdentity,
   now: number = Date.now()
-): IdentityCheckResult {
-  const actualElapsedSeconds = readProcessElapsedSeconds(pid);
-  if (actualElapsedSeconds === undefined) return { status: "not-found" };
-  const expectedElapsedSeconds = (now - expectedSpawnedAtMs) / 1000;
-  if (!identityElapsedTimesMatch(actualElapsedSeconds, expectedElapsedSeconds)) {
+): Promise<IdentityCheckResult> {
+  const observed = await readProcessElapsedSecondsAsync(
+    pid,
+    ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS
+  );
+  if (observed.status === "not-found") return { status: "not-found" };
+  if (observed.status === "observer-failure") {
+    return { status: "observer-failure", reason: observed.reason };
+  }
+  const expectedElapsedSeconds =
+    birthIdentity.elapsedSecondsAtCapture + (now - birthIdentity.capturedAtMs) / 1000;
+  if (!identityElapsedTimesMatch(observed.elapsedSeconds, expectedElapsedSeconds)) {
     return {
       status: "identity-mismatch",
-      reason: `pid ${pid} has been alive for ~${actualElapsedSeconds}s, expected ~${expectedElapsedSeconds.toFixed(1)}s - this looks like a reused pid, not the process we originally spawned`,
+      reason: `pid ${pid} has been alive for ~${observed.elapsedSeconds}s, expected ~${expectedElapsedSeconds.toFixed(1)}s - this looks like a reused pid, not the process we originally spawned`,
     };
   }
   return { status: "alive-confirmed" };
+}
+
+/**
+ * What a kill/shutdown caller should actually DO before ever signaling a
+ * tracked pid - the single real entry point every caller uses, wrapping
+ * `checkProcessIdentity` (and the "no identity captured at all" case
+ * that function can't handle on its own, since it requires a real
+ * `ProcessBirthIdentity` to compare against):
+ *
+ * - `"skip"`: the pid is genuinely gone (a confident `not-found`) -
+ *   nothing to signal, and no error.
+ * - `"refuse"`: a genuine identity mismatch - never signal, surface `reason`.
+ * - `"proceed"`: either identity was captured AND confirmed
+ *   (`identityConfirmed: true`), or identity could never be verified at
+ *   all - no birth identity was ever captured at spawn time (`ps` was
+ *   unavailable then, or the process died before capture could run), or
+ *   the KILL-TIME `ps` read itself just failed (`observer-failure`) -
+ *   in which case `identityConfirmed: false` and the caller proceeds via
+ *   the honest, disclosed DEGRADED path: pgid-only group signaling,
+ *   never silently treated as if identity had been confirmed. Both
+ *   `identityConfirmed: false` triggers are deliberately collapsed into
+ *   the identical caller-visible outcome - a caller with no reference to
+ *   compare against and a caller whose comparison just failed are in the
+ *   same epistemic position: it cannot verify identity right now, so it
+ *   must not silently claim it did.
+ */
+export type PreSignalGateResult =
+  | { readonly action: "skip" }
+  | { readonly action: "refuse"; readonly reason: string }
+  | { readonly action: "proceed"; readonly identityConfirmed: boolean };
+
+export async function evaluatePreSignalIdentityGate(
+  pid: number,
+  birthIdentity: ProcessBirthIdentity | undefined,
+  now: number = Date.now()
+): Promise<PreSignalGateResult> {
+  if (birthIdentity === undefined) {
+    // Capture failed (or was never attempted) at spawn time - there is
+    // nothing to compare against, so identity cannot be verified at all.
+    // Never silently treated as confirmed.
+    return { action: "proceed", identityConfirmed: false };
+  }
+  const identity = await checkProcessIdentity(pid, birthIdentity, now);
+  if (identity.status === "not-found") return { action: "skip" };
+  if (identity.status === "identity-mismatch") {
+    return { action: "refuse", reason: identity.reason };
+  }
+  if (identity.status === "observer-failure") {
+    // The KILL-TIME observer itself is broken/unavailable right now -
+    // genuinely unable to verify identity, but NOT genuinely "not found"
+    // either (collapsing the two is exactly the bug this whole gate
+    // exists to close). Proceed via the same degraded, honestly-
+    // disclosed path a missing captured identity uses, rather than
+    // either a false success or an uncaught failure.
+    return { action: "proceed", identityConfirmed: false };
+  }
+  return { action: "proceed", identityConfirmed: true };
 }
 
 /** True if `pid` still exists, checked via the real, zero-side-effect `kill -0` probe. */
@@ -589,7 +980,7 @@ export function isProcessGroupAlive(pid: number): boolean {
 }
 
 export type SignalResult =
-  | { readonly ok: true }
+  | { readonly ok: true; readonly delivered: boolean }
   | { readonly ok: false; readonly message: string; readonly code: string | undefined };
 
 /**
@@ -604,10 +995,15 @@ export type SignalResult =
 export function signalProcessGroupPosix(pid: number, signal: string): SignalResult {
   try {
     process.kill(-pid, signal);
-    return { ok: true };
+    return { ok: true, delivered: true };
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
-    if (err.code === "ESRCH") return { ok: true }; // the group is already gone - nothing left to signal, not a failure
+    // The group is already gone - nothing left to signal, not a failure, but
+    // also NOT a delivery: no live process ever received this signal, so a
+    // caller must never treat this the same as an actual send (see
+    // `killProcessGroupPosix`'s own docs for why `delivered` gates
+    // `onSignaled` and the terminal-state write it triggers).
+    if (err.code === "ESRCH") return { ok: true, delivered: false };
     return { ok: false, message: err.message, code: err.code };
   }
 }
@@ -622,26 +1018,39 @@ export function signalProcessGroupPosix(pid: number, signal: string): SignalResu
  * GROUP to be gone instead - `killProcessGroupPosix` does exactly this,
  * since a group-level kill must confirm the group is genuinely gone, not
  * merely that its leader exited (see `isProcessGroupAlive`'s own docs).
+ *
+ * `isAlive` may return a `boolean` directly (the fast, synchronous
+ * `kill(pid, 0)`-based checks above - a real syscall, not a shelled-out
+ * process, so there is nothing here for a caller-side bound to guard
+ * against) or a `Promise<boolean>` (`hasLiveProcessGroupMembersPosixAsync`,
+ * which shells out to a real `pgrep` and carries its own independent
+ * settlement bound - see that function's own docs for why a plain
+ * synchronous predicate calling `execFileSync` here would block this
+ * loop's own event loop for as long as the external process takes). Each
+ * tick `await`s whatever `isAlive` returns, which is a no-op for the
+ * synchronous case and a real await for the async one.
  */
 export function waitForProcessDeath(
   pid: number,
   timeoutMs: number,
   pollIntervalMs = 50,
-  isAlive: (pid: number) => boolean = isProcessAlive
+  isAlive: (pid: number) => boolean | Promise<boolean> = isProcessAlive
 ): Promise<boolean> {
   return new Promise((resolve) => {
     const deadline = Date.now() + timeoutMs;
     const tick = (): void => {
-      if (!isAlive(pid)) {
-        resolve(true);
-        return;
-      }
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        resolve(false);
-        return;
-      }
-      setTimeout(tick, Math.min(pollIntervalMs, remaining));
+      void (async () => {
+        if (!(await isAlive(pid))) {
+          resolve(true);
+          return;
+        }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          resolve(false);
+          return;
+        }
+        setTimeout(tick, Math.min(pollIntervalMs, remaining));
+      })();
     };
     tick();
   });
@@ -657,10 +1066,58 @@ export function waitForProcessDeath(
  */
 export const POSIX_KILL_GRACE_PERIOD_MS = 5000;
 
+/**
+ * The whole-phase budget for EACH of the two real observations the
+ * escalation identity gate makes - the pre-SIGTERM membership snapshot
+ * (`captureEscalationIdentitySnapshot`) and the escalation-time re-read
+ * (`evaluateEscalationIdentityGate`). Both phases get their OWN fresh
+ * 2000ms, never one budget shared or split across the two - a slow
+ * snapshot never eats into the re-read's own allowance, and neither
+ * phase's OBSERVATION COUNT scales with how many process-group members
+ * it observes (see `readPidStartTimesBatchPosix`'s own docs: every
+ * member is read in ONE batched `ps` call, never one call per member) -
+ * though that one batched call still constructs, emits, and parses data
+ * proportional to the group's own size, so the byte cost of a single
+ * observation is not itself size-independent, only its call count is.
+ *
+ * Strictly less than `POSIX_KILL_GRACE_PERIOD_MS` (asserted directly by
+ * this codebase's own test suite, not just eyeballed here) - so neither
+ * observation phase can ever outlast the grace window it sits beside.
+ */
+export const PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS = 2000;
+
 export interface PosixKillResult {
   readonly finalSignal: "SIGTERM" | "SIGKILL";
   /** True if SIGTERM alone was NOT enough within the grace period, and SIGKILL was actually sent too. */
   readonly escalated: boolean;
+  /**
+   * Whether the bounded, EXTERNAL, `pgrep`-based process-group check
+   * (`confirmProcessGroupReapedPosix`) actually observed zero surviving
+   * process-group members after signaling completed (`true`), or the bound
+   * elapsed without confirming (`false` - an honest "attempted, not
+   * confirmed" result, never silently upgraded to `true`). Computed AFTER,
+   * and never gating, the synchronous killed-state transition
+   * `callbacks.onSignaled` already claimed - see that field's own docs for
+   * why the state transition can't wait on this.
+   */
+  readonly confirmed: boolean;
+  /**
+   * Present ONLY when the group survived the grace period AND the
+   * escalation identity gate (`evaluateEscalationIdentityGate`) refused to
+   * confirm the group is still the one this codebase spawned - in which
+   * case no SIGKILL was ever sent (`escalated` stays `false`, the same as
+   * a group that died from SIGTERM alone). Absent whenever escalation was
+   * never reached at all (the group died within grace, or was already
+   * gone) - never present-as-undefined-string, genuinely absent. The
+   * value is a short, honest description of WHICH fail-closed cell fired
+   * (see `evaluateEscalationIdentityGate`'s own docs for the full
+   * enumeration) - never a claim that the group is confirmed gone, and
+   * never a claim that the earlier SIGTERM was "confirmed" or "guarded"
+   * when identity could not be verified at all (see this field's own
+   * combined-degraded wording in `captureEscalationIdentitySnapshot`'s
+   * docs).
+   */
+  readonly escalationRefusedReason?: string;
 }
 
 export interface PosixKillCallbacks {
@@ -709,13 +1166,27 @@ const SIGKILL_CONFIRMATION_TIMEOUT_MS = 1000;
  * same race, making it a no-op as a disambiguator. `pgrep -g <pgid>` reads
  * the real process table through an entirely different mechanism, so it
  * is not fooled the same way - the same external, independent-of-our-own-
- * bookkeeping oracle this repo's own tests already trust for exactly this
- * purpose (see `pgrepGroupMembers` in test/kill.test.ts and
- * test/shutdown.test.ts), promoted here because a production decision now
- * needs the same disambiguation a test already relied on. Deliberately
- * NOT consulted for any other errno: an unanticipated failure shape is
- * surfaced unconditionally rather than run through an oracle built to
- * arbitrate one specific, verified ambiguity. POSIX-only, matching every
+ * bookkeeping check already used elsewhere in this codebase for exactly
+ * this purpose, now needed for a production decision too.
+ *
+ * A pgrep EXECUTION failure (a missing binary - `ENOENT`; any other
+ * unexpected execution error) is FAIL-CLOSED to `true` ("treat the group
+ * as still alive/unconfirmed"), never rethrown. This function is this
+ * codebase's ONE real external process-table observer, consulted from two
+ * places, and `true` is the safe answer at both: `throwUnlessBenignAlreadyGoneRace`
+ * reads `true` as "the group is NOT confirmed gone" and correctly
+ * surfaces the ambiguous signal-send failure as real rather than silently
+ * swallowing it as the benign already-gone race; `confirmProcessGroupReapedPosix`'s
+ * poll loop reads `true` as "not yet confirmed dead" and simply keeps
+ * waiting until its own bound elapses, at which point it honestly reports
+ * `confirmed: false` - the same "attempted, never silently upgraded to
+ * confirmed" disclosure this codebase already uses everywhere else,
+ * rather than an uncaught exception reaching a client with no tool result
+ * at all (the bug this fail-closed behavior exists to close - see
+ * `confirmProcessGroupReapedPosix`'s own docs). Only pgrep's own
+ * documented "nothing matched" exit code (1) is a confident, POSITIVE
+ * "zero real survivors" result - every other execution failure is treated
+ * as "cannot tell," never as either extreme. POSIX-only, matching every
  * other function in this section.
  */
 export function hasLiveProcessGroupMembersPosix(pid: number): boolean {
@@ -728,8 +1199,127 @@ export function hasLiveProcessGroupMembersPosix(pid: number): boolean {
   } catch (error) {
     const err = error as NodeJS.ErrnoException & { status?: number };
     if (err.status === 1) return false; // pgrep's own "nothing matched" exit code - a real, expected zero-survivors result
-    throw error;
+    // Any other failure (ENOENT - pgrep missing entirely; a permission
+    // failure; anything unanticipated) means THIS observer is broken
+    // right now, not that the group is confirmed gone - fail closed to
+    // "still alive/unconfirmed" rather than rethrow (see this function's
+    // own docs above for exactly how each real caller turns that into a
+    // safe, honest outcome on its own).
+    return true;
   }
+}
+
+/**
+ * How long a single `hasLiveProcessGroupMembersPosixAsync` call is given to
+ * answer before this codebase gives up on IT specifically and force-reaps
+ * it - independent of, and smaller than, `confirmProcessGroupReapedPosix`'s
+ * own outer polling deadline, so one resistant `pgrep` invocation cannot
+ * consume that entire budget by itself.
+ */
+export const PGREP_SINGLE_CALL_TIMEOUT_MS = 500;
+
+/**
+ * The ASYNC counterpart of `hasLiveProcessGroupMembersPosix` above, built
+ * on the identical caller-side-bound-plus-force-reap shape
+ * `readProcessElapsedSecondsAsync` already establishes (see that function's
+ * own docs for the full rationale): `execFile`'s own `timeout` option only
+ * REQUESTS SIGTERM, so a `pgrep` that installs a handler and ignores it
+ * would otherwise leave this promise - and the single Node event loop this
+ * whole server runs on - unsettled for as long as that `pgrep` process
+ * chooses to run. A second, independent timer forces settlement regardless
+ * of the child's cooperation, and SIGKILLs it directly if it is still alive
+ * at that point.
+ *
+ * Fails closed to `true` ("still alive/unconfirmed") on any observer
+ * failure or timeout, exactly matching the sync version's own documented
+ * fail-closed behavior - never silently upgraded to a confirmed-gone
+ * result just because this codebase gave up waiting.
+ */
+function hasLiveProcessGroupMembersPosixAsync(
+  pid: number,
+  timeoutMs: number = PGREP_SINGLE_CALL_TIMEOUT_MS
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const child = execFile(
+      "pgrep",
+      ["-g", String(pid)],
+      { encoding: "utf8", timeout: timeoutMs },
+      (error, stdout) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(externalBound);
+        if (error === null) {
+          resolve(
+            stdout
+              .split("\n")
+              .map((line) => line.trim())
+              .some((line) => line.length > 0)
+          );
+          return;
+        }
+        const err = error as ExecFileCallbackError & { status?: number };
+        if (err.status === 1 || err.code === 1) {
+          resolve(false); // pgrep's own "nothing matched" exit code - a real, expected zero-survivors result
+          return;
+        }
+        resolve(true); // observer failure - fail closed to "still alive/unconfirmed"
+      }
+    );
+    const externalBound = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      resolve(true); // did not settle in time - fail closed to "still alive/unconfirmed"
+    }, timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS);
+  });
+}
+
+/**
+ * How long the FINAL, external `pgrep`-based process-group confirmation
+ * (`confirmProcessGroupReapedPosix`) is given to observe zero surviving
+ * process-group members before giving up and reporting the kill as
+ * attempted-but-unconfirmed rather than silently claiming confirmed. On a
+ * real system this resolves almost immediately once the group is actually
+ * gone (signaling already happened, and in the default phased path an
+ * internal `kill(pid, 0)`-based wait already ran first) - this bound exists
+ * purely to close the same tiny real async gap `SIGKILL_CONFIRMATION_TIMEOUT_MS`
+ * closes, one level up: between "signaling is done" and "an independent,
+ * differently-mechanized oracle also agrees the group is gone."
+ */
+export const GROUP_CONFIRMATION_TIMEOUT_MS = 1000;
+
+/**
+ * The final, external check a kill's `confirmed` result relies on: polls the
+ * real process table via `pgrep -g` (`hasLiveProcessGroupMembersPosixAsync`)
+ * until it reports zero surviving members or `timeoutMs` elapses without
+ * confirming, reusing `waitForProcessDeath`'s poll loop with this pgrep-based
+ * predicate. ASYNC, not the plain synchronous `hasLiveProcessGroupMembersPosix`
+ * - a blocking `execFileSync` here would stall the single Node event loop
+ * this whole server runs on for as long as `pgrep` takes, which defeats the
+ * "bounded" half of this function's own name the moment `pgrep` is slow or
+ * hung (see `hasLiveProcessGroupMembersPosixAsync`'s own docs for the
+ * measured case: a resistant `pgrep` left this promise settling seconds
+ * after its configured bound, with every other job's output/status and
+ * every other MCP request frozen for that whole span).
+ *
+ * This function always just resolves a `confirmed` boolean and never
+ * touches job state directly. Callers differ in what they do with it:
+ * `killProcessGroupPosix`'s phased default and the shutdown reaper run this
+ * AFTER the synchronous `killed`-state transition already happened, so it
+ * only refines the result's honesty, never the state itself. For a
+ * caller-supplied signal with no termination guarantee (SIGSTOP), this
+ * return value is what gates whether the job becomes `killed` at all. For
+ * one that cannot be caught or ignored (an explicit SIGKILL), the state can
+ * independently reach `killed` via the process's own exit before this ever
+ * resolves - this value then only gates `kill_confirmed`/`identity_confirmed`,
+ * never the state itself.
+ */
+export function confirmProcessGroupReapedPosix(
+  pid: number,
+  timeoutMs: number = GROUP_CONFIRMATION_TIMEOUT_MS
+): Promise<boolean> {
+  return waitForProcessDeath(pid, timeoutMs, 50, (p) => hasLiveProcessGroupMembersPosixAsync(p));
 }
 
 /**
@@ -762,10 +1352,21 @@ export function hasLiveProcessGroupMembersPosix(pid: number): boolean {
  * actual goal (a dead group) and is treated as success, exactly as if
  * `ESRCH` had been returned; only a failed send where the group is
  * CONFIRMED still alive is a genuine failure worth throwing over.
- * `callbacks.onSignaled` still fires in the benign-race case -
- * `jobStore.markKilled`'s own terminal-state guard (first write wins)
- * makes this safe even if the job's natural `exit` event already claimed
- * the terminal state a moment earlier.
+ * `callbacks.onSignaled` does NOT fire in the benign-race case, nor for a
+ * signal that resolved to ESRCH before ever reaching this arbitration -
+ * both are "the group was already gone," never a real send, and firing
+ * the callback for either would claim a terminal kill on a job nothing
+ * here ever signaled. An earlier version of this comment reasoned about
+ * only ONE direction of the natural-exit-vs-signal race: it observed that
+ * firing `onSignaled` in the benign-race case was safe because
+ * `jobStore.markKilled`'s terminal-state guard is first-write-wins, so a
+ * natural `exit` that already claimed the slot couldn't be overwritten.
+ * True for that ordering - but the opposite ordering is the one that
+ * actually bites: `markKilled` claiming the slot FIRST, for a process
+ * nobody signaled, with first-write-wins then locking in the WRONG
+ * answer before the real natural `exit` ever arrives. `delivered` on
+ * `SignalResult` (see its own docs) is what closes this: only a
+ * genuine send may ever call `onSignaled`.
  */
 /**
  * The ONE owning arbitration point for a failed signal-send, shared by
@@ -775,21 +1376,570 @@ export function hasLiveProcessGroupMembersPosix(pid: number): boolean {
  * accidentally-untested copy. Only `EPERM` is the known already-gone-race
  * errno (verified empirically); any OTHER non-ESRCH failure (EINVAL, or
  * anything unanticipated) is surfaced unconditionally, fail-closed,
- * without ever consulting the survivor oracle - `hasLiveProcessGroupMembersPosix`
+ * without ever consulting the survivor oracle - `hasLiveProcessGroupMembersPosixAsync`
  * exists to arbitrate the ONE specific ambiguity this file has actually
  * observed, not as a blanket "maybe it's fine" check for any failure shape.
- * Throws when the failure is real; returns normally when it is the benign
- * already-gone race.
+ * ASYNC because that oracle shells out to a real `pgrep`; a synchronous
+ * arbitration here would block the event loop on the exact same live kill
+ * path this function already guards. Throws when the failure is real;
+ * returns normally when it is the benign already-gone race.
  */
-export function throwUnlessBenignAlreadyGoneRace(
+export async function throwUnlessBenignAlreadyGoneRace(
   pid: number,
   signal: string,
   result: SignalResult
-): void {
+): Promise<void> {
   if (result.ok) return;
-  if (result.code !== "EPERM" || hasLiveProcessGroupMembersPosix(pid)) {
+  if (result.code !== "EPERM" || (await hasLiveProcessGroupMembersPosixAsync(pid))) {
     throw new Error(`kill: failed to send ${signal} to process group ${pid}: ${result.message}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// The escalation identity gate: before the SIGKILL escalation, check
+// whether the group is still the one this codebase spawned - never before
+// the FIRST SIGTERM (that send is covered by
+// process.evaluatePreSignalIdentityGate's own, separate etime-based
+// mechanism, out of scope here by design).
+// ---------------------------------------------------------------------------
+
+/** One originally-recorded process-group member's real, OS-read identity: a pid plus the instant it started (never a `Date.now()`-derived guess). */
+export interface RecordedGroupMember {
+  readonly pid: number;
+  /** Epoch milliseconds, parsed under the frozen `LC_ALL=C`/`TZ=UTC0` grammar `parsePidLstartRow` implements. */
+  readonly startTimeMs: number;
+}
+
+/**
+ * The real outcome of one batched `ps -p <pid[,pid...]> -o pid=,lstart=`
+ * read - never per-member sequential calls, so the NUMBER OF REAL CALLS
+ * this observer makes never scales with how many pids are asked about
+ * (see this function's own docs further down for why that single-batch
+ * shape is what keeps a group of any size inside ONE whole-operation
+ * deadline). That single call's own BYTE cost is a different question:
+ * it still constructs a comma-joined pid list, and `ps` still emits and
+ * this function still parses one row per requested pid, so the data a
+ * batch of size N produces and this function processes genuinely grows
+ * with N - only the CALL COUNT is size-independent, not the work inside
+ * that one call.
+ *
+ * `rows` holds only the pids whose row parsed cleanly under
+ * `parsePidLstartRow`'s frozen six-token grammar - a pid simply absent from
+ * `rows` may mean it has genuinely exited (the normal, expected "not
+ * found" outcome - real `ps` silently omits a nonexistent pid from a
+ * multi-pid query rather than erroring, confirmed empirically), or that
+ * its own row was present but malformed and therefore discarded (never
+ * guessed at). Distinguishing those two would require attributing
+ * a malformed row to a specific pid, which this parser's own contract explicitly forbids - so
+ * this deliberately does not attempt to; the caller's own "did any
+ * ORIGINALLY-RECORDED pid still produce an exactly-matching row" question
+ * never needs that distinction; it only needs to know a pid's own
+ * attempted read failed to produce a positive match.
+ */
+export type PidBatchReadResult =
+  | { readonly status: "ok"; readonly rows: readonly RecordedGroupMember[] }
+  | { readonly status: "observer-failure"; readonly reason: string };
+
+/** Looks up `pid`'s start time in a `PidBatchReadResult`'s (or a snapshot's) `readonly RecordedGroupMember[]` rows - a plain linear scan over a small, per-call, never-persisted array (see this module's own "no persistent state outside jobStore.ts" boundary), not a `Map`. */
+function findRecordedStartTime(
+  rows: readonly RecordedGroupMember[],
+  pid: number
+): number | undefined {
+  return rows.find((row) => row.pid === pid)?.startTimeMs;
+}
+
+/** `ps`'s ordinary weekday abbreviations under the `C` locale - part of this module's own frozen six-token grammar's sanity check, not merely a token-count check. */
+const LSTART_WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+/** `ps`'s ordinary month abbreviations under the `C` locale. */
+const LSTART_MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
+
+/**
+ * Parses ONE `ps -p <pid> -o pid=,lstart=` output ROW - this module's own
+ * frozen grammar: `pid weekday month day HH:MM:SS year`, produced under pinned
+ * `LC_ALL=C`/`TZ=UTC0` - into a real pid plus an epoch-millisecond instant.
+ * Splits on any RUN of whitespace, never a single space: `ps` pads its
+ * `lstart` column to a fixed width, so a single-digit day (`" 5"` rather
+ * than `"25"`) would otherwise shift plain single-space splitting off by
+ * one token (verified empirically against the real installed `ps`).
+ *
+ * Returns `undefined` - a failed read for this row, never a partial or
+ * best-effort one - for ANY of: not exactly six tokens after that
+ * whitespace-collapse; an unrecognized weekday or month abbreviation; a
+ * day/hour/minute/second/year field that isn't the right shape; a parsed
+ * instant that does not ROUND-TRIP exactly back through `Date.UTC` (e.g.
+ * a day value `Date` would otherwise silently normalize into the next
+ * month); or a weekday token that is a recognized abbreviation but
+ * disagrees with the day-of-week the other five tokens actually compute
+ * to. `Date.UTC` never looks at the weekday token at all, so without this
+ * last check a row like `123 Mon Jul 25 15:00:00 2026` would parse
+ * identically to the genuinely correct `123 Sat Jul 25 15:00:00 2026` (25
+ * July 2026 is a real Saturday) even though the two rows contradict each
+ * other - stated plainly: a guard exactly right about which token is
+ * which and silently wrong by hours about what it means is worse than
+ * one that fails to parse.
+ *
+ * The zone is FROZEN, not merely the layout: `lstart` itself carries no
+ * zone token at all, so the pinned `TZ=UTC0` environment (see
+ * `readPidStartTimesBatchPosix`) is what makes treating tokens 2-6 as a
+ * plain UTC instant (via `Date.UTC`, no offset math) correct - this
+ * function trusts that environment was actually set by its one real
+ * caller, it does not (and cannot) verify it from the string alone.
+ */
+export function parsePidLstartRow(rawLine: string): RecordedGroupMember | undefined {
+  const tokens = rawLine.trim().split(/\s+/);
+  if (tokens.length !== 6) return undefined;
+  const [pidRaw, weekday, month, dayRaw, time, yearRaw] = tokens as [
+    string,
+    string,
+    string,
+    string,
+    string,
+    string,
+  ];
+  if (!/^\d+$/.test(pidRaw)) return undefined;
+  const pid = Number(pidRaw);
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  const weekdayIndex = LSTART_WEEKDAYS.indexOf(weekday);
+  if (weekdayIndex === -1) return undefined;
+  const monthIndex = LSTART_MONTHS.indexOf(month);
+  if (monthIndex === -1) return undefined;
+  if (!/^\d{1,2}$/.test(dayRaw)) return undefined;
+  const day = Number(dayRaw);
+  const timeParts = time.split(":");
+  if (timeParts.length !== 3 || timeParts.some((part) => !/^\d{2}$/.test(part))) return undefined;
+  const [hours, minutes, seconds] = timeParts.map(Number) as [number, number, number];
+  if (!/^\d{4}$/.test(yearRaw)) return undefined;
+  const year = Number(yearRaw);
+
+  const startTimeMs = Date.UTC(year, monthIndex, day, hours, minutes, seconds);
+  const roundTrip = new Date(startTimeMs);
+  if (
+    roundTrip.getUTCFullYear() !== year ||
+    roundTrip.getUTCMonth() !== monthIndex ||
+    roundTrip.getUTCDate() !== day ||
+    roundTrip.getUTCHours() !== hours ||
+    roundTrip.getUTCMinutes() !== minutes ||
+    roundTrip.getUTCSeconds() !== seconds ||
+    roundTrip.getUTCDay() !== weekdayIndex
+  ) {
+    // Either did not round-trip (invalid/out-of-range/ambiguous), or DID
+    // round-trip to a real instant whose actual day-of-week contradicts
+    // the weekday token this row claimed - never guessed at either way.
+    return undefined;
+  }
+  return { pid, startTimeMs };
+}
+
+function parseLstartBatchOutput(stdout: string): RecordedGroupMember[] {
+  const rows: RecordedGroupMember[] = [];
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    const parsed = parsePidLstartRow(trimmed);
+    if (parsed !== undefined) rows.push(parsed);
+  }
+  return rows;
+}
+
+/**
+ * Reads pid+lstart for a SET of pids in ONE real `ps -p <comma-list>` call
+ * - this module's own frozen six-token grammar, run under pinned `LC_ALL=C`/`TZ=UTC0`
+ * (never the server's own inherited locale/zone, which could vary the
+ * output shape) - batched so this observer's cost is ONE real subprocess
+ * call regardless of how many members the group has (an N-member
+ * group must never create N sequential timeout windows).
+ *
+ * Bounded and force-reaped exactly like this file's other async `ps`/`pgrep`
+ * observers (`readProcessElapsedSecondsAsync`, `hasLiveProcessGroupMembersPosixAsync`):
+ * `execFile`'s own `timeout` option only REQUESTS SIGTERM, so a second,
+ * independent settlement timer forces this promise to resolve at
+ * `timeoutMs` plus a small fixed grace regardless of the child's own
+ * cooperation, SIGKILLing it directly if it is still alive then - a
+ * resistant `ps` can never leave this pending indefinitely, and can never
+ * outlive this call as a leaked process either.
+ *
+ * `ps -p <list>` returns exit code 1 with EMPTY output when NONE of the
+ * requested pids currently exist (confirmed empirically) - a real,
+ * confident "nothing there" result, `{status: "ok", rows: <empty>}`,
+ * never an observer failure. Any OTHER execution failure (a missing
+ * binary, a permission failure, this call's own settlement timer firing)
+ * is `{status: "observer-failure"}` - genuinely different: this observer
+ * never ran successfully at all, so there is no basis for either "found"
+ * or "not found" about ANY requested pid.
+ *
+ * An empty `pids` array is a defensive no-op (`{status: "ok", rows: <empty>}`
+ * without ever shelling out) - there is nothing to ask `ps` about.
+ */
+export function readPidStartTimesBatchPosix(
+  pids: readonly number[],
+  timeoutMs: number = PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS
+): Promise<PidBatchReadResult> {
+  if (pids.length === 0) return Promise.resolve({ status: "ok", rows: [] });
+  return new Promise((resolve) => {
+    let settled = false;
+    const child = execFile(
+      "ps",
+      ["-p", pids.join(","), "-o", "pid=,lstart="],
+      {
+        encoding: "utf8",
+        timeout: timeoutMs,
+        env: { ...process.env, LC_ALL: "C", TZ: "UTC0" },
+      },
+      (error, stdout) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(externalBound);
+        if (error === null) {
+          resolve({ status: "ok", rows: parseLstartBatchOutput(stdout) });
+          return;
+        }
+        const err = error as ExecFileCallbackError;
+        if (err.code === 1) {
+          // ps's own documented "none of the requested pids matched" exit
+          // code - a real, confident "nothing there" result, not an
+          // observer failure.
+          resolve({ status: "ok", rows: [] });
+          return;
+        }
+        resolve({
+          status: "observer-failure",
+          reason:
+            typeof err.code === "string"
+              ? `ps failed to execute (${err.code})`
+              : `ps failed unexpectedly: ${err.message ?? String(error)}`,
+        });
+      }
+    );
+    const externalBound = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      resolve({
+        status: "observer-failure",
+        reason: `ps did not settle within ${timeoutMs}ms (observer unresponsive to SIGTERM)`,
+      });
+    }, timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS);
+  });
+}
+
+/** The real outcome of enumerating a process group's current membership via `pgrep -g <pgid>`. */
+export type PgrepEnumerationResult =
+  | { readonly status: "ok"; readonly pids: readonly number[] }
+  | { readonly status: "observer-failure"; readonly reason: string };
+
+/**
+ * Enumerates a process group's CURRENT real members via `pgrep -g <pgid>` -
+ * bounded and force-reaped on the identical shape `readPidStartTimesBatchPosix`
+ * above and `hasLiveProcessGroupMembersPosixAsync` (elsewhere in this file)
+ * both already use. A pgrep line that isn't a bare positive integer marks
+ * the WHOLE enumeration malformed (`observer-failure`) rather than
+ * silently discarding just that one line - unlike a `ps` row (where a
+ * malformed ROW only ever costs that one pid's identity, never the
+ * others'), a malformed pgrep line means this codebase cannot trust that
+ * it has correctly enumerated membership AT ALL, so the safe, fail-closed
+ * reading is to distrust the whole read rather than guess at a partial
+ * member list.
+ */
+function enumerateProcessGroupMembersPosixAsync(
+  pid: number,
+  timeoutMs: number
+): Promise<PgrepEnumerationResult> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const child = execFile(
+      "pgrep",
+      ["-g", String(pid)],
+      { encoding: "utf8", timeout: timeoutMs },
+      (error, stdout) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(externalBound);
+        if (error === null) {
+          const parsed = parsePgrepPidList(stdout);
+          if (parsed === undefined) {
+            resolve({
+              status: "observer-failure",
+              reason: `pgrep produced output this codebase could not parse: ${JSON.stringify(stdout)}`,
+            });
+            return;
+          }
+          resolve({ status: "ok", pids: parsed });
+          return;
+        }
+        const err = error as ExecFileCallbackError & { status?: number };
+        if (err.status === 1 || err.code === 1) {
+          resolve({ status: "ok", pids: [] }); // pgrep's own "nothing matched" exit code
+          return;
+        }
+        resolve({
+          status: "observer-failure",
+          reason:
+            typeof err.code === "string"
+              ? `pgrep failed to execute (${err.code})`
+              : `pgrep failed unexpectedly: ${err.message ?? String(error)}`,
+        });
+      }
+    );
+    const externalBound = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      resolve({
+        status: "observer-failure",
+        reason: `pgrep did not settle within ${timeoutMs}ms (observer unresponsive to SIGTERM)`,
+      });
+    }, timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS);
+  });
+}
+
+function parsePgrepPidList(stdout: string): number[] | undefined {
+  const lines = stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const pids: number[] = [];
+  for (const line of lines) {
+    if (!/^\d+$/.test(line)) return undefined; // malformed - never guessed at
+    const parsedPid = Number(line);
+    if (!Number.isInteger(parsedPid) || parsedPid <= 0) return undefined;
+    pids.push(parsedPid);
+  }
+  return pids;
+}
+
+/**
+ * The pre-SIGTERM membership snapshot the escalation identity gate is
+ * built on: the leader's own pid plus every CURRENTLY-live descendant's
+ * pid, each paired with its real, `ps`-read start time (this module's own frozen grammar) -
+ * captured BEFORE the first signal in this escalation is ever sent, never
+ * re-derived later. `degraded: true` means this snapshot captured ZERO
+ * usable records (every candidate pid was gone, unreadable, or the
+ * observation itself failed/timed out/produced malformed output) - see
+ * `degradedReason` for which. A degraded snapshot is never fatal to the
+ * SIGTERM this codebase is about to send (terminating the job is the
+ * user's own request, and must not be blocked by an observation failure -
+ * see `killProcessGroupPosix`'s own call site) - it only means the
+ * escalation gate below has nothing positive to work with later, and must
+ * therefore refuse (see `evaluateEscalationIdentityGate`'s own docs).
+ */
+export interface EscalationIdentitySnapshot {
+  readonly members: readonly RecordedGroupMember[];
+  readonly degraded: boolean;
+  readonly degradedReason?: string;
+}
+
+/**
+ * Captures `EscalationIdentitySnapshot` for `leaderPid`'s process group -
+ * the ORIGINAL membership the escalation identity gate later re-reads and
+ * compares against. Three real observations, in order, ALL sharing ONE
+ * overall `timeoutMs` deadline (never `timeoutMs` per step - see this
+ * function's own docs for why that single shared deadline is what keeps
+ * this phase's total cost independent of how it happens to be internally
+ * split):
+ *
+ * 1. The leader's OWN start time, read on its own (`readPidStartTimesBatchPosix`
+ *    with a single pid) - independently observable/testable from step 2's
+ *    own failure modes (this is "the initial leader read").
+ * 2. The group's CURRENT descendants, discovered via `pgrep -g leaderPid`
+ *    (`enumerateProcessGroupMembersPosixAsync`) - "member enumeration".
+ * 3. Every discovered descendant's own start time, in ONE batched
+ *    `readPidStartTimesBatchPosix` call.
+ *
+ * FAIL CLOSED, WITH THE CASES ENUMERATED: a genuine observer failure at
+ * ANY of the three steps above (a timeout, a missing binary, malformed
+ * enumeration output) marks the WHOLE snapshot `degraded`, even if an
+ * earlier step already captured a usable record - a member enumeration
+ * that itself timed out or came back malformed means this codebase cannot
+ * trust that it has correctly discovered the group's real membership, so
+ * the safe reading is to distrust the whole attempt, not to quietly keep
+ * whatever partial success came before it. Distinct from a pid simply
+ * being ABSENT from a successful read (gone, not malformed, not timed
+ * out) - that is a legitimate, expected outcome (a member that
+ * disappeared on its own, or was never there), never itself a
+ * degradation, and never prevents another, still-present member from
+ * being recorded. Zero usable records after an otherwise-clean read is
+ * ALSO `degraded` (there is nothing to compare against later, regardless
+ * of whether every step "succeeded").
+ */
+export async function captureEscalationIdentitySnapshot(
+  leaderPid: number,
+  timeoutMs: number = PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS
+): Promise<EscalationIdentitySnapshot> {
+  const deadline = Date.now() + timeoutMs;
+  const remainingBudget = (): number => Math.max(0, deadline - Date.now());
+
+  let sawObserverFailure = false;
+  let observerFailureReason: string | undefined;
+  const recorded: RecordedGroupMember[] = [];
+
+  // Step 1: the initial leader read - independently observable from step 2's own timeout/failure below.
+  const leaderBudget = remainingBudget();
+  if (leaderBudget <= 0) {
+    sawObserverFailure = true;
+    observerFailureReason =
+      "pre-SIGTERM snapshot budget exhausted before the initial leader read could run";
+  } else {
+    const leaderRead = await readPidStartTimesBatchPosix([leaderPid], leaderBudget);
+    if (leaderRead.status === "observer-failure") {
+      sawObserverFailure = true;
+      observerFailureReason = `the initial leader read failed: ${leaderRead.reason}`;
+    } else {
+      const leaderStart = findRecordedStartTime(leaderRead.rows, leaderPid);
+      if (leaderStart !== undefined) recorded.push({ pid: leaderPid, startTimeMs: leaderStart });
+    }
+  }
+
+  // Step 2: member enumeration - who else is currently in this group.
+  const enumerationBudget = remainingBudget();
+  let descendantPids: readonly number[] = [];
+  if (enumerationBudget <= 0) {
+    sawObserverFailure = true;
+    observerFailureReason ??=
+      "pre-SIGTERM snapshot budget exhausted before member enumeration could run";
+  } else {
+    const enumeration = await enumerateProcessGroupMembersPosixAsync(leaderPid, enumerationBudget);
+    if (enumeration.status === "observer-failure") {
+      sawObserverFailure = true;
+      observerFailureReason ??= `member enumeration failed: ${enumeration.reason}`;
+    } else {
+      descendantPids = enumeration.pids.filter((candidate) => candidate !== leaderPid);
+    }
+  }
+
+  // Step 3: every discovered descendant's own start time, batched in ONE call.
+  if (descendantPids.length > 0) {
+    const readBudget = remainingBudget();
+    if (readBudget <= 0) {
+      sawObserverFailure = true;
+      observerFailureReason ??=
+        "pre-SIGTERM snapshot budget exhausted before the descendant start-time read could run";
+    } else {
+      const descendantRead = await readPidStartTimesBatchPosix(descendantPids, readBudget);
+      if (descendantRead.status === "observer-failure") {
+        sawObserverFailure = true;
+        observerFailureReason ??= `descendant start-time read failed: ${descendantRead.reason}`;
+      } else {
+        for (const candidate of descendantPids) {
+          const startTimeMs = findRecordedStartTime(descendantRead.rows, candidate);
+          if (startTimeMs !== undefined) recorded.push({ pid: candidate, startTimeMs });
+        }
+      }
+    }
+  }
+
+  if (sawObserverFailure || recorded.length === 0) {
+    return {
+      members: [],
+      degraded: true,
+      degradedReason:
+        observerFailureReason ??
+        "zero usable identity records captured (every candidate pid was gone, unreadable, or malformed)",
+    };
+  }
+  return { members: recorded, degraded: false };
+}
+
+export type EscalationIdentityGateResult =
+  { readonly action: "escalate" } | { readonly action: "refuse"; readonly reason: string };
+
+/**
+ * THE ESCALATION IDENTITY GATE - the single real decision point for
+ * whether `killProcessGroupPosix` may send its SIGKILL escalation.
+ * Boundedly re-reads ONLY the pids `snapshot` already recorded (never a
+ * fresh enumeration - the group is compared against its OWN prior
+ * snapshot, not re-discovered) via ONE batched `readPidStartTimesBatchPosix`
+ * call, on its OWN fresh `timeoutMs` budget (never the snapshot phase's
+ * leftover budget - see `PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS`'s own
+ * docs for why each phase gets its own independent allowance).
+ *
+ * THE ALGORITHM, exactly: if ANY ONE originally-recorded member's current
+ * start time EXACTLY matches its recorded value, the group is still ours
+ * and escalation proceeds - the leader is NOT a special case here, it is
+ * compared through the identical exact-match rule as every descendant, no
+ * tolerance window. If NONE matches, escalation is refused. This is a
+ * strict superset of every enumerated fail-closed cell, because every one
+ * of them collapses to the same observable fact - "no positive match was
+ * found":
+ *
+ * - the snapshot itself never captured a usable original member
+ *   (`snapshot.degraded`) - nothing to compare against at all;
+ * - the bounded re-read TIMES OUT or the observer fails to execute -
+ *   `observer-failure`, so no member's current state could be read;
+ * - every recorded member is gone at re-read (a real `ps -p <list>` read
+ *   that simply omits every one of them - the SIGTERM working, never
+ *   itself a failure);
+ * - a recorded member is still present but its start time DIFFERS from
+ *   the record (the recycled-pid case);
+ * - a recorded member's row came back malformed (discarded, never
+ *   guessed at - contributes no match, same as if it were absent).
+ *
+ * In every one of those, `matched` below is `false`, and this function
+ * refuses - there is no separate branch to keep in sync with this list,
+ * so a change to any one of them can never silently diverge from the
+ * others.
+ *
+ * IDENTITY IS THE GATE, NEVER THE TARGET: this function only ever decides
+ * WHETHER to escalate - the escalation itself remains the single
+ * group-granularity `kill(-pgid, SIGKILL)` `killProcessGroupPosix` already
+ * sends; nothing here ever signals an individual member's own pid.
+ *
+ * THE RESIDUAL, DISCLOSED AS NARROWED, NEVER AS CLOSED: this gate does not
+ * make identity-and-signal atomic. After this function returns `escalate`,
+ * the member that proved the match can still exit, and the numeric pgid
+ * can still become reusable, in the real gap between this check completing
+ * and the caller's own `kill(-pgid, SIGKILL)` syscall - two separate
+ * syscalls, with no atomic check-and-signal for a process group anywhere
+ * in portable POSIX. This narrows the exposure from the multi-second
+ * grace window (the OLD, un-gated behavior) down to one syscall-to-syscall
+ * interval plus this gate's own whole-second `lstart` resolution - it does
+ * not eliminate it.
+ */
+export async function evaluateEscalationIdentityGate(
+  snapshot: EscalationIdentitySnapshot,
+  timeoutMs: number = PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS
+): Promise<EscalationIdentityGateResult> {
+  if (snapshot.degraded || snapshot.members.length === 0) {
+    return {
+      action: "refuse",
+      reason:
+        "escalation refused: the pre-SIGTERM identity snapshot never captured a usable original process-group member" +
+        (snapshot.degradedReason !== undefined ? ` (${snapshot.degradedReason})` : ""),
+    };
+  }
+
+  const pids = snapshot.members.map((member) => member.pid);
+  const read = await readPidStartTimesBatchPosix(pids, timeoutMs);
+  if (read.status === "observer-failure") {
+    return {
+      action: "refuse",
+      reason: `escalation refused: the escalation-time identity re-read failed (${read.reason})`,
+    };
+  }
+
+  const matched = snapshot.members.some(
+    (member) => findRecordedStartTime(read.rows, member.pid) === member.startTimeMs
+  );
+  if (!matched) {
+    return {
+      action: "refuse",
+      reason:
+        "escalation refused: none of the originally-recorded process-group members still report their original start time (each is either gone, has a differing start time, or could not be read)",
+    };
+  }
+  return { action: "escalate" };
 }
 
 export async function killProcessGroupPosix(
@@ -797,21 +1947,119 @@ export async function killProcessGroupPosix(
   graceMs: number = POSIX_KILL_GRACE_PERIOD_MS,
   callbacks?: PosixKillCallbacks
 ): Promise<PosixKillResult> {
+  // Existence check before the FIRST signal - distinguishes a group that
+  // has already gone from one that is present. This establishes only
+  // EXISTENCE, never OWNERSHIP: a process group that has been fully
+  // vacated and had its numeric pgid recycled by an unrelated later group
+  // reports exactly as "alive" here as our own would. A gone group is a
+  // clean no-op - nothing is signaled, and "no signal delivered to any
+  // live process" (see `src/tools/kill.ts`'s own docs) is therefore
+  // literally true here, not merely true because a signal attempt happens
+  // to return ESRCH harmlessly.
+  if (!isProcessGroupAlive(pid)) {
+    return { finalSignal: "SIGTERM", escalated: false, confirmed: true };
+  }
+
+  // Snapshot the ORIGINAL process-group membership - the leader plus every
+  // currently-live descendant, each one's pid and real OS-read start time -
+  // BEFORE the first signal below is ever sent. This is the escalation
+  // identity gate's own pre-SIGTERM observation (see
+  // captureEscalationIdentitySnapshot's own docs for the full three-step
+  // capture and its fail-closed cells). A degraded/failed snapshot here
+  // NEVER blocks this SIGTERM - terminating the job is the caller's own
+  // request, and must not be held hostage by an observation failure - it
+  // only means the escalation gate further down has nothing positive to
+  // work with later and must therefore refuse (see evaluateEscalationIdentityGate).
+  const identitySnapshot = await captureEscalationIdentitySnapshot(pid);
+
   const termResult = signalProcessGroupPosix(pid, "SIGTERM");
-  throwUnlessBenignAlreadyGoneRace(pid, "SIGTERM", termResult);
-  callbacks?.onSignaled?.("SIGTERM");
-  if (!termResult.ok) return { finalSignal: "SIGTERM", escalated: false };
+  await throwUnlessBenignAlreadyGoneRace(pid, "SIGTERM", termResult);
+  // Only a GENUINE delivery may claim the terminal slot - an already-gone
+  // group (ESRCH, delivered:false) or a benign already-gone race arbitrated
+  // above (ok:false but not thrown) never reaches here as a live send, and
+  // must never fire the callback that records "we killed this" (see this
+  // function's own docs for the ordering bug this guards against: a job
+  // that exited naturally must never be recorded as killed).
+  if (termResult.ok && termResult.delivered) {
+    callbacks?.onSignaled?.("SIGTERM");
+  }
+  if (!termResult.ok) {
+    return {
+      finalSignal: "SIGTERM",
+      escalated: false,
+      confirmed: await confirmProcessGroupReapedPosix(pid),
+    };
+  }
 
   const diedFromTerm = await waitForProcessDeath(pid, graceMs, 50, isProcessGroupAlive);
-  if (diedFromTerm) return { finalSignal: "SIGTERM", escalated: false };
+  if (diedFromTerm) {
+    return {
+      finalSignal: "SIGTERM",
+      escalated: false,
+      confirmed: await confirmProcessGroupReapedPosix(pid),
+    };
+  }
+
+  // Re-check existence immediately before escalating. The group can empty
+  // during the grace period just waited out - that is the normal,
+  // intended outcome of the SIGTERM above.
+  if (!isProcessGroupAlive(pid)) {
+    return {
+      finalSignal: "SIGTERM",
+      escalated: false,
+      confirmed: await confirmProcessGroupReapedPosix(pid),
+    };
+  }
+
+  // THE ESCALATION IDENTITY GATE (see evaluateEscalationIdentityGate's own
+  // docs for the full algorithm and its complete fail-closed enumeration):
+  // boundedly re-reads ONLY the members identitySnapshot already recorded
+  // and requires at least one of them to still report an EXACTLY matching
+  // start time before this codebase will ever send SIGKILL. This narrows -
+  // materially, not completely - the window between "still alive" and
+  // "about to send SIGKILL": an unrelated group that happens to receive
+  // this exact recycled pgid, with a member whose start time happens to
+  // fall within the SAME whole second as an originally-recorded one, would
+  // still read as a match and would still receive this SIGKILL - the
+  // check and the signal below remain two separate syscalls, and portable
+  // POSIX offers no atomic check-and-signal for a process group. This is
+  // distinct from the eager-reap gap (`reapProcessGroupOnce`'s own docs),
+  // which is a single scheduling tick, not a whole grace period, and
+  // arises only when a job's leader exits on its own rather than being
+  // actively signaled here. The once-per-job reap guard does not help
+  // here either: it prevents a LATER `kill` call from re-signaling this
+  // job, not a reused pgid encountered within this SAME escalation.
+  const identityGate = await evaluateEscalationIdentityGate(identitySnapshot);
+  if (identityGate.action === "refuse") {
+    return {
+      finalSignal: "SIGTERM",
+      escalated: false,
+      confirmed: await confirmProcessGroupReapedPosix(pid),
+      escalationRefusedReason: identityGate.reason,
+    };
+  }
 
   const killResult = signalProcessGroupPosix(pid, "SIGKILL");
-  throwUnlessBenignAlreadyGoneRace(pid, "SIGKILL", killResult);
-  callbacks?.onSignaled?.("SIGKILL");
-  if (!killResult.ok) return { finalSignal: "SIGKILL", escalated: true };
+  await throwUnlessBenignAlreadyGoneRace(pid, "SIGKILL", killResult);
+  // Same guard as the SIGTERM site above - only a genuine delivery claims
+  // the terminal slot.
+  if (killResult.ok && killResult.delivered) {
+    callbacks?.onSignaled?.("SIGKILL");
+  }
+  if (!killResult.ok) {
+    return {
+      finalSignal: "SIGKILL",
+      escalated: true,
+      confirmed: await confirmProcessGroupReapedPosix(pid),
+    };
+  }
 
   await waitForProcessDeath(pid, SIGKILL_CONFIRMATION_TIMEOUT_MS, 50, isProcessGroupAlive);
-  return { finalSignal: "SIGKILL", escalated: true };
+  return {
+    finalSignal: "SIGKILL",
+    escalated: true,
+    confirmed: await confirmProcessGroupReapedPosix(pid),
+  };
 }
 
 // ---------------------------------------------------------------------------

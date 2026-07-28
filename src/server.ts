@@ -70,8 +70,13 @@ import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import type { JSONRPCMessage, Transport } from "@modelcontextprotocol/server";
 import { Readable } from "node:stream";
 
+import type { JobState } from "./jobStore.js";
 import { isTerminalJobState, jobStore } from "./jobStore.js";
-import { checkProcessIdentity, killProcessGroupPosix, killProcessTreeWindows } from "./process.js";
+import {
+  evaluatePreSignalIdentityGate,
+  killProcessGroupPosix,
+  killProcessTreeWindows,
+} from "./process.js";
 import { dispatchToolCall, listToolDefinitions } from "./registry.js";
 import * as tasksAdapter from "./tasksAdapter.js";
 
@@ -108,8 +113,11 @@ export interface GhantikaServer {
    * process behind, so closing the transport alone is not enough - it
    * never touches `jobStore` or any live child, and a job started before
    * shutdown would otherwise stay alive and orphaned after this server
-   * process exits cleanly. This REAPS every still-live (`starting`/
-   * `running`) job's whole process tree before the transport closes - see
+   * process exits cleanly. This REAPS every tracked job's whole process
+   * tree before the transport closes - `starting`/`running` jobs via the
+   * full identity-gated kill path, AND already-terminal jobs via a
+   * real group-level reap for any orphaned descendants their own leader
+   * left behind by exiting first (root-exits-first) - see
    * `reapLiveJobsOnShutdown`'s own docs for exactly how, and why it reuses
    * process.ts's real kill machinery rather than a second one.
    */
@@ -326,20 +334,34 @@ async function performShutdown(transport: Transport, reason: string): Promise<vo
 }
 
 /**
- * Reaps every currently non-terminal (`starting`/`running`) job's WHOLE
- * process tree, on every shutdown path -
- * stdin EOF, SIGTERM, SIGINT all funnel through the single `shutdown()`
- * function above (see `attachProcessShutdownHandlers` below), so this runs
- * identically for all three. Deliberately REUSES the real
- * containment machinery (`process.ts`'s `checkProcessIdentity`/
+ * Reaps every currently tracked job's own process GROUP, on every
+ * shutdown path - stdin EOF, SIGTERM, SIGINT all funnel through the single
+ * `shutdown()` function above (see `attachProcessShutdownHandlers` below),
+ * so this runs identically for all three. Deliberately REUSES the real
+ * containment machinery (`process.ts`'s `evaluatePreSignalIdentityGate`/
  * `killProcessGroupPosix`/`killProcessTreeWindows`, the exact functions
  * `src/tools/kill.ts` itself calls) rather than inventing a second kill
  * mechanism - the identity check (never blindly signal a possibly-reused
- * pid) and the POSIX whole-process-GROUP signaling (reaching every
- * descendant, not just the one tracked child) both matter just as much at
- * shutdown as they do for an explicit `kill()` call.
+ * pid), the POSIX whole-process-GROUP signaling (reaching every
+ * descendant that remains in the group, not just the one tracked child -
+ * see `src/tools/kill.ts`'s own "Escape boundary" docs for the one class
+ * this deliberately does not reach), and the FINAL external process-group
+ * confirmation (`killProcessGroupPosix`'s own `confirmed` result,
+ * recorded via `jobStore.setKillConfirmation` below) all matter just as
+ * much at shutdown as they do for an explicit `kill()` call.
  *
- * Every live job is reaped CONCURRENTLY (`Promise.all`), not one after
+ * Covers EVERY tracked job, terminal or not - not just the
+ * `starting`/`running` ones (broadened from the original filter, which
+ * excluded terminal jobs entirely). A terminal job record (its own LEADER
+ * `exited` or was `killed`) can still have a real process GROUP with live
+ * DESCENDANTS the leader forked and never `wait`-ed on before exiting on
+ * its own (root-exits-first) - see `src/tools/kill.ts`'s own
+ * `reapTerminalJobProcessGroup` docs for the identical fix applied there.
+ * Excluding terminal jobs left exactly that class of orphan alive across
+ * a server shutdown, regardless of the `kill()` fix, since shutdown is a
+ * SEPARATE code path that never calls `kill()`'s own handler.
+ *
+ * Every job is reaped CONCURRENTLY (`Promise.all`), not one after
  * another - reaping N jobs serially would multiply whatever grace period is
  * used by N, which is exactly the "meaningfully delay server shutdown"
  * outcome to avoid.
@@ -360,15 +382,19 @@ async function performShutdown(transport: Transport, reason: string): Promise<vo
 const SHUTDOWN_KILL_GRACE_PERIOD_MS = 300;
 
 async function reapLiveJobsOnShutdown(): Promise<void> {
-  const liveJobs = jobStore.list().filter((record) => !isTerminalJobState(record.state));
-  await Promise.all(liveJobs.map((record) => reapOneJobOnShutdown(record.job_id)));
+  const allJobs = jobStore.list();
+  await Promise.all(allJobs.map((record) => reapOneJobOnShutdown(record.job_id, record.state)));
 }
 
-async function reapOneJobOnShutdown(jobId: string): Promise<void> {
+async function reapOneJobOnShutdown(jobId: string, state: JobState): Promise<void> {
   const handle = jobStore.getChildHandle(jobId);
   if (handle === undefined) return; // no child was ever attached (e.g. a job that started already-failed) - nothing to reap
 
   if (process.platform === "win32") {
+    // No equivalent root-exits-first fix on Windows today (no pgid
+    // concept to reap against post-hoc - see kill.ts's own identical
+    // scope note), so a terminal job is left exactly as it was here.
+    if (isTerminalJobState(state)) return;
     try {
       killProcessTreeWindows(handle.pid);
     } catch (error) {
@@ -379,19 +405,72 @@ async function reapOneJobOnShutdown(jobId: string): Promise<void> {
     return;
   }
 
-  // The identity check's own safety property, reused here verbatim: never
-  // signal a tracked pid without first confirming, via a real external OS
-  // lookup, that it's still genuinely the process this codebase spawned -
-  // a job that already exited naturally in a race just before shutdown
-  // reached it (identity "not-found") or whose pid has since been reused
-  // by an unrelated process (identity "identity-mismatch") is left
-  // untouched either way, exactly matching `src/tools/kill.ts`'s own
-  // handling of both cases.
-  const identity = checkProcessIdentity(handle.pid, handle.spawnedAtMs);
-  if (identity.status !== "alive-confirmed") return;
+  if (isTerminalJobState(state)) {
+    // Root-exits-first: the job record is already terminal (its leader
+    // exited/was killed/failed to spawn), but the real process GROUP can
+    // still hold live descendants the leader forked and never
+    // `wait`-ed on. Routed through the SAME reap-once-guarded path
+    // `kill()` itself uses (`jobStore.reapProcessGroupOnce`) rather than
+    // signaling directly here: the eager reap at leader-exit has usually
+    // already run by the time shutdown reaches this record, and a second,
+    // unguarded signal here would be exactly the already-reaped-record
+    // re-signal the reap-once guard exists to prevent (see that method's
+    // own docs for why a later attempt can no longer tell a surviving
+    // group from an unrelated one that has since reused the same pgid).
+    // This never runs the leader-pid identity check below, for the same
+    // reason `reapProcessGroupOnce` itself never does: the leader is
+    // already gone by construction whenever this branch runs, so that
+    // check would always read "not-found" before ever reaching a group
+    // that can still hold real, live descendants.
+    const alreadyReaped = jobStore.hasReapBeenAttempted(jobId);
+    try {
+      await jobStore.reapProcessGroupOnce(jobId, SHUTDOWN_KILL_GRACE_PERIOD_MS);
+      if (!alreadyReaped && jobStore.get(jobId)?.kill_confirmed === false) {
+        // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- jobId is this codebase's own randomUUID(), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
+        console.error(
+          `[ghantika] job ${jobId}'s TERMINAL-record process-group reap could not be externally confirmed within the bound during shutdown - signal(s) were sent, but zero surviving members was not observed in time`
+        );
+      }
+    } catch (error) {
+      // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- jobId is this codebase's own randomUUID(), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
+      console.error(`[ghantika] error reaping job ${jobId}'s terminal group:`, error);
+    }
+    return;
+  }
 
+  // The identity gate's own safety property, reused here verbatim: never
+  // signal a tracked pid without first evaluating, via a real external OS
+  // lookup, whether it's still genuinely the process this codebase
+  // spawned - a job that already exited naturally in a race just before
+  // shutdown reached it ("skip") or whose pid has since been reused by an
+  // unrelated process ("refuse") is left untouched either way, exactly
+  // matching `src/tools/kill.ts`'s own handling of both cases. When
+  // identity can't be verified at all (no captured identity, or the
+  // observer itself fails), this still proceeds via the same honest,
+  // disclosed DEGRADED path `kill()` uses, rather than a false success.
+  //
+  // `resolveBirthIdentityForKill`, not a direct `handle.birthIdentity`
+  // read - mirrors `kill.ts`'s own identical reasoning: `run()`'s birth-
+  // identity capture is async and fire-and-forget, so a shutdown reaching
+  // a very recently started job can race ahead of a still-in-flight
+  // capture; awaiting that SAME promise here (bounded by its own hard
+  // timeout) gives this reap a real chance at a confirmed identity
+  // comparison instead of needlessly degrading.
+  const birthIdentity = await jobStore.resolveBirthIdentityForKill(jobId);
+  const gate = await evaluatePreSignalIdentityGate(handle.pid, birthIdentity);
+  if (gate.action === "skip" || gate.action === "refuse") return;
+
+  // Marked as a reap attempt BEFORE signaling, same reasoning as
+  // kill.ts's own live-job branches: the identity gate above just
+  // confirmed this group is genuinely ours, so this is the moment of
+  // guaranteed continuity a later reap attempt on the resulting terminal
+  // record (the branch above, or a subsequent kill() call) can no longer
+  // rely on - marking it here is what makes that later attempt a safe,
+  // signal-free no-op instead of a second real signal against this same
+  // job.
+  jobStore.markReapAttempted(jobId);
   try {
-    await killProcessGroupPosix(handle.pid, SHUTDOWN_KILL_GRACE_PERIOD_MS, {
+    const result = await killProcessGroupPosix(handle.pid, SHUTDOWN_KILL_GRACE_PERIOD_MS, {
       onSignaled: (sentSignal) => {
         // Mirrors kill.ts's own kill/exit race handling:
         // claim the terminal slot synchronously, right when each real
@@ -404,6 +483,34 @@ async function reapOneJobOnShutdown(jobId: string): Promise<void> {
         }
       },
     });
+    // The same process-group-confirmation model kill.ts's own handler
+    // uses - honestly records whether the bounded external pgrep check
+    // actually confirmed zero surviving process-group members, never
+    // gating the state transition above.
+    // There's no MCP client left to read this back once the process exits,
+    // so an unconfirmed result is also logged here rather than only
+    // silently recorded.
+    jobStore.setKillConfirmation(jobId, result.confirmed);
+    jobStore.setIdentityConfirmation(jobId, gate.identityConfirmed);
+    if (!result.confirmed) {
+      // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- jobId is this codebase's own randomUUID(), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
+      console.error(
+        `[ghantika] job ${jobId}'s process-group reap could not be externally confirmed within the bound during shutdown - signal(s) were sent, but zero surviving members was not observed in time`
+      );
+      if (result.escalationRefusedReason !== undefined) {
+        // Distinguishes "SIGKILL was sent but the external confirmation
+        // read itself failed/timed out" from "escalation was refused, so
+        // no SIGKILL was ever sent at all" - the generic message above
+        // reads identically in both cases, and only this field (set by
+        // evaluateEscalationIdentityGate) tells them apart. There is no
+        // MCP client left to read this back once the process exits, so
+        // this is the only place it can surface.
+        // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- jobId is this codebase's own randomUUID(), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
+        console.error(
+          `[ghantika] job ${jobId}'s SIGKILL escalation was refused during shutdown: ${result.escalationRefusedReason}`
+        );
+      }
+    }
   } catch (error) {
     // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- jobId is this codebase's own randomUUID(), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
     console.error(`[ghantika] error killing job ${jobId}'s process group during shutdown:`, error);

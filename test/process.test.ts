@@ -18,8 +18,16 @@ import {
 } from "../dist/process.js";
 import {
   IDENTITY_TOLERANCE_SECONDS,
+  GROUP_CONFIRMATION_TIMEOUT_MS,
   POSIX_KILL_GRACE_PERIOD_MS,
+  PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS,
+  captureBirthIdentityPosix,
+  captureBirthIdentityPosixAsync,
+  captureEscalationIdentitySnapshot,
   checkProcessIdentity,
+  confirmProcessGroupReapedPosix,
+  evaluateEscalationIdentityGate,
+  evaluatePreSignalIdentityGate,
   hasLiveProcessGroupMembersPosix,
   identityElapsedTimesMatch,
   isProcessAlive,
@@ -27,10 +35,21 @@ import {
   killProcessGroupPosix,
   killProcessTreeWindows,
   parseEtime,
+  parsePidLstartRow,
+  readPidStartTimesBatchPosix,
   signalProcessGroupPosix,
   throwUnlessBenignAlreadyGoneRace,
   waitForProcessDeath,
 } from "../dist/process.js";
+
+// Explicit ".ts" extension - this helper has no relative imports of its
+// own, so Node's native TypeScript support can load it directly without a
+// build step - see test/kill.test.ts's identical comment on the same
+// pattern for a sibling helper.
+import {
+  retryBirthIdentityCapture,
+  BIRTH_IDENTITY_CAPTURE_RETRY_BOUND_MS,
+} from "./helpers/birthIdentityRetry.ts";
 
 // A handful of tests below exercise real POSIX process-GROUP primitives
 // this codebase's own code never asks Windows to perform (real `ps`/`pgrep`
@@ -646,6 +665,349 @@ test(
   }
 );
 
+// --- captureBirthIdentityPosixAsync (the non-blocking counterpart run()'s
+// own production handler actually calls - see src/tools/run.ts's docs) ---
+
+test(
+  "captureBirthIdentityPosixAsync: a successful real capture reads a near-zero elapsed age for a freshly spawned process, same as the sync version",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const child = spawnManaged(
+      { argv: ["sleep", "2"], cwd: process.cwd(), env: buildChildEnv("merge", {}) },
+      callbacksFor(recorder())
+    );
+    const identity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosixAsync(child!.pid!),
+      "captureBirthIdentityPosixAsync"
+    );
+    assert.notEqual(identity, undefined, "expected a real captured identity");
+    assert.equal(typeof identity!.capturedAtMs, "number");
+    assert.ok(
+      identity!.elapsedSecondsAtCapture >= 0 && identity!.elapsedSecondsAtCapture < 5,
+      `expected a near-zero elapsed age, got ${identity!.elapsedSecondsAtCapture}`
+    );
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
+
+test(
+  "captureBirthIdentityPosixAsync: projects forward to the same real elapsed time an independent SYNC captureBirthIdentityPosix reading observes moments later - proving both are the same genuine external observation, not two different mechanisms",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const child = spawnManaged(
+      { argv: ["sleep", "2"], cwd: process.cwd(), env: buildChildEnv("merge", {}) },
+      callbacksFor(recorder())
+    );
+    const asyncIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosixAsync(child!.pid!),
+      "captureBirthIdentityPosixAsync"
+    );
+    assert.notEqual(asyncIdentity, undefined);
+    const syncIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosix(child!.pid!),
+      "captureBirthIdentityPosix"
+    );
+    assert.notEqual(syncIdentity, undefined);
+    const projected =
+      asyncIdentity!.elapsedSecondsAtCapture +
+      (syncIdentity!.capturedAtMs - asyncIdentity!.capturedAtMs) / 1000;
+    assert.ok(
+      Math.abs(projected - syncIdentity!.elapsedSecondsAtCapture) <= 5,
+      `expected the async capture to project forward to the same real elapsed time the sync capture just observed - async: ${JSON.stringify(asyncIdentity)}, sync: ${JSON.stringify(syncIdentity)}`
+    );
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
+
+test(
+  "captureBirthIdentityPosixAsync: a genuinely HUNG ps observer is forcibly killed once the bound elapses and resolves to undefined - never left unsettled indefinitely",
+  {
+    skip: process.platform === "win32" ? "shadows a slow ps on PATH, POSIX-only" : false,
+  },
+  async () => {
+    const realPath = process.env.PATH;
+    // A ps that sleeps far longer (5s) than the short custom timeout this
+    // test passes (300ms) - if execFile's own `timeout` option didn't
+    // actually SIGTERM this child at the bound, this promise would never
+    // settle within any reasonable window and the test would time out
+    // instead of completing.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-hung-ps-"));
+    const psPath = path.join(dir, "ps");
+    fs.writeFileSync(psPath, "#!/bin/sh\nsleep 5\necho '00:00'\n");
+    fs.chmodSync(psPath, 0o755);
+
+    let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
+    let elapsedMs: number;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      const before = Date.now();
+      identity = await captureBirthIdentityPosixAsync(process.pid, 300);
+      elapsedMs = Date.now() - before;
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    assert.equal(
+      identity,
+      undefined,
+      "a ps that never answers within the bound must resolve to undefined (unavailable), never fabricate a value"
+    );
+    assert.ok(
+      elapsedMs < 2000,
+      `expected the bounded timeout to actually fire well before the ps's own 5s sleep - took ${elapsedMs}ms`
+    );
+  }
+);
+
+test(
+  "captureBirthIdentityPosixAsync: on Windows, never even attempted - always resolves to undefined there",
+  { skip: process.platform !== "win32" ? "Windows-only assertion" : false },
+  async () => {
+    assert.equal(await captureBirthIdentityPosixAsync(process.pid), undefined);
+  }
+);
+
+// --- retryBirthIdentityCapture (test/helpers/birthIdentityRetry.ts - the
+// bounded retry every immediate-capture-then-assert test call site below
+// and elsewhere now uses to absorb the real fork-visibility race, per this
+// story's own ACs). Proven here with pure, injected fake captures - no
+// real spawn or `ps` needed at all - since this is a proof about the
+// RETRY LOOP's own logic, not about the real OS-level capture functions
+// (those are already covered exhaustively by the real-process tests
+// throughout this file). Both directions (eventually succeeds / never
+// succeeds), for both call shapes (sync-returning / Promise-returning),
+// as separate tests - they exercise genuinely different code inside the
+// retry loop's `await attemptCapture()` (a no-op await vs a real one), not
+// just the same path with different fixtures. ---
+
+test("retryBirthIdentityCapture: a SYNC-shaped capture that returns undefined for its first attempts and succeeds on the Nth still resolves - proves the loop genuinely RETRIES rather than merely succeeding by luck on the first call", async () => {
+  const successOnAttempt = 4;
+  const fakeIdentity = { capturedAtMs: Date.now(), elapsedSecondsAtCapture: 0 };
+  let calls = 0;
+  const result = await retryBirthIdentityCapture(() => {
+    calls += 1;
+    return calls >= successOnAttempt ? fakeIdentity : undefined;
+  }, "captureBirthIdentityPosix (fake, sync)");
+  assert.equal(result, fakeIdentity);
+  assert.notEqual(result, undefined);
+  assert.equal(
+    calls,
+    successOnAttempt,
+    "expected exactly the Nth attempt to succeed, not the first - a loop that returned early on attempt 1 (or kept going past a real success) would fail this count"
+  );
+});
+
+test("retryBirthIdentityCapture: a SYNC-shaped capture that ALWAYS returns undefined still FAILS at the bound - a diagnostic naming the capture function, never a silent resolve to undefined and never an unbounded retry", async () => {
+  let calls = 0;
+  const before = Date.now();
+  await assert.rejects(
+    () =>
+      retryBirthIdentityCapture(() => {
+        calls += 1;
+        return undefined;
+      }, "captureBirthIdentityPosix (fake, sync, always-undefined)"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(
+        error.message,
+        /captureBirthIdentityPosix \(fake, sync, always-undefined\)/,
+        "the thrown diagnostic must name the capture function, never a generic timeout message"
+      );
+      assert.match(error.message, /attempt/);
+      return true;
+    }
+  );
+  const elapsedMs = Date.now() - before;
+  assert.ok(
+    calls > 1,
+    `expected more than one attempt before giving up (proves a genuine bounded RETRY, not a single try) - got ${calls}`
+  );
+  assert.ok(
+    elapsedMs >= BIRTH_IDENTITY_CAPTURE_RETRY_BOUND_MS,
+    `expected the loop to actually spend the full bound retrying before giving up, got ${elapsedMs}ms`
+  );
+  assert.ok(
+    elapsedMs < BIRTH_IDENTITY_CAPTURE_RETRY_BOUND_MS + 500,
+    `expected the bound to actually be enforced (never drift far past it), got ${elapsedMs}ms`
+  );
+});
+
+test("retryBirthIdentityCapture: an ASYNC-shaped capture (a real Promise that resolves after a real delay on each attempt) that fails for its first attempts and succeeds on the Nth still resolves - a genuinely separate code path from the sync-shaped case above (a real await, not a no-op one)", async () => {
+  const successOnAttempt = 3;
+  const fakeIdentity = { capturedAtMs: Date.now(), elapsedSecondsAtCapture: 0 };
+  let calls = 0;
+  const result = await retryBirthIdentityCapture(async () => {
+    calls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return calls >= successOnAttempt ? fakeIdentity : undefined;
+  }, "captureBirthIdentityPosixAsync (fake, async)");
+  assert.equal(result, fakeIdentity);
+  assert.notEqual(result, undefined);
+  assert.equal(calls, successOnAttempt);
+});
+
+test("retryBirthIdentityCapture: an ASYNC-shaped capture that ALWAYS resolves undefined still FAILS at the bound, with a diagnostic naming the capture function", async () => {
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      retryBirthIdentityCapture(async () => {
+        calls += 1;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return undefined;
+      }, "captureBirthIdentityPosixAsync (fake, async, always-undefined)"),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(
+        error.message,
+        /captureBirthIdentityPosixAsync \(fake, async, always-undefined\)/
+      );
+      return true;
+    }
+  );
+  assert.ok(calls > 1, `expected more than one attempt before giving up - got ${calls}`);
+});
+
+// --- retryBirthIdentityCapture: per-attempt deadline enforcement (the
+// race, not just a post-await check). The four tests above prove the
+// retry LOOP's own logic (does it retry, does it eventually give up); the
+// four below prove the DEADLINE is enforced around each individual
+// attempt rather than only checked once an attempt has already settled
+// on its own schedule - a slow or hung attempt must never be able to run
+// past its own configured bound. ---
+
+test("retryBirthIdentityCapture: an async capture that eventually resolves to a REAL value, but only after its own configured bound has already elapsed, must NOT have that late success accepted - a value arriving after its own deadline is exactly what this retry exists to reject, not a free pass for eventually succeeding", async () => {
+  const boundMs = 30;
+  const lateResolveDelayMs = 200;
+  const fakeIdentity = { capturedAtMs: Date.now(), elapsedSecondsAtCapture: 0 };
+  const before = Date.now();
+  await assert.rejects(
+    () =>
+      retryBirthIdentityCapture(
+        async () => {
+          await new Promise((resolve) => setTimeout(resolve, lateResolveDelayMs));
+          return fakeIdentity;
+        },
+        "captureBirthIdentityPosixAsync (fake, async, late-success)",
+        boundMs
+      ),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(
+        error.message,
+        /captureBirthIdentityPosixAsync \(fake, async, late-success\)/,
+        "the thrown diagnostic must still name the capture function even when the reason is a per-attempt race timeout, not merely an undefined answer"
+      );
+      return true;
+    }
+  );
+  const elapsedMs = Date.now() - before;
+  assert.ok(
+    elapsedMs < lateResolveDelayMs,
+    `expected the retry to give up around its own ${boundMs}ms bound rather than wait out the attempt's full ${lateResolveDelayMs}ms settlement time before deciding - got ${elapsedMs}ms, which would mean the late success was allowed to race to completion instead of being cut off`
+  );
+});
+
+test("retryBirthIdentityCapture: an async capture that resolves to undefined, but only after its own configured bound has already elapsed, makes the retry throw PROMPTLY at that bound - it must never wait out the slow attempt's own settlement time before giving up", async () => {
+  const boundMs = 30;
+  const lateUndefinedDelayMs = 200;
+  const before = Date.now();
+  await assert.rejects(
+    () =>
+      retryBirthIdentityCapture(
+        async () => {
+          await new Promise((resolve) => setTimeout(resolve, lateUndefinedDelayMs));
+          return undefined;
+        },
+        "captureBirthIdentityPosixAsync (fake, async, slow-undefined)",
+        boundMs
+      ),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /captureBirthIdentityPosixAsync \(fake, async, slow-undefined\)/);
+      return true;
+    }
+  );
+  const elapsedMs = Date.now() - before;
+  assert.ok(
+    elapsedMs < lateUndefinedDelayMs,
+    `expected the retry to give up around its own ${boundMs}ms bound instead of waiting for this attempt's own ${lateUndefinedDelayMs}ms settlement - got ${elapsedMs}ms`
+  );
+  assert.ok(
+    elapsedMs < boundMs + 250,
+    `expected the bound to actually be enforced close to its configured value, not merely eventually - got ${elapsedMs}ms for a ${boundMs}ms bound`
+  );
+});
+
+test("retryBirthIdentityCapture: an async capture whose promise NEVER settles at all (never resolves, never rejects) still fails at, or very near, the configured bound rather than hanging forever - the exact hang this fix exists to close, since the original `await attemptCapture()` at the top of the loop would never return and the deadline check below it would never run", async () => {
+  const boundMs = 30;
+  let calls = 0;
+  const before = Date.now();
+  await assert.rejects(
+    () =>
+      retryBirthIdentityCapture(
+        () => {
+          calls += 1;
+          return new Promise<undefined>(() => {
+            // Deliberately never resolves or rejects - models a
+            // genuinely hung observer, not merely a slow one.
+          });
+        },
+        "captureBirthIdentityPosixAsync (fake, async, never-settles)",
+        boundMs
+      ),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /captureBirthIdentityPosixAsync \(fake, async, never-settles\)/);
+      return true;
+    }
+  );
+  const elapsedMs = Date.now() - before;
+  assert.ok(
+    elapsedMs < boundMs + 250,
+    `expected the retry to give up close to its own ${boundMs}ms bound rather than hang indefinitely on an attempt that will never settle - got ${elapsedMs}ms`
+  );
+  assert.ok(calls >= 1, "expected at least one real attempt to have been made before giving up");
+});
+
+test("retryBirthIdentityCapture: a losing attempt that times out and THEN, some time after the retry has already thrown its own failure, rejects with a real error - that later rejection must never surface as a process-level unhandledRejection", async () => {
+  const boundMs = 30;
+  const lateRejectDelayMs = 150;
+  let unhandled: unknown;
+  const onUnhandledRejection = (reason: unknown): void => {
+    unhandled = reason;
+  };
+  // Same pattern this project already uses for the identical concern in
+  // test/integration.test.ts (search that file for "unhandledRejection"):
+  // listen for the real process-level event directly around the
+  // scenario, rather than trusting "the test didn't crash" as proof.
+  process.on("unhandledRejection", onUnhandledRejection);
+  try {
+    await assert.rejects(() =>
+      retryBirthIdentityCapture(
+        () =>
+          new Promise<undefined>((_resolve, reject) => {
+            setTimeout(
+              () => reject(new Error("late rejection from a losing, already-abandoned attempt")),
+              lateRejectDelayMs
+            );
+          }),
+        "captureBirthIdentityPosixAsync (fake, async, loses-then-rejects)",
+        boundMs
+      )
+    );
+    // Give the event loop a real, bounded grace window past when the
+    // losing attempt's own rejection actually fires.
+    await new Promise((resolve) => setTimeout(resolve, lateRejectDelayMs + 200));
+  } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
+  }
+  assert.equal(
+    unhandled,
+    undefined,
+    `expected no unhandled rejection to surface once the losing attempt's promise eventually rejects, got: ${String(unhandled)}`
+  );
+});
+
 // --- parseEtime (pure, no real process needed) ---
 
 test("parseEtime parses mm:ss", () => {
@@ -669,6 +1031,40 @@ test("parseEtime returns undefined for unrecognized shapes - defensive: never si
   assert.equal(parseEtime(":30"), undefined);
 });
 
+test("parseEtime rejects a non-2-digit mm/ss/hh field, even when every character is a digit - a malformed or concatenated read must fail closed, never parse as a syntactically-valid but physically-impossible elapsed time", () => {
+  // The exact shape a real CI failure produced: minutes="0" (unpadded,
+  // real ps never emits this - see this file's own mm:ss/hh:mm:ss cases
+  // above, all zero-padded), seconds a 14-digit run. Before this
+  // tightening this parsed as a "found" reading of 38,109,073,018,720
+  // seconds (~1.2 million years) instead of the observer-failure a
+  // malformed read actually is.
+  assert.equal(parseEtime("0:38109073018720"), undefined);
+  // Single-digit (unpadded) fields alone, the narrower case: real ps
+  // always zero-pads mm/ss/hh to two digits.
+  assert.equal(parseEtime("0:5"), undefined);
+  assert.equal(parseEtime("1:02:03"), undefined);
+  assert.equal(parseEtime("01:2:03"), undefined);
+  assert.equal(parseEtime("01:02:3"), undefined);
+  // Three-or-more-digit fields, the wider case the real corruption hit.
+  assert.equal(parseEtime("00:123"), undefined);
+  assert.equal(parseEtime("123:00:00"), undefined);
+});
+
+test("parseEtime rejects an implausibly large leading days field, even when every other field is validly formatted - the same corrupted-value class the mm/ss/hh tightening closes can equally corrupt the unbounded days field", () => {
+  // The exact second real CI failure this closes: a genuinely real,
+  // synchronous `ps -p <pid> -o etime=` read against a freshly spawned
+  // process (alive for well under a second) parsed - through the
+  // already-tightened hh/mm/ss check above - as 38,109,073,018,720
+  // seconds via this decomposition: 441,077,234 days (~1.2 million years)
+  // plus a validly-2-digit-formatted "00:18:40" remainder. The mm/ss/hh
+  // fix alone does not catch this shape, since every field it checks is
+  // correctly 2 digits; only bounding the days field itself does.
+  assert.equal(parseEtime("441077234-00:18:40"), undefined);
+  // A merely large but genuinely plausible days count must still parse -
+  // this bound must never reject a real long-lived process.
+  assert.equal(parseEtime("100-00:00:00"), 100 * 86_400);
+});
+
 // --- identityElapsedTimesMatch (pure comparison, checkProcessIdentity's building block) ---
 
 test("identityElapsedTimesMatch: within tolerance is a match", () => {
@@ -689,45 +1085,59 @@ test("identityElapsedTimesMatch defaults to IDENTITY_TOLERANCE_SECONDS when no t
 });
 
 // --- checkProcessIdentity ---
+//
+// `checkProcessIdentity` now takes a real `ProcessBirthIdentity` (captured
+// via `captureBirthIdentityPosix`, per src/process.ts's own docs), never a
+// raw `Date.now()`-derived number - these tests build one the same way
+// production code does (`captureBirthIdentityPosix` right after a real
+// spawn), or construct one directly for the synthetic not-found/mismatch
+// cases below.
 
-test("checkProcessIdentity: not-found for a pid that plainly doesn't exist", () => {
-  const result = checkProcessIdentity(999_999, Date.now());
+test("checkProcessIdentity: not-found for a pid that plainly doesn't exist", async () => {
+  const result = await checkProcessIdentity(999_999, {
+    capturedAtMs: Date.now(),
+    elapsedSecondsAtCapture: 0,
+  });
   assert.equal(result.status, "not-found");
 });
 
 test(
-  "checkProcessIdentity: alive-confirmed for a real process whose ACTUAL recorded spawn time matches",
+  "checkProcessIdentity: alive-confirmed for a real process whose ACTUAL captured birth identity matches",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async () => {
     const rec = recorder();
     const env = buildChildEnv("merge", {});
-    const spawnedAtMs = Date.now();
     const child = spawnManaged(
       { argv: ["sleep", "3"], cwd: process.cwd(), env },
       callbacksFor(rec)
     );
     await waitFor(() => rec.spawned > 0);
-    const result = checkProcessIdentity(child!.pid!, spawnedAtMs);
+    const birthIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosix(child!.pid!),
+      "captureBirthIdentityPosix"
+    );
+    assert.notEqual(birthIdentity, undefined, "expected a real, successful capture");
+    const result = await checkProcessIdentity(child!.pid!, birthIdentity!);
     assert.equal(result.status, "alive-confirmed");
     process.kill(-child!.pid!, "SIGKILL"); // cleanup
   }
 );
 
 test(
-  "checkProcessIdentity REFUSES to confirm a real, currently-alive process when the expected spawn time is far in the past - a convincing simulation of PID reuse",
+  "checkProcessIdentity REFUSES to confirm a real, currently-alive process when the captured birth identity is far in the past - a convincing simulation of PID reuse",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async () => {
     // Real pid recycling can't be forced deterministically from a test, so
     // this simulates its ESSENCE instead: a REAL, currently-alive process
-    // (ps reports its REAL, near-0s elapsed time) checked against an
-    // `expectedSpawnedAtMs` far in the past - exactly what a stale, post-
-    // reuse bookkeeping record would look like from the outside (our record
-    // still points at this pid, but the REAL process now living there
-    // started at a very different time than the one we originally spawned).
-    // How convincing this is: fully real `ps` call and fully real elapsed-
-    // time comparison logic, on a genuinely live process - just not an
-    // actual OS-level pid recycling event, which this environment cannot
-    // force to order.
+    // (ps reports its REAL, near-0s elapsed time) checked against a
+    // captured birth identity that claims capture happened far in the
+    // past - exactly what a stale, post-reuse bookkeeping record would
+    // look like from the outside (our record still points at this pid,
+    // but the REAL process now living there started at a very different
+    // time than the one we originally spawned). How convincing this is:
+    // fully real `ps` call and fully real elapsed-time comparison logic,
+    // on a genuinely live process - just not an actual OS-level pid
+    // recycling event, which this environment cannot force to order.
     const rec = recorder();
     const env = buildChildEnv("merge", {});
     const child = spawnManaged(
@@ -735,12 +1145,76 @@ test(
       callbacksFor(rec)
     );
     await waitFor(() => rec.spawned > 0);
-    const fakeExpectedSpawnedAtMs = Date.now() - 10 * 60 * 1000; // 10 minutes "ago"
-    const result = checkProcessIdentity(child!.pid!, fakeExpectedSpawnedAtMs);
+    const fakeBirthIdentity = {
+      capturedAtMs: Date.now() - 10 * 60 * 1000, // 10 minutes "ago"
+      elapsedSecondsAtCapture: 0,
+    };
+    const result = await checkProcessIdentity(child!.pid!, fakeBirthIdentity);
     assert.equal(result.status, "identity-mismatch");
     if (result.status === "identity-mismatch") {
       assert.match(result.reason, /reused pid/);
     }
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
+
+// --- evaluatePreSignalIdentityGate (the single real entry point every kill
+// caller uses - wraps checkProcessIdentity plus the "no identity captured
+// at all" case that function can't handle on its own) ---
+
+test(
+  "evaluatePreSignalIdentityGate: alive-confirmed identity -> proceed with identityConfirmed: true",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "3"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const birthIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosix(child!.pid!),
+      "captureBirthIdentityPosix"
+    );
+    assert.notEqual(birthIdentity, undefined);
+    const gate = await evaluatePreSignalIdentityGate(child!.pid!, birthIdentity);
+    assert.deepEqual(gate, { action: "proceed", identityConfirmed: true });
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
+
+test("evaluatePreSignalIdentityGate: no captured identity at all (undefined) -> proceed, honestly degraded (identityConfirmed: false)", async () => {
+  const gate = await evaluatePreSignalIdentityGate(999_999, undefined);
+  assert.deepEqual(gate, { action: "proceed", identityConfirmed: false });
+});
+
+test("evaluatePreSignalIdentityGate: a genuinely gone pid -> skip (nothing to signal)", async () => {
+  const gate = await evaluatePreSignalIdentityGate(999_999, {
+    capturedAtMs: Date.now(),
+    elapsedSecondsAtCapture: 0,
+  });
+  assert.deepEqual(gate, { action: "skip" });
+});
+
+test(
+  "evaluatePreSignalIdentityGate: a real identity mismatch -> refuse, with an honest reason",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "3"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const fakeBirthIdentity = {
+      capturedAtMs: Date.now() - 10 * 60 * 1000,
+      elapsedSecondsAtCapture: 0,
+    };
+    const gate = await evaluatePreSignalIdentityGate(child!.pid!, fakeBirthIdentity);
+    assert.equal(gate.action, "refuse");
+    if (gate.action === "refuse") assert.match(gate.reason, /reused pid/);
     process.kill(-child!.pid!, "SIGKILL"); // cleanup
   }
 );
@@ -771,7 +1245,7 @@ test("isProcessAlive: false for a pid that plainly doesn't exist", () => {
 // --- signalProcessGroupPosix ---
 
 test(
-  "signalProcessGroupPosix: signaling the group actually reaches it (green control, precursor to the real external-lineage e2e proof in test/kill.test.ts)",
+  "signalProcessGroupPosix: signaling the group actually reaches it",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async () => {
     const rec = recorder();
@@ -822,6 +1296,148 @@ test(
     assert.equal(hasLiveProcessGroupMembersPosix(999_999), false);
   }
 );
+
+test(
+  "hasLiveProcessGroupMembersPosix: a real pgrep EXECUTION failure (missing binary) fails CLOSED to true ('still alive/unconfirmed'), never rethrown",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+
+    const realPath = process.env.PATH;
+    // A real ENOENT fault injection - a PATH with no `pgrep` binary on it
+    // at all - not a mock. hasLiveProcessGroupMembersPosix has no `env`
+    // parameter of its own (it always shells out against this PROCESS's
+    // own process.env), so mutating process.env.PATH is the real fault
+    // path a broken deployment PATH would actually hit.
+    process.env.PATH = "/tmp/does-not-exist-ghantika-empty-path-dir";
+    let result: boolean | undefined;
+    let thrown: unknown;
+    try {
+      result = hasLiveProcessGroupMembersPosix(pid);
+    } catch (error) {
+      thrown = error;
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    assert.equal(
+      thrown,
+      undefined,
+      `must never rethrow a pgrep execution failure - got: ${thrown instanceof Error ? thrown.stack : String(thrown)}`
+    );
+    assert.equal(
+      result,
+      true,
+      "a broken observer must fail CLOSED to true ('cannot confirm gone'), never silently report false ('confirmed zero survivors')"
+    );
+
+    process.kill(-pid, "SIGKILL"); // cleanup
+  }
+);
+
+test(
+  "confirmProcessGroupReapedPosix: a broken pgrep observer never throws - it honestly reports unconfirmed (false) once its own bound elapses, rather than an uncaught exception",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+
+    const realPath = process.env.PATH;
+    process.env.PATH = "/tmp/does-not-exist-ghantika-empty-path-dir";
+    let confirmed: boolean | undefined;
+    let thrown: unknown;
+    try {
+      // A short bound - the fail-closed "still alive" result from a
+      // broken observer means this loops until the bound elapses, never
+      // resolving early.
+      confirmed = await confirmProcessGroupReapedPosix(pid, 150);
+    } catch (error) {
+      thrown = error;
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    assert.equal(
+      thrown,
+      undefined,
+      `confirmProcessGroupReapedPosix must never throw when pgrep is broken - this is exactly the bug that reached src/tools/kill.ts's handler as an uncaught exception pre-fix - got: ${thrown instanceof Error ? thrown.stack : String(thrown)}`
+    );
+    assert.equal(
+      confirmed,
+      false,
+      "a broken observer must honestly resolve to unconfirmed (false) once the bound elapses, never silently upgraded to true"
+    );
+
+    process.kill(-pid, "SIGKILL"); // cleanup
+  }
+);
+
+// --- confirmProcessGroupReapedPosix (the FINAL, external process-group confirmation) ---
+
+test(
+  "confirmProcessGroupReapedPosix: resolves true once a real process group is genuinely gone",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+    process.kill(-pid, "SIGKILL");
+    await waitFor(() => isProcessAlive(pid) === false);
+    const confirmed = await confirmProcessGroupReapedPosix(pid, 1000);
+    assert.equal(confirmed, true);
+  }
+);
+
+test(
+  "confirmProcessGroupReapedPosix: resolves false within the bound for a group that is genuinely STILL alive - never falsely claims confirmed",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "10"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+    const start = Date.now();
+    const confirmed = await confirmProcessGroupReapedPosix(pid, 150);
+    const elapsed = Date.now() - start;
+    assert.equal(
+      confirmed,
+      false,
+      "a group that is genuinely still alive must never be reported as confirmed-gone"
+    );
+    assert.ok(
+      elapsed >= 150 && elapsed < 1000,
+      `expected to resolve close to the 150ms bound, took ${elapsed}ms`
+    );
+    process.kill(-pid, "SIGKILL"); // cleanup
+  }
+);
+
+test("GROUP_CONFIRMATION_TIMEOUT_MS defaults confirmProcessGroupReapedPosix's own bound", () => {
+  assert.equal(typeof GROUP_CONFIRMATION_TIMEOUT_MS, "number");
+  assert.ok(GROUP_CONFIRMATION_TIMEOUT_MS > 0);
+});
 
 // --- waitForProcessDeath ---
 
@@ -877,6 +1493,11 @@ test(
     assert.equal(result.finalSignal, "SIGTERM");
     assert.equal(result.escalated, false);
     assert.equal(isProcessAlive(child!.pid!), false);
+    assert.equal(
+      result.confirmed,
+      true,
+      "the FINAL external pgrep-based process-group check must confirm zero survivors for a real, fully dead group"
+    );
   }
 );
 
@@ -921,6 +1542,11 @@ test(
       isProcessAlive(child!.pid!),
       false,
       "the SIGTERM-resistant process must actually be dead after SIGKILL escalation"
+    );
+    assert.equal(
+      result.confirmed,
+      true,
+      "the FINAL external pgrep-based process-group check must confirm zero survivors after escalation too"
     );
   }
 );
@@ -1062,9 +1688,13 @@ test(
 // (so pgrep truly doesn't), keeping the survivor-oracle half of every
 // assertion honest.
 
-test("throwUnlessBenignAlreadyGoneRace: a successful signal result is a no-op regardless of signal name", () => {
-  assert.doesNotThrow(() => throwUnlessBenignAlreadyGoneRace(900_101, "SIGTERM", { ok: true }));
-  assert.doesNotThrow(() => throwUnlessBenignAlreadyGoneRace(900_101, "SIGKILL", { ok: true }));
+test("throwUnlessBenignAlreadyGoneRace: a successful signal result is a no-op regardless of signal name", async () => {
+  await assert.doesNotReject(() =>
+    throwUnlessBenignAlreadyGoneRace(900_101, "SIGTERM", { ok: true })
+  );
+  await assert.doesNotReject(() =>
+    throwUnlessBenignAlreadyGoneRace(900_101, "SIGKILL", { ok: true })
+  );
 });
 
 test(
@@ -1081,12 +1711,12 @@ test(
     const pid = child!.pid!;
     try {
       const epermResult = { ok: false, code: "EPERM", message: "kill EPERM" };
-      assert.throws(
+      await assert.rejects(
         () => throwUnlessBenignAlreadyGoneRace(pid, "SIGTERM", epermResult),
         /failed to send SIGTERM to process group/,
         "a genuinely alive, unsignalable group must surface a real error on the SIGTERM name"
       );
-      assert.throws(
+      await assert.rejects(
         () => throwUnlessBenignAlreadyGoneRace(pid, "SIGKILL", epermResult),
         /failed to send SIGKILL to process group/,
         "a genuinely alive, unsignalable group must surface a real error on the SIGKILL name too - the same function, the same arbitration, for both call sites"
@@ -1097,22 +1727,26 @@ test(
   }
 );
 
-test("throwUnlessBenignAlreadyGoneRace: EPERM against a group that is already gone is the benign race, no error, for either signal name", () => {
+test("throwUnlessBenignAlreadyGoneRace: EPERM against a group that is already gone is the benign race, no error, for either signal name", async () => {
   const fakePid = 900_102; // never a real group in this process's lifetime
   const epermResult = { ok: false, code: "EPERM", message: "kill EPERM" };
-  assert.doesNotThrow(() => throwUnlessBenignAlreadyGoneRace(fakePid, "SIGTERM", epermResult));
-  assert.doesNotThrow(() => throwUnlessBenignAlreadyGoneRace(fakePid, "SIGKILL", epermResult));
+  await assert.doesNotReject(() =>
+    throwUnlessBenignAlreadyGoneRace(fakePid, "SIGTERM", epermResult)
+  );
+  await assert.doesNotReject(() =>
+    throwUnlessBenignAlreadyGoneRace(fakePid, "SIGKILL", epermResult)
+  );
 });
 
-test("throwUnlessBenignAlreadyGoneRace: a non-EPERM failure surfaces unconditionally, even when the group is already gone - never consults the survivor oracle at all", () => {
+test("throwUnlessBenignAlreadyGoneRace: a non-EPERM failure surfaces unconditionally, even when the group is already gone - never consults the survivor oracle at all", async () => {
   const fakePid = 900_103; // never a real group in this process's lifetime
   const einvalResult = { ok: false, code: "EINVAL", message: "kill EINVAL" };
-  assert.throws(
+  await assert.rejects(
     () => throwUnlessBenignAlreadyGoneRace(fakePid, "SIGTERM", einvalResult),
     /failed to send SIGTERM to process group/,
     "a non-EPERM failure must surface unconditionally, fail-closed, regardless of whether the group happens to be gone"
   );
-  assert.throws(
+  await assert.rejects(
     () => throwUnlessBenignAlreadyGoneRace(fakePid, "SIGKILL", einvalResult),
     /failed to send SIGKILL to process group/
   );
@@ -1122,12 +1756,13 @@ test("throwUnlessBenignAlreadyGoneRace: a non-EPERM failure surfaces uncondition
 // actually invoke the shared function above, not a copy of its logic. ---
 
 test(
-  "killProcessGroupPosix: the SIGTERM-site already-gone race is treated as success end to end, via a mocked process.kill (EPERM) on a fake pid",
+  "killProcessGroupPosix: the SIGTERM-site already-gone race is treated as success end to end, via a mocked process.kill (EPERM) on a fake pid, WITHOUT ever claiming a delivery that never happened",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async (t) => {
     const fakePid = 900_104; // never a real group in this process's lifetime
     const realKill = process.kill.bind(process);
     t.mock.method(process, "kill", (target: number, signal?: string | number) => {
+      if (target === -fakePid && signal === 0) return undefined; // the pre-signal existence check reports "alive", so the SIGTERM attempt below is actually reached rather than short-circuited
       if (target === -fakePid && signal === "SIGTERM") {
         const err = new Error("kill EPERM") as NodeJS.ErrnoException;
         err.code = "EPERM";
@@ -1140,26 +1775,60 @@ test(
     const result = await killProcessGroupPosix(fakePid, 50, {
       onSignaled: (sig) => signaled.push(sig),
     });
-    assert.deepEqual(result, { finalSignal: "SIGTERM", escalated: false });
+    // confirmed: true - a fake pid was never a real group, so the FINAL
+    // external pgrep-based process-group check correctly reports zero survivors.
+    assert.deepEqual(result, { finalSignal: "SIGTERM", escalated: false, confirmed: true });
     assert.deepEqual(
       signaled,
-      ["SIGTERM"],
-      "onSignaled must still fire for the benign already-gone race - jobStore.markKilled's terminal-state guard makes this safe"
+      [],
+      "onSignaled must NOT fire for the benign already-gone race - nothing was ever delivered, so a caller claiming a terminal kill on the strength of this callback would be recording a natural exit as a requested one"
     );
   }
 );
 
 test(
-  "killProcessGroupPosix: the SIGKILL-site already-gone race is treated as success end to end, via a mocked process.kill (EPERM) on a fake pid - the same fake-pid pattern as the SIGTERM-site proof above, never a real process or signal",
+  "killProcessGroupPosix: the SIGKILL-site already-gone race is treated as success end to end, via a REAL SIGTERM-resistant process the mock itself genuinely ends right before reporting a fake EPERM, WITHOUT claiming the SIGKILL half was delivered when it never was",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async (t) => {
-    const fakePid = 900_105; // never a real group in this process's lifetime
+    // A totally fake, never-real pid can no longer reach this far: the
+    // escalation identity gate now runs before ANY SIGKILL is even
+    // attempted, and it requires a real, matching originally-recorded
+    // member - a fake pid produces zero usable records and is refused
+    // long before this benign-already-gone arbitration is ever reached
+    // (see the REGRESSION CLOSED test below, which proves exactly that).
+    // So this test now needs a REAL, genuinely alive, SIGTERM-resistant
+    // process for the identity gate to capture and re-confirm - the mock's
+    // own job is narrowed to simulating the SIGKILL-send race itself: it
+    // genuinely ends the real process (so the external pgrep-based
+    // survivor check the arbitration relies on finds it truly gone) and
+    // THEN reports the fake EPERM, reproducing "the group emptied in the
+    // instant between the identity gate's own re-read and the SIGKILL
+    // syscall" - precisely the narrowed (never closed) residual the escalation identity gate discloses.
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      {
+        argv: [
+          "node",
+          "-e",
+          "process.on('SIGTERM', () => {}); console.log('ready'); setInterval(() => {}, 1000)",
+        ],
+        cwd: process.cwd(),
+        env,
+      },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    await waitFor(() => Buffer.concat(rec.stdout).toString("utf8").includes("ready"));
+    const pid = child!.pid!;
+
     const realKill = process.kill.bind(process);
     t.mock.method(process, "kill", (target: number, signal?: string | number) => {
-      if (target !== -fakePid) return realKill(target, signal);
-      if (signal === "SIGTERM") return undefined; // succeeds - reaches escalation instead of the real ESRCH a fake pid would otherwise short-circuit on
-      if (signal === 0) return undefined; // the liveness poll inside waitForProcessDeath reports "still alive" for the whole grace period, forcing a real escalation to SIGKILL
-      if (signal === "SIGKILL") {
+      if (target === -pid && signal === "SIGKILL") {
+        // Genuinely end the real process FIRST, via the real, unmocked
+        // kill - so the external pgrep-based survivor check moments later
+        // truthfully finds nothing, exactly like the real benign race.
+        realKill(-pid, "SIGKILL");
         const err = new Error("kill EPERM") as NodeJS.ErrnoException;
         err.code = "EPERM";
         throw err;
@@ -1168,11 +1837,26 @@ test(
     });
 
     const signaled: string[] = [];
-    const result = await killProcessGroupPosix(fakePid, 50, {
+    const result = await killProcessGroupPosix(pid, 300, {
       onSignaled: (sig) => signaled.push(sig),
     });
-    assert.deepEqual(result, { finalSignal: "SIGKILL", escalated: true });
-    assert.deepEqual(signaled, ["SIGTERM", "SIGKILL"]);
+    // The real process genuinely dies from the mock's own realKill call
+    // above, so the FINAL external pgrep-based check truthfully confirms
+    // zero survivors.
+    assert.deepEqual(result, { finalSignal: "SIGKILL", escalated: true, confirmed: true });
+    // The SIGTERM half was a genuine delivery (the real, resistant process
+    // ignored it and survived the grace period), so it correctly fires.
+    // The SIGKILL half hit the benign already-gone race (EPERM, confirmed
+    // gone) - nothing was delivered BY THIS CALL (the process died from
+    // the mock's own realKill, not from a signal this function's own send
+    // ever successfully delivered), so it must NOT appear here, even
+    // though the overall result still reports the call as a successful,
+    // confirmed escalation.
+    assert.deepEqual(
+      signaled,
+      ["SIGTERM"],
+      "onSignaled must fire for the genuinely-delivered SIGTERM but NOT for the benign already-gone SIGKILL race"
+    );
   }
 );
 
@@ -1235,6 +1919,72 @@ test(
   }
 );
 
+// REGRESSION CLOSED: this test used to reproduce the OLD, wide-open
+// residual - a totally fake, never-real pid, with existence checks alone
+// mocked to always report "alive", used to escalate to SIGKILL anyway,
+// because a bare kill(pid, 0) liveness poll cannot distinguish a survived
+// original group from a coincidentally-reused (or entirely fictitious)
+// one. The escalation identity gate closes EXACTLY that case: a fake pid
+// produces zero usable identity records at the pre-SIGTERM snapshot (no
+// real process ever existed to read pid+lstart from), so escalation is
+// now REFUSED before any SIGKILL is even attempted - existence-alone can
+// no longer carry a fake pid all the way to a real SIGKILL send.
+//
+// The gate's OWN disclosed residual is narrower, not eliminated: the real
+// gap now lives strictly between the gate's OWN successful re-read (which
+// requires a genuine, matching original member) and the actual SIGKILL
+// syscall - a window real pid reuse cannot be forced to land in
+// deterministically from a test. That narrower gap is what the
+// "already-gone race" test above this one demonstrates directly: a REAL,
+// live, matching process whose mock only intervenes at the SIGKILL send
+// itself, genuinely ending it right there rather than lying about its
+// existence throughout.
+test(
+  "killProcessGroupPosix: a totally fake, never-real pid - the OLD wide-open escalation residual - is now REFUSED at the identity gate before any SIGKILL is attempted, closing exactly the case the prior version of this test used to reproduce",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async (t) => {
+    const fakePid = 900_106; // never a real group in this process's lifetime
+    const realKill = process.kill.bind(process);
+
+    let sawSigkillAttempt = false;
+    t.mock.method(process, "kill", (target: number, signal?: string | number) => {
+      if (target !== -fakePid) return realKill(target, signal);
+      if (signal === "SIGTERM") return undefined; // succeeds - reaches the grace period
+      if (signal === 0) return undefined; // "still alive" for the whole grace period, forcing the escalation decision to actually be reached
+      if (signal === "SIGKILL") sawSigkillAttempt = true;
+      return undefined;
+    });
+
+    const signaled: string[] = [];
+    const result = await killProcessGroupPosix(fakePid, 60, {
+      onSignaled: (sig) => signaled.push(sig),
+    });
+
+    assert.equal(
+      result.finalSignal,
+      "SIGTERM",
+      "expected escalation to be REFUSED, not proceed to SIGKILL, against a pid with zero real identity records"
+    );
+    assert.equal(result.escalated, false);
+    assert.equal(
+      typeof result.escalationRefusedReason,
+      "string",
+      "expected an honest, disclosed reason for the refusal"
+    );
+    assert.match(result.escalationRefusedReason!, /zero usable identity records|snapshot/);
+    assert.deepEqual(
+      signaled,
+      ["SIGTERM"],
+      "onSignaled must fire for the genuinely-delivered SIGTERM but never for a SIGKILL that was correctly refused"
+    );
+    assert.equal(
+      sawSigkillAttempt,
+      false,
+      "the mock must never even observe a SIGKILL attempt against this fake pid - the gate refuses before that send is ever reached"
+    );
+  }
+);
+
 test("POSIX_KILL_GRACE_PERIOD_MS is the real 5-second default ('a real grace period, not a token delay')", () => {
   assert.equal(POSIX_KILL_GRACE_PERIOD_MS, 5000);
 });
@@ -1260,3 +2010,797 @@ test("killProcessTreeWindows: synchronous and immediate - no waiting, no grace p
     `must return immediately - no waiting/grace-period logic on the Windows path, took ${elapsed}ms`
   );
 });
+
+// ---------------------------------------------------------------------------
+// The escalation identity gate: before the SIGKILL escalation,
+// prove the process group is still the one this codebase spawned. Covers
+// the frozen six-token ps grammar (parsePidLstartRow), the batched/bounded/
+// force-reaped observer (readPidStartTimesBatchPosix), the pre-SIGTERM
+// snapshot (captureEscalationIdentitySnapshot) and its own fail-closed
+// cells, and the escalation-time decision (evaluateEscalationIdentityGate).
+// ---------------------------------------------------------------------------
+
+test("PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS is the named 2000ms whole-phase budget, and is strictly less than POSIX_KILL_GRACE_PERIOD_MS - asserted directly, never eyeballed", () => {
+  assert.equal(PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS, 2000);
+  assert.ok(
+    PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS < POSIX_KILL_GRACE_PERIOD_MS,
+    `expected the observation budget (${PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS}ms) to be strictly less than the grace period (${POSIX_KILL_GRACE_PERIOD_MS}ms), so neither observation phase can ever outlast the window it sits beside`
+  );
+});
+
+// --- parsePidLstartRow: the frozen six-token grammar (pure, no real process needed) ---
+
+test("parsePidLstartRow parses a well-formed six-token row into the correct epoch-millisecond instant under UTC0", () => {
+  const parsed = parsePidLstartRow("12345 Sat Jul 25 13:39:12 2026");
+  assert.notEqual(parsed, undefined);
+  assert.equal(parsed!.pid, 12345);
+  assert.equal(parsed!.startTimeMs, Date.UTC(2026, 6, 25, 13, 39, 12));
+});
+
+test("parsePidLstartRow collapses ps's own column-padding whitespace (a single-digit day is padded with an extra space) rather than shifting tokens off by one", () => {
+  // 5 July 2026 is genuinely a Sunday - the weekday token here must agree
+  // with the actual date (see the dedicated contradictory-weekday test
+  // below), not merely be A recognized abbreviation.
+  const parsed = parsePidLstartRow("12345 Sun Jul  5 13:39:12 2026");
+  assert.notEqual(parsed, undefined);
+  assert.equal(parsed!.pid, 12345);
+  assert.equal(parsed!.startTimeMs, Date.UTC(2026, 6, 5, 13, 39, 12));
+});
+
+test("parsePidLstartRow tolerates leading/trailing whitespace around the whole row", () => {
+  const parsed = parsePidLstartRow("   12345 Sat Jul 25 13:39:12 2026   ");
+  assert.notEqual(parsed, undefined);
+  assert.equal(parsed!.pid, 12345);
+});
+
+test("parsePidLstartRow REFUSES a row with only FIVE tokens (a missing field) - never a partial/best-effort parse", () => {
+  assert.equal(parsePidLstartRow("12345 Sat Jul 25 13:39:12"), undefined);
+});
+
+test("parsePidLstartRow REFUSES a row with SEVEN tokens (an extra field) - never silently drops the extra one", () => {
+  assert.equal(parsePidLstartRow("12345 Sat Jul 25 13:39:12 2026 EXTRA"), undefined);
+});
+
+test("parsePidLstartRow REFUSES an unrecognized weekday token", () => {
+  assert.equal(parsePidLstartRow("12345 Xyz Jul 25 13:39:12 2026"), undefined);
+});
+
+test("parsePidLstartRow REFUSES an unrecognized month abbreviation", () => {
+  assert.equal(parsePidLstartRow("12345 Sat Xyz 25 13:39:12 2026"), undefined);
+});
+
+test("parsePidLstartRow REFUSES a malformed HH:MM:SS time field (wrong shape, not just wrong value)", () => {
+  assert.equal(parsePidLstartRow("12345 Sat Jul 25 13:39 2026"), undefined);
+  assert.equal(parsePidLstartRow("12345 Sat Jul 25 13-39-12 2026"), undefined);
+});
+
+test("parsePidLstartRow REFUSES a non-numeric or non-positive pid token", () => {
+  assert.equal(parsePidLstartRow("abc Sat Jul 25 13:39:12 2026"), undefined);
+  assert.equal(parsePidLstartRow("0 Sat Jul 25 13:39:12 2026"), undefined);
+  assert.equal(parsePidLstartRow("-5 Sat Jul 25 13:39:12 2026"), undefined);
+});
+
+test("parsePidLstartRow REFUSES a value that does not ROUND-TRIP through Date.UTC (an out-of-range day Date would otherwise silently normalize into the next month)", () => {
+  // February never has a 30th - Date.UTC would normalize this into March,
+  // which would silently misreport the month were this not checked.
+  assert.equal(parsePidLstartRow("12345 Mon Feb 30 13:39:12 2026"), undefined);
+});
+
+test("parsePidLstartRow REFUSES a recognized-but-CONTRADICTORY weekday token - the weekday must match the day-of-week its own year/month/day actually compute to, never merely be a recognized abbreviation", () => {
+  // 25 July 2026 is genuinely a Saturday - the correctly-paired row parses
+  // cleanly, and this is what the contradictory row below is compared
+  // against: same pid, same date, same time, only the weekday differs.
+  const correct = parsePidLstartRow("123 Sat Jul 25 15:00:00 2026");
+  assert.notEqual(correct, undefined);
+  assert.equal(correct!.pid, 123);
+  assert.equal(correct!.startTimeMs, Date.UTC(2026, 6, 25, 15, 0, 0));
+  // `Date.UTC` never looks at the weekday token at all, so a parser that
+  // only checks the weekday is a RECOGNIZED abbreviation (never that it
+  // agrees with the computed date) would parse this identically to the
+  // row above - the exact bug this test exists to close.
+  assert.equal(parsePidLstartRow("123 Mon Jul 25 15:00:00 2026"), undefined);
+});
+
+test("parsePidLstartRow REFUSES an empty string", () => {
+  assert.equal(parsePidLstartRow(""), undefined);
+  assert.equal(parsePidLstartRow("   "), undefined);
+});
+
+// --- readPidStartTimesBatchPosix: the batched, bounded, force-reaped observer ---
+
+test("readPidStartTimesBatchPosix: an empty pids array is a defensive no-op, never shelling out at all", async () => {
+  const result = await readPidStartTimesBatchPosix([]);
+  assert.deepEqual(result, { status: "ok", rows: [] });
+});
+
+test(
+  "readPidStartTimesBatchPosix: reads a real, single, freshly-spawned process's own pid+lstart correctly",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+    const before = Date.now();
+    const result = await readPidStartTimesBatchPosix([pid]);
+    assert.equal(result.status, "ok");
+    if (result.status === "ok") {
+      assert.equal(result.rows.length, 1);
+      assert.equal(result.rows[0]!.pid, pid);
+      // A freshly-spawned process's real start time must land within a
+      // generous window around "now" - never a stale/fabricated value.
+      assert.ok(
+        Math.abs(result.rows[0]!.startTimeMs - before) < 15_000,
+        `expected a near-now start time, got ${result.rows[0]!.startTimeMs} vs before=${before}`
+      );
+    }
+    process.kill(-pid, "SIGKILL");
+  }
+);
+
+test(
+  "readPidStartTimesBatchPosix: reads MULTIPLE real pids in ONE batched call (a fake ps counts its own invocations to prove this), returning every one's own correct row",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec1 = recorder();
+    const rec2 = recorder();
+    const env = buildChildEnv("merge", {});
+    const child1 = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec1)
+    );
+    const child2 = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec2)
+    );
+    await waitFor(() => rec1.spawned > 0 && rec2.spawned > 0);
+    const pid1 = child1!.pid!;
+    const pid2 = child2!.pid!;
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-batch-count-ps-"));
+    const invocationMarker = path.join(dir, "invocations.txt");
+    const realPsPath = execFileSync("which", ["ps"], { encoding: "utf8" }).trim();
+    const wrapperPath = path.join(dir, "ps");
+    fs.writeFileSync(
+      wrapperPath,
+      `#!/bin/sh\necho x >> '${invocationMarker}'\nexec '${realPsPath}' "$@"\n`
+    );
+    fs.chmodSync(wrapperPath, 0o755);
+
+    const realPath = process.env.PATH;
+    let result: Awaited<ReturnType<typeof readPidStartTimesBatchPosix>>;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      result = await readPidStartTimesBatchPosix([pid1, pid2]);
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    assert.equal(result.status, "ok");
+    if (result.status === "ok") {
+      const foundPids = result.rows.map((row) => row.pid).sort((a, b) => a - b);
+      assert.deepEqual(
+        foundPids,
+        [pid1, pid2].sort((a, b) => a - b)
+      );
+    }
+    const invocationCount = fs
+      .readFileSync(invocationMarker, "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0).length;
+    assert.equal(
+      invocationCount,
+      1,
+      `expected exactly ONE real ps invocation for both pids (call count must stay independent of group size), saw ${invocationCount}`
+    );
+
+    process.kill(-pid1, "SIGKILL");
+    process.kill(-pid2, "SIGKILL");
+  }
+);
+
+test(
+  "readPidStartTimesBatchPosix: a mix of one alive and one already-gone pid returns ONLY the alive one's row, ok - never an error for the merely-absent one",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+
+    // A genuinely dead-but-plausible pid: spawn and let it actually exit and
+    // be reaped, so its pid is a real, in-range, but no-longer-live value -
+    // never an out-of-range synthetic pid `ps` itself would reject outright.
+    const shortRec = recorder();
+    const shortChild = spawnManaged(
+      { argv: ["true"], cwd: process.cwd(), env },
+      callbacksFor(shortRec)
+    );
+    await waitFor(() => shortRec.exits.length > 0);
+    const deadPid = shortChild!.pid!;
+
+    const result = await readPidStartTimesBatchPosix([pid, deadPid]);
+    assert.equal(result.status, "ok");
+    if (result.status === "ok") {
+      assert.equal(result.rows.length, 1);
+      assert.equal(result.rows[0]!.pid, pid);
+    }
+    process.kill(-pid, "SIGKILL");
+  }
+);
+
+test("readPidStartTimesBatchPosix: when NONE of the requested pids exist, resolves ok with genuinely empty rows (ps's own exit-1 'nothing matched' code), never an observer failure", async () => {
+  const result = await readPidStartTimesBatchPosix([88_888_881, 88_888_882]);
+  assert.deepEqual(result, { status: "ok", rows: [] });
+});
+
+test("readPidStartTimesBatchPosix: a real execution failure (missing ps binary) reports observer-failure, never a false 'ok'", async () => {
+  const realPath = process.env.PATH;
+  process.env.PATH = "/tmp/does-not-exist-ghantika-empty-path-dir-3";
+  let result: Awaited<ReturnType<typeof readPidStartTimesBatchPosix>>;
+  try {
+    result = await readPidStartTimesBatchPosix([12345]);
+  } finally {
+    process.env.PATH = realPath;
+  }
+  assert.equal(result.status, "observer-failure");
+});
+
+test(
+  "readPidStartTimesBatchPosix: a mix of one well-formed row and one malformed row keeps the well-formed one - a malformed row is discarded, never poisoning the others",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-malformed-ps-"));
+    const fakePsPath = path.join(dir, "ps");
+    // Emits one genuinely well-formed row for the real pid, plus one
+    // deliberately malformed row (missing the year token) for a synthetic
+    // second pid - a real ps would never produce this shape; this
+    // simulates it directly to prove malformed-row handling.
+    fs.writeFileSync(
+      fakePsPath,
+      `#!/bin/sh\necho '${pid} Sat Jul 25 13:39:12 2026'\necho '999999 Sat Jul 25 13:39:12'\n`
+    );
+    fs.chmodSync(fakePsPath, 0o755);
+
+    const realPath = process.env.PATH;
+    let result: Awaited<ReturnType<typeof readPidStartTimesBatchPosix>>;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      result = await readPidStartTimesBatchPosix([pid, 999_999]);
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    assert.equal(result.status, "ok");
+    if (result.status === "ok") {
+      assert.equal(result.rows.length, 1, "expected only the well-formed row to survive");
+      assert.equal(result.rows[0]!.pid, pid);
+    }
+    process.kill(-pid, "SIGKILL");
+  }
+);
+
+// --- captureEscalationIdentitySnapshot: the pre-SIGTERM membership snapshot ---
+
+test(
+  "captureEscalationIdentitySnapshot: a real, single-process group (no descendants) captures exactly the leader's own pid+start time",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+    const snapshot = await captureEscalationIdentitySnapshot(pid);
+    assert.equal(snapshot.degraded, false);
+    assert.equal(snapshot.members.length, 1);
+    assert.equal(snapshot.members[0]!.pid, pid);
+    process.kill(-pid, "SIGKILL");
+  }
+);
+
+test(
+  "captureEscalationIdentitySnapshot: a real group with descendants captures the leader PLUS every live descendant",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["bash", "-c", "sleep 30 & sleep 30 & wait"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const leaderPid = child!.pid!;
+    // Let the two descendants actually fork before snapshotting.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const snapshot = await captureEscalationIdentitySnapshot(leaderPid);
+    assert.equal(snapshot.degraded, false);
+    assert.ok(
+      snapshot.members.length >= 3,
+      `expected the leader plus 2 descendants (>= 3 members), got ${snapshot.members.length}`
+    );
+    assert.ok(snapshot.members.some((member) => member.pid === leaderPid));
+    process.kill(-leaderPid, "SIGKILL");
+  }
+);
+
+test(
+  "captureEscalationIdentitySnapshot: PRE-SNAPSHOT NEGATIVE - the initial leader read timing out degrades the WHOLE snapshot to zero usable members",
+  {
+    skip: process.platform === "win32" ? "shadows a slow ps on PATH, POSIX-only" : false,
+  },
+  async () => {
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-leader-hang-ps-"));
+    const psPath = path.join(dir, "ps");
+    // Hangs unconditionally regardless of which pid(s) it was asked about -
+    // this is specifically "the initial leader read" (the very first
+    // observer call the snapshot phase makes).
+    fs.writeFileSync(psPath, "#!/bin/sh\ntrap '' TERM\nsleep 5\n");
+    fs.chmodSync(psPath, 0o755);
+
+    let snapshot: Awaited<ReturnType<typeof captureEscalationIdentitySnapshot>>;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      snapshot = await captureEscalationIdentitySnapshot(999_111, 300);
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    assert.equal(snapshot.degraded, true);
+    assert.equal(snapshot.members.length, 0);
+    assert.match(snapshot.degradedReason ?? "", /leader/i);
+  }
+);
+
+test(
+  "captureEscalationIdentitySnapshot: PRE-SNAPSHOT NEGATIVE - member enumeration (pgrep) timing out degrades the WHOLE snapshot, even though the leader's own read would otherwise have succeeded",
+  {
+    skip: process.platform === "win32" ? "shadows a slow pgrep on PATH, POSIX-only" : false,
+  },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-enum-hang-pgrep-"));
+    const pgrepPath = path.join(dir, "pgrep");
+    fs.writeFileSync(pgrepPath, "#!/bin/sh\ntrap '' TERM\nsleep 5\n");
+    fs.chmodSync(pgrepPath, 0o755);
+
+    let snapshot: Awaited<ReturnType<typeof captureEscalationIdentitySnapshot>>;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      snapshot = await captureEscalationIdentitySnapshot(pid, 300);
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    assert.equal(
+      snapshot.degraded,
+      true,
+      "expected the whole snapshot to degrade, even though the leader's own read alone would have succeeded"
+    );
+    assert.match(snapshot.degradedReason ?? "", /enumeration/i);
+    process.kill(-pid, "SIGKILL");
+  }
+);
+
+test(
+  "captureEscalationIdentitySnapshot: PRE-SNAPSHOT NEGATIVE - malformed pgrep enumeration output degrades the whole snapshot rather than guessing at a partial member list",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-malformed-pgrep-"));
+    const pgrepPath = path.join(dir, "pgrep");
+    fs.writeFileSync(pgrepPath, "#!/bin/sh\necho 'not-a-pid'\n");
+    fs.chmodSync(pgrepPath, 0o755);
+
+    let snapshot: Awaited<ReturnType<typeof captureEscalationIdentitySnapshot>>;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      snapshot = await captureEscalationIdentitySnapshot(pid, 300);
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    assert.equal(snapshot.degraded, true);
+    process.kill(-pid, "SIGKILL");
+  }
+);
+
+test(
+  "captureEscalationIdentitySnapshot: PRE-SNAPSHOT NEGATIVE - zero usable records when the leader has ALREADY exited by snapshot time (no observer failure at all, just genuinely nothing there)",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged({ argv: ["true"], cwd: process.cwd(), env }, callbacksFor(rec));
+    await waitFor(() => rec.exits.length > 0);
+    const pid = child!.pid!;
+    const snapshot = await captureEscalationIdentitySnapshot(pid);
+    assert.equal(snapshot.degraded, true);
+    assert.equal(snapshot.members.length, 0);
+    assert.match(snapshot.degradedReason ?? "", /zero usable/i);
+  }
+);
+
+// --- evaluateEscalationIdentityGate: the escalation-time decision ---
+
+test(
+  "evaluateEscalationIdentityGate: THE HAPPY PATH - a real member with an exactly-matching current start time escalates",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+    const snapshot = await captureEscalationIdentitySnapshot(pid);
+    assert.equal(snapshot.degraded, false);
+    const gate = await evaluateEscalationIdentityGate(snapshot);
+    assert.deepEqual(gate, { action: "escalate" });
+    process.kill(-pid, "SIGKILL");
+  }
+);
+
+test("evaluateEscalationIdentityGate: a degraded snapshot (zero members) always refuses, regardless of what the escalation-time re-read would find", async () => {
+  const gate = await evaluateEscalationIdentityGate({
+    members: [],
+    degraded: true,
+    degradedReason: "test-injected degradation",
+  });
+  assert.equal(gate.action, "refuse");
+});
+
+test(
+  "evaluateEscalationIdentityGate: NEGATIVE - every recorded member is gone at re-read - REFUSES, no positive match possible",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+    const snapshot = await captureEscalationIdentitySnapshot(pid);
+    assert.equal(snapshot.degraded, false);
+    process.kill(-pid, "SIGKILL");
+    await waitFor(() => isProcessAlive(pid) === false);
+    const gate = await evaluateEscalationIdentityGate(snapshot);
+    assert.equal(gate.action, "refuse");
+  }
+);
+
+test("evaluateEscalationIdentityGate: NEGATIVE - a recorded pid is still present but its start time DIFFERS from the record (the recycled-pid simulation) - REFUSES", async () => {
+  // Uses this process's own real, currently-alive pid, but with a
+  // deliberately WRONG recorded start time - simulating exactly what a
+  // stale, post-reuse bookkeeping record would look like.
+  const snapshot = {
+    members: [{ pid: process.pid, startTimeMs: Date.UTC(2000, 0, 1, 0, 0, 0) }],
+    degraded: false,
+  };
+  const gate = await evaluateEscalationIdentityGate(snapshot);
+  assert.equal(gate.action, "refuse");
+});
+
+test(
+  "evaluateEscalationIdentityGate: a legitimately disappeared member is NOT a failure - with one other original still matching exactly, escalation proceeds",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    // The leader backgrounds the child, `wait`s on that ONE specific pid
+    // (so the child is genuinely reaped rather than left a <defunct>
+    // zombie once killed - a zombie's pid stays "alive" to a plain
+    // `kill(pid, 0)` probe until its parent reaps it, which would hang
+    // this test's own liveness wait forever), THEN runs its own
+    // independent, long-running sleep - so the leader stays genuinely
+    // alive and unaffected once the child is killed, rather than exiting
+    // the instant a blind `wait` (with no target) would have returned.
+    const child = spawnManaged(
+      {
+        argv: [
+          "bash",
+          "-c",
+          'sleep 30 & CPID=$!; echo "CHILD_PID:$CPID"; wait "$CPID" 2>/dev/null; sleep 30',
+        ],
+        cwd: process.cwd(),
+        env,
+      },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    await waitFor(() => Buffer.concat(rec.stdout).toString("utf8").includes("CHILD_PID:"));
+    const leaderPid = child!.pid!;
+    const childPid = Number(
+      Buffer.concat(rec.stdout)
+        .toString("utf8")
+        .match(/CHILD_PID:(\d+)/)![1]
+    );
+
+    const snapshot = await captureEscalationIdentitySnapshot(leaderPid);
+    assert.equal(snapshot.degraded, false);
+    assert.ok(snapshot.members.some((member) => member.pid === childPid));
+
+    // The descendant legitimately disappears on its own - not a failure,
+    // just the normal case a positive match elsewhere must still cover.
+    process.kill(childPid, "SIGKILL");
+    await waitFor(() => isProcessAlive(childPid) === false);
+
+    const gate = await evaluateEscalationIdentityGate(snapshot);
+    assert.deepEqual(
+      gate,
+      { action: "escalate" },
+      "expected the still-alive, still-matching leader to be sufficient proof, despite the descendant's own legitimate disappearance"
+    );
+    process.kill(-leaderPid, "SIGKILL");
+  }
+);
+
+test(
+  "evaluateEscalationIdentityGate: ANY-ONE sufficiency - a group of many descendants where only a SINGLE one still matches still escalates (never requires full-set survival)",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      {
+        argv: [
+          "bash",
+          "-c",
+          'sleep 30 & echo "P1:$!"; sleep 30 & echo "P2:$!"; sleep 30 & echo "P3:$!"; wait',
+        ],
+        cwd: process.cwd(),
+        env,
+      },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    await waitFor(() => {
+      const out = Buffer.concat(rec.stdout).toString("utf8");
+      return out.includes("P1:") && out.includes("P2:") && out.includes("P3:");
+    });
+    const leaderPid = child!.pid!;
+    const out = Buffer.concat(rec.stdout).toString("utf8");
+    const p1 = Number(out.match(/P1:(\d+)/)![1]);
+    const p2 = Number(out.match(/P2:(\d+)/)![1]);
+
+    const snapshot = await captureEscalationIdentitySnapshot(leaderPid);
+    assert.equal(snapshot.degraded, false);
+    assert.ok(
+      snapshot.members.length >= 4,
+      `expected the leader plus 3 descendants recorded, got ${snapshot.members.length}`
+    );
+
+    // Kill the LEADER and two of the three descendants - only ONE
+    // descendant (p2) survives to prove the group's identity.
+    process.kill(leaderPid, "SIGKILL");
+    process.kill(p1, "SIGKILL");
+    await waitFor(() => isProcessAlive(leaderPid) === false && isProcessAlive(p1) === false);
+
+    const gate = await evaluateEscalationIdentityGate(snapshot);
+    assert.deepEqual(
+      gate,
+      { action: "escalate" },
+      "expected the single surviving, still-matching descendant to be sufficient - the gate never requires full-set survival"
+    );
+    process.kill(p2, "SIGKILL"); // cleanup the sole survivor
+  }
+);
+
+test(
+  "evaluateEscalationIdentityGate: the leader is compared by the SAME exact-match rule as any descendant, no tolerance window - a recorded value off by even a single millisecond REFUSES",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+    const realSnapshot = await captureEscalationIdentitySnapshot(pid);
+    assert.equal(realSnapshot.degraded, false);
+    const real = realSnapshot.members.find((member) => member.pid === pid)!;
+
+    // A snapshot claiming the SAME pid but a start time off by exactly one
+    // millisecond from the real, current value - this must REFUSE, proving
+    // no tolerance window (unlike the pre-signal birth-identity check's
+    // several-second etime tolerance, which is a wholly separate,
+    // out-of-scope mechanism here).
+    const offByOneMs = {
+      members: [{ pid, startTimeMs: real.startTimeMs + 1 }],
+      degraded: false,
+    };
+    const gate = await evaluateEscalationIdentityGate(offByOneMs);
+    assert.equal(
+      gate.action,
+      "refuse",
+      "expected an off-by-one-millisecond recorded value to REFUSE - the leader gets no tolerance window, exactly like any descendant"
+    );
+    process.kill(-pid, "SIGKILL");
+  }
+);
+
+test(
+  "evaluateEscalationIdentityGate: NEGATIVE - the bounded re-read TIMES OUT - refuses rather than defaulting to escalation",
+  {
+    skip: process.platform === "win32" ? "shadows a slow ps on PATH, POSIX-only" : false,
+  },
+  async () => {
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-reread-hang-ps-"));
+    const psPath = path.join(dir, "ps");
+    fs.writeFileSync(psPath, "#!/bin/sh\ntrap '' TERM\nsleep 5\n");
+    fs.chmodSync(psPath, 0o755);
+
+    const snapshot = { members: [{ pid: 424_242, startTimeMs: Date.now() }], degraded: false };
+    let gate: Awaited<ReturnType<typeof evaluateEscalationIdentityGate>>;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      gate = await evaluateEscalationIdentityGate(snapshot, 300);
+    } finally {
+      process.env.PATH = realPath;
+    }
+    assert.equal(gate.action, "refuse");
+  }
+);
+
+test("evaluateEscalationIdentityGate: NEGATIVE - a malformed re-read row for the only recorded member REFUSES, never guessed at", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-reread-malformed-ps-"));
+  const psPath = path.join(dir, "ps");
+  fs.writeFileSync(psPath, "#!/bin/sh\necho '424242 Sat Jul 25 13:39:12'\n"); // missing year token
+  fs.chmodSync(psPath, 0o755);
+
+  const realPath = process.env.PATH;
+  const snapshot = {
+    members: [{ pid: 424_242, startTimeMs: Date.UTC(2026, 6, 25, 13, 39, 12) }],
+    degraded: false,
+  };
+  let gate: Awaited<ReturnType<typeof evaluateEscalationIdentityGate>>;
+  try {
+    process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+    gate = await evaluateEscalationIdentityGate(snapshot);
+  } finally {
+    process.env.PATH = realPath;
+  }
+  assert.equal(gate.action, "refuse");
+});
+
+test(
+  "evaluateEscalationIdentityGate: NEGATIVE - partial re-read (one recorded member gone, the other unreadable) with no positive proof anywhere - REFUSES",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    // pidA is genuinely gone at re-read time; pidB's row is deliberately
+    // malformed - between the two of them, NOTHING positively matches.
+    const snapshot = {
+      members: [
+        { pid: 88_888_883, startTimeMs: Date.now() },
+        { pid: 88_888_884, startTimeMs: Date.UTC(2026, 6, 25, 13, 39, 12) },
+      ],
+      degraded: false,
+    };
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-partial-reread-ps-"));
+    const psPath = path.join(dir, "ps");
+    // Only ever emits a malformed row for 88888884 - never anything for
+    // 88888883 (simulating it being genuinely gone), and never a
+    // well-formed, matching row for either.
+    fs.writeFileSync(psPath, "#!/bin/sh\necho '88888884 not-a-valid-lstart-row'\n");
+    fs.chmodSync(psPath, 0o755);
+
+    const realPath = process.env.PATH;
+    let gate: Awaited<ReturnType<typeof evaluateEscalationIdentityGate>>;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      gate = await evaluateEscalationIdentityGate(snapshot);
+    } finally {
+      process.env.PATH = realPath;
+    }
+    assert.equal(gate.action, "refuse");
+  }
+);
+
+// --- structural prohibition - the escalation path never signals an individual member's own pid, only kill(-pgid, ...) ---
+
+test(
+  "STRUCTURAL: across a real multi-descendant escalation, every process.kill call this codebase's own escalation path makes targets ONLY the group's negative pgid - never an individual member's own positive pid",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async (t) => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    // A SIGTERM-resistant leader with real descendants, forcing a genuine
+    // escalation - exactly the shape that would (if the prohibition were
+    // ever violated) have a real, plausible reason to try signalling a
+    // descendant individually.
+    const child = spawnManaged(
+      {
+        argv: ["bash", "-c", "sleep 60 & sleep 60 & (trap '' TERM; sleep 60) & trap '' TERM; wait"],
+        cwd: process.cwd(),
+        env,
+      },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const leaderPid = child!.pid!;
+    await new Promise((resolve) => setTimeout(resolve, 200)); // let descendants fork
+
+    const realKill = process.kill.bind(process);
+    const observedTargets: number[] = [];
+    t.mock.method(process, "kill", (target: number, signal?: string | number) => {
+      if (signal === "SIGTERM" || signal === "SIGKILL") observedTargets.push(target);
+      return realKill(target, signal);
+    });
+
+    await killProcessGroupPosix(leaderPid, 300);
+
+    const realSignalSends = observedTargets.filter((target) => target !== undefined);
+    assert.ok(
+      realSignalSends.length > 0,
+      "expected at least one real signal send to have been observed"
+    );
+    for (const target of realSignalSends) {
+      assert.ok(
+        target < 0,
+        `expected every real SIGTERM/SIGKILL send to target a NEGATIVE (group) pid, got ${target} - an individual member's own positive pid must never be signalled directly`
+      );
+      assert.equal(
+        target,
+        -leaderPid,
+        `expected every send to target exactly -leaderPid (${-leaderPid}), got ${target} - identity is the GATE, never the target`
+      );
+    }
+
+    // Best-effort cleanup: killProcessGroupPosix above already escalated to
+    // a real SIGKILL, so the group is normally already gone by this point -
+    // an ESRCH here is the expected, benign "nothing left to signal"
+    // outcome, not a real failure, and the mock (still active until this
+    // test ends) does not itself catch it.
+    try {
+      realKill(-leaderPid, "SIGKILL");
+    } catch {
+      // already gone - fine.
+    }
+  }
+);

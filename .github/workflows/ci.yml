@@ -156,7 +156,7 @@ jobs:
       # directly rather than `npm test` avoids building twice - the build
       # step above already did it, and `npm test` would run its own
       # `npm run build` first.
-      - run: node scripts/run-tests.mjs --test-timeout=30000
+      - run: node scripts/run-tests.mjs --test-timeout=120000
         env:
           GHANTIKA_JUNIT: test-results.xml
       # A contributor whose change breaks a test on this leg should see

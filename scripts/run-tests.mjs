@@ -189,10 +189,42 @@ const CLI_FLAGS = {
  */
 export function parseArgs(argv) {
   const options = {
-    // Matches the --test-timeout=30000 already in package.json's test and
-    // coverage scripts and in ci.yml's test job at the time this file was
-    // written (checked directly, not assumed).
-    testTimeoutMs: 30_000,
+    // Raised from 30_000 to 120_000, final rather than provisional. The
+    // prior 30s ceiling was clamping process.test.ts, kill-slow-paths.test.ts,
+    // and (under c8 coverage instrumentation) loader-escape-matrix.test.ts on
+    // CI's node 22 legs while all three passed clean on node 24 - confirmed
+    // pre-existing (the same three files already failed on the commit before
+    // any test-file split) and confirmed NOT generic node22 JS-execution
+    // slowness (most per-test durations match or beat node24), but real
+    // OS-level subprocess/signal-wait latency specific to this workload plus
+    // c8's per-module instrumentation cost.
+    //
+    // Real, unclamped node22 completion times measured at this ceiling
+    // (first-test-start to last-test-completion, per file): process.test.ts
+    // 6.6s (126 tests), kill-slow-paths.test.ts 31.4s (7 tests, the worst
+    // observed), process-slow-paths.test.ts 14.4s (5 tests),
+    // loader-escape-matrix.test.ts 33ms (49 tests, under the coverage job).
+    // 120_000 gives ~3.8x headroom over the worst observed file, and no
+    // previously-timing-out file has hit a file-level timeout since.
+    //
+    // One number in that run complicated its own recommendation rather than
+    // being quietly dropped: process.test.ts's pre-raise completion, still
+    // clamped at the old 30s ceiling, clustered tightly at 29.85-29.93s
+    // across three separate node22 legs - close enough to the ceiling to
+    // look like the file's real cost. Unclamped at 120s it came in at 6.6s,
+    // matching node24 exactly and matching the file's own per-test duration
+    // sum (6.66s). The best-supported reading is that the ~29.9s reading was
+    // contention - several files sitting near their own 30s ceilings at once
+    // on a shared, noisy CI runner - rather than a measurement of this file's
+    // true cost; that is a reading of the numbers, not something measured
+    // directly, and is disclosed as such rather than asserted as fact.
+    // Trimming the ceiling toward a single clean run was rejected precisely
+    // because a noisier day could reproduce the 29.9s reading.
+    //
+    // Matches the explicit --test-timeout flag in ci.yml's test job - the
+    // two move together; package.json's test and coverage scripts carry no
+    // such flag at all and rely on this default.
+    testTimeoutMs: 120_000,
     // No event of any kind (not just no test finishing - ANY event,
     // including test:start on some other still-running test) for this
     // long means something is stuck badly enough that the test runner

@@ -325,9 +325,9 @@ export function parsesAsJsonObject(content: string): boolean {
 
 // ---------------------------------------------------------------------------
 // Real external process-group observer (the SAME `pgrep -g <pgid>` pattern
-// test/kill.test.ts's "THE CENTERPIECE" test and test/shutdown.test.ts's
-// whole-tree reap tests each already establish independently - never this
-// codebase's own bookkeeping, a real external OS-level check).
+// test/kill.test.ts's own real-wire tests and test/shutdown.test.ts's
+// process-group reap tests each already establish independently - never
+// this codebase's own bookkeeping, a real external OS-level check).
 // ---------------------------------------------------------------------------
 
 export function pgrepGroupMembers(pgid: number): number[] {
@@ -390,14 +390,14 @@ export async function barrier(
 // ---------------------------------------------------------------------------
 // A real noisy, multi-descendant, real-live job fixture - the exact same
 // process-group-leader-writes-its-own-pgid-then-forks-descendants-then-waits
-// shape test/kill.test.ts's centerpiece and test/shutdown.test.ts's
+// shape test/kill.test.ts's own real-wire tests and test/shutdown.test.ts's
 // spawnServerWithLiveTree already establish (a real shell child that is the
 // process-group LEADER, since spawnManaged always spawns detached - see
 // src/process.ts's own docs), extended here to DESCENDANTS_PER_JOB
 // descendants and NOISE_BYTES of real stdout noise (plus a smaller amount
 // of real stderr noise, for stream-isolation proof) before the final
-// `wait`, which is what keeps the whole tree genuinely alive until the test
-// decides to kill (or shut down under) it.
+// `wait`, which is what keeps the whole process group genuinely alive
+// until the test decides to kill (or shut down under) it.
 // ---------------------------------------------------------------------------
 
 /** A short, distinctive, per-job token so a job's own noise text can never be mistaken for a sibling job's (test/integration.test.ts's stream-isolation proof reads this back out of a live job's own `output()`). */
@@ -506,8 +506,8 @@ export interface NoisyLiveJobOptions {
  * stdout noise (via `yes | head -c`, a real, fast, deterministically-sized
  * generator) -> write a smaller amount of real stderr noise -> write the
  * noise-done marker -> `wait` on the backgrounded descendants, which is
- * what keeps the whole tree (leader + descendants) alive until the caller
- * kills it or the server shuts down.
+ * what keeps the whole process group (leader + descendants) alive until
+ * the caller kills it or the server shuts down.
  *
  * Shape for a `sigtermResistant` job - see `NoisyLiveJobOptions.
  * sigtermResistant`'s own docs for why each reordering/addition below is
@@ -624,8 +624,8 @@ export interface NoisyJobsResult {
 }
 
 /**
- * The shared setup phase both the centerpiece test and
- * the whole-tree-reap-under-load test build on: starts `count`
+ * The shared setup phase both the real stdio-client concurrent-jobs test and
+ * the process-group-reap-under-load test build on: starts `count`
  * noisy, multi-descendant live jobs CONCURRENTLY (pipelined `run` calls,
  * never awaited one at a time - proving the session doesn't serialize even
  * the starts), then two explicit barriers:

@@ -213,7 +213,7 @@ for (const { mod, name } of jobIdTools) {
 // section), output/tail are fully implemented too (their "valid
 // job_id" behavior is real, unknown-job not-found, tested thoroughly in
 // test/output-tail.test.ts), and kill is fully implemented as well
-// (its own real-behavior tests, including the external pgrep lineage
+// (its own real-behavior tests, including the external pgrep process-group
 // proof, live in test/kill.test.ts) - none of the six tools are left
 // returning the old "not implemented yet" stub message.
 
