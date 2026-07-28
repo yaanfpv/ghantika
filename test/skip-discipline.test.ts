@@ -772,8 +772,19 @@ function collectChildResult(
  * with is not a bug. A survivor still present after the full 2s throws
  * loudly, naming the exact pids left, rather than letting a leak pass
  * silently the way the fixture that motivated this helper once did.
+ *
+ * A no-op on win32: `process.kill` with a negative pid and `pgrep -g`
+ * are both POSIX-only primitives with no Windows equivalent used here.
+ * This is a disclosed test-harness gap, not a claim that the underlying
+ * leak this guards against cannot happen on Windows - it means this
+ * repository's suite does not yet verify it there, matching this same
+ * PR's own production kill.ts, which already discloses no process-group
+ * confirmation on Windows today. Every one of `collectChildResult`'s
+ * callers keeps working on win32 exactly as it did before this reap
+ * existed; only the extra protection is unavailable there.
  */
 function reapFixtureProcessGroup(pgid: number): void {
+  if (process.platform === "win32") return;
   try {
     process.kill(-pgid, "SIGKILL");
   } catch (error) {
@@ -946,41 +957,48 @@ test("the real supervisor exits zero when only legitimate per-platform skips are
 // prove nothing a short timeout doesn't already prove just as well).
 // ---------------------------------------------------------------------------
 
+/**
+ * The hung fixture shared by both the cross-platform timeout test below
+ * and its POSIX-only survivor-check companion. A bare
+ * `await new Promise(() => {})` with nothing else scheduled lets
+ * node:test take a DIFFERENT, faster exit on some Node versions -
+ * confirmed empirically, not assumed: Node 22 on CI cancels this shape
+ * in a few milliseconds via its own "Promise resolution is still
+ * pending but the event loop has already resolved" diagnostic, never
+ * reaching the configured `--test-timeout` at all, while a version
+ * tested locally instead waits out the real bound. The bounded
+ * `setTimeout` below keeps the event loop genuinely busy across that
+ * window - the same shape a real hung test in this codebase's own suite
+ * has (a spawned process, a pending signal) - so neither Node version
+ * can take that early exit and the assertions built on this fixture
+ * actually prove the configured bound, not whichever mechanism happens
+ * to fire first. Bounded (not setInterval) so nothing about this
+ * fixture's OWN timer lingers past its own 2s expiry - comfortably
+ * longer than the 500ms both tests below configure, comfortably shorter
+ * than run-tests.mjs's own 60s idle watchdog. This bound does not, by
+ * itself, guarantee the underlying OS process exits: node:test's own
+ * `--test-timeout` marks THIS TEST failed without necessarily
+ * terminating the process it runs in, if something else (the
+ * never-resolving promise below) still holds the event loop open -
+ * `collectChildResult`'s own process-group reap is what actually closes
+ * that gap on POSIX, not this timer.
+ */
+function buildHungTestFixtureFiles(): Record<string, string> {
+  return {
+    "hang.test.mjs": [
+      'import { test } from "node:test";',
+      'test("a deliberately hung test that never resolves", async () => {',
+      "  setTimeout(() => {}, 2000);",
+      "  await new Promise(() => {});",
+      "});",
+      "",
+    ].join("\n"),
+  };
+}
+
 test("the real supervisor still fails a genuinely hung test fast, at whatever --test-timeout value is configured - proving the mechanism a raised production ceiling depends on", () => {
   const result = runSupervisorAgainstFixture({
-    testFiles: {
-      "hang.test.mjs": [
-        'import { test } from "node:test";',
-        'test("a deliberately hung test that never resolves", async () => {',
-        // A bare `await new Promise(() => {})` with nothing else scheduled
-        // lets node:test take a DIFFERENT, faster exit on some Node
-        // versions - confirmed empirically, not assumed: Node 22 on CI
-        // cancels this shape in a few milliseconds via its own "Promise
-        // resolution is still pending but the event loop has already
-        // resolved" diagnostic, never reaching the configured
-        // --test-timeout at all, while a version tested locally instead
-        // waits out the real bound. The bounded setTimeout below keeps
-        // the event loop genuinely busy across that window - the same
-        // shape a real hung test in this codebase's own suite has (a
-        // spawned process, a pending signal) - so neither Node version
-        // can take that early exit and the assertion below actually
-        // proves the configured bound, not whichever mechanism happens
-        // to fire first. Bounded (not setInterval) so nothing about this
-        // fixture's OWN timer lingers past its own 2s expiry - comfortably
-        // longer than the 500ms this fixture configures, comfortably
-        // shorter than run-tests.mjs's own 60s idle watchdog. This bound
-        // does not, by itself, guarantee the underlying OS process exits:
-        // node:test's own --test-timeout marks THIS TEST failed without
-        // necessarily terminating the process it runs in, if something
-        // else (the never-resolving promise below) still holds the event
-        // loop open - collectChildResult's own process-group reap below is
-        // what actually closes that gap, not this timer.
-        "  setTimeout(() => {}, 2000);",
-        "  await new Promise(() => {});",
-        "});",
-        "",
-      ].join("\n"),
-    },
+    testFiles: buildHungTestFixtureFiles(),
     buildBaseline: () => ({}),
     buildCriticalTests: () => [],
     extraArgs: ["--test-timeout=500"],
@@ -995,19 +1013,43 @@ test("the real supervisor still fails a genuinely hung test fast, at whatever --
     result.stdout.includes("test timed out after 500ms"),
     `expected node:test's own timeout message naming the configured 500ms value, got: ${result.stdout}`
   );
+
   // The exit code and stdout above only prove the SUPERVISOR reported the
   // timeout - they say nothing about whether the hung test's own real OS
-  // process is actually gone. This is the real external postcondition:
-  // collectChildResult (via reapFixtureProcessGroup) already force-killed
-  // and confirmed the whole group empty before returning, so this is a
-  // second, independent confirmation of exactly the property that once
-  // went unchecked - a real orphan surviving this exact fixture, reparented
-  // to init, running for over 20 hours before it was found.
-  assert.deepEqual(
-    pgrepGroupMembers(result.pgid),
-    [],
-    `expected zero real survivors in pgid ${result.pgid} after the hung fixture's supervisor exited`
-  );
+  // process is actually gone. collectChildResult (via
+  // reapFixtureProcessGroup) already force-killed and confirmed the whole
+  // group empty before returning; this is a second, independent
+  // confirmation of exactly the property that once went unchecked - a real
+  // orphan surviving this exact fixture, reparented to init, running for
+  // over 20 hours before it was found.
+  //
+  // Deliberately a plain runtime conditional rather than a node:test
+  // `{skip}` option: this file's own "seed denominator" test above scans
+  // every other test/*.test.ts file for win32-conditional skips and
+  // excludes THIS file from that scan (its own source text contains the
+  // scanner's regex as a string, plus fixture-building code with literal
+  // `skip:`/`process.platform === "win32"` substrings that would
+  // false-positive the scanner if it read itself). A `{skip}` here could
+  // never be matched by that derived side, so any matching baseline entry
+  // would be a permanent, unfixable parity mismatch. A plain conditional
+  // sidesteps that architecture entirely - node:test always reports this
+  // test as fully passed, nothing is "skipped", so there is nothing for
+  // the seed-denominator scan to derive or disagree with - while still
+  // unconditionally enforcing the real POSIX postcondition on every
+  // platform this suite's CI actually runs today (macOS/Linux; Windows
+  // carries no CI presence for this repo, per CHANGELOG history). No
+  // Windows-equivalent path exists here yet, matching every other
+  // identity/process-group test in this codebase (see
+  // test/process.test.ts's own POSIX_PROCESS_GROUP_SKIP for the identical
+  // rationale) and this repository's own production kill.ts, which
+  // discloses no process-group confirmation on Windows either.
+  if (process.platform !== "win32") {
+    assert.deepEqual(
+      pgrepGroupMembers(result.pgid),
+      [],
+      `expected zero real survivors in pgid ${result.pgid} after the hung fixture's supervisor exited`
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------
