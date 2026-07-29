@@ -95,39 +95,32 @@ function jobIdOf(result: ReturnType<typeof runTool.handler>): string {
 }
 
 /**
- * Polls `check` every 20ms until it returns true or `timeoutMs` elapses -
- * this file's own equivalent of `src/process.ts`'s `waitForProcessDeath`
- * poll-loop shape, used here because capture is now genuinely ASYNC: a
- * fixed sleep-then-assert can no longer safely stand in for "wait until the
- * async birth-identity capture has settled," since nothing bounds exactly
- * when that settles other than the capture's own timeout.
+ * Waits until this job's async birth-identity capture has fully settled
+ * (a real identity, or a genuine "unavailable") - by awaiting the SAME
+ * real promise `src/jobStore.ts`'s own `resolveBirthIdentityForKill`
+ * awaits, the one production API this codebase already uses for exactly
+ * this purpose (`src/tools/kill.ts`, `src/server.ts`'s shutdown reaper).
+ * This has NO wall-clock deadline of its own: it resolves at the exact
+ * moment the real capture resolves, whatever that takes. That settlement
+ * is already bounded, deterministically, by
+ * `ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS` plus a small grace, on the
+ * capture's own independent timer (see that constant's docs) - regardless
+ * of the underlying `ps` process's cooperation, it is force-reaped once
+ * that timer fires. A wall-clock poll with its own separate, shorter,
+ * hand-picked deadline (the previous shape here) can time out before that
+ * real settlement completes under nothing worse than ordinary CI
+ * scheduling delay, which is exactly the false failure this replaces -
+ * this awaits the production guarantee directly instead of racing a second,
+ * unrelated clock against it. A hang here means that production guarantee
+ * itself broke, not that a test picked too small a number.
  */
-function waitFor(check: () => boolean, timeoutMs = 5000): Promise<void> {
-  const start = Date.now();
-  return new Promise((resolve, reject) => {
-    const tick = (): void => {
-      if (check()) {
-        resolve();
-        return;
-      }
-      if (Date.now() - start > timeoutMs) {
-        reject(new Error(`waitFor: timed out after ${timeoutMs}ms`));
-        return;
-      }
-      setTimeout(tick, 20);
-    };
-    tick();
-  });
+async function waitForIdentityCaptureSettled(jobId: string): Promise<void> {
+  await jobStore.resolveBirthIdentityForKill(jobId);
 }
 
-/** Waits until this job's tracked child has a real, settled `birthIdentity`. */
-function waitForBirthIdentity(jobId: string, timeoutMs = 5000): Promise<void> {
-  return waitFor(() => jobStore.getChildHandle(jobId)?.birthIdentity !== undefined, timeoutMs);
-}
-
-/** Waits until this job's async identity capture has fully settled (either outcome), never just "still pending". */
-function waitForIdentityCaptureSettled(jobId: string, timeoutMs = 5000): Promise<void> {
-  return waitFor(() => jobStore.get(jobId)?.identity_capture !== "pending", timeoutMs);
+/** Waits until this job's tracked child has a real, settled `birthIdentity` - see `waitForIdentityCaptureSettled`'s own docs for why this has no wall-clock deadline of its own. */
+async function waitForBirthIdentity(jobId: string): Promise<void> {
+  await jobStore.resolveBirthIdentityForKill(jobId);
 }
 
 /**

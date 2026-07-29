@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 // Explicit ".ts" extension (not the NodeNext-style ".js" src/ uses): this
 // helper has no relative imports of its own (only node: builtins), so
@@ -22,6 +24,22 @@ import { parsesAsJsonObject, waitForFile } from "./harness.ts";
  * assertion here is about OBSERVABLE WIRE BEHAVIOR, not implementation
  * detail.
  */
+
+/** Polls the real process table for `pid`'s pgid rather than sleeping a
+ * fixed guess for the spawn to become schedulable. */
+async function waitForPgid(pid: number, timeoutMs = 3000, pollIntervalMs = 10): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      return Number(
+        execFileSync("ps", ["-p", String(pid), "-o", "pgid="], { encoding: "utf8" }).trim()
+      );
+    } catch (error) {
+      if (Date.now() >= deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+  }
+}
 
 const spawned: SpawnedServer[] = [];
 function tracked(): SpawnedServer {
@@ -61,6 +79,63 @@ test("initialize negotiates successfully and advertises tools capability", async
   assert.equal(result.serverInfo.name, "ghantika");
   server.child.kill("SIGKILL");
 });
+
+test(
+  "spawnServer(): the spawned server-under-test is its own process-group leader, outside the invoking test process's own group",
+  { skip: process.platform === "win32" ? "POSIX process-group semantics only" : false },
+  async () => {
+    const server = tracked();
+    const serverPid = server.child.pid!;
+    const serverPgid = await waitForPgid(serverPid);
+    const ownPgid = await waitForPgid(process.pid);
+    assert.equal(
+      serverPgid,
+      serverPid,
+      "the spawned server must be the leader of its own process group (pgid === its own pid)"
+    );
+    assert.notEqual(
+      serverPgid,
+      ownPgid,
+      "the spawned server's group must differ from the invoking test process's own group"
+    );
+    server.child.kill("SIGKILL");
+  }
+);
+
+test(
+  "spawnServer(): a real SIGKILL to the server's own process group kills the server but never reaches its own caller",
+  { skip: process.platform === "win32" ? "POSIX process-group semantics only" : false },
+  async () => {
+    // Runs the actual group-kill inside its own detached child process
+    // (test/helpers/hostileGroupKillProbe.ts), rather than in this test
+    // process directly: if spawnServer()'s own containment were ever
+    // broken, the group signal below would land on whatever process
+    // issues it, so that issuing process must never be this test runner.
+    const probePath = fileURLToPath(new URL("./helpers/hostileGroupKillProbe.ts", import.meta.url));
+    const result = spawnSync(process.execPath, [probePath], {
+      detached: true,
+      encoding: "utf8",
+      timeout: 10000,
+    });
+    assert.equal(
+      result.signal,
+      null,
+      `the probe process must survive signaling the server's group and exit normally - a non-null signal (${result.signal}) means the group-kill reached the probe itself. stderr: ${result.stderr}`
+    );
+    assert.equal(result.status, 0, `probe exited non-zero: ${result.stderr}`);
+    const reported = JSON.parse(result.stdout.trim());
+    assert.equal(
+      reported.serverSignal,
+      "SIGKILL",
+      "the server itself must actually die from the group signal"
+    );
+    assert.notEqual(
+      reported.ownPgidAfter,
+      reported.serverPgid,
+      "the probe's own group must differ from the server's group it just killed"
+    );
+  }
+);
 
 test("tools/list, after initialization, advertises exactly the six frozen tools with explicit input JSON Schemas", async () => {
   const server = tracked();

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 
 // Real client, real in-process transport, real server - the end-to-end
@@ -35,7 +38,7 @@ import {
   snapshotStreamBuffer,
   toPublicProjection,
 } from "../dist/jobStore.js";
-import { spawnManaged } from "../dist/process.js";
+import { isProcessAlive, spawnManaged } from "../dist/process.js";
 import { createServer } from "../dist/server.js";
 import * as runTool from "../dist/tools/run.js";
 
@@ -666,6 +669,118 @@ test("resolveBirthIdentityForKill returns undefined for an untracked job id", as
   const store = new JobStore();
   assert.equal(await store.resolveBirthIdentityForKill("nope"), undefined);
 });
+
+test(
+  "OWNER 7 - kill()'s real caller (resolveBirthIdentityForKill) settles a genuinely still-pending capture by the aggregate cap, never hanging past it",
+  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  async () => {
+    // Real server, real SDK Client, real tools/call round trip for BOTH
+    // run() and kill() - not resolveBirthIdentityForKill called directly on
+    // a bare JobStore. The real kill() handler (src/tools/kill.ts:388) is
+    // what actually awaits resolveBirthIdentityForKill, then runs the real
+    // pre-signal identity gate, then dispatches the real signal - a direct
+    // call to resolveBirthIdentityForKill alone would skip all three and
+    // prove nothing about kill()'s own real behavior.
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const instance = createServer(serverTransport);
+    await instance.server.connect(instance.transport);
+
+    const client = new Client({ name: "ghantika-kill-aggregate-cap-test", version: "0.0.0" });
+    await client.connect(clientTransport);
+
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-kill-aggregate-cap-ps-"));
+    const invocationMarker = path.join(dir, "invocations.txt");
+    const psPath = path.join(dir, "ps");
+    // First invocation: sleeps ~2.7 real seconds before reporting not-found
+    // - this is the REAL production call path (no injectable clock, unlike
+    // the isolated jobStore-level owner), so the aggregate cap's remaining-
+    // budget capping on the retry's own timeout only becomes numerically
+    // distinguishable from the uncapped nominal timeout once real wall-
+    // clock time has genuinely been consumed. Second invocation (the
+    // retry): a real, SIGTERM-resistant ps that sleeps far longer than
+    // either timeout - proving kill()'s own real caller
+    // (resolveBirthIdentityForKill) does not hang past the aggregate cap.
+    fs.writeFileSync(
+      psPath,
+      `#!/bin/sh\ntrap '' TERM\ncount=$(wc -l < '${invocationMarker}' 2>/dev/null || echo 0)\necho x >> '${invocationMarker}'\nif [ "$count" -eq 0 ]; then\n  sleep 2.0\n  exit 1\nfi\nsleep 10\necho '00:01'\n`
+    );
+    fs.chmodSync(psPath, 0o755);
+
+    let realPid: number | undefined;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+
+      // The real run() handler fires its own captureBirthIdentityPosixAsync
+      // call with the shipped defaults - our fake ps on PATH is what forces
+      // that real, unmodified production call toward its own aggregate cap.
+      const runResult = (await client.callTool({
+        name: "run",
+        arguments: { command: ["sleep", "30"], label: "kill-aggregate-cap-check" },
+      })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
+      assert.notEqual(runResult.isError, true, `run() must succeed: ${JSON.stringify(runResult)}`);
+      const jobId = runResult.structuredContent?.job_id as string;
+      assert.equal(typeof jobId, "string");
+
+      const handle = jobStore.getChildHandle(jobId);
+      assert.notEqual(handle, undefined, "expected a real attached child for this job");
+      realPid = handle!.pid;
+
+      const before = Date.now();
+      // signal: "SIGKILL" sends exactly once with no grace-period
+      // escalation (src/tools/kill.ts), isolating the aggregate-cap wait
+      // itself from POSIX_KILL_GRACE_PERIOD_MS's separate 5s window.
+      const killResult = (await client.callTool({
+        name: "kill",
+        arguments: { job_id: jobId, signal: "SIGKILL" },
+      })) as { isError?: boolean };
+      const elapsedMs = Date.now() - before;
+      assert.notEqual(
+        killResult.isError,
+        true,
+        `kill() must succeed even via the degraded identity path: ${JSON.stringify(killResult)}`
+      );
+
+      // At least 2: the capture's own not-found-then-retry pair. This real
+      // end-to-end path may add more (kill's own pre-signal identity
+      // re-check also shells out to ps against the same shadowed PATH), so
+      // this only asserts the retry itself genuinely started - it does not
+      // pin the exact incidental total the way an isolated unit-level owner
+      // would.
+      const invocationCount = fs
+        .readFileSync(invocationMarker, "utf8")
+        .split("\n")
+        .filter((line) => line.trim().length > 0).length;
+      assert.ok(
+        invocationCount >= 2,
+        `expected the retry to genuinely start (at least 2 attempts observed) before the aggregate cap force-reaps it - saw ${invocationCount} invocations`
+      );
+      assert.ok(
+        elapsedMs < 4500,
+        `expected kill()'s own wait (aggregate-cap-bounded, ~3.25s from the real spawn) to settle well short of the resistant observer's own 10s sleep or the retry's uncapped nominal timeout (~6s) - took ${elapsedMs}ms`
+      );
+      // The proof that kill() actually reaped the job (not just that the
+      // call returned): a real, external isProcessAlive check, never our
+      // own internal bookkeeping.
+      assert.equal(
+        isProcessAlive(realPid),
+        false,
+        "kill()'s own real caller must have actually killed the job's real process via the degraded-but-honest path, not merely settled the capture and returned"
+      );
+      realPid = undefined;
+    } finally {
+      process.env.PATH = realPath;
+      await client.close();
+      if (realPid !== undefined) {
+        try {
+          process.kill(-realPid, "SIGKILL");
+        } catch {
+          // already gone - nothing to do
+        }
+      }
+    }
+  }
+);
 
 // ---------------------------------------------------------------------------
 // JobStore: output buffering integration (per-job, per-stream)

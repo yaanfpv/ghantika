@@ -121,3 +121,10 @@ auth.json
 # Packaged output
 *.tgz
 *.mcpb
+
+# test/lint-scope.test.js's own disposable runtime-witness canary: a real
+# file it plants inside src/ to prove `npm run lint` genuinely executes
+# against this repository's real tree, then deletes. Ignored so a test run
+# that crashes before its own cleanup can never leave something a `git add`
+# would pick up.
+/src/__lint_scope_runtime_canary__.ts
