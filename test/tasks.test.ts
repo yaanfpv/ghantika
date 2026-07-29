@@ -1180,7 +1180,7 @@ test("on a capable connection, status/output/tail on the mapped job_id keep work
 // the tasks/get-observable state
 // ---------------------------------------------------------------------------
 
-test("interim contract: on a LIVE (working) task, tasks/update and tasks/cancel each return a well-formed current-state result and mutate NOTHING observable - proven by a FULL-OBJECT deep-equality across all four reads, not just status plus one discriminator field", async () => {
+test("interim contract: on a LIVE (working) task, tasks/update returns a well-formed current-state result and mutates NOTHING observable - proven by a FULL-OBJECT deep-equality across all three reads, not just status plus one discriminator field. tasks/cancel no longer shares this read-only contract on a live task - see test/tasks-lifecycle.test.ts for its real kill-and-reap coverage", async () => {
   const pair = await startPair(true);
   try {
     const minted = await runJob(pair.client, {
@@ -1195,15 +1195,14 @@ test("interim contract: on a LIVE (working) task, tasks/update and tasks/cancel 
     assert.equal(before.extension, TASKS_EXTENSION_URI);
 
     const updateResult = await tasksRequest(pair.client, "tasks/update", taskId);
-    const cancelResult = await tasksRequest(pair.client, "tasks/cancel", taskId);
     const after = await tasksRequest(pair.client, "tasks/get", taskId);
 
     // A live, still-working task's current-state snapshot has nothing
-    // that legitimately changes across these four back-to-back reads -
+    // that legitimately changes across these three back-to-back reads -
     // createdAt is fixed at record creation, status stays "working"
     // throughout a no-output background process, and output/exitCode are
     // not even present until the task reaches a terminal state - so the
-    // real invariant is a FULL deep-equal across all four, not merely
+    // real invariant is a FULL deep-equal across all three, not merely
     // "status agrees" plus one discriminator field. A mutant that alters
     // ONE specific field (e.g. createdAt) while leaving status/extension
     // untouched survives the old, narrower assertion but is caught here.
@@ -1213,14 +1212,9 @@ test("interim contract: on a LIVE (working) task, tasks/update and tasks/cancel 
       "tasks/update must return the IDENTICAL current-state snapshot, field for field"
     );
     assert.deepEqual(
-      cancelResult,
-      before,
-      "tasks/cancel must return the IDENTICAL current-state snapshot, field for field - this interim registration does not implement real cooperative cancellation"
-    );
-    assert.deepEqual(
       after,
       before,
-      "tasks/update and tasks/cancel must not have altered the observable job state in ANY field"
+      "tasks/update must not have altered the observable job state in ANY field"
     );
 
     // Clean up the still-live background process.
@@ -1868,9 +1862,9 @@ const COMPLETENESS_AREAS: readonly CompletenessArea[] = [
     titleContains: "the plain poll floor is never replaced",
   },
   {
-    area: "the update/cancel interim contract preserves state across live, terminal, and unknown taskIds, by full-object comparison",
+    area: "the update interim contract preserves state on a LIVE task, by full-object comparison across three reads - tasks/cancel no longer shares this contract on a live task (see test/tasks-lifecycle.test.ts for its real kill-and-reap coverage)",
     file: "test/tasks.test.ts",
-    titleContains: "proven by a FULL-OBJECT deep-equality across all four reads",
+    titleContains: "proven by a FULL-OBJECT deep-equality across all three reads",
   },
   {
     area: "the update/cancel interim contract on a TERMINAL task is idempotent AND each of update/cancel individually matches the real tasks/get snapshot, not merely itself",

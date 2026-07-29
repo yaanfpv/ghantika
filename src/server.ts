@@ -303,10 +303,12 @@ export function createServer(transport: Transport = createStdioTransport()): Gha
   });
 
   // The three registered task methods - see tasksAdapter.ts's header for
-  // why tasks/update and tasks/cancel share getTask's one read-only
-  // snapshot as their complete interim behavior, and why no tasks/list or
-  // tasks/result method is registered at all (the legacy result/list
-  // surface is deliberately not implemented).
+  // why tasks/get and tasks/update share getTask's one read-only snapshot
+  // as their complete behavior, why tasks/cancel is the one place that
+  // adapter has a real side effect (it delegates to tools/kill.ts's own
+  // process-group kill/reap containment via tasksAdapter.cancelTask), and
+  // why no tasks/list or tasks/result method is registered at all (the
+  // legacy result/list surface is deliberately not implemented).
   server.setRequestHandler(
     "tasks/get",
     { params: tasksAdapter.taskIdParamsSchema() },
@@ -320,7 +322,7 @@ export function createServer(transport: Transport = createStdioTransport()): Gha
   server.setRequestHandler(
     "tasks/cancel",
     { params: tasksAdapter.taskIdParamsSchema() },
-    async (params) => tasksAdapter.getTask(params.taskId)
+    async (params) => tasksAdapter.cancelTask(params.taskId)
   );
 
   let shuttingDown: Promise<void> | undefined;
