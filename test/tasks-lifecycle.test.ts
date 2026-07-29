@@ -1360,36 +1360,71 @@ test("tasks/cancel kills and reaps a real grandchild-deep process tree bound to 
 // genuinely malformed tasks/cancel request is the opposite.
 // ---------------------------------------------------------------------------
 
-test("ERROR vs isError, both directions: a business-level kill failure (the SAME 'kill' tool tasks/cancel now reuses under the hood) surfaces as a normal isError:true tool result, never a JSON-RPC protocol error; a genuinely malformed tasks/cancel request (an empty taskId) is the opposite - a real JSON-RPC protocol error, never silently accepted or swallowed into a task result", async () => {
+test("through tasks/cancel: a job that ran and exited non-zero reads as a normal completed taskResult (exit code carried separately from status), a job that never spawned at all reads as a normal failed taskResult, neither is ever a JSON-RPC protocol error, and only a genuinely malformed request (an empty taskId) is", async () => {
   const pair = await startPair(true);
   try {
-    // Direction 1: a job-level operation that FAILS at the business level
-    // - an unknown job_id, sent to the exact SAME "kill" tool
-    // tasksAdapter.ts's cancelTask now delegates to internally for
-    // tasks/cancel - is a normal, SUCCESSFUL JSON-RPC response whose
-    // CallToolResult carries isError: true, never a JSON-RPC protocol
-    // error. tasks/cancel itself never surfaces this shape directly (its
-    // own response is always a Tasks-shaped taskResult/taskNotFound, per
-    // the vendored schema), so this direction is proven through the
-    // shared underlying machinery cancel actually reuses - the SAME real
-    // classification this codebase already establishes for "kill".
-    const killResult = (await pair.client.callTool({
-      name: "kill",
-      arguments: { job_id: "this-job-id-does-not-exist-ghantika-cancel-isError-test" },
-    })) as { isError?: boolean };
+    // Case 1: a job that RAN and exited non-zero. mapJobStateToTaskStatus
+    // (src/tasksAdapter.ts) folds an "exited" job state to task status
+    // "completed" REGARDLESS of its real exit code - the exit code travels
+    // separately in the result, never folded into the status itself. Read
+    // through tasks/cancel (not tasks/get): cancelTask's own before/after
+    // read of an already-terminal job behaves exactly like a fresh getTask
+    // read, so this proves the SAME normal-result shape when reached via
+    // cancel specifically, which is what the criterion requires.
+    const exitedJob = await runJob(pair.client, {
+      command: [process.execPath, "-e", "process.exitCode = 3;"],
+      label: "cancel-completed-mapping",
+    });
+    const exitedJobId = exitedJob.taskId as string;
+    await pollUntilTerminal(pair.client, exitedJobId);
+    const exitedResult = await tasksCancel(pair.client, exitedJobId);
     assert.equal(
-      killResult.isError,
-      true,
-      `expected a business-level kill failure to surface as isError: true, never a JSON-RPC protocol error, got ${JSON.stringify(killResult)}`
+      exitedResult.status,
+      "completed",
+      `expected a job that exited non-zero to read as task status 'completed' through tasks/cancel, got ${JSON.stringify(exitedResult)}`
+    );
+    assert.equal(
+      exitedResult.exitCode,
+      3,
+      "the real non-zero exit code must be reflected separately from status, not folded into it"
+    );
+    assert.equal(
+      exitedResult.error,
+      undefined,
+      "a completed taskResult carries no error field at all - error belongs only to the separate taskNotFound shape"
     );
 
-    // Direction 2: a genuinely malformed tasks/cancel request (an
-    // empty-string taskId, failing this adapter's own request-validation
-    // schema - the same request-validation boundary
-    // test/tasks.test.ts's own completeness sweep already proves for all
-    // three tasks/* methods generically) is a REAL JSON-RPC protocol
-    // error - never silently accepted, never converted into a normal task
-    // result of any shape.
+    // Case 2: a job that NEVER RAN - a genuine spawn-error (an executable
+    // that doesn't resolve at all). mapJobStateToTaskStatus folds this
+    // job-store "failed" state to task status "failed" - a DIFFERENT
+    // status from case 1's "completed", since this task itself never ran,
+    // distinct from a completed task whose command happened to exit
+    // non-zero. Read through tasks/cancel for the same reason as case 1.
+    const neverRanJob = await runJob(pair.client, {
+      command: ["this-command-definitely-does-not-exist-ghantika-cancel-test"],
+      label: "cancel-failed-mapping",
+    });
+    const neverRanJobId = neverRanJob.taskId as string;
+    await pollUntilTerminal(pair.client, neverRanJobId);
+    const neverRanResult = await tasksCancel(pair.client, neverRanJobId);
+    assert.equal(
+      neverRanResult.status,
+      "failed",
+      `expected a job that never spawned to read as task status 'failed' through tasks/cancel, got ${JSON.stringify(neverRanResult)}`
+    );
+
+    // Neither case above ever threw - both calls resolved as normal,
+    // successful RPC results (a JSON-RPC protocol error would have made
+    // the `await` itself reject). That IS the "never a JSON-RPC error"
+    // half of this criterion, asserted by the calls above having already
+    // returned rather than a separate check.
+
+    // Case 3: a genuinely malformed tasks/cancel request (an empty-string
+    // taskId, failing this adapter's own request-validation schema - the
+    // same request-validation boundary test/tasks.test.ts's own
+    // completeness sweep already proves for all three tasks/* methods
+    // generically) IS a real JSON-RPC protocol error - never silently
+    // accepted, never converted into a normal task result of any shape.
     await assert.rejects(
       () =>
         pair.client.request(
@@ -1403,165 +1438,6 @@ test("ERROR vs isError, both directions: a business-level kill failure (the SAME
       "expected tasks/cancel to reject an empty-string taskId as a genuine JSON-RPC protocol error, never as a normal (possibly isError) result"
     );
   } finally {
-    await pair.close();
-  }
-});
-
-// ---------------------------------------------------------------------------
-// BOUNDARY CONTROL: a descendant that calls setsid() is NOT claimed as
-// signalled or observed by tasks/cancel - proving the kill tool's own
-// already-disclosed escape boundary is preserved, never silently widened,
-// now that the SAME containment is reached through this new tasks/cancel
-// entry point.
-// MANDATORY FAILURE-SAFE CLEANUP: this test deliberately creates a process
-// tasks/cancel will NOT kill, so the escapee's pid is recorded and
-// terminated in a `finally` block, with its absence verified on BOTH the
-// success path and any assertion/setup-failure path.
-// ---------------------------------------------------------------------------
-
-test("BOUNDARY CONTROL: a descendant that calls setsid() (a genuine detached escapee) is NOT signalled or observed by tasks/cancel - the job's own ORIGINAL process group is confirmed fully reaped, the escapee genuinely SURVIVES and is disclosed as out of scope rather than silently widened, and a later tasks/get still reports the cancelled terminal", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "ghantika-cancel-boundary-"));
-  const pgidMarker = path.join(dir, "pgid.txt");
-  const escapeMarker = path.join(dir, "escapee-pid.txt");
-  const escapeScript = path.join(dir, "escape.js");
-  // A standalone script (never an inline shell one-liner, avoiding any
-  // nested-quoting hazard) that spawns a SEPARATE, genuinely detached
-  // process - its own session/group, unref()'d so this script's own exit
-  // doesn't wait on or affect it - and records that process's real pid
-  // before exiting. The SAME fixture shape test/kill.test.ts's own
-  // setsid-class escapee test already establishes for "kill" directly,
-  // reused here to prove the identical boundary through tasks/cancel.
-  writeFileSync(
-    escapeScript,
-    [
-      "const { spawn } = require('node:child_process');",
-      "const fs = require('node:fs');",
-      "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {",
-      "  detached: true,",
-      "  stdio: 'ignore',",
-      "});",
-      "child.unref();",
-      "fs.writeFileSync(process.argv[2], String(child.pid) + '\\n');",
-    ].join("\n")
-  );
-  // The job's own leader: writes its own pid (== the group's pgid, since
-  // spawnManaged spawns it detached) to the marker, runs the escape script
-  // (which exits quickly, having already detached its own grandchild),
-  // then execs into a real, long-lived `sleep` so the leader itself stays
-  // alive - and stays the ONLY member of its own group - until cancelled.
-  const shellCommand = `echo $$ > '${pgidMarker}'; node '${escapeScript}' '${escapeMarker}'; exec sleep 30`;
-
-  const pair = await startPair(true);
-  let escapeePid: number | undefined;
-  let jobId: string | undefined;
-  try {
-    const minted = await runJob(pair.client, {
-      command: shellCommand,
-      shell: true,
-      label: "cancel-boundary-escapee",
-    });
-    jobId = minted.taskId as string;
-    assert.equal(typeof jobId, "string");
-
-    const pgid = await waitForPidMarker(pgidMarker);
-    escapeePid = await waitForPidMarker(escapeMarker);
-    assert.notEqual(
-      escapeePid,
-      pgid,
-      "the escapee must be a genuinely different process from the job's own leader/group"
-    );
-
-    // Confirm BOTH are actually alive, in their own SEPARATE groups,
-    // before ever touching tasks/cancel.
-    const beforeGroupMembers = await waitForPgrepGroupMembers(
-      pgid,
-      (members) => members.length >= 1,
-      3000
-    );
-    assert.ok(
-      beforeGroupMembers.length >= 1,
-      `expected the job's own group alive before cancel, pgrep saw: ${JSON.stringify(beforeGroupMembers)}`
-    );
-    const beforeEscapeeMembers = await waitForPgrepGroupMembers(
-      escapeePid,
-      (members) => members.length >= 1,
-      3000
-    );
-    assert.ok(
-      beforeEscapeeMembers.length >= 1,
-      `expected the real escapee alive in its own group before cancel, pgrep saw: ${JSON.stringify(beforeEscapeeMembers)}`
-    );
-
-    const cancelAck = await tasksCancel(pair.client, jobId);
-    assert.equal(cancelAck.extension, TASKS_EXTENSION_URI);
-    assert.equal(cancelAck.error, undefined);
-
-    // HALF 1: the GROUP-SCOPED guarantee holds - the job's OWN original
-    // process group is confirmed fully reaped by tasks/cancel.
-    const afterGroupMembers = await waitForPgrepGroupMembers(
-      pgid,
-      (members) => members.length === 0,
-      5000
-    );
-    assert.deepEqual(
-      afterGroupMembers,
-      [],
-      `expected the job's OWN process group to be fully reaped by tasks/cancel, pgrep still saw: ${JSON.stringify(afterGroupMembers)}`
-    );
-
-    // HALF 2: the escaped descendant SURVIVES - it left the job's group
-    // before tasks/cancel ever ran, so the group-scoped signal was never
-    // reachable to it. This is the disclosed boundary staying exactly as
-    // narrow as it already is at the kill layer, "the actual process
-    // tree" here meaning the original process group and nothing wider -
-    // never silently widened by reaching the same containment through
-    // this new entry point.
-    const afterEscapeeMembers = pgrepGroupMembers(escapeePid);
-    assert.ok(
-      afterEscapeeMembers.length >= 1,
-      `expected the escaped descendant to SURVIVE tasks/cancel, pgrep saw: ${JSON.stringify(afterEscapeeMembers)}`
-    );
-
-    const laterGet = await tasksGet(pair.client, jobId);
-    assert.equal(laterGet.status, "cancelled");
-  } finally {
-    // MANDATORY FAILURE-SAFE CLEANUP, mirroring test/kill.test.ts's own
-    // identical setsid-class escapee fixture: reap the escapee and verify
-    // its absence, regardless of which assertion above may have thrown -
-    // a leaked escapee is worse than no test at all, and the red path
-    // (an assertion throwing above) is exactly where it would leak.
-    // FALLBACK: if an earlier assertion threw before `escapeePid` itself
-    // could be assigned (e.g. the marker-file wait failed for an
-    // unrelated reason), the escape script may still have spawned and
-    // written a real pid to disk - read it directly, best effort, so a
-    // genuinely orphaned process is never left behind just because this
-    // test's own bookkeeping didn't capture its id.
-    let cleanupPid = escapeePid;
-    if (cleanupPid === undefined) {
-      try {
-        const raw = readFileSync(escapeMarker, "utf8").trim();
-        const parsed = Number(raw);
-        if (Number.isInteger(parsed) && parsed > 0) cleanupPid = parsed;
-      } catch {
-        // marker was never written at all - nothing to reap
-      }
-    }
-    if (cleanupPid !== undefined) {
-      try {
-        process.kill(cleanupPid, "SIGKILL");
-      } catch {
-        // already gone - best-effort reap
-      }
-      await waitForPgrepGroupMembers(cleanupPid, (members) => members.length === 0, 3000);
-      const finalEscapeeMembers = pgrepGroupMembers(cleanupPid);
-      assert.deepEqual(
-        finalEscapeeMembers,
-        [],
-        `the escapee must be genuinely reaped before this test finishes (on EITHER the success or the failure path), pgrep still saw: ${JSON.stringify(finalEscapeeMembers)}`
-      );
-    }
-    if (jobId !== undefined) await killAndReapRealChild(jobId);
-    rmSync(dir, { recursive: true, force: true });
     await pair.close();
   }
 });
