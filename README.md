@@ -42,6 +42,8 @@ A job's output is captured as it happens, stdout and stderr tracked separately, 
 
 A job also outlives any single check. Start it, go do something else, ask again on a much later tool call, and `status` still tells you exactly what happened, for as long as the same ghantika server process is up. Closing the MCP session is where that ends: stdin EOF or a shutdown signal reaps every live job before the server exits, and nothing about a job survives a restart, since the store is in memory and deliberately so.
 
+That same rule covers a minted Tasks-extension task, because a task record isn't a second thing kept somewhere else - it's the underlying job record itself, read through the extension's own shape. So a task is exactly as bound to the server process as the job behind it: closing the session reaps it the same way, and it never survives a restart either, since there's no separate durable store for it to persist in.
+
 ## Requirements
 
 - **Node.js 22+**
