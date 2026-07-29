@@ -1,0 +1,95 @@
+{
+  "list": {
+    "jobs": [
+      {
+        "job_id": "<JOB_ID>",
+        "label": "<LABEL>",
+        "state": "exited",
+        "started_at": "<TIMESTAMP>"
+      }
+    ]
+  },
+  "run": {
+    "job_id": "<JOB_ID>",
+    "state": "starting",
+    "started_at": "<TIMESTAMP>",
+    "command_summary": "true",
+    "label": "<LABEL>",
+    "counts": {
+      "stdout_lines": 0,
+      "stdout_bytes": 0,
+      "stderr_lines": 0,
+      "stderr_bytes": 0
+    }
+  },
+  "status": {
+    "job_id": "<JOB_ID>",
+    "state": "exited",
+    "started_at": "<TIMESTAMP>",
+    "ended_at": "<TIMESTAMP>",
+    "exit_code": 0,
+    "command_summary": "true",
+    "label": "<LABEL>",
+    "counts": {
+      "stdout_lines": 0,
+      "stdout_bytes": 0,
+      "stderr_lines": 0,
+      "stderr_bytes": 0
+    }
+  },
+  "output": {
+    "events": [
+      {
+        "seq": 1,
+        "stream": "stdout",
+        "text": "golden-stdout-1"
+      },
+      {
+        "seq": 2,
+        "stream": "stdout",
+        "text": "golden-stdout-2"
+      },
+      {
+        "seq": 3,
+        "stream": "stdout",
+        "text": "golden-stdout-3"
+      }
+    ],
+    "next_cursor": 3
+  },
+  "tail": {
+    "events": [
+      {
+        "seq": 1,
+        "stream": "stdout",
+        "text": "golden-stdout-1"
+      },
+      {
+        "seq": 2,
+        "stream": "stdout",
+        "text": "golden-stdout-2"
+      },
+      {
+        "seq": 3,
+        "stream": "stdout",
+        "text": "golden-stdout-3"
+      }
+    ],
+    "next_cursor": 3
+  },
+  "kill": {
+    "job_id": "<JOB_ID>",
+    "state": "killed",
+    "started_at": "<TIMESTAMP>",
+    "ended_at": "<TIMESTAMP>",
+    "signal": "SIGTERM",
+    "command_summary": "node",
+    "label": "<LABEL>",
+    "counts": {
+      "stdout_lines": 0,
+      "stdout_bytes": 0,
+      "stderr_lines": 0,
+      "stderr_bytes": 0
+    }
+  }
+}
