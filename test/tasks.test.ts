@@ -1174,10 +1174,12 @@ test("on a capable connection, status/output/tail on the mapped job_id keep work
 });
 
 // ---------------------------------------------------------------------------
-// tasks/update + tasks/cancel interim contract: LIVE task (current-state,
+// tasks/update's own interim contract: LIVE task (current-state,
 // read-only), TERMINAL task (idempotent), UNKNOWN taskId (one fixed shape) -
-// state-preservation invariant: neither method alters the backing job or
-// the tasks/get-observable state
+// state-preservation invariant: this method alters neither the backing job
+// nor the tasks/get-observable state. tasks/cancel no longer shares this
+// contract on a live task (it now really kills and reaps - see
+// test/tasks-lifecycle.test.ts), so it is not covered by this block.
 // ---------------------------------------------------------------------------
 
 test("interim contract: on a LIVE (working) task, tasks/update returns a well-formed current-state result and mutates NOTHING observable - proven by a FULL-OBJECT deep-equality across all three reads, not just status plus one discriminator field. tasks/cancel no longer shares this read-only contract on a live task - see test/tasks-lifecycle.test.ts for its real kill-and-reap coverage", async () => {

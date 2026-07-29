@@ -37,15 +37,17 @@
  * grandchild-deep process tree bound to the job's original POSIX process
  * group is genuinely signalled and reaped through `tasks/cancel` itself
  * (never the raw `kill` tool), the cancel acknowledgement and a later
- * `tasks/get`'s terminal observation are asserted as two DISTINCT steps,
- * the disclosed setsid()-escape boundary is proven to stay exactly as
- * narrow as `src/tools/kill.ts` already establishes it (never silently
- * widened by reaching that same containment through this new entry
- * point), and the isError/JSON-RPC-error distinction is proven in both
- * directions. `test/tasks.test.ts`'s own "interim contract" tests keep
- * covering `tasks/update`'s read-only behavior and `tasks/cancel`'s
- * unchanged idempotent no-op on an already-terminal or unknown taskId -
- * this file is where a LIVE task's real cancellation is proven.
+ * `tasks/get`'s terminal observation are asserted as two DISTINCT steps
+ * (the acknowledgement's own status independently checked, not inferred
+ * from the later read), and the real terminal-status mapping is proven for
+ * every case tasks/cancel can actually reach - a job that exited
+ * non-zero, a job that never spawned at all, and a genuinely malformed
+ * request. The disclosed setsid()-escape boundary this containment
+ * inherits from `src/tools/kill.ts` is proven there, not duplicated here.
+ * `test/tasks.test.ts`'s own "interim contract" tests keep covering
+ * `tasks/update`'s read-only behavior and `tasks/cancel`'s unchanged
+ * idempotent no-op on an already-terminal or unknown taskId - this file is
+ * where a LIVE task's real cancellation is proven.
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -1279,7 +1281,11 @@ test("tasks/cancel kills and reaps a real grandchild-deep process tree bound to 
     // -------------------------------------------------------------------
     // CANCEL ACK: tasks/cancel returns an acknowledgement of the request -
     // asserted on its OWN return value here, independently of the LATER
-    // tasks/get read below (never inferred from it).
+    // tasks/get read below (never inferred from it). Message shape alone
+    // (extension/taskId/no-error) is not enough: a mutant that kills
+    // nothing and returns a stale "working" projection would still pass a
+    // shape-only check. The status must genuinely reflect the kill this
+    // call just performed.
     // -------------------------------------------------------------------
     const cancelAck = await tasksCancel(pair.client, jobId);
     assert.equal(
@@ -1296,6 +1302,11 @@ test("tasks/cancel kills and reaps a real grandchild-deep process tree bound to 
       cancelAck.error,
       undefined,
       `expected a real acknowledgement, never a not-found response, got ${JSON.stringify(cancelAck)}`
+    );
+    assert.equal(
+      cancelAck.status,
+      "cancelled",
+      `expected the cancel acknowledgement's own status to already reflect the kill just performed, got ${JSON.stringify(cancelAck)}`
     );
 
     // -------------------------------------------------------------------
@@ -1350,14 +1361,13 @@ test("tasks/cancel kills and reaps a real grandchild-deep process tree bound to 
 });
 
 // ---------------------------------------------------------------------------
-// ERROR vs isError, both directions - proving tasks/cancel's own new kill
-// wiring never blurs the two: a business-level kill failure (the exact
-// SAME "kill" tool tasksAdapter.ts's cancelTask now delegates to
-// internally) still surfaces as isError:true through a normal, successful
-// JSON-RPC result, never a JSON-RPC protocol error (mirroring
-// test/kill.test.ts's own "kill() over the real wire: unknown job_id is a
-// real tool-execution error, never a JSON-RPC protocol error"); a
-// genuinely malformed tasks/cancel request is the opposite.
+// TERMINAL SHAPES vs PROTOCOL ERROR, read through tasks/cancel: a job that
+// ran and exited non-zero reads as a normal "completed" taskResult, with
+// the real exit code carried separately from status; a job that never
+// spawned at all (a genuine spawn error) reads as a normal "failed"
+// taskResult, a materially different case from a completed job whose
+// command happened to fail. Neither of those is ever a JSON-RPC protocol
+// error - only a genuinely malformed request (an empty taskId) is.
 // ---------------------------------------------------------------------------
 
 test("through tasks/cancel: a job that ran and exited non-zero reads as a normal completed taskResult (exit code carried separately from status), a job that never spawned at all reads as a normal failed taskResult, neither is ever a JSON-RPC protocol error, and only a genuinely malformed request (an empty taskId) is", async () => {
