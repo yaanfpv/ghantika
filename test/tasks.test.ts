@@ -1473,8 +1473,8 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
     );
     assert.deepEqual(
       Object.keys(listResult).sort(),
-      ["jobs"],
-      `expected list's response to deep-equal the real {jobs} key set exactly, got: ${JSON.stringify(Object.keys(listResult).sort())}`
+      ["concurrency_cap", "jobs"],
+      `expected list's response to deep-equal the real {jobs, concurrency_cap} key set exactly, got: ${JSON.stringify(Object.keys(listResult).sort())}`
     );
     const listedJobs = listResult.jobs as unknown[];
     assert.ok(
@@ -1499,6 +1499,7 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
         label: "six-tool-mint-rule",
         state: "exited",
         started_at: statusResult.started_at,
+        queue_position: undefined,
       },
       `expected list's entry for the minted job to deep-equal its real, complete values - not just an absent handle field - got: ${JSON.stringify(listedEntry)}`
     );

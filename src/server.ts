@@ -342,6 +342,17 @@ export function createServer(transport: Transport = createStdioTransport()): Gha
 async function performShutdown(transport: Transport, reason: string): Promise<void> {
   console.error(`[ghantika] shutting down (${reason})`);
   try {
+    // Any job still sitting in the concurrency queue never got a real
+    // child attached at all (see `JobStore.drainQueueOnShutdown`'s own
+    // docs), so it is killed and cleared here, BEFORE the live-job reap
+    // below - which only ever has real process-group work to do for a job
+    // that actually spawned. Deterministic: this always fully empties the
+    // queue before shutdown proceeds.
+    jobStore.drainQueueOnShutdown();
+  } catch (error) {
+    console.error("[ghantika] error while draining the concurrency queue during shutdown:", error);
+  }
+  try {
     await reapLiveJobsOnShutdown();
   } catch (error) {
     console.error("[ghantika] error while reaping live jobs during shutdown:", error);

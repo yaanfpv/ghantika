@@ -611,7 +611,7 @@ test("list: enumerates a real job immediately after run(), never the old not-imp
   assert.equal("job_id" in found!, true);
   assert.equal(
     Object.keys(found!).sort().join(","),
-    ["job_id", "label", "started_at", "state"].sort().join(",")
+    ["job_id", "label", "started_at", "state", "queue_position"].sort().join(",")
   );
 });
 

@@ -40,6 +40,13 @@ import path from "node:path";
 
 import { POSIX_KILL_GRACE_PERIOD_MS, killProcessGroupPosix } from "./process.js";
 import type { ProcessBirthIdentity } from "./process.js";
+import {
+  type AdmissionDecision,
+  type ConcurrencyConfig,
+  decideAdmission,
+  loadConcurrencyConfigFromEnv,
+  normalizeConcurrencyConfig,
+} from "./scheduler.js";
 
 // ---------------------------------------------------------------------------
 // Frozen shapes
@@ -1035,6 +1042,15 @@ interface CreateFailedJobInput extends CreateJobInput {
 }
 
 /**
+ * One job waiting in the FIFO concurrency queue - see `JobStore.enqueueJob`'s
+ * own docs for the full contract `onDequeued` operates under.
+ */
+interface QueuedJob {
+  readonly jobId: string;
+  readonly onDequeued: () => void;
+}
+
+/**
  * What `JobStore` tracks about a job's real, live child process, alongside
  * the `ChildProcess` handle itself - the pid, the (approximate) real spawn
  * time, and the leader's real captured birth identity (nullable), the
@@ -1128,6 +1144,26 @@ export class JobStore {
   private readonly reapAttempted = new Set<string>();
   private seqCounter = 0;
 
+  /**
+   * The concurrency-cap + max-queue-depth policy this store enforces - see
+   * `src/scheduler.ts`'s own header for why the POLICY lives there (pure
+   * functions over plain numbers) while the actual COUNTS live here (this
+   * store is the sole designated owner of persistent state). Defaults to
+   * the real, production, environment-sourced config; a test constructs a
+   * fresh `JobStore` with an explicit small config instead, or calls
+   * `setConcurrencyConfig` to reconfigure an already-constructed store
+   * (e.g. the shared singleton) without a fresh instance.
+   */
+  private concurrencyConfig: ConcurrencyConfig;
+  /** How many jobs currently hold a concurrency slot - spawned and not yet reaped. See `releaseSlot`'s own docs for exactly when a slot is freed. */
+  private activeSlots = 0;
+  /** The FIFO queue of jobs admitted into the queue (the cap was full when they arrived, but queue depth allowed it) - this array's own push/shift order IS insertion order, the queue's own tie-break. */
+  private readonly queue: QueuedJob[] = [];
+
+  constructor(concurrencyConfig: ConcurrencyConfig = loadConcurrencyConfigFromEnv()) {
+    this.concurrencyConfig = normalizeConcurrencyConfig(concurrencyConfig);
+  }
+
   /** True if a job with this id has ever been registered. */
   has(jobId: string): boolean {
     return this.jobs.has(jobId);
@@ -1212,6 +1248,191 @@ export class JobStore {
       stderr: createStreamBufferState(eventSeq),
     });
     return record;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Concurrency cap + FIFO queue
+  // ---------------------------------------------------------------------------
+
+  /** The currently configured concurrency cap - `src/tools/list.ts`'s own response surfaces this. */
+  getConcurrencyCap(): number {
+    return this.concurrencyConfig.maxConcurrentJobs;
+  }
+
+  /** How many jobs are currently waiting in the FIFO queue - exposed for observability/testing, the same "real oracle" role `getJobTerminalListenerCount` already plays for its own subscriber count. */
+  getQueueLength(): number {
+    return this.queue.length;
+  }
+
+  /** How many concurrency slots are currently held (spawned and not yet reaped) - exposed for the same observability/testing reason as `getQueueLength`. */
+  getActiveSlotCount(): number {
+    return this.activeSlots;
+  }
+
+  /**
+   * Reconfigures the concurrency cap / max-queue-depth this store
+   * enforces, from this call onward. Never touches the CURRENT active
+   * count or already-queued entries: lowering the cap below a currently-
+   * elevated active count just means no NEW slot opens up until enough
+   * jobs finish to bring it back under the new cap (nothing already
+   * running is ever killed just because the configured cap changed under
+   * it); raising the cap does not proactively re-admit anything already
+   * sitting in the queue - those entries are re-evaluated the normal way,
+   * the next time a slot actually frees (`releaseSlot`), not synchronously
+   * here. Exists so a long-lived server (or this store's own test suite)
+   * can retune without a restart - see `loadConcurrencyConfigFromEnv` for
+   * how the real, production singleton is normally configured once, at
+   * startup.
+   */
+  setConcurrencyConfig(config: ConcurrencyConfig): void {
+    this.concurrencyConfig = normalizeConcurrencyConfig(config);
+  }
+
+  /**
+   * The whole admission decision for a NEW `run()` call, plus its
+   * corresponding state commit, as one step a caller can never split apart
+   * into "decide" without "commit" (this codebase is single-threaded end
+   * to end, so nothing else can interleave between the decision and the
+   * commit below). See `src/scheduler.ts`'s `decideAdmission` for the pure
+   * policy this wraps.
+   *
+   * - `"admit"`: a real slot was free - RESERVED here (this call already
+   *   incremented the active count); the caller should spawn the job
+   *   right now.
+   * - `"queue"`: no slot was free (or something is already ahead of this
+   *   job in line), but the queue has room - the caller must follow up
+   *   with `enqueueJob(jobId, onDequeued)` once it has a real `jobId` to
+   *   enqueue (this method alone can't do that: no job exists yet at
+   *   decision time).
+   * - `"reject"`: neither a slot nor queue room exists - the caller must
+   *   never create a running/queued job for this `run()` call at all.
+   */
+  requestSlot(): AdmissionDecision {
+    const decision = decideAdmission(this.activeSlots, this.queue.length, this.concurrencyConfig);
+    if (decision.kind === "admit") {
+      this.activeSlots += 1;
+    }
+    return decision;
+  }
+
+  /**
+   * Enqueues an ALREADY-admitted-to-the-queue job (the caller must have
+   * just received `{kind: "queue"}` from `requestSlot()`) onto the FIFO
+   * queue, in real insertion order - this array's own push order IS the
+   * insertion-sequence tie-break: two `run()` calls can only ever be
+   * enqueued one after the other, never simultaneously, since this
+   * codebase's handler is synchronous end to end with no `await` between
+   * validating one call and returning its result (see `src/tools/run.ts`'s
+   * own docs). Writes this job's own 1-based `queue_position` onto its
+   * `JobRecord` - appending to the tail never changes any EARLIER queued
+   * job's own distance from the front, so only this new entry's position
+   * needs setting here (contrast `dequeueNext`, which removes from the
+   * FRONT and therefore does renumber every remaining entry).
+   *
+   * `onDequeued` is called EXACTLY ONCE, later, whenever this entry
+   * reaches the front of the queue AND a slot has just been reserved for
+   * it (see `releaseSlot`/`dequeueNext`) - never before, and never more
+   * than once. The caller (`src/tools/run.ts`) supplies a closure that
+   * performs the actual deferred `spawnManaged` call for this exact job at
+   * that moment; this store has no opinion on what "actually running the
+   * job" means, only on WHEN it becomes this job's turn.
+   */
+  enqueueJob(jobId: string, onDequeued: () => void): void {
+    this.queue.push({ jobId, onDequeued });
+    const record = this.jobs.get(jobId);
+    if (record) record.queue_position = this.queue.length;
+  }
+
+  /**
+   * Releases exactly one concurrency slot - called once a job that
+   * previously held one (admitted immediately, or dequeued and actually
+   * spawned) reaches its real end: either a genuine exit/kill (after its
+   * reap has been awaited to completion - see `reapPromise` below) or a
+   * spawn failure (no reap needed at all, since no real child was ever
+   * attached for one). A slot is released exactly once, and only after
+   * the finishing job's own reap has been awaited to completion.
+   *
+   * @param reapPromise - the SAME reap promise `src/tools/run.ts`'s
+   *   `onExit` wiring already kicks off via `reapProcessGroupOnce`
+   *   (already wrapped with its own `.catch`, so this never rejects) -
+   *   awaited here BEFORE the slot is actually freed, so a slow/delayed
+   *   reap can never release the slot early. Omit (or pass `undefined`)
+   *   for a job that never had a real child attached at all (a spawn
+   *   failure) - there is nothing to reap, so the slot releases
+   *   immediately.
+   *
+   * Frees the slot, then immediately hands it to the next queued job (if
+   * any) - see `dequeueNext`'s own docs. Never lets the active count go
+   * negative (a defensive floor - this method is the only writer that
+   * ever decrements it, and it is only ever meant to be called once per
+   * slot that `requestSlot`/`dequeueNext` reserved, but the floor costs
+   * nothing and removes any possibility of it drifting negative under a
+   * future bug).
+   */
+  async releaseSlot(reapPromise?: Promise<unknown>): Promise<void> {
+    if (reapPromise !== undefined) {
+      await reapPromise;
+    }
+    this.activeSlots = Math.max(0, this.activeSlots - 1);
+    this.dequeueNext();
+  }
+
+  /**
+   * Gives a just-freed slot to the NEXT queued job (FIFO - the queue
+   * array's own order IS insertion order), if any are waiting. Reserves
+   * the slot for it immediately (increments the active count again right
+   * here - `releaseSlot`/`dequeueNext` are the only writers of that count,
+   * and this codebase is single-threaded, so there is no real concurrency
+   * to race between "freed" and "reserved again" regardless), clears the
+   * dequeued job's own `queue_position` (it is no longer queued - it is
+   * about to actually start), renumbers every STILL-queued job's position
+   * (each one just moved one closer to the front), then calls the
+   * dequeued job's own `onDequeued` closure, which performs the actual
+   * deferred spawn for it (see `enqueueJob`'s own docs). A no-op when the
+   * queue is empty.
+   */
+  private dequeueNext(): void {
+    const next = this.queue.shift();
+    if (!next) return;
+    const record = this.jobs.get(next.jobId);
+    if (record) record.queue_position = undefined;
+    this.renumberQueuePositions();
+    this.activeSlots += 1;
+    next.onDequeued();
+  }
+
+  /** Rewrites every currently-queued job's own `queue_position` from its (1-based) index in the queue array - called after a dequeue, since removing the FRONT entry moves every remaining one a position closer to the front (an enqueue, by contrast, only ever needs to set the ONE new entry's own position - see `enqueueJob`). */
+  private renumberQueuePositions(): void {
+    this.queue.forEach((entry, index) => {
+      const record = this.jobs.get(entry.jobId);
+      if (record) record.queue_position = index + 1;
+    });
+  }
+
+  /**
+   * Called once, at server shutdown (`src/server.ts`'s `performShutdown`):
+   * kills every job still sitting in the FIFO queue (it never got a
+   * chance to actually spawn) and empties the queue, so nothing is left
+   * waiting in limbo once the process exits. Drains front-to-back (this
+   * queue's own FIFO order), one entry at a time; idempotent (a second
+   * call finds an already-empty queue and is a pure no-op).
+   *
+   * A queued job never had a real child attached (`attachChild` is only
+   * ever called once a job actually spawns - see `enqueueJob`'s own
+   * docs), so there is nothing to reap here: `markKilled` alone is the
+   * complete termination for this class of job. `"queue-drained-at-
+   * shutdown"` is a descriptive synthetic `signal` value, not a real POSIX
+   * signal - the same pattern `src/tools/kill.ts`'s own Windows path
+   * already uses (`"SIGKILL-equiv"`) for a termination that never
+   * involved sending an actual signal to a real process.
+   */
+  drainQueueOnShutdown(): void {
+    while (this.queue.length > 0) {
+      const entry = this.queue.shift()!;
+      const record = this.jobs.get(entry.jobId);
+      if (record) record.queue_position = undefined;
+      this.markKilled(entry.jobId, "queue-drained-at-shutdown");
+    }
   }
 
   /**

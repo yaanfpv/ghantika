@@ -55,6 +55,8 @@ export interface ListedJob {
   readonly label: string;
   readonly state: JobState;
   readonly started_at: string;
+  /** See `JobRecord.queue_position`'s own docs - the same value, passed through verbatim (present only while this job is actually queued, waiting for a concurrency slot). */
+  readonly queue_position?: number;
 }
 
 /**
@@ -81,10 +83,15 @@ export function handler(): CallToolResult {
       label: projection.label,
       state: projection.state,
       started_at: projection.started_at,
+      queue_position: projection.queue_position,
     };
   });
   return {
     content: [{ type: "text", text: JSON.stringify(listed, null, 2) }],
-    structuredContent: { jobs: listed },
+    // `concurrency_cap` is the server-wide currently configured
+    // concurrency cap (see `JobStore.getConcurrencyCap`) - not a
+    // per-job field, so it sits alongside `jobs` rather than on each
+    // entry.
+    structuredContent: { jobs: listed, concurrency_cap: jobStore.getConcurrencyCap() },
   };
 }
