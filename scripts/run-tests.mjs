@@ -662,9 +662,15 @@ const CRITICAL_TESTS_PATH = path.join(REPO_ROOT, "test", "critical-tests.json");
  * inherits by default, via GHANTIKA_POLICY_FILE (see src/policy.ts) - a
  * small, fixed set of well-known executables (a POSIX shell, and the
  * handful of ordinary binaries the existing suite's own fixtures spawn:
- * node, echo, ls, true, sleep) the wider suite's pre-existing tests need
- * to keep exercising a real `run` the same way they did before the policy
- * gate existed. A fixed path computed unconditionally from REPO_ROOT, the
+ * node, echo, ls, true, sleep, fswatch) the wider suite's pre-existing
+ * tests need to keep exercising a real `run` the same way they did before
+ * the policy gate existed - fswatch specifically for test/dogfood.test.ts's
+ * own real fswatch job, without which that file's run() call denies the
+ * command outright and settles the job to "failed" on any host where
+ * fswatch happens to be installed (confirmed directly: before this entry
+ * existed, that file's real-fswatch run failed exactly that way on a host
+ * where DOGFOOD_SKIP's own fswatchIsInstalled() check is true, rather than
+ * skipping or passing). A fixed path computed unconditionally from REPO_ROOT, the
  * same pattern SKIP_BASELINE_PATH/CRITICAL_TESTS_PATH above already use -
  * this file still reads/consults no environment variable to change ANY of
  * its own behavior (see this file's own header doc comment); this is the

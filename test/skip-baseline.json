@@ -142,7 +142,8 @@
     "test/status-process-identity.test.ts::a3: a TERMINAL job retains the pid it HAD and reports whatever birth_identity capture state actually holds, including pending - never omits either just because the process is gone",
     "test/status-process-identity.test.ts::a4/a6: kill()'s own response never carries pid or birth_identity, even though it shares toPublicProjection with status",
     "test/modern-handshake.test.ts::negative control (initialize-gate): a serveStdio server built with NO gate wiring at all lets tools/call succeed with ZERO handshake - proving the real pre-handshake-rejection assertions above observe a real failure mode, not one that would pass regardless - and its own unrelated parse-recovery and reap guarantees stay intact",
-    "test/modern-handshake.test.ts::negative control (parse-error reply): a serveStdio server using the SDK's stock, UNWRAPPED StdioServerTransport produces NO reply at all to an unparseable line - proving createStdioTransport's own wrapping is what produces the real -32700 the e2e tests observe - and its own unrelated initialize-gate and reap guarantees stay intact"
+    "test/modern-handshake.test.ts::negative control (parse-error reply): a serveStdio server using the SDK's stock, UNWRAPPED StdioServerTransport produces NO reply at all to an unparseable line - proving createStdioTransport's own wrapping is what produces the real -32700 the e2e tests observe - and its own unrelated initialize-gate and reap guarantees stay intact",
+    "test/dogfood.test.ts::dogfood: a real ghantika run() job running fswatch on a scratch mailbox proves the Tasks wake genuinely fires on a real file change, correlated to a fresh nonce via output(), with no other process's command line referencing the trigger path, and a confirmed kill+reap rollback"
   ],
   "darwin": [
     "test/process-slow-paths.test.ts::captureBirthIdentityPosixAsync (Linux): a hung /proc observer (GHANTIKA_TEST_DEGRADE_PROC_READ=hang) still settles within this codebase's own bound and does not block the event loop while doing so",
@@ -154,7 +155,8 @@
     "test/process.test.ts::evaluatePreSignalIdentityGate (LINUX): alive-confirmed identity -> proceed with identityConfirmed: true",
     "test/run.test.ts::run(): on Windows, birth-identity capture is never even attempted - birthIdentity is always undefined there",
     "test/policy.test.ts::two distinct real files differing only by case are never conflated by the allowlist, on a filesystem that genuinely keeps them apart",
-    "test/policy.test.ts::a case-variant PARENT directory with a case-free executable leaf is never conflated by the allowlist, on a filesystem that genuinely keeps the two parents apart"
+    "test/policy.test.ts::a case-variant PARENT directory with a case-free executable leaf is never conflated by the allowlist, on a filesystem that genuinely keeps the two parents apart",
+    "test/dogfood.test.ts::dogfood: a real ghantika run() job running fswatch on a scratch mailbox proves the Tasks wake genuinely fires on a real file change, correlated to a fresh nonce via output(), with no other process's command line referencing the trigger path, and a confirmed kill+reap rollback"
   ],
   "linux": [
     "test/process-slow-paths.test.ts::captureBirthIdentityPosixAsync: a SIGTERM-RESISTANT ps observer (installs a handler and ignores it) still settles within this codebase's own bound, does not block the event loop while doing so, and is genuinely gone afterward - not merely a slow-but-cooperative child",
@@ -170,6 +172,7 @@
     "test/process.test.ts::captureBirthIdentityPosixAsync: on Windows, never even attempted - always resolves to undefined there",
     "test/process.test.ts::captureBirthIdentityPosixAsync: repeated not-found outcomes stop at the bounded deadline, never retrying forever",
     "test/process.test.ts::captureBirthIdentityPosixAsync: the SHIPPED DEFAULT not-found retry bound - called with no bound arguments at all - still retries through to a real captured identity",
-    "test/run.test.ts::run(): on Windows, birth-identity capture is never even attempted - birthIdentity is always undefined there"
+    "test/run.test.ts::run(): on Windows, birth-identity capture is never even attempted - birthIdentity is always undefined there",
+    "test/dogfood.test.ts::dogfood: a real ghantika run() job running fswatch on a scratch mailbox proves the Tasks wake genuinely fires on a real file change, correlated to a fresh nonce via output(), with no other process's command line referencing the trigger path, and a confirmed kill+reap rollback"
   ]
 }
