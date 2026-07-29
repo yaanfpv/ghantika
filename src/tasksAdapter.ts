@@ -88,24 +88,43 @@
  * `tasks/get(taskId)` and `status(job_id)` can never observe two different
  * truths about the same job.
  *
- * ## tasks/update and tasks/cancel: interim contract, by construction
+ * ## tasks/get and tasks/update stay pure reads; tasks/cancel is real
  *
- * `tasks/get`, `tasks/update`, and `tasks/cancel` are three separately
- * REGISTERED JSON-RPC methods, but all three route through this file's one
- * `getTask` snapshot function - a PURE read with no write path anywhere in
- * this module. That is not a shortcut: a job-backed task has no client-
- * updatable state at all, so `tasks/update`'s complete behavior IS this
- * read-only snapshot; this registration does not implement real
- * cooperative cancellation for `tasks/cancel` - `tasks/cancel` shares the
- * SAME read-only snapshot, same as `tasks/update`. Sharing one read-only
- * snapshot function is what makes the state-preservation
- * invariant (neither method may alter the backing job or the
- * tasks/get-observable state) true by construction rather than by a
- * runtime check: there is no mutating call in this file for either method
- * to reach. (Real cooperative cancellation is tracked as separate,
- * follow-on work - this adapter's own `getTask`/`buildTaskResult` already
- * carry the output-driven wake, TTL purge, and firehose-guard machinery
- * below regardless of that follow-on's timing.)
+ * `tasks/get` and `tasks/update` are two separately REGISTERED JSON-RPC
+ * methods that both route through this file's one `getTask` snapshot
+ * function - a PURE read with no write path anywhere in this module. That
+ * is not a shortcut: a job-backed task has no client-updatable state at
+ * all, so `tasks/update`'s complete behavior IS this read-only snapshot,
+ * and always will be.
+ *
+ * `tasks/cancel` is different: it is the one place this file has a REAL
+ * side effect. `cancelTask` (below) resolves `taskId` the same way every
+ * other function here does (a `jobStore` `job_id` read, never a second
+ * table), then delegates the actual termination to `src/tools/kill.ts`'s
+ * own exported `handler` - the SAME POSIX-process-group kill/reap
+ * containment the `kill` tool already provides (grace-period SIGTERM,
+ * SIGKILL escalation, the pre-signal and escalation identity gates, the
+ * external `pgrep`-based reap confirmation) - rather than reimplementing
+ * any of it here. This file still never gains persistent state of its
+ * own: `killTool.handler` performs the one real write (through
+ * `jobStore`), and `cancelTask` only reads the result back through the
+ * SAME `buildTaskResult` projection `getTask` already uses.
+ *
+ * BOUNDARY, unwidened from `kill`'s own already-disclosed scope (see
+ * `src/tools/kill.ts`'s extensive docs on this): cancelling means
+ * signalling the job's ORIGINAL POSIX process group. A descendant that
+ * calls `setsid()` or otherwise moves itself into a DIFFERENT process
+ * group is neither signalled by `tasks/cancel` nor observed by its
+ * confirmation check - reaching the same containment through a new entry
+ * point does not claim a stronger guarantee than the one `kill` already
+ * discloses.
+ *
+ * `cancelTask` never treats `killTool.handler`'s own `isError` outcomes (an
+ * unreachable defensive branch, or a rare pre-signal identity-gate
+ * refusal) as a reason to fail this call itself - a kill attempt that
+ * could not proceed simply leaves the job exactly as a fresh `getTask`
+ * read would find it, the same honest, retry-friendly shape `kill` itself
+ * already provides for a caller that calls it again.
  */
 import type {
   CallToolResult,
@@ -122,6 +141,15 @@ import {
   isTerminalJobState,
   jobStore,
 } from "./jobStore.js";
+// The SAME import shape `src/registry.ts` already uses to reach `kill`'s
+// handler for `tools/call` dispatch - `cancelTask` (below) reuses that
+// identical POSIX-process-group kill/reap containment for `tasks/cancel`
+// rather than reimplementing it here. `tasksAdapter.ts` sits outside
+// `src/tools/`, so this import is a normal adapter-reads-a-tool dependency,
+// never a sibling-tools-importing-tools reference (the ONLY shape
+// `scripts/check-module-boundaries.mjs`'s sibling-import guard forbids -
+// see that script's own header for the exact, narrower scope of that rule).
+import * as killTool from "./tools/kill.js";
 
 // ---------------------------------------------------------------------------
 // The extension identity and the vendored, digest-verified schema
@@ -365,17 +393,18 @@ function isExpiredTerminalRecord(record: JobRecord, now: number): boolean {
 
 /**
  * The one live-read entry point every tasks/* handler in `src/server.ts`
- * calls, directly or (for tasks/update and tasks/cancel) as their WHOLE
- * interim implementation - see this file's header on why that sharing is
- * what makes the state-preservation invariant true by construction. A PURE
- * read with one deliberate side effect: the lazy TTL purge (see
- * `TASK_TTL_MS`'s own docs) - once a terminal record is read PAST its TTL,
- * this call both reports `task_not_found` AND reclaims the record via
- * `jobStore.deleteJob`, so the SAME expired record is never "found, but
- * reported not-found" more than once; a caller that never reads it again
- * simply leaves it in `jobStore` until the next read (or never, which is
- * an accepted, honest trade-off of a lazy-on-read design over a scheduled
- * sweep - no separate timer is needed per terminal task).
+ * calls: directly for `tasks/get`/`tasks/update` (their WHOLE
+ * implementation - see this file's header on why sharing this read is what
+ * makes `tasks/update`'s state-preservation invariant true by
+ * construction), and as `cancelTask`'s own before-and-after read for
+ * `tasks/cancel` (below). A PURE read with one deliberate side effect: the
+ * lazy TTL purge (see `TASK_TTL_MS`'s own docs) - once a terminal record is
+ * read PAST its TTL, this call both reports `task_not_found` AND reclaims
+ * the record via `jobStore.deleteJob`, so the SAME expired record is never
+ * "found, but reported not-found" more than once; a caller that never
+ * reads it again simply leaves it in `jobStore` until the next read (or
+ * never, which is an accepted, honest trade-off of a lazy-on-read design
+ * over a scheduled sweep - no separate timer is needed per terminal task).
  *
  * `now` defaults to the real `Date.now()`; a caller never overrides it in
  * production - it exists as a parameter (mirroring
@@ -392,6 +421,46 @@ export function getTask(taskId: string, now: number = Date.now()): TaskResult | 
     return taskNotFound(taskId);
   }
   return buildTaskResult(record);
+}
+
+/**
+ * The real `tasks/cancel` implementation - see this file's header ("tasks/get
+ * and tasks/update stay pure reads; tasks/cancel is real") for the full
+ * design. Resolves `taskId` -> `job_id` the SAME way `getTask` does (an
+ * unknown or just-TTL-purged taskId returns `task_not_found` WITHOUT ever
+ * attempting a kill - there is nothing left to terminate), then delegates
+ * the actual termination to `src/tools/kill.ts`'s own exported `handler`,
+ * reusing its existing process-group kill/reap containment rather than
+ * reimplementing it here.
+ *
+ * The value returned is a FRESH `getTask` read taken AFTER that call
+ * settles - already the job's real terminal `cancelled` status for an
+ * ordinary live job (this codebase's own `kill.ts` claims the terminal
+ * state SYNCHRONOUSLY, the instant it actually signals, well before its
+ * own external reap-confirmation wait resolves - see that file's
+ * "Idempotency and races" docs), or the SAME state a fresh `getTask` call
+ * would already report for a job the kill attempt could not (or, for an
+ * already-terminal job, did not need to) touch. `killTool.handler`'s own
+ * `isError` outcomes are never surfaced as a failure of THIS call (see
+ * this file's header) - `cancelTask` simply reads back whatever is
+ * actually true of the job afterward.
+ *
+ * `now` is captured ONCE by the caller (or defaults to one real
+ * `Date.now()` here) and reused for BOTH the pre-kill existence/TTL check
+ * and the post-kill read, so a real-time kill attempt that happens to
+ * straddle a TTL boundary is judged consistently against one instant,
+ * never two different ones.
+ */
+export async function cancelTask(
+  taskId: string,
+  now: number = Date.now()
+): Promise<TaskResult | TaskNotFound> {
+  const current = getTask(taskId, now);
+  if ("error" in current) return current; // unknown, or just TTL-purged - nothing to kill
+
+  await killTool.handler({ job_id: taskId });
+
+  return getTask(taskId, now);
 }
 
 // ---------------------------------------------------------------------------

@@ -32,19 +32,26 @@
  * own), letting the test drive stdout/stderr arrival directly.
  *
  * SCOPE NOTE: this file exercises the tasked wait lifecycle end to end -
- * keepalive status, TTL purge, and the output-driven notification wake -
- * but deliberately does NOT cover cooperative cancel: real process-tree
- * death verification for a cancelled task, plus the isError/error
- * JSON-RPC-vs-result distinction that comes with it. That work depends on
- * an in-flight, not-yet-merged refinement to the kill primitives and is
- * tracked separately; nothing here asserts cancel's kill-and-reap
- * end-to-end or the isError/error distinction, and `tasks/cancel` itself
- * is untouched (still the pre-existing read-only interim snapshot
- * `test/tasks.test.ts` already covers).
+ * keepalive status, TTL purge, the output-driven notification wake, AND
+ * (below) `tasks/cancel`'s REAL kill-and-reap behavior: a real,
+ * grandchild-deep process tree bound to the job's original POSIX process
+ * group is genuinely signalled and reaped through `tasks/cancel` itself
+ * (never the raw `kill` tool), the cancel acknowledgement and a later
+ * `tasks/get`'s terminal observation are asserted as two DISTINCT steps
+ * (the acknowledgement's own status independently checked, not inferred
+ * from the later read), and the real terminal-status mapping is proven for
+ * every case tasks/cancel can actually reach - a job that exited
+ * non-zero, a job that never spawned at all, and a genuinely malformed
+ * request. The disclosed setsid()-escape boundary this containment
+ * inherits from `src/tools/kill.ts` is proven there, not duplicated here.
+ * `test/tasks.test.ts`'s own "interim contract" tests keep covering
+ * `tasks/update`'s read-only behavior and `tasks/cancel`'s unchanged
+ * idempotent no-op on an already-terminal or unknown taskId - this file is
+ * where a LIVE task's real cancellation is proven.
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { mock, test } from "node:test";
@@ -120,6 +127,14 @@ async function tasksGet(client: Client, taskId: string): Promise<Record<string, 
   return result as Record<string, unknown>;
 }
 
+async function tasksCancel(client: Client, taskId: string): Promise<Record<string, unknown>> {
+  const result = await client.request(
+    { method: "tasks/cancel", params: { taskId } },
+    passthroughSchema()
+  );
+  return result as Record<string, unknown>;
+}
+
 function runResultStructured(result: unknown): Record<string, unknown> {
   const structured = (result as { structuredContent?: unknown }).structuredContent;
   assert.equal(typeof structured, "object");
@@ -172,6 +187,51 @@ async function waitForRealDeath(pid: number, timeoutMs = 8000): Promise<void> {
       );
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+/** Polls a real external `pgrep -g <pgid>` read until `condition` holds, or returns whatever the LAST read was once `timeoutMs` elapses - the same shape test/harness.ts's own `waitForPgrepGroupMembers` establishes, kept local here (matching this file's own established self-contained-helper convention - see `pgrepGroupMembers` above) rather than imported. */
+async function waitForPgrepGroupMembers(
+  pgid: number,
+  condition: (members: number[]) => boolean,
+  timeoutMs: number
+): Promise<number[]> {
+  const start = Date.now();
+  for (;;) {
+    const members = pgrepGroupMembers(pgid);
+    if (condition(members)) return members;
+    if (Date.now() - start > timeoutMs) return members;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+/** True once `content` (a marker file's raw bytes) holds a single, complete, newline-terminated positive integer - a real pid or pgid. A shell `echo $$ > marker` redirect can be observed mid-write, and the leading digits of a longer pid parse as a perfectly valid (but wrong, truncated) smaller integer - the trailing newline is what says the whole number actually landed. */
+function parsesAsSinglePid(content: string): boolean {
+  if (!content.endsWith("\n")) return false;
+  const text = content.trim();
+  if (!/^\d+$/.test(text)) return false;
+  const pid = Number(text);
+  return Number.isInteger(pid) && pid > 0;
+}
+
+/** Polls a marker file for a COMPLETE single pid/pgid, never mere existence - a file appears the instant a shell redirect opens it, well before any bytes land (see `parsesAsSinglePid`'s own docs). */
+async function waitForPidMarker(filePath: string, timeoutMs = 8000): Promise<number> {
+  const start = Date.now();
+  let lastRead: string | undefined;
+  for (;;) {
+    if (existsSync(filePath)) {
+      const content = readFileSync(filePath, "utf8");
+      lastRead = content;
+      if (parsesAsSinglePid(content)) return Number(content.trim());
+    }
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(
+        lastRead === undefined
+          ? `timed out waiting for ${filePath} to appear`
+          : `timed out waiting for ${filePath} to hold a complete pid; last read ${JSON.stringify(lastRead)}`
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
 
@@ -1132,5 +1192,262 @@ test("ISOLATION: a listener registered on job A never receives job B's lines, an
   } finally {
     unsubA();
     unsubB();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// tasks/cancel: REAL kill-and-reap of the job's ORIGINAL process group,
+// reusing src/tools/kill.ts's own POSIX-process-group containment (never
+// reimplementing it) - proven end to end through the Tasks adapter surface
+// itself (tasks/cancel, never the raw "kill" tool), non-vacuously, with the
+// cancel acknowledgement and a later, separate tasks/get terminal
+// observation asserted as two distinct steps.
+// ---------------------------------------------------------------------------
+
+test("tasks/cancel kills and reaps a real grandchild-deep process tree bound to the job's original process group: the direct child and grandchild are observed live and RECORDED before any cancel is issued, the grandchild confirmed a member of the job's original pgid; the cancel acknowledgement is asserted independently; the recorded pids are confirmed gone afterward via a real external process-group observer, never the cancel call's own return value alone; and a LATER, separate tasks/get call independently confirms the cancelled terminal", async () => {
+  const pair = await startPair(true);
+  const dir = mkdtempSync(path.join(tmpdir(), "ghantika-cancel-tree-"));
+  let jobId: string | undefined;
+  try {
+    const pgidMarker = path.join(dir, "pgid.txt");
+    const childMarker = path.join(dir, "child.txt");
+    const grandchildMarker = path.join(dir, "grandchild.txt");
+    // A real shell tree three levels deep. The top-level shell is the
+    // job's own leader (and, since spawnManaged always spawns detached,
+    // the process group's own pgid). It backgrounds a subshell - the
+    // CHILD, a real, distinct forked process - and captures that
+    // subshell's own real pid via `$!` in THIS outer shell, immediately
+    // after backgrounding it: `$$` INSIDE a backgrounded subshell reports
+    // the PARENT shell's pid in every POSIX shell (bash and dash both), so
+    // `$!` in the parent is the only portable way to capture the
+    // subshell's own real identity. The subshell in turn backgrounds a
+    // real `sleep` - the GRANDCHILD - capturing ITS pid via its OWN `$!`,
+    // then `wait`s on it, which is what keeps the whole three-level tree
+    // (leader -> child -> grandchild), all sharing the leader's original
+    // process group (none of them ever call setsid()), genuinely alive
+    // until cancelled.
+    const shellCommand =
+      `echo $$ > '${pgidMarker}'; ` +
+      `( sleep 300 & echo $! > '${grandchildMarker}'; wait ) & ` +
+      `echo $! > '${childMarker}'; ` +
+      `wait`;
+
+    const minted = await runJob(pair.client, {
+      command: shellCommand,
+      shell: true,
+      label: "cancel-grandchild-tree",
+    });
+    jobId = minted.taskId as string;
+    assert.equal(typeof jobId, "string");
+
+    // -------------------------------------------------------------------
+    // PRE-CANCEL LIVENESS, anti-vacuity: the direct child AND the
+    // grandchild are observed live and RECORDED, the grandchild confirmed
+    // a member of the job's ORIGINAL process group, BEFORE any cancel is
+    // issued. Synchronizing on this real, external state - never a fixed
+    // sleep, never merely "the fixture was launched" - is what rules out
+    // cancel winning a race against the grandchild's own fork: if cancel
+    // could ever run before the grandchild genuinely exists in this group,
+    // this wait is exactly what would time out rather than silently
+    // passing having proven nothing.
+    // -------------------------------------------------------------------
+    const pgid = await waitForPidMarker(pgidMarker);
+    const childPid = await waitForPidMarker(childMarker);
+    const grandchildPid = await waitForPidMarker(grandchildMarker);
+    assert.notEqual(
+      childPid,
+      grandchildPid,
+      "the child and grandchild must be genuinely distinct real processes"
+    );
+    assert.notEqual(childPid, pgid, "the child must be distinct from the leader/pgid");
+    assert.notEqual(grandchildPid, pgid, "the grandchild must be distinct from the leader/pgid");
+
+    const beforeMembers = await waitForPgrepGroupMembers(
+      pgid,
+      (members) => members.includes(childPid) && members.includes(grandchildPid),
+      8000
+    );
+    assert.ok(
+      beforeMembers.includes(childPid),
+      `expected the direct child (pid ${childPid}) to be a live member of the original pgid ${pgid} BEFORE cancel, pgrep saw: ${JSON.stringify(beforeMembers)}`
+    );
+    assert.ok(
+      beforeMembers.includes(grandchildPid),
+      `expected the grandchild (pid ${grandchildPid}) to be a live member of the SAME original pgid ${pgid} BEFORE cancel - the non-vacuity proof this test exists for - pgrep saw: ${JSON.stringify(beforeMembers)}`
+    );
+    assert.ok(isProcessAlive(childPid), "expected the direct child to be alive before cancel");
+    assert.ok(isProcessAlive(grandchildPid), "expected the grandchild to be alive before cancel");
+
+    // -------------------------------------------------------------------
+    // CANCEL ACK: tasks/cancel returns an acknowledgement of the request -
+    // asserted on its OWN return value here, independently of the LATER
+    // tasks/get read below (never inferred from it). Message shape alone
+    // (extension/taskId/no-error) is not enough: a mutant that kills
+    // nothing and returns a stale "working" projection would still pass a
+    // shape-only check. The status must genuinely reflect the kill this
+    // call just performed.
+    // -------------------------------------------------------------------
+    const cancelAck = await tasksCancel(pair.client, jobId);
+    assert.equal(
+      cancelAck.extension,
+      TASKS_EXTENSION_URI,
+      `expected tasks/cancel's own return value to be a well-formed Tasks-shaped acknowledgement, got ${JSON.stringify(cancelAck)}`
+    );
+    assert.equal(
+      cancelAck.taskId,
+      jobId,
+      "expected the cancel acknowledgement to name this exact task"
+    );
+    assert.equal(
+      cancelAck.error,
+      undefined,
+      `expected a real acknowledgement, never a not-found response, got ${JSON.stringify(cancelAck)}`
+    );
+    assert.equal(
+      cancelAck.status,
+      "cancelled",
+      `expected the cancel acknowledgement's own status to already reflect the kill just performed, got ${JSON.stringify(cancelAck)}`
+    );
+
+    // -------------------------------------------------------------------
+    // POST-CANCEL DEATH: the pids RECORDED above are genuinely gone - an
+    // observer bound to the ORIGINAL pgid finds no surviving member, and
+    // the direct child (and the grandchild) are genuinely reaped. Real,
+    // external process-state checks (pgrep + isProcessAlive), never a
+    // trust in the cancel call's own return value alone.
+    // -------------------------------------------------------------------
+    const afterMembers = await waitForPgrepGroupMembers(
+      pgid,
+      (members) => members.length === 0,
+      8000
+    );
+    assert.deepEqual(
+      afterMembers,
+      [],
+      `expected zero surviving members of the ORIGINAL process group ${pgid} after tasks/cancel, pgrep still saw: ${JSON.stringify(afterMembers)}`
+    );
+    assert.equal(
+      isProcessAlive(childPid),
+      false,
+      "expected the direct child to be genuinely gone after cancel"
+    );
+    assert.equal(
+      isProcessAlive(grandchildPid),
+      false,
+      "expected the grandchild to be genuinely gone after cancel"
+    );
+
+    // -------------------------------------------------------------------
+    // LATER TERMINAL: a LATER, SEPARATE tasks/get call - never inferred
+    // from the cancel acknowledgement above - independently observes the
+    // cancelled terminal status.
+    // -------------------------------------------------------------------
+    const laterGet = await tasksGet(pair.client, jobId);
+    assert.equal(
+      laterGet.status,
+      "cancelled",
+      `expected a LATER, separate tasks/get to report the cancelled terminal status, got ${JSON.stringify(laterGet)}`
+    );
+  } finally {
+    // Best-effort safety net: if an earlier assertion above threw before
+    // tasks/cancel ever ran (or before it could complete), this still
+    // reaps the real backing process rather than leaking it - a no-op
+    // when tasks/cancel already succeeded (see killAndReapRealChild's own
+    // docs; every other test in this file follows the identical pattern).
+    if (jobId !== undefined) await killAndReapRealChild(jobId);
+    rmSync(dir, { recursive: true, force: true });
+    await pair.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// TERMINAL SHAPES vs PROTOCOL ERROR, read through tasks/cancel: a job that
+// ran and exited non-zero reads as a normal "completed" taskResult, with
+// the real exit code carried separately from status; a job that never
+// spawned at all (a genuine spawn error) reads as a normal "failed"
+// taskResult, a materially different case from a completed job whose
+// command happened to fail. Neither of those is ever a JSON-RPC protocol
+// error - only a genuinely malformed request (an empty taskId) is.
+// ---------------------------------------------------------------------------
+
+test("through tasks/cancel: a job that ran and exited non-zero reads as a normal completed taskResult (exit code carried separately from status), a job that never spawned at all reads as a normal failed taskResult, neither is ever a JSON-RPC protocol error, and only a genuinely malformed request (an empty taskId) is", async () => {
+  const pair = await startPair(true);
+  try {
+    // Case 1: a job that RAN and exited non-zero. mapJobStateToTaskStatus
+    // (src/tasksAdapter.ts) folds an "exited" job state to task status
+    // "completed" REGARDLESS of its real exit code - the exit code travels
+    // separately in the result, never folded into the status itself. Read
+    // through tasks/cancel (not tasks/get): cancelTask's own before/after
+    // read of an already-terminal job behaves exactly like a fresh getTask
+    // read, so this proves the SAME normal-result shape when reached via
+    // cancel specifically, which is what the criterion requires.
+    const exitedJob = await runJob(pair.client, {
+      command: [process.execPath, "-e", "process.exitCode = 3;"],
+      label: "cancel-completed-mapping",
+    });
+    const exitedJobId = exitedJob.taskId as string;
+    await pollUntilTerminal(pair.client, exitedJobId);
+    const exitedResult = await tasksCancel(pair.client, exitedJobId);
+    assert.equal(
+      exitedResult.status,
+      "completed",
+      `expected a job that exited non-zero to read as task status 'completed' through tasks/cancel, got ${JSON.stringify(exitedResult)}`
+    );
+    assert.equal(
+      exitedResult.exitCode,
+      3,
+      "the real non-zero exit code must be reflected separately from status, not folded into it"
+    );
+    assert.equal(
+      exitedResult.error,
+      undefined,
+      "a completed taskResult carries no error field at all - error belongs only to the separate taskNotFound shape"
+    );
+
+    // Case 2: a job that NEVER RAN - a genuine spawn-error (an executable
+    // that doesn't resolve at all). mapJobStateToTaskStatus folds this
+    // job-store "failed" state to task status "failed" - a DIFFERENT
+    // status from case 1's "completed", since this task itself never ran,
+    // distinct from a completed task whose command happened to exit
+    // non-zero. Read through tasks/cancel for the same reason as case 1.
+    const neverRanJob = await runJob(pair.client, {
+      command: ["this-command-definitely-does-not-exist-ghantika-cancel-test"],
+      label: "cancel-failed-mapping",
+    });
+    const neverRanJobId = neverRanJob.taskId as string;
+    await pollUntilTerminal(pair.client, neverRanJobId);
+    const neverRanResult = await tasksCancel(pair.client, neverRanJobId);
+    assert.equal(
+      neverRanResult.status,
+      "failed",
+      `expected a job that never spawned to read as task status 'failed' through tasks/cancel, got ${JSON.stringify(neverRanResult)}`
+    );
+
+    // Neither case above ever threw - both calls resolved as normal,
+    // successful RPC results (a JSON-RPC protocol error would have made
+    // the `await` itself reject). That IS the "never a JSON-RPC error"
+    // half of this criterion, asserted by the calls above having already
+    // returned rather than a separate check.
+
+    // Case 3: a genuinely malformed tasks/cancel request (an empty-string
+    // taskId, failing this adapter's own request-validation schema - the
+    // same request-validation boundary test/tasks.test.ts's own
+    // completeness sweep already proves for all three tasks/* methods
+    // generically) IS a real JSON-RPC protocol error - never silently
+    // accepted, never converted into a normal task result of any shape.
+    await assert.rejects(
+      () =>
+        pair.client.request(
+          { method: "tasks/cancel", params: { taskId: "" } },
+          passthroughSchema()
+        ),
+      (error: unknown) => {
+        const message = String((error as { message?: unknown })?.message ?? error);
+        return /-32602|invalid|taskId/i.test(message);
+      },
+      "expected tasks/cancel to reject an empty-string taskId as a genuine JSON-RPC protocol error, never as a normal (possibly isError) result"
+    );
+  } finally {
+    await pair.close();
   }
 });
