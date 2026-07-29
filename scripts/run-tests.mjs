@@ -606,6 +606,26 @@ export function checkSkipDiscipline({
 const SKIP_BASELINE_PATH = path.join(REPO_ROOT, "test", "skip-baseline.json");
 const CRITICAL_TESTS_PATH = path.join(REPO_ROOT, "test", "critical-tests.json");
 
+/**
+ * The command-policy allowlist every spawned test-file child process
+ * inherits by default, via GHANTIKA_POLICY_FILE (see src/policy.ts) - a
+ * small, fixed set of well-known executables (a POSIX shell, and the
+ * handful of ordinary binaries the existing suite's own fixtures spawn:
+ * node, echo, ls, true, sleep) the wider suite's pre-existing tests need
+ * to keep exercising a real `run` the same way they did before the policy
+ * gate existed. A fixed path computed unconditionally from REPO_ROOT, the
+ * same pattern SKIP_BASELINE_PATH/CRITICAL_TESTS_PATH above already use -
+ * this file still reads/consults no environment variable to change ANY of
+ * its own behavior (see this file's own header doc comment); this is the
+ * one place it SETS one, for the child processes it spawns, to a value
+ * nothing external can redirect. test/policy.test.ts exercises the policy
+ * gate's own default-deny/malformed-source behavior directly, reassigning
+ * this variable only within its own isolated child process (node:test's
+ * default per-file process isolation means that never affects a sibling
+ * test file's own process).
+ */
+const TEST_POLICY_ALLOW_PATH = path.join(REPO_ROOT, "test", "fixtures", "policy-allow.json");
+
 /** @param {string} [filePath] @returns {Record<string, string[]>} */
 export function loadSkipBaseline(filePath = SKIP_BASELINE_PATH) {
   return JSON.parse(readFileSync(filePath, "utf8"));
@@ -942,6 +962,10 @@ async function main() {
   }
 
   const junitPath = process.env.GHANTIKA_JUNIT ? path.resolve(process.env.GHANTIKA_JUNIT) : null;
+
+  // Every spawned test-file child process inherits this - see
+  // TEST_POLICY_ALLOW_PATH's own doc comment above for why.
+  process.env.GHANTIKA_POLICY_FILE = TEST_POLICY_ALLOW_PATH;
 
   await runOnce({ discovered, tracked, junitPath, options, skipBaseline, criticalTests });
 }

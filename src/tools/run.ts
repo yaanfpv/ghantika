@@ -22,15 +22,19 @@
  * deliberately slow `ps` observer - a synchronous capture used to block
  * this exact response on however long `ps` took.
  *
- * ## Two ways a job can be `failed` before this handler even returns
+ * ## Three ways a job can be `failed` before this handler even returns
  *
- * A `cwd` that doesn't exist (or isn't a directory), or a command that
- * doesn't resolve to a real executable file, are validated BEFORE ever
+ * A `cwd` that doesn't exist (or isn't a directory), a command that
+ * doesn't resolve to a real executable file, or a resolved command/shell
+ * binary the configured policy denies, are all validated BEFORE ever
  * calling `spawnManaged` - this handler explicitly forbids silently
- * defaulting a bad `cwd`, and requires that both failure classes produce a
- * job that starts already in a terminal state, rather than either
- * throwing a protocol error or racing an async OS-level failure. See
- * `src/process.ts`'s `resolveCwd`/`resolveExecutable`.
+ * defaulting a bad `cwd`, and requires that every one of the three failure
+ * classes produce a job that starts already in a terminal state, rather
+ * than either throwing a protocol error or racing an async OS-level
+ * failure. See `src/process.ts`'s `resolveCwd`/`resolveExecutable` for the
+ * first two, and `src/policy.ts`'s `decideRunPolicy`/`decideShellPolicy`
+ * for the policy gate - run last, on the already-resolved target, so
+ * nothing between it and the real spawn can change what actually executes.
  *
  * ## Birth-identity capture, at spawn time - ASYNC, never on the response path
  *
@@ -63,6 +67,7 @@
 import type { CallToolResult, Tool } from "@modelcontextprotocol/server";
 
 import { type PublicJobProjection, jobStore, toPublicProjection } from "../jobStore.js";
+import { decideRunPolicy, decideShellPolicy } from "../policy.js";
 import {
   buildChildEnv,
   captureBirthIdentityPosixAsync,
@@ -74,7 +79,7 @@ import {
 export const name = "run";
 
 export const description =
-  "Start a command in the background without blocking the calling agent. Returns a job_id immediately; use that id with status to check whether the job is still running, output to read its lines from a cursor, and tail to read just the last N. command is an argv array by default (never shell-interpreted) - pass shell: true to run a real shell command line instead.";
+  "Start a command in the background without blocking the calling agent. Returns a job_id immediately; use that id with status to check whether the job is still running, output to read its lines from a cursor, and tail to read just the last N. command is an argv array by default (never shell-interpreted) - pass shell: true to run a real shell command line instead. The resolved command (or, with shell: true, the platform shell itself) must be on the operator's configured allowlist; anything else settles as a failed job rather than running.";
 
 const MAX_LABEL_LENGTH = 64;
 
@@ -231,6 +236,7 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
     return toolSuccess(toPublicProjection(record, jobStore.getOutputCounts(record.job_id)));
   }
 
+  let policyDecision: ReturnType<typeof decideRunPolicy>;
   if (!isShell) {
     const resolvedBinary = resolveExecutable(argv[0]!, cwdResult.resolvedCwd, resolvedEnv);
     if (resolvedBinary === undefined) {
@@ -244,6 +250,34 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
       });
       return toolSuccess(toPublicProjection(record, jobStore.getOutputCounts(record.job_id)));
     }
+    // The policy check runs on the RESOLVED executable (never re-derived -
+    // this is the exact same resolution result the "command not found"
+    // check just above already computed), and as late as possible before
+    // the real spawn below - nothing between here and spawnManaged() can
+    // still change what actually gets executed.
+    policyDecision = decideRunPolicy(resolvedBinary);
+  } else {
+    // shell: true has no caller-named executable to resolve at all -
+    // decideShellPolicy resolves the FIXED platform shell binary
+    // spawnManaged's own shell: true call will actually invoke (see its
+    // own docs), and judges THAT, never anything from shellCommand
+    // itself. This is the same gate a direct invocation gets, run at the
+    // same "as late as possible" point - shell: true is never a bypass
+    // route.
+    policyDecision = decideShellPolicy(resolvedEnv);
+  }
+
+  if (!policyDecision.allowed) {
+    const record = jobStore.createFailedJob({
+      argv: internalArgv,
+      cwd: cwdResult.resolvedCwd,
+      env: resolvedEnv,
+      label,
+      isShell,
+      diagnosticReason: "policy-denied",
+      diagnosticMessage: policyDecision.reason ?? "denied by policy",
+    });
+    return toolSuccess(toPublicProjection(record, jobStore.getOutputCounts(record.job_id)));
   }
 
   const record = jobStore.createJob({

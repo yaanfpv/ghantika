@@ -96,25 +96,26 @@ export function isJobDiagnosticReason(value: unknown): value is JobDiagnosticRea
  * Why a job ended up `failed`. `reason` is a CLOSED three-value set, never
  * an open string:
  *
- * - `spawn-error`: the ONLY value this codebase's real code paths produce
- *   today - a cwd/executable pre-flight rejection (`createFailedJob`,
+ * - `spawn-error`: a cwd/executable pre-flight rejection (`createFailedJob`,
  *   called from `src/tools/run.ts` before ever attempting a real spawn) or
  *   a genuine async OS-level spawn failure (`markSpawnFailed`, called from
  *   `src/process.ts`'s `spawnManaged` `onError` callback).
- * - `policy-denied`: reserved for a future command allowlist/denylist
- *   policy gate - this codebase has no such gate today, so nothing ever
- *   produces this value yet. Declared now so the type is closed over its
- *   full legal range from the start, rather than every future producer
- *   needing to widen an already-shipped union.
+ * - `policy-denied`: the resolved command (or, with `shell: true`, the
+ *   resolved platform shell binary) was rejected by the command allowlist
+ *   gate - `createFailedJob`, called from `src/tools/run.ts` with this
+ *   reason when `src/policy.ts`'s `decideRunPolicy`/`decideShellPolicy`
+ *   returns `allowed: false`, before ever attempting a real spawn. See
+ *   `src/policy.ts`'s own docs for how that decision is made.
  * - `watcher/runtime-error`: reserved for a future background
  *   watcher/supervisor failure class - this codebase has no such watcher
  *   today (job state is driven directly by real `child_process` events,
  *   never a separate polling watcher process), so nothing produces this
- *   value yet either, for the same reason as `policy-denied` above.
+ *   value yet.
  *
- * Deliberately NOT wiring a real producer for the latter two here: doing so
- * would mean inventing a scenario this codebase doesn't actually have,
- * which is worse than an honestly-reserved, closed, currently-unused value.
+ * Deliberately NOT wiring a real producer for `watcher/runtime-error` here:
+ * doing so would mean inventing a scenario this codebase doesn't actually
+ * have, which is worse than an honestly-reserved, closed, currently-unused
+ * value.
  */
 export interface JobDiagnostic {
   readonly reason: JobDiagnosticReason;
@@ -975,6 +976,15 @@ interface CreateJobInput {
 
 interface CreateFailedJobInput extends CreateJobInput {
   readonly diagnosticMessage: string;
+  /**
+   * Defaults to `"spawn-error"` - the reason every call site had before the
+   * command-policy gate existed. `src/tools/run.ts` passes
+   * `"policy-denied"` explicitly for a job rejected by
+   * `src/policy.ts`'s `decideRunPolicy`/`decideShellPolicy`; every other
+   * existing call site (a bad `cwd`, an unresolvable executable) is
+   * unchanged and keeps relying on this default.
+   */
+  readonly diagnosticReason?: JobDiagnosticReason;
 }
 
 /**
@@ -1136,7 +1146,7 @@ export class JobStore {
       state: "failed",
       started_at: now,
       ended_at: now,
-      diagnostic: { reason: "spawn-error", message: input.diagnosticMessage },
+      diagnostic: { reason: input.diagnosticReason ?? "spawn-error", message: input.diagnosticMessage },
       label: input.label,
       seq: this.nextSeq(),
       is_shell: input.isShell,

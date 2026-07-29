@@ -209,9 +209,10 @@ export function isTaskStatusValue(value: unknown): value is TaskStatusValue {
  * status); `exited` is `completed` REGARDLESS of the job's real exit code
  * (a task that ran to completion is a completed task - the actual
  * `exitCode` travels separately in the result, see `buildTaskResult`,
- * never folded into the status itself); `failed` (this codebase's own
- * spawn-error class - a cwd/executable preflight rejection or a genuine
- * async spawn failure, see `src/jobStore.ts`'s `JobDiagnosticReason` docs)
+ * never folded into the status itself); `failed` (the job never actually
+ * spawned at all - see `src/jobStore.ts`'s `JobDiagnosticReason` docs for
+ * the specific reasons, e.g. a cwd/executable preflight rejection, a
+ * genuine async spawn failure, or a command the policy gate denied)
  * is the task-level `failed` (the task itself never ran, distinct from a
  * completed task whose command happened to exit non-zero); `killed` is
  * `cancelled` (an explicit kill, whether via the `kill` tool today or a
