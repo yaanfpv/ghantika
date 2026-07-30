@@ -43,6 +43,7 @@ import {
   throwUnlessBenignAlreadyGoneRace,
   waitForProcessDeath,
 } from "../dist/process.js";
+import { TASK_TTL_MS, getTask } from "../dist/tasksAdapter.js";
 
 // Explicit ".ts" extension - this helper has no relative imports of its
 // own, so Node's native TypeScript support can load it directly without a
@@ -3291,5 +3292,305 @@ test(
     } catch {
       // already gone - fine.
     }
+  }
+);
+
+// -----------------------------------------------------------------------------
+// Optional per-job execution deadline: run() accepts an optional deadline_ms.
+// Once it elapses on a still-running job, this codebase's own real
+// process-group kill machinery (the same primitives exercised throughout
+// this file - evaluatePreSignalIdentityGate, killProcessGroupPosix) is used
+// to terminate it, and the job is recorded as failed - never a new status.
+// Exercised end to end through run()'s real handler and the real jobStore
+// it's built on, never by re-implementing any kill logic here.
+//
+// A note on distinctness from the Tasks-extension's own TTL purge
+// (src/tasksAdapter.ts): the deadline transition itself never removes the
+// job's record - it only fails the job, exactly like any other failure
+// path. The record can still be purged later, on a subsequent
+// `tasks/get` read, once it has been terminal for at least TASK_TTL_MS -
+// the SAME lazy, on-read purge every other terminal job is already
+// subject to, nothing deadline-specific about it. The tests below assert
+// the deadline half directly (expiring fails the job, the record is
+// present immediately after); the combined test further down proves the
+// TTL half actually reaches a deadline-failed record too, rather than
+// leaving that as an unverified assumption.
+// -----------------------------------------------------------------------------
+
+import { jobStore } from "../dist/jobStore.js";
+import * as runTool from "../dist/tools/run.js";
+
+/** The closed set of job states this codebase's job model has, spelled out
+ * as an independent literal oracle (not imported from jobStore.ts) so a
+ * future change that quietly widens the real union cannot also widen what
+ * this file checks against. */
+const KNOWN_JOB_STATES = ["starting", "running", "exited", "killed", "failed"];
+
+function runJobIdOf(result: ReturnType<typeof runTool.handler>): string {
+  const structured = result.structuredContent as Record<string, unknown>;
+  const jobId = structured.job_id;
+  assert.equal(typeof jobId, "string", `expected a real job_id, got: ${JSON.stringify(result)}`);
+  return jobId as string;
+}
+
+test(
+  "run(): omitting deadline_ms leaves a job's own natural lifecycle completely untouched, even across a huge mocked time jump - no deadline was ever scheduled to expire",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const result = runTool.handler({ command: ["sleep", "60"] }); // deadline_ms omitted entirely
+    const jobId = runJobIdOf(result);
+    const handle = jobStore.getChildHandle(jobId)!;
+
+    // A jump far larger than any deadline this file sets anywhere else -
+    // if this feature's mere existence affected an un-timed job at all,
+    // this is where it would show up.
+    t.mock.timers.tick(10 * 60 * 1000);
+    t.mock.timers.reset();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    try {
+      assert.equal(
+        jobStore.get(jobId)!.state,
+        "running",
+        "an un-timed job must still be running after a huge mocked time jump - nothing was ever scheduled to end it early"
+      );
+      assert.equal(
+        isProcessGroupAlive(handle.pid),
+        true,
+        "a real, external liveness check must confirm the process is still genuinely alive, not merely trust the job record's own state"
+      );
+    } finally {
+      process.kill(-handle.pid, "SIGKILL");
+    }
+  }
+);
+
+test(
+  "run(): a still-running job whose deadline_ms elapses is terminated through the real process-group kill machinery, recorded as failed with its record still present - driven entirely by a deterministic mocked clock, never a real sleep for the deadline itself",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async (t) => {
+    const deadlineMs = 200_000; // reachable only by advancing the mocked clock - a real wait this long would make this test itself the thing it is meant to prove unnecessary
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const result = runTool.handler({ command: ["sleep", "600"], deadline_ms: deadlineMs });
+    const jobId = runJobIdOf(result);
+    const handle = jobStore.getChildHandle(jobId)!;
+    const pid = handle.pid;
+
+    assert.notEqual(
+      jobStore.get(jobId)!.state,
+      "failed",
+      "the job must not already be failed before its deadline has elapsed at all"
+    );
+
+    // Advance the mocked clock past the deadline - the entire "wait" this
+    // test ever performs for the deadline itself - then hand real timers
+    // back so the real kill mechanics this fires off (the identity gate,
+    // the real SIGTERM, the grace-period wait, the external confirmation)
+    // run and complete against the real spawned process on real time,
+    // exactly as this file's own existing kill tests already do elsewhere.
+    t.mock.timers.tick(deadlineMs);
+    t.mock.timers.reset();
+
+    await waitFor(() => jobStore.get(jobId)?.state === "failed", 5000);
+    // A real, external, no-zombie-survivors liveness check - polled rather
+    // than sampled once, so a process still mid-death from the SIGTERM this
+    // codebase just sent cannot read as a flaky failure.
+    await waitFor(() => !isProcessGroupAlive(pid), 5000);
+
+    const record = jobStore.get(jobId)!;
+    assert.equal(record.state, "failed");
+    assert.ok(
+      KNOWN_JOB_STATES.includes(record.state),
+      `expected one of this codebase's five pre-existing job states, got "${record.state}"`
+    );
+    assert.notEqual(record.state, "expired", "a deadline must never introduce a new job status");
+    assert.equal(
+      record.diagnostic?.reason,
+      "watcher/runtime-error",
+      "a deadline-exceeded job must reuse the same closed diagnostic-reason enum every other failed job already uses, never a bespoke one"
+    );
+    assert.match(record.diagnostic!.message, /deadline/i);
+    assert.equal(
+      isProcessGroupAlive(pid),
+      false,
+      "the real process group must be genuinely dead - an external liveness observation, not merely a claimed state"
+    );
+
+    // A deadline is a job-layer concern only - it must never surface as
+    // anything other than an ordinary failed job's own real output counts.
+    assert.equal(jobStore.getOutputCounts(jobId).stdout_lines, 0);
+
+    // The deadline transition itself does not remove the job's record -
+    // it is present immediately after the deadline failure. This does not
+    // claim the record is retained forever: see the combined test below
+    // for what happens once TASK_TTL_MS has also elapsed and a Tasks read
+    // triggers the purge.
+    assert.equal(
+      jobStore.has(jobId),
+      true,
+      "a deadline-expired job's record must be present immediately after the deadline fires"
+    );
+    assert.notEqual(jobStore.get(jobId), undefined);
+  }
+);
+
+test(
+  "run(): a deadline-expired job's record, present right after the deadline fires, is later purged by the ordinary Tasks-extension TTL read once TASK_TTL_MS has also elapsed - the two mechanisms compose, proving the distinctness claim above rather than merely asserting it",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async (t) => {
+    const deadlineMs = 200_000;
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const result = runTool.handler({ command: ["sleep", "600"], deadline_ms: deadlineMs });
+    const jobId = runJobIdOf(result);
+    const handle = jobStore.getChildHandle(jobId)!;
+    const pid = handle.pid;
+
+    t.mock.timers.tick(deadlineMs);
+    t.mock.timers.reset();
+
+    await waitFor(() => jobStore.get(jobId)?.state === "failed", 5000);
+    await waitFor(() => !isProcessGroupAlive(pid), 5000);
+
+    // Immediately after the deadline fires: failed, record present -
+    // the same claim the test above already covers, re-asserted here as
+    // the starting point this test's own TTL half builds on.
+    assert.equal(jobStore.get(jobId)!.state, "failed");
+    assert.equal(jobStore.has(jobId), true);
+
+    // getTask takes an explicit `now`, so the TTL half needs no timer
+    // mock at all - just a computed instant past TASK_TTL_MS from this
+    // job's real end time.
+    const endedAtMs = jobStore.get(jobId)!.ended_at
+      ? new Date(jobStore.get(jobId)!.ended_at!).getTime()
+      : Date.now();
+    const notYetPastTtl = getTask(jobId, endedAtMs + TASK_TTL_MS - 1000);
+    assert.equal(
+      notYetPastTtl.status,
+      "failed",
+      "just under TASK_TTL_MS since the deadline-driven end, the record must still read normally"
+    );
+    assert.equal(jobStore.has(jobId), true, "not yet purged - still under TASK_TTL_MS");
+
+    const pastTtl = getTask(jobId, endedAtMs + TASK_TTL_MS + 1000);
+    assert.equal(
+      pastTtl.error,
+      "task_not_found",
+      `expected the deadline-failed record to be purged past TASK_TTL_MS by the ordinary TTL read, got ${JSON.stringify(pastTtl)}`
+    );
+    assert.equal(
+      jobStore.has(jobId),
+      false,
+      "the TTL read must have actually removed the record from jobStore, not merely reported it as gone"
+    );
+  }
+);
+
+test(
+  "run(): a job that finishes naturally well before its own deadline keeps its natural outcome - the deadline timer never fires and never overrides a real result",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const result = runTool.handler({
+      command: ["sh", "-c", "exit 7"],
+      deadline_ms: 3000, // a real deadline the job's own near-instant exit will always beat
+    });
+    const jobId = runJobIdOf(result);
+
+    await waitFor(() => jobStore.get(jobId)?.state === "exited", 5000);
+
+    const record = jobStore.get(jobId)!;
+    assert.equal(record.state, "exited");
+    assert.equal(record.exit_code, 7);
+    assert.equal(
+      record.diagnostic,
+      undefined,
+      "a job that finished on its own must never carry a deadline-exceeded diagnostic"
+    );
+  }
+);
+
+test("run(): deadline_ms rejects a non-positive or non-finite value rather than silently accepting it", () => {
+  for (const badValue of [
+    0,
+    -1,
+    -1000,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+  ]) {
+    const result = runTool.handler({ command: ["true"], deadline_ms: badValue });
+    assert.equal(result.isError, true, `expected deadline_ms: ${badValue} to be rejected`);
+  }
+});
+
+test("run(): deadline_ms rejects a non-number value", () => {
+  for (const badValue of ["1000", true, [], {}, null]) {
+    const result = runTool.handler({
+      command: ["true"],
+      deadline_ms: badValue as unknown as number,
+    });
+    assert.equal(
+      result.isError,
+      true,
+      `expected deadline_ms: ${JSON.stringify(badValue)} to be rejected`
+    );
+  }
+});
+
+test("run(): deadline_ms rejects the first value above Node's own timer maximum, before ever spawning - Node itself would otherwise silently clamp this to a near-immediate deadline rather than honoring the requested one", () => {
+  const result = runTool.handler({ command: ["sleep", "60"], deadline_ms: 2_147_483_648 });
+  assert.equal(result.isError, true, "the first overflowing value must be rejected outright");
+  assert.match(
+    (result.content[0] as { text: string }).text,
+    /2147483647/,
+    "the rejection message must name Node's own maximum, not just say the value is invalid"
+  );
+  // validateRunInput (see validateDeadlineMs) fails and this handler
+  // returns via toolError() BEFORE ever reaching the block that resolves
+  // cwd/executable, calls spawnManaged, or generates a job id - reading
+  // that control flow directly shows no path from a rejected deadline_ms
+  // to a real spawn. So the isError assertion above already establishes
+  // "no job started" by construction; there is no observable job id or
+  // process to additionally check, the same way the sibling rejection
+  // tests above (non-positive/non-finite, non-number) don't either.
+});
+
+test(
+  "run(): deadline_ms accepts Node's own exact timer maximum (2147483647) - the supported boundary is not accidentally excluded by the overflow rejection above",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const result = runTool.handler({
+      command: ["sleep", "600"],
+      deadline_ms: 2_147_483_647,
+    });
+    assert.equal(result.isError, undefined, "the exact supported maximum must be accepted");
+    const jobId = runJobIdOf(result);
+    assert.notEqual(
+      jobStore.get(jobId)!.state,
+      "failed",
+      "the job must be running normally immediately after accepting the boundary deadline"
+    );
+
+    // Prove the timer was genuinely scheduled at this exact value, not
+    // silently rounded or dropped - tick the mocked clock to one
+    // millisecond short of it first (must NOT fire), then to the exact
+    // value (must fire), reusing this file's own real-kill-verification
+    // pattern rather than a bare timer-scheduled assertion.
+    t.mock.timers.tick(2_147_483_646);
+    assert.notEqual(
+      jobStore.get(jobId)!.state,
+      "failed",
+      "the deadline must not fire one millisecond early"
+    );
+    t.mock.timers.tick(1);
+    t.mock.timers.reset();
+
+    await waitFor(() => jobStore.get(jobId)?.state === "failed", 5000);
+    const handle = jobStore.getChildHandle(jobId);
+    if (handle !== undefined) {
+      await waitFor(() => !isProcessGroupAlive(handle.pid), 5000);
+    }
+    assert.equal(jobStore.get(jobId)!.diagnostic?.reason, "watcher/runtime-error");
   }
 );
