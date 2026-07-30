@@ -157,7 +157,7 @@ function checkTasksExtensionSchemaPin(root) {
  * `checkExpectedDevPackage` both compare every exact pin against this one
  * recorded literal, not just against each other.
  */
-export const REQUIRED_MCP_SDK_VERSION = "2.0.0-beta.5";
+export const REQUIRED_MCP_SDK_VERSION = "2.0.0";
 
 /**
  * The exact production `@modelcontextprotocol/*` package SET this repo

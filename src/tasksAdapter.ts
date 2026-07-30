@@ -22,7 +22,7 @@
  * ## Why this is a hand-rolled adapter, not a thin re-export of the SDK's
  * own Task machinery
  *
- * The installed `@modelcontextprotocol/server@2.0.0-beta.5` package's own
+ * The installed `@modelcontextprotocol/server@2.0.0` package's own
  * Task-shaped exports (`Task`, `TaskStatus`, `CreateTaskResult`,
  * `GetTaskRequest`, `ListTasksRequest`, `CancelTaskRequest`, ...) are ALL
  * individually marked `@deprecated 2025-11-25 wire vocabulary with no SDK

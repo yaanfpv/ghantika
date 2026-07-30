@@ -121,7 +121,7 @@
  * purposes. This cannot cause a missed detection (only, in principle, a
  * broader-than-strictly-necessary match), and no subpath of this package
  * exports a Tasks-named symbol today - verified against the pinned
- * `@modelcontextprotocol/server@2.0.0-beta.5` package tree.
+ * `@modelcontextprotocol/server@2.0.0` package tree.
  *
  * This file's OWN createRequire ban (calling `createRequire` at all, the
  * global `require`/`eval`/`Function`/`module`/`Reflect` acquisition sites,
@@ -163,7 +163,7 @@ const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SRC_DIR = path.join(REPO_ROOT, "src");
 const THIS_FILE_PATH = fileURLToPath(import.meta.url);
 
-/** The installed package name this guard's root specifier resolves against. Pinned per package.json/package-lock.json: `@modelcontextprotocol/server@2.0.0-beta.5`. */
+/** The installed package name this guard's root specifier resolves against. Pinned per package.json/package-lock.json: `@modelcontextprotocol/server@2.0.0`. */
 const SERVER_PACKAGE_NAME = "@modelcontextprotocol/server";
 
 /**
@@ -196,7 +196,7 @@ export const TASKS_ADAPTER_RELATIVE_PATH = "tasksAdapter.ts";
 
 /**
  * The enumerated Tasks export set - exactly the root exports of the pinned
- * `@modelcontextprotocol/server@2.0.0-beta.5` package's `dist/index.d.mts`
+ * `@modelcontextprotocol/server@2.0.0` package's `dist/index.d.mts`
  * whose PUBLIC name matches `/Task/i`, copied here by hand from that real,
  * pinned declaration file (never hand-guessed or trimmed to "the symbols
  * some earlier row happened to import"). Spans type-only symbols
@@ -212,9 +212,9 @@ export const TASKS_ADAPTER_RELATIVE_PATH = "tasksAdapter.ts";
  * this constant - so under- or over-enumerating this list, or the set
  * drifting out of sync with a future dependency bump, reds that test
  * rather than silently narrowing (or vacuously widening) what this guard
- * catches. Byte-identical to `2.0.0-beta.4`'s own `/Task/i` root-export
- * set (verified by a direct `dist/index.d.mts` diff) - the beta.4 -> beta.5
- * bump is inert for the Tasks surface this guard cares about.
+ * catches. Byte-identical to `2.0.0-beta.5`'s own `/Task/i` root-export
+ * set (verified by a direct `dist/index.d.mts` diff) - the beta.5 -> 2.0.0
+ * GA bump is inert for the Tasks surface this guard cares about.
  */
 export const TASKS_SYMBOLS = new Set([
   "CancelTaskRequest",
