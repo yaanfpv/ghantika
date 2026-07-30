@@ -460,6 +460,61 @@ test(
   }
 );
 
+test("otherLiveChildCount excludes an exited child's job - markExited transitions its state to terminal without ever removing its entry from `children`, so a plain count of that map would still count it", async () => {
+  // `[process.execPath, "-e", "process.exit(0)"]` - the same cross-platform
+  // trivial-spawn shape `test/e2e-server.test.ts` already uses elsewhere,
+  // chosen deliberately over a bare `true`/`sleep` (POSIX-only, and every
+  // existing `attachChild` test above skips on win32 for exactly that
+  // reason): this method has nothing to do with process groups or POSIX
+  // signaling, only `this.children`/`this.jobs` bookkeeping, so nothing
+  // here should be platform-gated.
+  const jobArgv = [process.execPath, "-e", "process.exit(0)"];
+  const store = new JobStore();
+  const excluded = store.createJob({ argv: jobArgv, cwd: "/tmp", env: {}, isShell: false });
+  const liveOther = store.createJob({ argv: jobArgv, cwd: "/tmp", env: {}, isShell: false });
+  const exitedOther = store.createJob({ argv: jobArgv, cwd: "/tmp", env: {}, isShell: false });
+
+  const spawnOpts = {
+    onSpawn: () => {},
+    onError: () => {},
+    onExit: () => {},
+    onStdoutChunk: () => {},
+    onStderrChunk: () => {},
+    onStdoutEnd: () => {},
+    onStderrEnd: () => {},
+  };
+  const childFor = () =>
+    spawnManaged(
+      { argv: jobArgv, cwd: process.cwd(), env: { PATH: process.env.PATH ?? "" } },
+      spawnOpts
+    );
+
+  const excludedChild = childFor();
+  const liveChild = childFor();
+  const exitedChild = childFor();
+  store.attachChild(excluded.job_id, excludedChild!);
+  store.attachChild(liveOther.job_id, liveChild!);
+  store.attachChild(exitedOther.job_id, exitedChild!);
+
+  // `exitedOther`'s job record transitions to a terminal state, but
+  // `attachChild`'s entry in `this.children` is never removed by
+  // `markExited` - later reads (output, tail, status) still need it. A
+  // plain `this.children.size` (or a count that skips only `excludeJobId`)
+  // would still count this job; `otherLiveChildCount` must not.
+  store.markExited(exitedOther.job_id, 0, null);
+
+  assert.equal(
+    store.otherLiveChildCount(excluded.job_id),
+    1,
+    "expected only liveOther to count - excluded is excluded by id, exitedOther is excluded by its terminal state"
+  );
+  assert.equal(
+    store.otherLiveChildCount(liveOther.job_id),
+    1,
+    "from liveOther's own perspective, only excluded's still-live child counts - exitedOther still must not"
+  );
+});
+
 test("getChildHandle returns undefined for a job that never had a child attached (e.g. a job that started already-failed)", () => {
   const store = new JobStore();
   const record = store.createFailedJob({

@@ -340,6 +340,56 @@ test(
   }
 );
 
+test(
+  "run(): a spawn-time capture failure's diagnostic carries run()'s own context-hook argument, not just captureBirthIdentityPosixAsync's generic hook mechanism exercised in isolation",
+  { skip: POSIX_ONLY_SKIP },
+  async (t) => {
+    const errorSpy = t.mock.method(console, "error");
+
+    const realPath = process.env.PATH;
+    let result: ReturnType<typeof runTool.handler>;
+    try {
+      process.env.PATH = "/tmp/does-not-exist-ghantika-empty-path-dir";
+      result = runTool.handler({
+        command: ["sleep", "5"],
+        env: { vars: { PATH: realPath ?? "/usr/bin:/bin" } },
+      });
+    } finally {
+      process.env.PATH = realPath;
+    }
+    assert.notEqual(result.isError, true);
+    const jobId = jobIdOf(result);
+    await waitForIdentityCaptureSettled(jobId);
+
+    // This proves WIRING, not VALUE correctness: "other spawned child(ren)
+    // tracked" is text only run.ts's own context-hook call produces
+    // (src/tools/run.ts's call into captureBirthIdentityPosixAsync) - a
+    // deletion of that call's context-hook argument would leave the
+    // diagnostic's branch/detail intact but drop this clause entirely,
+    // which is what this test catches. It does NOT check that the
+    // reported otherLiveChildCount number is itself meaningful under real
+    // concurrent load - that is `jobStore.test.ts`'s job for
+    // `otherLiveChildCount` directly.
+    const wiredCalls = errorSpy.mock.calls.filter((call) =>
+      String(call.arguments[0]).includes("other spawned child(ren) tracked")
+    );
+    assert.equal(
+      wiredCalls.length,
+      1,
+      `expected exactly one diagnostic carrying run()'s own context-hook argument, got: ${JSON.stringify(
+        errorSpy.mock.calls.map((c) => c.arguments.map(String))
+      )}`
+    );
+
+    const killResult = await killTool.handler({ job_id: jobId });
+    assert.notEqual(
+      killResult.isError,
+      true,
+      `cleanup kill() must succeed: ${JSON.stringify(killResult)}`
+    );
+  }
+);
+
 // ---------------------------------------------------------------------------
 // 4. PERMANENT REGRESSION: run()'s response time must be independent of a
 //    slow-but-successful identity observer, AND a kill() that races ahead
