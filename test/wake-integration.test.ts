@@ -742,6 +742,17 @@ test("green control: a bounded stream UNDER FIREHOSE_LINES_PER_SEC runs to its o
 // comparison below is against this canonical projection, not literal wire
 // bytes - see the field-exclusion rationale below for exactly what it masks
 // and why.
+//
+// Each tool's golden entry carries BOTH `structuredContent` and `content`
+// (the human-readable text block every real CallToolResult also carries),
+// captured and canonicalized independently. Every tool handler in this
+// codebase builds `content` as `JSON.stringify(structuredContent, null,
+// 2)` - a real, source-verified invariant at capture time, not an assumed
+// one - but that is exactly the kind of parity a future edit could break
+// without touching structuredContent at all (a stale or hand-edited
+// content string, say). Comparing only structuredContent, as this file
+// used to, would pass right through such a break; capturing and comparing
+// both closes that gap.
 // =============================================================================
 
 const golden = JSON.parse(readFileSync(GOLDEN_PATH, "utf8")) as Record<string, unknown>;
@@ -834,7 +845,33 @@ function assertPlainPollByteIdentical(live: unknown, context: string): void {
   );
 }
 
-/** Runs the same six deterministic scenarios the golden was captured from, against a PLAIN (non-Tasks-capable) client, and returns each tool's canonicalized structuredContent keyed by tool name. */
+/**
+ * Extracts BOTH halves of a real `CallToolResult` a golden comparison
+ * needs: `structuredContent` as-is, and `content`'s own text block
+ * independently re-parsed from its raw JSON string - never assumed equal
+ * to `structuredContent` just because that is every handler's current
+ * contract. A future regression that lets the two drift (a stale
+ * `content` string a handler forgot to update alongside a real
+ * `structuredContent` change, say) is exactly what capturing both
+ * separately is for.
+ */
+function toCanonicalResultPair(result: {
+  content?: Array<{ type: string; text?: string }>;
+  structuredContent?: unknown;
+}): { structuredContent: unknown; content: unknown } {
+  const text = result.content?.[0]?.text;
+  assert.equal(
+    typeof text,
+    "string",
+    `expected a text content block, got: ${JSON.stringify(result.content)}`
+  );
+  return {
+    structuredContent: result.structuredContent,
+    content: JSON.parse(text as string),
+  };
+}
+
+/** Runs the same six deterministic scenarios the golden was captured from, against a PLAIN (non-Tasks-capable) client, and returns each tool's canonicalized {structuredContent, content} pair keyed by tool name. */
 async function runPlainPollScenarios(
   client: Client,
   labelPrefix: string
@@ -847,6 +884,7 @@ async function runPlainPollScenarios(
     await pollUntilTerminal(client, jobId);
     const listResult = (await client.callTool({ name: "list", arguments: {} })) as {
       structuredContent?: { jobs?: Array<Record<string, unknown>> };
+      content?: Array<{ type: string; text?: string }>;
     };
     const allJobs = listResult.structuredContent?.jobs ?? [];
     const mine = allJobs.filter((entry) => entry.label === `${labelPrefix}-list-job`);
@@ -855,7 +893,50 @@ async function runPlainPollScenarios(
       1,
       `expected exactly one list entry for this scenario's own job, got ${mine.length}`
     );
-    results.list = { jobs: mine };
+    // The REAL, process-wide list response can legitimately carry other
+    // jobs too - a separate Tasks-capable connection's own keepalive job,
+    // in the cross-connection scenario below, since jobStore is a single
+    // process-wide singleton shared by every connection. The golden
+    // comparison below is necessarily scoped to this scenario's own entry
+    // (job COUNT varies by design between scenarios), but that alone would
+    // miss an additivity regression that corrupts OTHER entries without
+    // touching this one - an extra field leaking onto every job the Tasks
+    // adapter can see, say, which a purely label-filtered view can never
+    // observe because it discards every entry but its own before any
+    // assertion runs. So every real entry in the UNFILTERED response is
+    // first asserted to share this job-entry's own canonical key set.
+    const expectedKeys = Object.keys(canonicalizePlainPollResponse(mine[0]) as object).sort();
+    for (const entry of allJobs) {
+      const entryKeys = Object.keys(canonicalizePlainPollResponse(entry) as object).sort();
+      assert.deepEqual(
+        entryKeys,
+        expectedKeys,
+        `every real entry in the process-wide list response must share this job-entry shape - found ${JSON.stringify(entry)}, expected keys ${JSON.stringify(expectedKeys)}`
+      );
+    }
+    // `list`'s own content text is a bare array (not wrapped under
+    // `jobs`, unlike structuredContent) - see src/tools/list.ts. Narrowed
+    // and shape-checked the same way as the structuredContent array above.
+    const listText = listResult.content?.[0]?.text;
+    assert.equal(typeof listText, "string", "expected list's content block to carry text");
+    const allJobsFromContent = JSON.parse(listText as string) as Array<Record<string, unknown>>;
+    const mineFromContent = allJobsFromContent.filter(
+      (entry) => entry.label === `${labelPrefix}-list-job`
+    );
+    assert.equal(
+      mineFromContent.length,
+      1,
+      `expected exactly one list entry (from content) for this scenario's own job, got ${mineFromContent.length}`
+    );
+    for (const entry of allJobsFromContent) {
+      const entryKeys = Object.keys(canonicalizePlainPollResponse(entry) as object).sort();
+      assert.deepEqual(
+        entryKeys,
+        expectedKeys,
+        `every real entry in the process-wide list content must share this job-entry shape - found ${JSON.stringify(entry)}, expected keys ${JSON.stringify(expectedKeys)}`
+      );
+    }
+    results.list = { structuredContent: { jobs: mine }, content: mineFromContent };
   }
 
   {
@@ -863,7 +944,9 @@ async function runPlainPollScenarios(
       name: "run",
       arguments: { command: ["true"], label: `${labelPrefix}-run-immediate` },
     });
-    results.run = runResultStructured(result);
+    results.run = toCanonicalResultPair(
+      result as { content?: Array<{ type: string; text?: string }>; structuredContent?: unknown }
+    );
   }
 
   {
@@ -872,7 +955,17 @@ async function runPlainPollScenarios(
       label: `${labelPrefix}-status-terminal`,
     });
     const jobId = minted.job_id as string;
-    results.status = await pollUntilTerminal(client, jobId);
+    await pollUntilTerminal(client, jobId);
+    // pollUntilTerminal's own return value is structuredContent-only (it
+    // exists to wait, not to capture) - a fresh direct call here is what
+    // actually captures this scenario's own content+structuredContent pair.
+    const statusResult = await client.callTool({ name: "status", arguments: { job_id: jobId } });
+    results.status = toCanonicalResultPair(
+      statusResult as {
+        content?: Array<{ type: string; text?: string }>;
+        structuredContent?: unknown;
+      }
+    );
   }
 
   {
@@ -893,13 +986,13 @@ async function runPlainPollScenarios(
     const outputResult = (await client.callTool({
       name: "output",
       arguments: { job_id: jobId, stream: "both" },
-    })) as { structuredContent?: unknown };
-    results.output = outputResult.structuredContent;
+    })) as { content?: Array<{ type: string; text?: string }>; structuredContent?: unknown };
+    results.output = toCanonicalResultPair(outputResult);
     const tailResult = (await client.callTool({
       name: "tail",
       arguments: { job_id: jobId, lines: 5 },
-    })) as { structuredContent?: unknown };
-    results.tail = tailResult.structuredContent;
+    })) as { content?: Array<{ type: string; text?: string }>; structuredContent?: unknown };
+    results.tail = toCanonicalResultPair(tailResult);
   }
 
   {
@@ -911,8 +1004,8 @@ async function runPlainPollScenarios(
     const killResult = (await client.callTool({
       name: "kill",
       arguments: { job_id: jobId },
-    })) as { structuredContent?: unknown };
-    results.kill = killResult.structuredContent;
+    })) as { content?: Array<{ type: string; text?: string }>; structuredContent?: unknown };
+    results.kill = toCanonicalResultPair(killResult);
   }
 
   return results;
