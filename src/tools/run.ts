@@ -62,10 +62,34 @@
  */
 import type { CallToolResult, Tool } from "@modelcontextprotocol/server";
 
-import { type PublicJobProjection, jobStore, toPublicProjection } from "../jobStore.js";
+/**
+ * Node's `setTimeout`/`setInterval` only support a delay up to this value
+ * (2^31 - 1, the largest signed 32-bit integer millisecond count the
+ * underlying libuv timer can represent). Anything at or above
+ * `MAX_TIMER_DELAY_MS + 1` is silently CLAMPED by Node itself to a 1ms
+ * timer (with a `TimeoutOverflowWarning`) rather than firing after the
+ * requested delay - so an unvalidated `deadline_ms` above this value would
+ * not fail to schedule, it would fire almost immediately, killing the job
+ * within milliseconds while claiming the full requested deadline had
+ * elapsed. `validateDeadlineMs` rejects anything above this before a job
+ * is ever spawned, rather than letting `setTimeout` silently reinterpret
+ * the caller's request.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
 import {
+  type PublicJobProjection,
+  isTerminalJobState,
+  jobStore,
+  toPublicProjection,
+} from "../jobStore.js";
+import {
+  POSIX_KILL_GRACE_PERIOD_MS,
   buildChildEnv,
   captureBirthIdentityPosixAsync,
+  evaluatePreSignalIdentityGate,
+  killProcessGroupPosix,
+  killProcessTreeWindows,
   resolveCwd,
   resolveExecutable,
   spawnManaged,
@@ -152,6 +176,13 @@ export const inputSchema: Tool["inputSchema"] = {
         "An optional human-readable label for this job. At most 64 characters, no control characters.",
       maxLength: MAX_LABEL_LENGTH,
     },
+    deadline_ms: {
+      type: "number",
+      exclusiveMinimum: 0,
+      maximum: MAX_TIMER_DELAY_MS,
+      description:
+        "Optional deadline in milliseconds, measured from when this job starts. If the job is still running once the deadline elapses, it is terminated through the same process-group kill machinery the kill tool uses, and its state becomes failed (never a new status) - see the diagnostic message for confirmation this is what happened. The deadline transition itself never deletes the record; ordinary task TTL can still purge that terminal record later, on a subsequent read, exactly as it would for any other terminal job. Omitted (the default): no deadline at all, and the job runs to its own natural completion exactly as it always has. Must not exceed 2147483647 (Node's own maximum timer delay) - a larger value is rejected outright rather than silently clamped to a near-immediate deadline.",
+    },
   },
   required: ["command"],
   // The `command.anyOf` above alone lets
@@ -196,6 +227,7 @@ interface ValidatedRunInput {
   readonly envMode: "merge" | "replace";
   readonly envVars: Record<string, string>;
   readonly label?: string;
+  readonly deadlineMs?: number;
 }
 
 type ValidationResult<T> =
@@ -212,7 +244,7 @@ type ValidationResult<T> =
 export function handler(args: Record<string, unknown> | undefined): CallToolResult {
   const validated = validateRunInput(args);
   if (!validated.ok) return toolError(validated.message);
-  const { argv, shellCommand, rawCwd, envMode, envVars, label } = validated.value;
+  const { argv, shellCommand, rawCwd, envMode, envVars, label, deadlineMs } = validated.value;
   const isShell = shellCommand !== undefined;
 
   const cwdResult = resolveCwd(rawCwd);
@@ -314,6 +346,25 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
       const identityCapture = captureBirthIdentityPosixAsync(child.pid);
       jobStore.attachPendingIdentityCapture(jobId, identityCapture);
     }
+    if (deadlineMs !== undefined) {
+      // A real, ordinary `setTimeout` - deliberately never wrapped in any
+      // injectable-clock abstraction of this codebase's own: this is
+      // exactly the shape `node:test`'s own timer mocking is built to
+      // intercept in tests, with no separate mechanism needed. Scheduled
+      // synchronously here, immediately after a real spawn succeeded, the
+      // same moment the birth-identity capture above is kicked off - never
+      // awaited, so it can never delay this handler's own response either.
+      // enforceDeadline is fire-and-forget for the identical reason
+      // reapProcessGroupOnce is above: a real failure inside it is a
+      // genuine promise rejection, caught and logged here rather than
+      // becoming an unhandled rejection.
+      const deadlineTimer = setTimeout(() => {
+        enforceDeadline(jobId, deadlineMs).catch((error: unknown) => {
+          console.error("[ghantika] error enforcing job deadline:", jobId, error);
+        });
+      }, deadlineMs);
+      jobStore.attachDeadlineTimer(jobId, deadlineTimer);
+    }
   }
 
   // Re-read from the store rather than reusing `record`: spawnManaged's
@@ -321,6 +372,71 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
   // `onError` by the time it returns, so the freshest state may already
   // differ from what `createJob` originally returned.
   return toolSuccess(toPublicProjection(jobStore.get(jobId)!, jobStore.getOutputCounts(jobId)));
+}
+
+/**
+ * Called once, when a job's own optional `deadline_ms` timer fires - never
+ * on the response path of anything, always well after `run()` itself has
+ * already returned. Terminates the job through the SAME real process-group
+ * kill machinery `src/tools/kill.ts`'s handler uses for its own default
+ * (no-signal) path - the pre-signal identity gate, then
+ * `killProcessGroupPosix`'s real SIGTERM/grace/SIGKILL escalation on
+ * POSIX, or `killProcessTreeWindows` on Windows - never a re-implementation
+ * of any of that. The one deliberate difference from `kill.ts`: the
+ * terminal state this records is `failed` (via `jobStore.markDeadlineExceeded`),
+ * never `killed` - a deadline is this codebase's OWN decision that the job
+ * ran too long, not a caller-requested termination, so it is recorded the
+ * same way any other reason a job never got to finish is recorded.
+ *
+ * A no-op, at every step, for a job that has already reached a terminal
+ * state by the time this runs (finished naturally, or was already killed)
+ * - the SAME terminal-state guards `jobStore`'s own `mark*` methods and
+ * `evaluatePreSignalIdentityGate`'s "skip" outcome already provide, exactly
+ * as `kill.ts` relies on them. Never touches a job's output buffers.
+ */
+async function enforceDeadline(jobId: string, deadlineMs: number): Promise<void> {
+  const record = jobStore.get(jobId);
+  if (record === undefined || isTerminalJobState(record.state)) return;
+  const handle = jobStore.getChildHandle(jobId);
+  if (handle === undefined) return; // defensive: a non-terminal job always has a tracked child by construction
+
+  const diagnosticMessage = `job exceeded its ${deadlineMs}ms deadline and was terminated`;
+
+  if (process.platform === "win32") {
+    // No graceful phase on Windows, matching kill.ts's own Windows branch.
+    killProcessTreeWindows(handle.pid);
+    jobStore.markDeadlineExceeded(jobId, diagnosticMessage);
+    return;
+  }
+
+  // Never signal a tracked pid without first evaluating, via a real
+  // external OS lookup, whether it's still genuinely the process this
+  // codebase spawned - the identical defense-in-depth `kill.ts` applies
+  // before every real signal it sends. `resolveBirthIdentityForKill`
+  // awaits the same in-flight async capture `run()` itself kicked off, so
+  // a deadline that fires moments after spawn still gets a real chance at
+  // a confirmed comparison rather than needlessly falling back to the
+  // (still safe) degraded path.
+  const birthIdentity = await jobStore.resolveBirthIdentityForKill(jobId);
+  const gate = await evaluatePreSignalIdentityGate(handle.pid, birthIdentity);
+  if (gate.action !== "proceed") {
+    // "skip": the process is already gone - its own natural exit event
+    // will already have recorded (or will shortly record) the real
+    // outcome, so there is nothing here for a deadline to override.
+    // "refuse": a genuine identity mismatch - refuse to signal, exactly as
+    // kill.ts refuses, rather than risk touching an unrelated process that
+    // happens to share this job's recycled pid.
+    return;
+  }
+
+  const result = await killProcessGroupPosix(handle.pid, POSIX_KILL_GRACE_PERIOD_MS, {
+    onSignaled: () => jobStore.markDeadlineExceeded(jobId, diagnosticMessage),
+  });
+  jobStore.setKillConfirmation(jobId, result.confirmed);
+  jobStore.setIdentityConfirmation(jobId, gate.identityConfirmed);
+  if (result.escalationRefusedReason !== undefined) {
+    jobStore.setEscalationRefusedReason(jobId, result.escalationRefusedReason);
+  }
 }
 
 function validateRunInput(
@@ -345,6 +461,9 @@ function validateRunInput(
   const labelResult = validateLabel(args?.label);
   if (!labelResult.ok) return labelResult;
 
+  const deadlineMsResult = validateDeadlineMs(args?.deadline_ms);
+  if (!deadlineMsResult.ok) return deadlineMsResult;
+
   return {
     ok: true,
     value: {
@@ -354,6 +473,7 @@ function validateRunInput(
       envMode: envResult.value.mode,
       envVars: envResult.value.vars,
       label: labelResult.value,
+      deadlineMs: deadlineMsResult.value,
     },
   };
 }
@@ -475,6 +595,31 @@ function validateLabel(label: unknown): ValidationResult<string | undefined> {
     return { ok: false, message: 'run\'s "label" must not contain control characters' };
   }
   return { ok: true, value: label };
+}
+
+/**
+ * `deadline_ms` must be a real, finite, strictly-positive number of
+ * milliseconds when provided at all - `undefined` (the field omitted
+ * entirely) means "no deadline", not "deadline of 0" or "deadline of
+ * NaN"/`Infinity`, so those are rejected here rather than silently
+ * accepted and handed to `setTimeout` (which would either fire immediately
+ * for a non-positive value or never fire at all for a non-finite one -
+ * either way not the caller's actual intent).
+ */
+function validateDeadlineMs(deadlineMs: unknown): ValidationResult<number | undefined> {
+  if (deadlineMs === undefined) return { ok: true, value: undefined };
+  if (
+    typeof deadlineMs !== "number" ||
+    !Number.isFinite(deadlineMs) ||
+    deadlineMs <= 0 ||
+    deadlineMs > MAX_TIMER_DELAY_MS
+  ) {
+    return {
+      ok: false,
+      message: `run's "deadline_ms" argument, if provided, must be a finite number greater than 0 and at most ${MAX_TIMER_DELAY_MS} (Node's own maximum timer delay)`,
+    };
+  }
+  return { ok: true, value: deadlineMs };
 }
 
 function toolError(message: string): CallToolResult {

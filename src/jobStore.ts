@@ -96,8 +96,7 @@ export function isJobDiagnosticReason(value: unknown): value is JobDiagnosticRea
  * Why a job ended up `failed`. `reason` is a CLOSED three-value set, never
  * an open string:
  *
- * - `spawn-error`: the ONLY value this codebase's real code paths produce
- *   today - a cwd/executable pre-flight rejection (`createFailedJob`,
+ * - `spawn-error`: a cwd/executable pre-flight rejection (`createFailedJob`,
  *   called from `src/tools/run.ts` before ever attempting a real spawn) or
  *   a genuine async OS-level spawn failure (`markSpawnFailed`, called from
  *   `src/process.ts`'s `spawnManaged` `onError` callback).
@@ -106,15 +105,18 @@ export function isJobDiagnosticReason(value: unknown): value is JobDiagnosticRea
  *   produces this value yet. Declared now so the type is closed over its
  *   full legal range from the start, rather than every future producer
  *   needing to widen an already-shipped union.
- * - `watcher/runtime-error`: reserved for a future background
- *   watcher/supervisor failure class - this codebase has no such watcher
- *   today (job state is driven directly by real `child_process` events,
- *   never a separate polling watcher process), so nothing produces this
- *   value yet either, for the same reason as `policy-denied` above.
+ * - `watcher/runtime-error`: a background timer watching over a job's own
+ *   optional run deadline (`markDeadlineExceeded`, wired from
+ *   `src/tools/run.ts` - see that file's own docs) - this is exactly the
+ *   "background watcher/supervisor" class this value was originally
+ *   reserved for, distinct from a spawn-time failure: the command started
+ *   fine and ran for a while, then this codebase itself decided it had run
+ *   long enough.
  *
- * Deliberately NOT wiring a real producer for the latter two here: doing so
- * would mean inventing a scenario this codebase doesn't actually have,
- * which is worse than an honestly-reserved, closed, currently-unused value.
+ * `policy-denied` alone remains reserved and currently unproduced -
+ * deliberately not wiring a real producer for it would mean inventing a
+ * scenario this codebase doesn't actually have, which is worse than an
+ * honestly-reserved, closed, currently-unused value.
  */
 export interface JobDiagnostic {
   readonly reason: JobDiagnosticReason;
@@ -1077,6 +1079,18 @@ interface TrackedChild {
    * lives in `birthIdentity` above and in `identity_capture`).
    */
   readonly identityCapture: Promise<ProcessBirthIdentity | undefined> | undefined;
+  /**
+   * The real `setTimeout` handle backing this job's own optional run
+   * deadline (see `attachDeadlineTimer`/`clearDeadlineTimer`) - `undefined`
+   * when this job was never given a deadline, or its deadline timer has
+   * already fired or been cleared. Stored here rather than in a separate
+   * map for the same reason `identityCapture` lives here: a tool handler
+   * under `src/tools/` may hold no state of its own (see this file's own
+   * header and `scripts/check-module-boundaries.mjs`), so the one real
+   * per-job timer this feature needs lives alongside this job's other
+   * tracked-child bookkeeping instead.
+   */
+  readonly deadlineTimer: NodeJS.Timeout | undefined;
 }
 
 /**
@@ -1250,6 +1264,7 @@ export class JobStore {
       spawnedAtMs: Date.now(),
       birthIdentity,
       identityCapture: undefined,
+      deadlineTimer: undefined,
     });
   }
 
@@ -1392,6 +1407,40 @@ export class JobStore {
     return tracked.identityCapture;
   }
 
+  /**
+   * Wires an already-scheduled `setTimeout` handle onto an ALREADY-attached
+   * child, so a later terminal transition (`markExited`/`markKilled`/
+   * `markSpawnFailed`/`markDeadlineExceeded`) can cancel it via
+   * `clearDeadlineTimer` - see that method's own docs for why a job that
+   * finishes before its own deadline must not leave a stray timer pending.
+   * `src/tools/run.ts` calls this immediately after scheduling the timer,
+   * only when the caller actually supplied a deadline. A safe no-op if the
+   * job's tracked child is no longer present, matching this file's other
+   * `attach*` setters.
+   */
+  attachDeadlineTimer(jobId: string, timer: NodeJS.Timeout): void {
+    const tracked = this.children.get(jobId);
+    if (!tracked) return;
+    this.children.set(jobId, { ...tracked, deadlineTimer: timer });
+  }
+
+  /**
+   * Cancels this job's own pending deadline timer, if it has one - called
+   * from every terminal-state transition below (`markExited`, `markKilled`,
+   * `markSpawnFailed`, `markDeadlineExceeded`) so a job that reaches a
+   * terminal state before its own deadline elapses (the ordinary case: most
+   * jobs finish long before any deadline a caller happens to set) does not
+   * leave a real Node timer sitting scheduled for no reason. Safe and cheap
+   * even when called on a job that never had a deadline at all, or whose
+   * timer already fired - a no-op in both cases, never an error.
+   */
+  clearDeadlineTimer(jobId: string): void {
+    const tracked = this.children.get(jobId);
+    if (!tracked || tracked.deadlineTimer === undefined) return;
+    clearTimeout(tracked.deadlineTimer);
+    this.children.set(jobId, { ...tracked, deadlineTimer: undefined });
+  }
+
   /** `starting` -> `running`, once the OS has actually confirmed the process started (the `spawn` event). No-op if the job is already terminal or already running. */
   markRunning(jobId: string): void {
     const record = this.jobs.get(jobId);
@@ -1412,6 +1461,40 @@ export class JobStore {
     record.state = "failed";
     record.diagnostic = { reason: "spawn-error", message };
     record.ended_at = new Date().toISOString();
+    this.clearDeadlineTimer(jobId);
+    this.fireJobTerminal(jobId);
+  }
+
+  /**
+   * `starting`/`running` -> `failed`, when a job's own optional run
+   * deadline (see `src/tools/run.ts`'s `deadline_ms`) elapsed before the
+   * job reached a terminal state on its own. Same shape as
+   * `markSpawnFailed` above - a diagnostic-carrying `failed` transition,
+   * never a new state - but with the `"watcher/runtime-error"` reason
+   * (see `JobDiagnosticReason`'s own docs) rather than `"spawn-error"`: the
+   * command genuinely started and ran, it just outlived the time this
+   * codebase itself was told to allow it. Same terminal-state guard as
+   * every other `mark*` transition (first write wins), so a job that
+   * already finished - naturally, or via an explicit `kill()` - a moment
+   * before its deadline fired is left exactly as it was; this call and
+   * that finish are simply racing to be the one that ISN'T a no-op.
+   * `src/tools/run.ts`'s deadline-enforcement path is the only real caller,
+   * and only invokes this once it has already used this codebase's own
+   * real process-group kill machinery (`process.killProcessGroupPosix` on
+   * POSIX, `process.killProcessTreeWindows` on Windows) to actually
+   * terminate the job - this method only ever records the OUTCOME, it
+   * performs no killing itself. Fires the same terminal wake notification
+   * every other `mark*` transition does (see `fireJobTerminal`) - a
+   * deadline-killed job is exactly as terminal as any other, and a
+   * listener waiting on it should not have to special-case this cause.
+   */
+  markDeadlineExceeded(jobId: string, message: string): void {
+    const record = this.jobs.get(jobId);
+    if (!record || isTerminalJobState(record.state)) return;
+    record.state = "failed";
+    record.diagnostic = { reason: "watcher/runtime-error", message };
+    record.ended_at = new Date().toISOString();
+    this.clearDeadlineTimer(jobId);
     this.fireJobTerminal(jobId);
   }
 
@@ -1463,6 +1546,7 @@ export class JobStore {
       record.exit_code = exitCode ?? undefined;
     }
     record.ended_at = new Date().toISOString();
+    this.clearDeadlineTimer(jobId);
     this.fireJobTerminal(jobId);
   }
 
@@ -1486,6 +1570,7 @@ export class JobStore {
     record.state = "killed";
     record.signal = signal;
     record.ended_at = new Date().toISOString();
+    this.clearDeadlineTimer(jobId);
     this.fireJobTerminal(jobId);
   }
 
@@ -1757,10 +1842,10 @@ export class JobStore {
   /**
    * Subscribes `listener` to fire EXACTLY ONCE, the moment `jobId`'s state
    * transitions into a terminal one (`markExited`/`markKilled`/
-   * `markSpawnFailed` - see each of their own docs; all three call
-   * `fireJobTerminal` as their last step, only when they themselves
-   * actually performed the transition, never on a no-op call against an
-   * already-terminal job). A job that is ALREADY terminal at subscribe
+   * `markSpawnFailed`/`markDeadlineExceeded` - see each of their own docs;
+   * all four call `fireJobTerminal` as their last step, only when they
+   * themselves actually performed the transition, never on a no-op call
+   * against an already-terminal job). A job that is ALREADY terminal at subscribe
    * time never fires this listener at all - it already had its one
    * transition before anyone was listening; a caller that cares should
    * check `get`/`has` itself first, matching this store's other reads.
