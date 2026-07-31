@@ -1190,7 +1190,7 @@ interface TasksGetResponseBody {
 }
 
 test(
-  "shutdown finitely reaps a genuinely-live task's real backing job within a bounded deadline (a hang is a distinct failure from a skip) - the real process is confirmed dead via the reused pgrep oracle, and an already-terminal task alongside it is read AGAIN mid-shutdown and found byte-for-byte unchanged",
+  "shutdown finitely reaps a genuinely-live task's real backing job within a bounded deadline on POSIX (a hang is a distinct failure from a skip) - the real process is confirmed dead via the reused pgrep oracle, and an already-terminal task alongside it is read AGAIN mid-shutdown and found byte-for-byte unchanged",
   { skip: PGREP_ORACLE_SKIP },
   async () => {
     const server = spawnServer();
@@ -1355,7 +1355,7 @@ test(
           () =>
             reject(
               new Error(
-                "shutdown did not complete within the bounded deadline - a hang, not a clean reap"
+                "shutdown did not complete within the bounded deadline on POSIX - a hang, not a clean reap"
               )
             ),
           8000
