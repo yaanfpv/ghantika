@@ -1057,8 +1057,7 @@ export async function readLinuxStartTimeTicksAsync(
  * entry for this fix): `ps -o etime=` does not read an elapsed time, it
  * COMPUTES one from `/proc/<pid>/stat`'s own `starttime` field converted
  * against `/proc/uptime`, and in a virtualized guest those two values can
- * come from mismatched sources (a documented family - a post-boot clock
- * correction, a `btime` that moves) - producing a wildly wrong elapsed-time
+ * come from mismatched sources, producing a wildly wrong elapsed-time
  * reading even though `ps` itself ran and parsed cleanly. A raw, unconverted,
  * directly-comparable token has no
  * such dependency, which is why the Linux variant below reads and compares
