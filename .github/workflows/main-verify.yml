@@ -102,6 +102,20 @@ jobs:
       contents: read
       issues: write
     steps:
+      # gh issue create/list --label fails outright if the label doesn't
+      # exist on the repo yet - this job would then fail on the one
+      # occasion it exists to report. --force makes this idempotent
+      # (create-or-update), so the label is provisioned here rather than
+      # depending on it having been created out-of-band beforehand.
+      - name: ensure the main-verify-failure label exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh label create main-verify-failure --repo "$REPO" \
+            --color d73a4a \
+            --description "Main Verify detected a test failure on main after merge" \
+            --force
       - name: open or update the main-verify tracking issue
         env:
           GH_TOKEN: ${{ github.token }}
