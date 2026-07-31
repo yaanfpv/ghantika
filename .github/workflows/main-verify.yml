@@ -22,8 +22,8 @@ name: Main Verify
 # literally require success from, EVERY job in that file - so a job that
 # only ever runs on push would show up "skipped" on every PR run and make
 # `gate` red on every PR, not just on main. Keeping this in its own file
-# means it never enters that computation at all, and per AC4 it is never
-# added to any required check - branch protection points only at `gate`.
+# means it never enters that computation at all, and it is never added to
+# any required check - branch protection points only at `gate`.
 #
 # LOCKSTEP WARNING: the `test` job below is a DELIBERATE, DISCLOSED
 # duplicate of ci.yml's own `test` job (same reasoning ci.yml's
@@ -33,8 +33,8 @@ name: Main Verify
 # a `workflow_call` refactor, since scripts/lint-workflow-jobs.mjs's matrix-
 # completeness check reads `job.strategy.matrix` from the CALLING side of a
 # job definition and would need its own rework to understand a matrix that
-# instead lives inside a reusable workflow's callee file - out of scope for
-# this story). test/main-verify-workflow.test.js asserts the two `test`
+# instead lives inside a reusable workflow's callee file - not attempted
+# here). test/main-verify-workflow.test.js asserts the two `test`
 # jobs' matrices and step lists stay identical, so a drift here fails a
 # test rather than failing silently.
 on:
@@ -87,12 +87,12 @@ jobs:
           fail_on_parse_error: true
           require_tests: true
 
-  # AC2 (attributable) + AC5 (reaches a human): runs only when `test`
-  # genuinely failed, and opens or updates ONE standing tracking issue
-  # naming the exact merge commit and linking to this run - never a bare
-  # red check nobody is watching. Reusing one issue (rather than filing a
-  # new one per failure) keeps a flaky intermittent from spamming the
-  # tracker while still recording every occurrence as its own comment.
+  # Attributable and human-visible: runs only when `test` genuinely
+  # failed, and opens or updates ONE standing tracking issue naming the
+  # exact merge commit and linking to this run - never a bare red check
+  # nobody is watching. Reusing one issue (rather than filing a new one
+  # per failure) keeps a flaky intermittent from spamming the tracker
+  # while still recording every occurrence as its own comment.
   report-failure:
     name: report main failure
     needs: test
@@ -102,11 +102,16 @@ jobs:
       contents: read
       issues: write
     steps:
-      # gh issue create/list --label fails outright if the label doesn't
-      # exist on the repo yet - this job would then fail on the one
-      # occasion it exists to report. --force makes this idempotent
-      # (create-or-update), so the label is provisioned here rather than
-      # depending on it having been created out-of-band beforehand.
+      # gh issue create --label fails outright if the label doesn't exist
+      # on the repo yet (gh issue list with the same flag does not - it
+      # returns an empty result, exit 0). Without this step the one time
+      # this job needs to run - a real post-merge failure - the create
+      # call would go red in Actions on that one call, visibly, not
+      # silently; the run itself would still be red, but the human
+      # tracking issue would never get filed. --force makes this
+      # idempotent (create-or-update), so the label is provisioned here
+      # rather than depending on it having been created out-of-band
+      # beforehand.
       - name: ensure the main-verify-failure label exists
         env:
           GH_TOKEN: ${{ github.token }}
