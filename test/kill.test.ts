@@ -369,7 +369,10 @@ test(
     );
     assert.notEqual(birthIdentity, undefined, "expected a real, successful capture to poke");
     jobStore.attachChild(record.job_id, child!, birthIdentity);
-    await new Promise((resolve) => setTimeout(resolve, 50)); // let the spawn event actually land
+    // Awaits the same real settlement resolveBirthIdentityForKill's own
+    // production callers already await, rather than a fixed wall-clock
+    // delay - see test/run.test.ts's waitForIdentityCaptureSettled.
+    await jobStore.resolveBirthIdentityForKill(record.job_id);
 
     // Real pid recycling can't be forced deterministically from a test (see
     // test/process.test.ts's identical simulation on checkProcessIdentity

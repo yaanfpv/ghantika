@@ -105,7 +105,8 @@
     "test/shutdown.test.ts::SIGTERM reaps a REAL live job's WHOLE process group - zero survivors confirmed by a real external pgrep",
     "test/shutdown.test.ts::root-exits-first, shutdown side: the eager reap already collects a job's real, live descendants automatically at leader-exit - well before shutdown ever runs - and shutdown still exits cleanly against that already-reaped, terminal record",
     "test/shutdown.test.ts::shutdown: a PRE-SIGNAL identity mismatch refuses to signal at all during the shutdown reap too - the fail-closed gate applies at BOTH real callers - the real tracked process survives shutdown, never falsely reaped",
-    "test/shutdown.test.ts::stdin EOF reaps a REAL live job's WHOLE process group - zero survivors confirmed by a real external pgrep"
+    "test/shutdown.test.ts::stdin EOF reaps a REAL live job's WHOLE process group - zero survivors confirmed by a real external pgrep",
+    "test/wake-integration.test.ts::shutdown finitely reaps a genuinely-live task's real backing job within a bounded deadline on POSIX (a hang is a distinct failure from a skip) - the real process is confirmed dead via the reused pgrep oracle, and an already-terminal task alongside it is read AGAIN mid-shutdown and found byte-for-byte unchanged"
   ],
   "darwin": [
     "test/process.test.ts::captureBirthIdentityPosixAsync: on Windows, never even attempted - always resolves to undefined there",
