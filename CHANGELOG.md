@@ -4,6 +4,7 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+- Corrected two README sentences that overstated job retention - one in "How it works", one in "How it's different from what agents already have" - both said `status`/`output`/`tail` stay accurate for as long as the server is up, with no further qualification. That much is still true for a client that only ever polls those three tools, but `tasksAdapter.ts`'s `getTask` reclaims a job's whole record, not just some Tasks-specific view of it, the moment anything reads an already-finished job through `tasks/get`, `tasks/update`, or `tasks/cancel` at least 24 hours after it ended (all three share the same read path); a still-running job is never touched by this, at any age. Both sentences now say so instead of the unqualified claim.
 - Two tests covering `captureBirthIdentityPosixAsync`'s aggregate-timeout behavior injected a fake clock whose
   `now()` read the filesystem (`fs.existsSync` on a fixture marker file written by a background subprocess) to
   decide when the simulated clock should jump forward. That made the clock itself racy: whether the check saw the
