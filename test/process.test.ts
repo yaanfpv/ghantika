@@ -23,6 +23,7 @@ import {
   GROUP_CONFIRMATION_TIMEOUT_MS,
   POSIX_KILL_GRACE_PERIOD_MS,
   PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS,
+  type ProcStatAsyncReader,
   captureBirthIdentityPosix,
   captureBirthIdentityPosixAsync,
   captureEscalationIdentitySnapshot,
@@ -39,6 +40,7 @@ import {
   parseEtime,
   parseLinuxStatStartTimeTicks,
   parsePidLstartRow,
+  readLinuxStartTimeTicksAsync,
   readPidStartTimesBatchPosix,
   signalProcessGroupPosix,
   throwUnlessBenignAlreadyGoneRace,
@@ -74,8 +76,7 @@ const POSIX_PROCESS_GROUP_SKIP =
 // `ps` binary on PATH - a fixture that only exercises anything on the
 // platform that mechanism actually runs on. `captureBirthIdentityPosixAsync`
 // never shells out to `ps` at all on Linux (it reads `/proc/<pid>/stat`
-// directly via a plain file read this codebase's own docs establish cannot
-// hang the way a spawned `ps` child can - see src/process.ts's own docs for
+// directly instead - see src/process.ts's own docs for
 // `readLinuxStartTimeTicksAsync`), so a fake `ps` placed on PATH is simply
 // never invoked there: these tests would either observe a real, genuinely
 // found identity almost instantly (the fake ps never gets the chance to
@@ -84,7 +85,8 @@ const POSIX_PROCESS_GROUP_SKIP =
 // fixture exists to exercise. This is a TEST-HARNESS gap for THIS
 // mechanism, not a product scope decision: the Linux capture path's own
 // real behavior is covered separately (see the platform-branched
-// real-capture tests and the dedicated Linux-only tests elsewhere in this
+// real-capture tests, the dedicated Linux-only tests, and
+// `readLinuxStartTimeTicksAsync`'s own bounded-read test elsewhere in this
 // file).
 const SHADOWS_PS_LINUX_SKIP =
   process.platform === "win32"
@@ -1690,6 +1692,44 @@ test("parseLinuxStatStartTimeTicks: returns undefined when the tail after ')' ha
 test("parseLinuxStatStartTimeTicks: returns undefined when the field-22 position holds a non-digit token - a malformed/corrupted read fails closed, exactly like parseEtime's own equivalent discipline", () => {
   const raw = "123 (bash) S 1 123 123 0 -1 4194304 100 200 0 0 10 20 5 3 20 0 1 0 not-a-number";
   assert.equal(parseLinuxStatStartTimeTicks(raw), undefined);
+});
+
+// --- readLinuxStartTimeTicksAsync's own bound (a real, confirmed defect: this
+// function used to `await` its `/proc/<pid>/stat` read directly, with no
+// timeout/AbortController/race at all - a reader that never settles left the
+// whole promise permanently pending, past every deadline
+// captureBirthIdentityPosixAsync's own aggregate-cap bookkeeping claimed to
+// enforce). This test injects a reader that never settles - the one case a
+// portable test can force deterministically, since a real `/proc` read
+// cannot be made to hang on demand - and proves the function's own returned
+// promise still settles within its caller-supplied bound regardless. Pure
+// and platform-agnostic like `parseLinuxStatStartTimeTicks`'s own tests
+// above: the injected reader means this needs no real Linux host or `/proc`
+// entry to exercise the exact code path production dispatches to on Linux. ---
+
+test("readLinuxStartTimeTicksAsync: a /proc read that never settles is still forced to resolve as an observer-failure within the caller's own bound, never left pending", async () => {
+  const neverSettles: ProcStatAsyncReader = () => new Promise(() => {});
+  const timeoutMs = 100;
+  const before = Date.now();
+  const result = await readLinuxStartTimeTicksAsync(process.pid, timeoutMs, neverSettles);
+  const elapsedMs = Date.now() - before;
+
+  assert.equal(
+    result.status,
+    "observer-failure",
+    "a /proc/<pid>/stat read that never settles must resolve as an observer-failure once the bound expires, never hang indefinitely - reverting the caller-side race this test guards leaves this promise pending forever"
+  );
+  if (result.status === "observer-failure") {
+    assert.match(
+      result.reason,
+      /did not settle within 100ms/,
+      "the diagnostic must attribute the failure to this exact bound, not a generic/unrelated message"
+    );
+  }
+  assert.ok(
+    elapsedMs < 1000,
+    `expected the caller-side bound to force settlement close to the ${timeoutMs}ms timeout, not hang - took ${elapsedMs}ms`
+  );
 });
 
 // --- identityElapsedTimesMatch (pure comparison, checkProcessIdentity's building block) ---

@@ -857,23 +857,84 @@ function readLinuxStartTimeTicks(pid: number): LinuxStartTimeTicksReadResult {
 }
 
 /**
+ * The real `/proc/<pid>/stat` read `readLinuxStartTimeTicksAsync` performs,
+ * factored into its own injectable type for exactly one reason: proving the
+ * bound below actually holds requires a reader that never settles at all,
+ * and there is no way to make a REAL `/proc` read hang on demand from a
+ * portable test. `signal` is passed straight through to `fs.promises.readFile`
+ * so the real implementation can react to the timeout below; an injected
+ * fake is free to ignore it, and the wrapper's own bound holds regardless -
+ * see `readLinuxStartTimeTicksAsync`'s own docs for why that has to be true.
+ */
+export type ProcStatAsyncReader = (pid: number, signal: AbortSignal) => Promise<string>;
+
+const REAL_PROC_STAT_ASYNC_READER: ProcStatAsyncReader = (pid, signal) =>
+  fs.promises.readFile(`/proc/${pid}/stat`, { encoding: "utf8", signal });
+
+/**
  * The ASYNC counterpart of `readLinuxStartTimeTicks` above, built on
  * `fs.promises.readFile` instead of the blocking sync call - used by the
  * ASYNC capture primitive (`captureBirthIdentityPosixAsync`) and by
- * `checkProcessIdentity`'s Linux branch. Same "cannot hang, no timeout
- * machinery needed" reasoning as the sync version: a plain `await` around
- * a `/proc` read is sufficient, with none of the settlement-timer/SIGKILL
- * apparatus `readProcessElapsedSecondsAsync` needs for a real shelled-out
- * `ps` child.
+ * `checkProcessIdentity`'s Linux branch.
+ *
+ * BOUNDED by `timeoutMs`, exactly like `readProcessElapsedSecondsAsync`
+ * above - this file previously claimed a `/proc` read "cannot hang" and
+ * needs no timeout machinery at all, which is true of the underlying KERNEL
+ * READ but not of this codebase's own PROMISE around it: a slow or
+ * contended host (a starved thread pool, a virtualized guest under heavy
+ * I/O pressure) can leave `fs.promises.readFile`'s promise unsettled for far
+ * longer than a normal `/proc` read takes, and `run()`'s own documented
+ * "never blocks the caller" contract (see this function's own callers'
+ * docs) depends on EVERY observer on this path actually honoring a bound,
+ * not on the common case being fast. An unbounded `await` here left
+ * `captureBirthIdentityPosixAsync`'s own aggregate deadline unenforced on
+ * Linux specifically - the one platform this function exists for - which is
+ * exactly the gap a caller-side race closes: an `AbortController` fired by
+ * an independent `setTimeout` forces this function's own returned promise to
+ * settle at `timeoutMs` regardless of whether the underlying read ever
+ * does, mirroring `readProcessElapsedSecondsAsync`'s `settled`-flag race
+ * against its external bound (no settlement grace is needed here the way
+ * that function needs one for a resistant child process to actually die
+ * from SIGKILL - aborting a promise is immediate, there is no second
+ * process to force-kill).
  */
-async function readLinuxStartTimeTicksAsync(pid: number): Promise<LinuxStartTimeTicksReadResult> {
-  let raw: string;
-  try {
-    raw = await fs.promises.readFile(`/proc/${pid}/stat`, "utf8");
-  } catch (error) {
-    return classifyProcStatReadFailure(error);
-  }
-  return interpretProcStatOutput(raw);
+export async function readLinuxStartTimeTicksAsync(
+  pid: number,
+  timeoutMs: number,
+  reader: ProcStatAsyncReader = REAL_PROC_STAT_ASYNC_READER
+): Promise<LinuxStartTimeTicksReadResult> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const controller = new AbortController();
+    reader(pid, controller.signal).then(
+      (raw) => {
+        if (settled) return; // the external bound below already resolved this promise
+        settled = true;
+        clearTimeout(externalBound);
+        resolve(interpretProcStatOutput(raw));
+      },
+      (error) => {
+        if (settled) return; // the external bound below already resolved this promise
+        settled = true;
+        clearTimeout(externalBound);
+        resolve(classifyProcStatReadFailure(error));
+      }
+    );
+    const externalBound = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // Best-effort: a real `fs.promises.readFile` reacts to this and
+      // rejects with an AbortError (harmlessly swallowed by the `settled`
+      // guard above, since this branch has already resolved). An injected
+      // reader that ignores `signal` entirely still cannot hold this
+      // function's own promise open past this point.
+      controller.abort();
+      resolve({
+        status: "observer-failure",
+        reason: `/proc/<pid>/stat did not settle within ${timeoutMs}ms`,
+      });
+    }, timeoutMs);
+  });
 }
 
 /**
@@ -886,11 +947,11 @@ async function readLinuxStartTimeTicksAsync(pid: number): Promise<LinuxStartTime
  * this is the fix for a real, confirmed class of bug (see the CHANGELOG
  * entry for this fix): `ps -o etime=` does not read an elapsed time, it
  * COMPUTES one from `/proc/<pid>/stat`'s own `starttime` field converted
- * against `/proc/uptime`, and in a container those two values can come
- * from mismatched sources (a known class on LXC/LXD/Proxmox-style
- * containers, which is what GitHub's own hosted Linux runner is) -
- * producing a wildly wrong elapsed-time reading even though `ps` itself ran
- * and parsed cleanly. A raw, unconverted, directly-comparable token has no
+ * against `/proc/uptime`, and in a virtualized guest those two values can
+ * come from mismatched sources (a documented family - a post-boot clock
+ * correction, a `btime` that moves) - producing a wildly wrong elapsed-time
+ * reading even though `ps` itself ran and parsed cleanly. A raw, unconverted,
+ * directly-comparable token has no
  * such dependency, which is why the Linux variant below reads and compares
  * one directly instead of ever deriving a duration. Keeping the two
  * variants as a discriminated union (rather than a single shape with
@@ -997,13 +1058,13 @@ export function captureBirthIdentityPosix(pid: number): ProcessBirthIdentity | u
  * take longer than this, however slow or hung the real `ps` process
  * actually is.
  *
- * On Linux this value still bounds the OVERALL capture (the aggregate
- * deadline `captureBirthIdentityPosixAsync` computes from it applies
- * identically on both platforms), even though the Linux read itself (a
- * plain `/proc/<pid>/stat` file read) needs no per-attempt timeout of its
- * own - a file read against an in-kernel virtual filesystem cannot hang
- * the way a shelled-out `ps` child can, so there is nothing on that path
- * for a per-attempt bound to actually guard against.
+ * On Linux this value bounds the OVERALL capture identically to the
+ * non-Linux path (the aggregate deadline `captureBirthIdentityPosixAsync`
+ * computes from it applies to both), AND each individual Linux attempt too:
+ * `readLinuxStartTimeTicksAsync` races its own `/proc/<pid>/stat` read
+ * against this same effective timeout (see that function's own docs for why
+ * this codebase's PROMISE around the read needs a caller-side bound even
+ * though the underlying kernel read itself is ordinarily near-instant).
  */
 export const ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS = 3000;
 
@@ -1066,8 +1127,8 @@ type BirthIdentityAttemptResult =
 /**
  * Makes ONE real birth-identity observation attempt for `pid`, dispatching
  * to the right platform-specific observer - `readLinuxStartTimeTicksAsync`
- * (a plain, unbounded-by-choice `/proc` read - see that function's own
- * docs for why it needs no timeout) on Linux, `readProcessElapsedSecondsAsync`
+ * (a `/proc` read bounded by `effectiveTimeoutMs`, same as the other branch -
+ * see that function's own docs) on Linux, `readProcessElapsedSecondsAsync`
  * (a bounded, force-reaped `execFile` of `ps`) everywhere else - and
  * wrapping whichever one answers into the identical
  * `BirthIdentityAttemptResult` shape `captureBirthIdentityPosixAsync`'s
@@ -1080,7 +1141,7 @@ async function attemptBirthIdentityCaptureAsync(
   effectiveTimeoutMs: number
 ): Promise<BirthIdentityAttemptResult> {
   if (process.platform === "linux") {
-    const observed = await readLinuxStartTimeTicksAsync(pid);
+    const observed = await readLinuxStartTimeTicksAsync(pid, effectiveTimeoutMs);
     if (observed.status !== "found") return observed;
     return {
       status: "found",
@@ -1123,13 +1184,17 @@ async function attemptBirthIdentityCaptureAsync(
  *   observer timeout is capped to whatever remains of this budget (minus
  *   `ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS`, since
  *   `readProcessElapsedSecondsAsync` adds that grace on top of whatever
- *   timeout it is given - the Linux attempt ignores this effective timeout
- *   entirely, since a `/proc` read cannot hang), so a retry can never
- *   itself run past this deadline on the `ps` path - `readProcessElapsedSecondsAsync`'s
- *   own force-SIGKILL is what actually reaps a still-running observer at
- *   that point, surfacing as an ordinary `observer-failure`. This is what
- *   keeps the retry addition from silently widening a latency bound other
- *   code already relies on.
+ *   timeout it is given - the Linux attempt honors this same effective
+ *   timeout directly, via `readLinuxStartTimeTicksAsync`'s own caller-side
+ *   race, no grace added, since aborting a promise needs no second
+ *   force-kill phase the way a resistant child process does), so a retry
+ *   can never itself run past this deadline on EITHER path -
+ *   `readProcessElapsedSecondsAsync`'s own force-SIGKILL reaps a
+ *   still-running `ps` observer, `readLinuxStartTimeTicksAsync`'s own
+ *   `AbortController` race reaps a still-unsettled `/proc` read, both
+ *   surfacing as an ordinary `observer-failure`. This is what keeps the
+ *   retry addition from silently widening a latency bound other code
+ *   already relies on.
  * - The RETRY budget, `BIRTH_IDENTITY_NOT_FOUND_RETRY_BOUND_MS` starting
  *   from the first `not-found`, governs only whether ANOTHER retry is
  *   allowed to START. It never gates whether an already-started attempt's
@@ -1249,7 +1314,10 @@ export async function checkProcessIdentity(
   now: number = Date.now()
 ): Promise<IdentityCheckResult> {
   if (birthIdentity.platform === "linux-starttime-ticks") {
-    const observed = await readLinuxStartTimeTicksAsync(pid);
+    const observed = await readLinuxStartTimeTicksAsync(
+      pid,
+      ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS
+    );
     if (observed.status === "not-found") return { status: "not-found" };
     if (observed.status === "observer-failure") {
       return { status: "observer-failure", reason: observed.reason };
