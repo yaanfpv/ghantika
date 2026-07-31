@@ -45,10 +45,10 @@
     "test/process.test.ts::captureBirthIdentityPosixAsync: OWNER 5 - the aggregate cap force-reaps an observer that is still active when it expires",
     "test/process.test.ts::captureBirthIdentityPosixAsync: OWNER 6 - the aggregate cap expiring between attempts (no observer active) settles immediately, with no new observer started",
     "test/process.test.ts::captureBirthIdentityPosixAsync: a genuinely HUNG ps observer is forcibly killed once the bound elapses and resolves to undefined - never left unsettled indefinitely",
-    "test/process.test.ts::captureBirthIdentityPosixAsync: a successful real capture reads a near-zero elapsed age for a freshly spawned process, same as the sync version",
+    "test/process.test.ts::captureBirthIdentityPosixAsync: a successful real capture reads a near-zero elapsed age for a freshly spawned process, same as the sync version (or, on Linux, a well-formed raw start-time tick token)",
     "test/process.test.ts::captureBirthIdentityPosixAsync: an initial not-found observation retries and succeeds once ps starts answering",
     "test/process.test.ts::captureBirthIdentityPosixAsync: an observer-failure makes exactly ONE attempt and is never retried",
-    "test/process.test.ts::captureBirthIdentityPosixAsync: projects forward to the same real elapsed time an independent SYNC captureBirthIdentityPosix reading observes moments later - proving both are the same genuine external observation, not two different mechanisms",
+    "test/process.test.ts::captureBirthIdentityPosixAsync: projects forward to the same real elapsed time an independent SYNC captureBirthIdentityPosix reading observes moments later - proving both are the same genuine external observation, not two different mechanisms (on Linux: the two readings must report the EXACT SAME raw start-time token, since there is nothing to project)",
     "test/process.test.ts::captureBirthIdentityPosixAsync: repeated not-found outcomes stop at the bounded deadline, never retrying forever",
     "test/process.test.ts::captureBirthIdentityPosixAsync: the SHIPPED DEFAULT not-found retry bound - called with no bound arguments at all - still retries through to a real captured identity",
     "test/process.test.ts::captureEscalationIdentitySnapshot: PRE-SNAPSHOT NEGATIVE - malformed pgrep enumeration output degrades the whole snapshot rather than guessing at a partial member list",
@@ -109,10 +109,24 @@
   ],
   "darwin": [
     "test/process.test.ts::captureBirthIdentityPosixAsync: on Windows, never even attempted - always resolves to undefined there",
+    "test/process.test.ts::checkProcessIdentity (LINUX): REFUSES to confirm a real, currently-alive process when the captured start-time ticks do not match - a convincing simulation of PID reuse, with NO tolerance window at all (unlike the posix-elapsed branch)",
+    "test/process.test.ts::checkProcessIdentity (LINUX): alive-confirmed for a real process whose ACTUAL captured start-time ticks match",
+    "test/process.test.ts::evaluatePreSignalIdentityGate (LINUX): a real identity mismatch -> refuse, with an honest reason",
+    "test/process.test.ts::evaluatePreSignalIdentityGate (LINUX): alive-confirmed identity -> proceed with identityConfirmed: true",
     "test/run.test.ts::run(): on Windows, birth-identity capture is never even attempted - birthIdentity is always undefined there"
   ],
   "linux": [
+    "test/process.test.ts::captureBirthIdentityPosixAsync: OWNER 1 - a zero retry budget still performs exactly the initial observation, never a retry",
+    "test/process.test.ts::captureBirthIdentityPosixAsync: OWNER 2 - a retry started before its retry deadline may settle found after that deadline, and is accepted",
+    "test/process.test.ts::captureBirthIdentityPosixAsync: OWNER 3 - a retry whose earliest permitted start is at or after the retry deadline never starts",
+    "test/process.test.ts::captureBirthIdentityPosixAsync: OWNER 5 - the aggregate cap force-reaps an observer that is still active when it expires",
+    "test/process.test.ts::captureBirthIdentityPosixAsync: OWNER 6 - the aggregate cap expiring between attempts (no observer active) settles immediately, with no new observer started",
+    "test/process.test.ts::captureBirthIdentityPosixAsync: a genuinely HUNG ps observer is forcibly killed once the bound elapses and resolves to undefined - never left unsettled indefinitely",
+    "test/process.test.ts::captureBirthIdentityPosixAsync: an initial not-found observation retries and succeeds once ps starts answering",
+    "test/process.test.ts::captureBirthIdentityPosixAsync: an observer-failure makes exactly ONE attempt and is never retried",
     "test/process.test.ts::captureBirthIdentityPosixAsync: on Windows, never even attempted - always resolves to undefined there",
+    "test/process.test.ts::captureBirthIdentityPosixAsync: repeated not-found outcomes stop at the bounded deadline, never retrying forever",
+    "test/process.test.ts::captureBirthIdentityPosixAsync: the SHIPPED DEFAULT not-found retry bound - called with no bound arguments at all - still retries through to a real captured identity",
     "test/run.test.ts::run(): on Windows, birth-identity capture is never even attempted - birthIdentity is always undefined there"
   ]
 }

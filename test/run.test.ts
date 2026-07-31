@@ -166,16 +166,28 @@ test(
       undefined,
       "expected a REAL captured birth identity, not left undefined, for an ordinary successful spawn"
     );
-    assert.equal(typeof handle!.birthIdentity!.capturedAtMs, "number");
-    assert.equal(typeof handle!.birthIdentity!.elapsedSecondsAtCapture, "number");
-    // A capture taken right after spawn should read a near-zero elapsed
-    // age - loosely bounded (not exact-equality) since this is a REAL `ps`
-    // read against a REAL just-spawned process, not a synthetic value.
-    assert.ok(
-      handle!.birthIdentity!.elapsedSecondsAtCapture >= 0 &&
-        handle!.birthIdentity!.elapsedSecondsAtCapture < 5,
-      `expected a near-zero captured elapsed age for a freshly spawned process, got: ${handle!.birthIdentity!.elapsedSecondsAtCapture}`
-    );
+    if (handle!.birthIdentity!.platform === "linux-starttime-ticks") {
+      // Linux: a raw /proc/<pid>/stat field-22 token, never an elapsed
+      // duration - see ProcessBirthIdentity's own docs for why.
+      assert.equal(typeof handle!.birthIdentity!.startTimeTicks, "string");
+      assert.match(
+        handle!.birthIdentity!.startTimeTicks,
+        /^\d+$/,
+        `expected a well-formed non-negative integer string, got ${JSON.stringify(handle!.birthIdentity!.startTimeTicks)}`
+      );
+    } else {
+      assert.equal(typeof handle!.birthIdentity!.capturedAtMs, "number");
+      assert.equal(typeof handle!.birthIdentity!.elapsedSecondsAtCapture, "number");
+      // A capture taken right after spawn should read a near-zero elapsed
+      // age - loosely bounded (not exact-equality) since this is a REAL
+      // `ps` read against a REAL just-spawned process, not a synthetic
+      // value.
+      assert.ok(
+        handle!.birthIdentity!.elapsedSecondsAtCapture >= 0 &&
+          handle!.birthIdentity!.elapsedSecondsAtCapture < 5,
+        `expected a near-zero captured elapsed age for a freshly spawned process, got: ${handle!.birthIdentity!.elapsedSecondsAtCapture}`
+      );
+    }
 
     // Cleanup.
     const killResult = await killTool.handler({ job_id: jobId });
@@ -212,13 +224,33 @@ test(
       undefined,
       "expected the process to still be alive and observable"
     );
-    const projectedElapsedAtLaterCapture =
-      recordedIdentity!.elapsedSecondsAtCapture +
-      (laterIdentity!.capturedAtMs - recordedIdentity!.capturedAtMs) / 1000;
-    assert.ok(
-      Math.abs(projectedElapsedAtLaterCapture - laterIdentity!.elapsedSecondsAtCapture) <= 5,
-      `expected run()'s own captured identity to project forward to the same real elapsed time an independent capture just observed - recorded: ${JSON.stringify(recordedIdentity)}, independent: ${JSON.stringify(laterIdentity)}`
-    );
+
+    if (recordedIdentity!.platform === "linux-starttime-ticks") {
+      // Linux: no projection needed or possible - the same real process's
+      // start-time ticks are a fixed kernel counter, so two independent
+      // reads moments apart must report the EXACT SAME token, never merely
+      // a close one.
+      assert.equal(
+        laterIdentity!.platform,
+        "linux-starttime-ticks",
+        "both readings of the same real pid must agree on which platform branch captured them"
+      );
+      if (laterIdentity!.platform === "linux-starttime-ticks") {
+        assert.equal(
+          laterIdentity!.startTimeTicks,
+          recordedIdentity!.startTimeTicks,
+          `expected run()'s own captured identity to report the same real start-time ticks an independent capture just observed - recorded: ${JSON.stringify(recordedIdentity)}, independent: ${JSON.stringify(laterIdentity)}`
+        );
+      }
+    } else {
+      const projectedElapsedAtLaterCapture =
+        recordedIdentity!.elapsedSecondsAtCapture +
+        (laterIdentity!.capturedAtMs - recordedIdentity!.capturedAtMs) / 1000;
+      assert.ok(
+        Math.abs(projectedElapsedAtLaterCapture - laterIdentity!.elapsedSecondsAtCapture) <= 5,
+        `expected run()'s own captured identity to project forward to the same real elapsed time an independent capture just observed - recorded: ${JSON.stringify(recordedIdentity)}, independent: ${JSON.stringify(laterIdentity)}`
+      );
+    }
 
     const killResult = await killTool.handler({ job_id: jobId });
     assert.notEqual(killResult.isError, true);

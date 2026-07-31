@@ -22,6 +22,7 @@ import { parsesAsPgid, waitForFile } from "./harness.ts";
 import { Client } from "@modelcontextprotocol/client";
 import { InMemoryTransport } from "@modelcontextprotocol/server";
 import { isProcessAlive } from "../dist/process.js";
+import type { ProcessBirthIdentity } from "../dist/process.js";
 import { createServer } from "../dist/server.js";
 import { jobStore } from "../dist/jobStore.js";
 
@@ -512,18 +513,31 @@ test(
             child: unknown;
             pid: number;
             spawnedAtMs: number;
-            birthIdentity: { capturedAtMs: number; elapsedSecondsAtCapture: number } | undefined;
+            birthIdentity: ProcessBirthIdentity | undefined;
           }
         >;
       };
       const tracked = internals.children.get(jobId)!;
       assert.notEqual(tracked, undefined);
+      // Platform-specific corruption technique - see test/kill.test.ts's
+      // identical comment for the full rationale: the two
+      // ProcessBirthIdentity variants are compared completely differently
+      // (checkProcessIdentity's own docs), so there is no single mutation
+      // that produces a mismatch on both.
+      const corruptedIdentity: ProcessBirthIdentity =
+        tracked.birthIdentity!.platform === "linux-starttime-ticks"
+          ? {
+              platform: "linux-starttime-ticks",
+              startTimeTicks: `${tracked.birthIdentity!.startTimeTicks}0`,
+            }
+          : {
+              platform: "posix-elapsed",
+              capturedAtMs: tracked.birthIdentity!.capturedAtMs - 10 * 60 * 1000, // 10 minutes "ago" - impossible for a process that just started
+              elapsedSecondsAtCapture: tracked.birthIdentity!.elapsedSecondsAtCapture,
+            };
       internals.children.set(jobId, {
         ...tracked,
-        birthIdentity: {
-          ...tracked.birthIdentity!,
-          capturedAtMs: tracked.birthIdentity!.capturedAtMs - 10 * 60 * 1000, // 10 minutes "ago" - impossible for a process that just started
-        },
+        birthIdentity: corruptedIdentity,
       });
 
       await client.close();
