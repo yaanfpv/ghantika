@@ -1191,15 +1191,26 @@ test(
     // A generous real timeoutMs (matching production's own default) gives
     // attempt 1's real fork/exec all the headroom this suite's other tests
     // rely on. The injected clock, not a tiny real bound, is what makes the
-    // aggregate window nearly exhausted by the time the retry starts: once
-    // the marker file exists (attempt 1 has genuinely completed), `now()`
-    // jumps forward so only ~100ms of aggregate budget remains - enough for
-    // the retry to be legitimately started, but too little for the
-    // resistant observer's own 5s sleep to ever complete voluntarily.
+    // aggregate window nearly exhausted by the time the retry starts.
+    //
+    // The clock advances on a CALL COUNT, never on an observation of the
+    // marker file: captureBirthIdentityPosixAsync calls `now()` exactly
+    // twice before attempt 1's result is known (once at entry to compute
+    // `aggregateDeadline`, once at the top of the first loop iteration to
+    // compute `remainingAggregate`) - both must read "no time has passed"
+    // (0). Every call after that point runs once attempt 1 has already
+    // resolved, so from the third call on the clock jumps forward, leaving
+    // ~100ms of aggregate budget - enough for the retry to be legitimately
+    // started, but too little for the resistant observer's own 5s sleep to
+    // ever complete voluntarily. A prior version of this clock inferred
+    // "attempt 1 has resolved" from `fs.existsSync` on the fixture's own
+    // marker file - reading the outcome of an async subprocess write is
+    // itself a race, and calling `now()` is not.
     const timeoutMs = ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS;
     const aggregateDeadline = timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS;
+    let nowCalls = 0;
     const clock = {
-      now: () => (fs.existsSync(invocationMarker) ? aggregateDeadline - 350 : 0),
+      now: () => (nowCalls++ < 2 ? 0 : aggregateDeadline - 350),
       sleep: async (ms: number) => {
         await new Promise((resolve) => setTimeout(resolve, Math.min(ms, 20)));
       },
@@ -1515,17 +1526,25 @@ test(
     // A generous real timeoutMs gives attempt 1's real fork/exec the same
     // headroom production uses. The injected clock - not a tiny real bound
     // - is what makes the aggregate window nearly exhausted the moment
-    // attempt 1's not-found registers (once the marker file exists,
-    // `now()` jumps forward to leave only 10ms of aggregate budget). The
-    // declared retry-poll delay (500ms) is deliberately far longer than
-    // that remaining budget, so the sleep must be capped short of the
-    // aggregate deadline - and the very next loop iteration must then
-    // settle without ever starting a second observer.
+    // attempt 1's not-found registers.
+    //
+    // The clock advances on a CALL COUNT, never on an observation of the
+    // marker file (see the sibling "OWNER 5" test above for the full
+    // reasoning): captureBirthIdentityPosixAsync calls `now()` exactly
+    // twice before attempt 1's result is known, both of which must read
+    // "no time has passed" (0); every call after that runs once attempt 1
+    // has already resolved, so from the third call on the clock jumps
+    // forward to leave only 10ms of aggregate budget. The declared
+    // retry-poll delay (500ms) is deliberately far longer than that
+    // remaining budget, so the sleep must be capped short of the aggregate
+    // deadline - and the very next loop iteration must then settle
+    // without ever starting a second observer.
     const timeoutMs = ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS;
     const aggregateDeadline = timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS;
     const declaredRetryDelayMs = 500;
+    let nowCalls = 0;
     const clock = {
-      now: () => (fs.existsSync(invocationMarker) ? aggregateDeadline - 10 : 0),
+      now: () => (nowCalls++ < 2 ? 0 : aggregateDeadline - 10),
       sleep: async (ms: number) => {
         await new Promise((resolve) => setTimeout(resolve, Math.min(ms, 20)));
       },
