@@ -743,16 +743,20 @@ test("green control: a bounded stream UNDER FIREHOSE_LINES_PER_SEC runs to its o
 // bytes - see the field-exclusion rationale below for exactly what it masks
 // and why.
 //
-// Each tool's golden entry carries BOTH `structuredContent` and `content`
-// (the human-readable text block every real CallToolResult also carries),
-// captured and canonicalized independently. Every tool handler in this
-// codebase builds `content` as `JSON.stringify(structuredContent, null,
-// 2)` - a real, source-verified invariant at capture time, not an assumed
-// one - but that is exactly the kind of parity a future edit could break
-// without touching structuredContent at all (a stale or hand-edited
-// content string, say). Comparing only structuredContent, as this file
-// used to, would pass right through such a break; capturing and comparing
-// both closes that gap.
+// Each tool's golden entry carries BOTH `structuredContent` and a second
+// value captured from `content` - but that second value is only the
+// independently JSON-parsed body of `content[0].text`, not `content`
+// itself: the array's length and ordering, each block's type, any
+// additional or non-text blocks, and every other CallToolResult envelope
+// field are captured nowhere in this fixture and compared nowhere below.
+// Every tool handler in this codebase builds `content[0].text` as
+// `JSON.stringify(structuredContent, null, 2)` - a real, source-verified
+// invariant at capture time, not an assumed one - but that is exactly the
+// kind of parity a future edit could break without touching
+// structuredContent at all (a stale or hand-edited content string, say).
+// Comparing only structuredContent, as this file used to, would pass
+// right through such a break; capturing and comparing the first block's
+// parsed body closes that one specific gap, and only that one.
 // =============================================================================
 
 const golden = JSON.parse(readFileSync(GOLDEN_PATH, "utf8")) as Record<string, unknown>;
