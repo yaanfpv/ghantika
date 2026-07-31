@@ -34,7 +34,7 @@ name: Main Verify
 # completeness check reads `job.strategy.matrix` from the CALLING side of a
 # job definition and would need its own rework to understand a matrix that
 # instead lives inside a reusable workflow's callee file - out of scope for
-# this story). test/main-verify-workflow.test.ts asserts the two `test`
+# this story). test/main-verify-workflow.test.js asserts the two `test`
 # jobs' matrices and step lists stay identical, so a drift here fails a
 # test rather than failing silently.
 on:
