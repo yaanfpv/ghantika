@@ -847,13 +847,20 @@ function assertPlainPollByteIdentical(live: unknown, context: string): void {
 
 /**
  * Extracts BOTH halves of a real `CallToolResult` a golden comparison
- * needs: `structuredContent` as-is, and `content`'s own text block
+ * needs: `structuredContent` as-is, and `content`'s own FIRST text block
  * independently re-parsed from its raw JSON string - never assumed equal
  * to `structuredContent` just because that is every handler's current
  * contract. A future regression that lets the two drift (a stale
  * `content` string a handler forgot to update alongside a real
  * `structuredContent` change, say) is exactly what capturing both
  * separately is for.
+ *
+ * The boundary this does NOT cover, stated explicitly rather than left
+ * implied: only the first `content` block's parsed body is compared. The
+ * array's own length and ordering, each block's `type`, any additional
+ * blocks beyond the first, and every other `CallToolResult` envelope
+ * field are outside what this - and therefore the additivity proof built
+ * on it - actually establishes.
  */
 function toCanonicalResultPair(result: {
   content?: Array<{ type: string; text?: string }>;
