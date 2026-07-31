@@ -482,7 +482,11 @@ test(
       const jobId = callResult.structuredContent?.job_id as string;
       assert.equal(typeof jobId, "string");
 
-      await new Promise((resolve) => setTimeout(resolve, 100)); // let the spawn event actually land
+      // Awaits the same real settlement `resolveBirthIdentityForKill`'s own
+      // production callers already await, rather than racing a fixed
+      // wall-clock delay against the async capture - see test/run.test.ts's
+      // waitForIdentityCaptureSettled for the full rationale.
+      await jobStore.resolveBirthIdentityForKill(jobId);
 
       const handle = jobStore.getChildHandle(jobId);
       assert.notEqual(handle, undefined, "expected a real attached child for this job");
