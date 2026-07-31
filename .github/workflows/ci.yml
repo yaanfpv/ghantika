@@ -115,7 +115,7 @@ jobs:
   #
   # LOCKSTEP WARNING: main-verify.yml's own `test` job is a DELIBERATE,
   # DISCLOSED duplicate of this one (see that file's header for why it is a
-  # duplicate rather than a shared `workflow_call`). test/main-verify-workflow.test.ts
+  # duplicate rather than a shared `workflow_call`). test/main-verify-workflow.test.js
   # asserts the two stay identical - keep them in sync, or fix that test's
   # own expectation if the divergence is intentional.
   test:
