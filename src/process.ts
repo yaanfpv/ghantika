@@ -868,8 +868,117 @@ function readLinuxStartTimeTicks(pid: number): LinuxStartTimeTicksReadResult {
  */
 export type ProcStatAsyncReader = (pid: number, signal: AbortSignal) => Promise<string>;
 
-const REAL_PROC_STAT_ASYNC_READER: ProcStatAsyncReader = (pid, signal) =>
-  fs.promises.readFile(`/proc/${pid}/stat`, { encoding: "utf8", signal });
+/**
+ * The finite set of ways a test may force the real reader below to fail -
+ * deliberately NOT a generic override: no path, no content, no way to
+ * supply an alternate `stat` line at all. Every member of this type
+ * degrades the read; none can satisfy it. `"not-found"` rejects with the
+ * same `ENOENT` shape a genuinely-missing pid produces (see
+ * `classifyProcStatReadFailure` below); `"observer-failure"` rejects with
+ * an unrelated error (any non-`ENOENT` code); `"hang"` never settles on its
+ * own, leaving `readLinuxStartTimeTicksAsync`'s own external bound to
+ * resolve it, exactly as a genuinely-stuck read would; `"not-found-then-hang"`
+ * is `"not-found"` on the first invocation of the current degrade session
+ * and `"hang"` on every one after - the shape a retry-then-force-reap test
+ * needs to prove a retry genuinely started before the aggregate cap fires.
+ */
+type ProcStatTestDegradeMode = "not-found" | "observer-failure" | "hang" | "not-found-then-hang";
+
+function isProcStatTestDegradeMode(value: string): value is ProcStatTestDegradeMode {
+  return (
+    value === "not-found" ||
+    value === "observer-failure" ||
+    value === "hang" ||
+    value === "not-found-then-hang"
+  );
+}
+
+function resolveProcStatTestDegradeMode(): ProcStatTestDegradeMode | undefined {
+  const raw = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+  if (raw === undefined || !isProcStatTestDegradeMode(raw)) return undefined;
+  return raw;
+}
+
+/**
+ * How many prior invocations this degrade session has recorded - derived
+ * fresh from the marker file itself EVERY call, never from an in-memory
+ * counter: this codebase's own architecture reserves persistent module
+ * state to `jobStore.ts` alone (see `test/module-boundaries.test.ts`), so
+ * `"not-found-then-hang"`'s only real requirement - tell its first
+ * invocation from a later one - is answered by reading the same external
+ * artifact `recordProcStatDegradeInvocation` writes, exactly the technique
+ * the `ps`-shadowing fixtures elsewhere in this test suite already use
+ * (`makeFakePsDir`'s own marker file) rather than this codebase's own
+ * internal bookkeeping. No marker set means no way to count, so
+ * `"not-found-then-hang"` requires `GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER`
+ * - every other mode ignores this entirely.
+ */
+function countPriorProcStatDegradeInvocations(marker: string | undefined): number {
+  if (marker === undefined) return 0;
+  try {
+    return fs
+      .readFileSync(marker, "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0).length;
+  } catch {
+    return 0;
+  }
+}
+
+function recordProcStatDegradeInvocation(marker: string | undefined): void {
+  if (marker !== undefined) fs.appendFileSync(marker, "x\n");
+}
+
+/**
+ * TEST-ONLY, FAILURE-ONLY hatch for the real reader below - the Linux
+ * analogue of the PATH-shadowing this codebase's own POSIX tests already
+ * use to simulate a missing/resistant/failing `ps` (see e.g. `makeFakePsDir`
+ * in the test suite): Linux capture never shells out to anything on PATH,
+ * so there is no equivalent environment lever for it without this.
+ *
+ * Deliberately NOT a generic root/content override: `GHANTIKA_TEST_DEGRADE_PROC_READ`
+ * only accepts the four literal failure-mode strings above, and every one
+ * of them only ever REJECTS the read or leaves it hanging for the caller's
+ * own bound to time out - there is no way to make a degraded read come back
+ * as a value this codebase would accept as a confirmed identity. A process
+ * with this var set gains only a forced degrade to `unavailable`/
+ * `unconfirmed`, never a spoofed confirm - see `test/process.test.ts`'s own
+ * removal-detects-it control for the mutation-strong proof of this
+ * property, and this file's `classifyProcStatReadFailure`/
+ * `interpretProcStatOutput` for why a rejection can only ever produce
+ * `"not-found"` or `"observer-failure"`, never `"found"`.
+ */
+const REAL_PROC_STAT_ASYNC_READER: ProcStatAsyncReader = (pid, signal) => {
+  const degradeMode = resolveProcStatTestDegradeMode();
+  if (degradeMode !== undefined) {
+    const marker = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
+    const isFirstInvocation = countPriorProcStatDegradeInvocations(marker) === 0;
+    recordProcStatDegradeInvocation(marker);
+    if (
+      degradeMode === "not-found" ||
+      (degradeMode === "not-found-then-hang" && isFirstInvocation)
+    ) {
+      const err = new Error(
+        "ENOENT: simulated by GHANTIKA_TEST_DEGRADE_PROC_READ"
+      ) as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      return Promise.reject(err);
+    }
+    if (degradeMode === "observer-failure") {
+      return Promise.reject(
+        new Error("simulated observer failure (GHANTIKA_TEST_DEGRADE_PROC_READ=observer-failure)")
+      );
+    }
+    // "hang" and every attempt after the first under "not-found-then-hang" -
+    // never resolves or rejects on its own; readLinuxStartTimeTicksAsync's
+    // own external bound is what settles this, exactly as it would for a
+    // real hung read (see that function's own docs: an injected reader
+    // that ignores the signal entirely still cannot hold its promise open
+    // past the bound).
+    return new Promise(() => {});
+  }
+  return fs.promises.readFile(`/proc/${pid}/stat`, { encoding: "utf8", signal });
+};
 
 /**
  * The ASYNC counterpart of `readLinuxStartTimeTicks` above, built on

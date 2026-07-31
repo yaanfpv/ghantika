@@ -1732,6 +1732,108 @@ test("readLinuxStartTimeTicksAsync: a /proc read that never settles is still for
   );
 });
 
+// --- GHANTIKA_TEST_DEGRADE_PROC_READ: the test-only, failure-only hatch on
+// the REAL reader (no injected reader passed below - this exercises the
+// production default, `REAL_PROC_STAT_ASYNC_READER`, exactly as run()'s own
+// real spawn-time capture and checkProcessIdentity's own kill-time
+// re-verify would). This is the removal-detects-it control the hatch's own
+// safety claim needs: it uses `process.pid` - a REAL, currently-alive
+// process whose genuine /proc entry a normal read WOULD find - so if a
+// future change ever let an engaged degrade mode fall through to a real or
+// fabricated "found" result, this is exactly the scenario that would catch
+// it. Every mode must produce "not-found" or "observer-failure", NEVER
+// "found", across the whole mode space - not just the modes each
+// individual test above happens to reach. ---
+
+test("GHANTIKA_TEST_DEGRADE_PROC_READ: every degrade mode degrades a REAL, currently-alive pid's read - none can ever produce found", async () => {
+  const realPath = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+  const realMarker = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
+  try {
+    delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
+
+    process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "not-found";
+    const notFound = await readLinuxStartTimeTicksAsync(process.pid, 200);
+    assert.equal(
+      notFound.status,
+      "not-found",
+      `"not-found" mode must classify a real, alive pid's read as not-found, never found - got ${JSON.stringify(notFound)}`
+    );
+
+    process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "observer-failure";
+    const observerFailure = await readLinuxStartTimeTicksAsync(process.pid, 200);
+    assert.equal(
+      observerFailure.status,
+      "observer-failure",
+      `"observer-failure" mode must never produce found - got ${JSON.stringify(observerFailure)}`
+    );
+
+    process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "hang";
+    const before = Date.now();
+    const hung = await readLinuxStartTimeTicksAsync(process.pid, 100);
+    const elapsedMs = Date.now() - before;
+    assert.equal(
+      hung.status,
+      "observer-failure",
+      `"hang" mode must settle to observer-failure via the caller's own bound, never found - got ${JSON.stringify(hung)}`
+    );
+    assert.ok(
+      elapsedMs < 1000,
+      `expected "hang" to settle near its 100ms bound, took ${elapsedMs}ms`
+    );
+
+    // "not-found-then-hang" tells its first invocation from a later one by
+    // reading this marker file's own line count (no in-memory counter - see
+    // countPriorProcStatDegradeInvocations's own docs for why), so this
+    // sub-case is the one mode that REQUIRES a real marker to exercise
+    // correctly - without one every invocation looks like the first.
+    const degradeMarkerDir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-degrade-marker-"));
+    const degradeMarkerPath = path.join(degradeMarkerDir, "invocations.txt");
+    process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = degradeMarkerPath;
+    process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "not-found-then-hang";
+    const firstAttempt = await readLinuxStartTimeTicksAsync(process.pid, 100);
+    assert.equal(
+      firstAttempt.status,
+      "not-found",
+      `"not-found-then-hang" mode's first invocation must be not-found - got ${JSON.stringify(firstAttempt)}`
+    );
+    const secondAttempt = await readLinuxStartTimeTicksAsync(process.pid, 100);
+    assert.equal(
+      secondAttempt.status,
+      "observer-failure",
+      `"not-found-then-hang" mode's second invocation must hang-then-degrade to observer-failure, never found - got ${JSON.stringify(secondAttempt)}`
+    );
+  } finally {
+    if (realPath === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+    else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realPath;
+    if (realMarker === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
+    else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = realMarker;
+  }
+});
+
+// mutation control: an unrecognized value must be IGNORED entirely (falls
+// through to the real read), never treated as some other implicit mode -
+// this is what keeps the hatch's surface exactly the four literals above,
+// not "anything truthy".
+test(
+  "GHANTIKA_TEST_DEGRADE_PROC_READ: an unrecognized value is ignored - the real read still runs, still finds a real alive pid",
+  { skip: LINUX_ONLY_SKIP },
+  async () => {
+    const realPath = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+    try {
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "success"; // not a real mode - must not be accepted as one
+      const result = await readLinuxStartTimeTicksAsync(process.pid, 200);
+      assert.equal(
+        result.status,
+        "found",
+        `an unrecognized value must fall through to the real read (which finds this real, alive pid), not be treated as a degrade mode - got ${JSON.stringify(result)}`
+      );
+    } finally {
+      if (realPath === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realPath;
+    }
+  }
+);
+
 // --- identityElapsedTimesMatch (pure comparison, checkProcessIdentity's building block) ---
 
 test("identityElapsedTimesMatch: within tolerance is a match", () => {

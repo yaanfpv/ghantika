@@ -303,19 +303,29 @@ test(
   { skip: POSIX_ONLY_SKIP },
   async () => {
     const realPath = process.env.PATH;
+    const realDegrade = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
     let result: ReturnType<typeof runTool.handler>;
     try {
       // Break PATH for the SERVER PROCESS itself (what captureBirthIdentityPosix's
       // own execFileSync("ps", ...) call reads) - the JOB's own env is a
       // separate, caller-supplied object (buildChildEnv), so `sleep`
-      // itself still resolves and spawns normally via its own PATH.
+      // itself still resolves and spawns normally via its own PATH. Also
+      // engage the Linux-only degrade hatch (src/process.ts's
+      // GHANTIKA_TEST_DEGRADE_PROC_READ) to the equivalent failure mode -
+      // captureBirthIdentityPosixAsync never shells out to ps on Linux, so
+      // breaking PATH alone has zero effect there; on every OTHER platform
+      // this var is simply never read, so setting it is inert. One test
+      // body, whichever real code path the running platform dispatches to.
       process.env.PATH = "/tmp/does-not-exist-ghantika-empty-path-dir";
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "observer-failure";
       result = runTool.handler({
         command: ["sleep", "5"],
         env: { vars: { PATH: realPath ?? "/usr/bin:/bin" } },
       });
     } finally {
       process.env.PATH = realPath;
+      if (realDegrade === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegrade;
     }
 
     assert.notEqual(
@@ -518,17 +528,21 @@ test(
   { skip: POSIX_ONLY_SKIP },
   async () => {
     const realPath = process.env.PATH;
+    const realDegrade = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
     // A real `ps` that executes successfully as a process but reports a
     // genuine failure - exit code 2, deliberately NOT 1 (ps's own
     // documented "no such pid" code, which this codebase must never
     // confuse with a real observer failure - see readProcessElapsedSecondsAsync's
-    // own docs).
+    // own docs). Also engages the Linux-only degrade hatch to the same
+    // "observer-failure" outcome - see the sibling "ps unavailable" test
+    // above for why both levers can coexist in one test body.
     const fakePsDir = makeFakePsDir("exit 2");
 
     let result: ReturnType<typeof runTool.handler>;
     let elapsedMs: number;
     try {
       process.env.PATH = `${fakePsDir}:${realPath ?? "/usr/bin:/bin"}`;
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "observer-failure";
       const before = Date.now();
       result = runTool.handler({
         command: ["sleep", "5"],
@@ -537,6 +551,8 @@ test(
       elapsedMs = Date.now() - before;
     } finally {
       process.env.PATH = realPath;
+      if (realDegrade === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegrade;
     }
 
     assert.notEqual(result.isError, true, `run() must succeed: ${JSON.stringify(result)}`);
