@@ -1021,7 +1021,7 @@ test("all six tools' plain-poll responses stay byte-identical (canonical project
   }
 });
 
-test("all six tools' plain-poll responses stay byte-identical (canonical projection) to the SAME frozen golden even while the Tasks adapter is ACTIVELY engaged elsewhere in the same process (a separate capable connection minting and wake-watching its own job)", async () => {
+test("run/status/output/tail/kill stay byte-identical (canonical projection) to the SAME frozen golden, and so does list's own scenario-owned entry, even while the Tasks adapter is ACTIVELY engaged elsewhere in the same process (a separate capable connection minting and wake-watching its own job) - every OTHER entry in the real process-wide list response is confirmed to share that entry's canonical key shape, not compared against a golden value", async () => {
   const capablePair = await startPair(true);
   const plainPair = await startPair(false);
   let capableJobId: string | undefined;

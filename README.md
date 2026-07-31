@@ -12,7 +12,7 @@ Ask an AI agent to do something that takes a while (a build, a render, a big upl
 
 Ghantika fixes that. Hand it a command, and it starts running in the background immediately, no blocking. The agent gets a job id back and is free to do other things. The moment that command produces output, ghantika rings, and the agent picks the thread back up exactly where it left off.
 
-**Set it up once, use it everywhere.** It's a standard [MCP](https://modelcontextprotocol.io) server over stdio, so every client that speaks MCP can start jobs and read them back with the same six tools, by polling. A client that declares `io.modelcontextprotocol/tasks` in its `capabilities.extensions` bag gets more than that: ghantika wakes it directly as new output arrives, instead of it having to ask. Declaring only the older, SDK-deprecated `capabilities.tasks` shape does not reach this - polling is what that client has. Every client reads the same jobs the same way, and the job runs regardless of whether anything is watching.
+**Set it up once, use it everywhere.** It's a standard [MCP](https://modelcontextprotocol.io) server over stdio, so every client that speaks MCP can start jobs and read them back with the same six tools, by polling. A client that declares `io.modelcontextprotocol/tasks` in its `capabilities.extensions` bag gets more than that: ghantika wakes it directly as new stdout output arrives, instead of it having to ask - stderr is still captured and readable through `output`/`tail` like any other job, it just does not itself trigger a wake. Declaring only the older, SDK-deprecated `capabilities.tasks` shape does not reach this - polling is what that client has. Every client reads the same jobs the same way, and the job runs regardless of whether anything is watching.
 
 ---
 
@@ -185,7 +185,7 @@ Some agent runtimes ship a plain "run a command" tool. Here's what ghantika adds
 
 - A plain run-command tool blocks the whole turn until the process exits. Ghantika returns a job id immediately and the process keeps running regardless of whether anything is watching it.
 - Backgrounding a process without a way to check on it later means the moment it finishes is lost the second your attention moves elsewhere. Ghantika keeps the job's state and output addressable by id for as long as the server is up, so `status`/`output`/`tail` answer correctly whenever you actually ask.
-- A fixed sleep-and-recheck loop burns a full round trip on every guess at how long something takes. Ghantika answers on the job's real state, not on a timer you had to estimate up front, and a client declaring the Tasks extension URI (see above) gets rung as new output arrives instead of having to ask.
+- A fixed sleep-and-recheck loop burns a full round trip on every guess at how long something takes. Ghantika answers on the job's real state, not on a timer you had to estimate up front, and a client declaring the Tasks extension URI (see above) gets rung as new stdout output arrives instead of having to ask.
 
 The new part isn't running a command in the background, it's never having to choose between blocking on it and losing track of it.
 
