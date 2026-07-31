@@ -586,10 +586,21 @@ test("setBirthIdentity is a safe no-op for an untracked job id - never throws, n
   assert.equal(store.getChildHandle("nope"), undefined);
 });
 
-test("attachPendingIdentityCapture is a safe no-op for an untracked job id - never throws", () => {
+test("attachPendingIdentityCapture is a safe no-op for an untracked job id - never throws, and names the silent branch via a diagnostic", (t) => {
   const store = new JobStore();
+  const errorSpy = t.mock.method(console, "error");
   assert.doesNotThrow(() => store.attachPendingIdentityCapture("nope", Promise.resolve(undefined)));
   assert.equal(store.getChildHandle("nope"), undefined);
+  const expected =
+    "[ghantika] attachPendingIdentityCapture(jobId=nope) found no tracked child - the in-flight capture was discarded, never attached";
+  const matching = errorSpy.mock.calls.filter((call) => String(call.arguments[0]) === expected);
+  assert.equal(
+    matching.length,
+    1,
+    `expected exactly one diagnostic matching the exact discarded-capture message, got: ${JSON.stringify(
+      errorSpy.mock.calls.map((c) => c.arguments.map(String))
+    )}`
+  );
 });
 
 test(
@@ -669,6 +680,46 @@ test("resolveBirthIdentityForKill returns undefined for an untracked job id", as
   const store = new JobStore();
   assert.equal(await store.resolveBirthIdentityForKill("nope"), undefined);
 });
+
+test(
+  "resolveBirthIdentityForKill: a tracked child whose identityCapture was never attached - attachPendingIdentityCapture was never called for it - settles undefined via the SILENT branch, named by its own diagnostic",
+  {
+    skip:
+      process.platform === "win32"
+        ? "spawns a real bare `sleep` and cleans it up via a negative-pid kill, POSIX-only"
+        : false,
+  },
+  async (t) => {
+    const store = new JobStore();
+    const record = store.createJob({ argv: ["sleep"], cwd: "/tmp", env: {}, isShell: false });
+    const child = attachRealChild(store, record.job_id);
+    const errorSpy = t.mock.method(console, "error");
+
+    // Deliberately never calling attachPendingIdentityCapture: child.pid is
+    // defined (attachChild ran), but identityCapture stays undefined because
+    // nothing ever wired a pending capture onto it.
+    const result = await store.resolveBirthIdentityForKill(record.job_id);
+    assert.equal(result, undefined, "expected undefined - no capture was ever attached");
+
+    const expectedPrefix = `[ghantika] resolveBirthIdentityForKill(jobId=${record.job_id}, pid=${child.pid}) found identityCapture undefined - no async capture was ever attached to this tracked child, `;
+    const expectedSuffix = "ms since attachChild";
+    const matching = errorSpy.mock.calls.filter((call) => {
+      const message = String(call.arguments[0]);
+      if (!message.startsWith(expectedPrefix) || !message.endsWith(expectedSuffix)) return false;
+      const elapsed = message.slice(expectedPrefix.length, message.length - expectedSuffix.length);
+      return /^\d+$/.test(elapsed);
+    });
+    assert.equal(
+      matching.length,
+      1,
+      `expected exactly one diagnostic matching the exact prefix/suffix with a numeric elapsed-time middle, got: ${JSON.stringify(
+        errorSpy.mock.calls.map((c) => c.arguments.map(String))
+      )}`
+    );
+
+    process.kill(-child.pid!, "SIGKILL"); // cleanup
+  }
+);
 
 test(
   "OWNER 7 - kill()'s real caller (resolveBirthIdentityForKill) settles a genuinely still-pending capture by the aggregate cap, never hanging past it",

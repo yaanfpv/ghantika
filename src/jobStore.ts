@@ -1094,6 +1094,51 @@ interface TrackedChild {
 }
 
 /**
+ * `resolveBirthIdentityForKill`'s SILENT branch - `tracked.identityCapture`
+ * itself is `undefined`, meaning `attachPendingIdentityCapture` was never
+ * called against this tracked child (see `TrackedChild.identityCapture`'s
+ * own docs - distinct from a capture that ran and later settled to
+ * nothing, which resolves through the awaited promise instead, not this
+ * branch): a successful `attachPendingIdentityCapture` call writes the
+ * in-flight promise onto `identityCapture` synchronously, before that
+ * promise ever settles, and nothing in this codebase clears the field
+ * back to `undefined` once it is set - so a still-`undefined` value at
+ * this point observes only that the call never happened for this tracked
+ * child, nothing more. Diagnostic only - `stderr` via `console.error`,
+ * never `console.log` (a stdio MCP server; see `src/server.ts`'s own
+ * docs on why stdout is reserved for the protocol). Changes no return
+ * value or control flow.
+ */
+// nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- jobId/pid/spawnedAtMs are this codebase's own literal/computed values, never attacker-supplied; this is a diagnostic console.error to stderr, not a format-string sink.
+function logResolveBirthIdentitySilent(jobId: string, pid: number, spawnedAtMs: number): void {
+  const elapsedMs = Date.now() - spawnedAtMs;
+  console.error(
+    `[ghantika] resolveBirthIdentityForKill(jobId=${jobId}, pid=${pid}) found identityCapture undefined - no async capture was ever attached to this tracked child, ${elapsedMs}ms since attachChild`
+  );
+}
+
+/**
+ * `attachPendingIdentityCapture`'s SILENT no-op - `this.children.get(jobId)`
+ * returned nothing, so the in-flight capture this call was meant to wire
+ * onto the tracked child is discarded instead. That method's own docs
+ * describe this as a defensive guard believed unreachable in practice
+ * (nothing in this codebase today removes a tracked-children entry once
+ * `attachChild` adds one) - this diagnostic exists to make that belief
+ * checkable against a real occurrence rather than merely asserted. Note
+ * that a later `resolveBirthIdentityForKill` call for the SAME missing
+ * tracked child never reaches `logResolveBirthIdentitySilent` above: it
+ * returns via its own earlier `if (!tracked)` check before ever looking
+ * at `identityCapture`. Diagnostic only - `stderr` via `console.error`,
+ * never `console.log`. Changes no return value or control flow.
+ */
+// nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- jobId is this codebase's own literal/computed value, never attacker-supplied; this is a diagnostic console.error to stderr, not a format-string sink.
+function logAttachPendingIdentityCaptureSilent(jobId: string): void {
+  console.error(
+    `[ghantika] attachPendingIdentityCapture(jobId=${jobId}) found no tracked child - the in-flight capture was discarded, never attached`
+  );
+}
+
+/**
  * The sole owner of ghantika's job/output state. Tool handlers use the
  * `jobStore` singleton this module exports below - never construct their
  * own `JobStore` (see this file's header for why a singleton rather than a
@@ -1357,7 +1402,10 @@ export class JobStore {
     capture: Promise<ProcessBirthIdentity | undefined>
   ): void {
     const tracked = this.children.get(jobId);
-    if (!tracked) return;
+    if (!tracked) {
+      logAttachPendingIdentityCaptureSilent(jobId);
+      return;
+    }
     this.children.set(jobId, { ...tracked, identityCapture: capture });
     const record = this.jobs.get(jobId);
     if (record) record.identity_capture = "pending";
@@ -1403,7 +1451,10 @@ export class JobStore {
     const tracked = this.children.get(jobId);
     if (!tracked) return undefined;
     if (tracked.birthIdentity !== undefined) return tracked.birthIdentity;
-    if (tracked.identityCapture === undefined) return undefined;
+    if (tracked.identityCapture === undefined) {
+      logResolveBirthIdentitySilent(jobId, tracked.pid, tracked.spawnedAtMs);
+      return undefined;
+    }
     return tracked.identityCapture;
   }
 
