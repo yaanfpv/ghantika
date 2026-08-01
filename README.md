@@ -204,6 +204,20 @@ The `run` tool takes:
 
 Ghantika never hands a job its own full environment. Even in `merge` mode the child starts from that minimal base and nothing else, so anything a command needs, it gets because you passed it.
 
+### Command policy
+
+`run` only spawns a command whose fully resolved executable is on an allowlist you configure - by default, with nothing configured, every command is denied. Point the `GHANTIKA_POLICY_FILE` environment variable at a JSON file shaped like:
+
+```json
+{ "allow": ["/usr/bin/ls", "node", "sleep"] }
+```
+
+Each entry can be a bare name (resolved via ghantika's own `PATH`) or a path; either way, the entry and the command actually being run are both resolved to their real, symlink-free path before comparison, so any way of spelling the same binary reaches the same decision. With `shell: true`, the same check runs against the platform shell binary itself (`/bin/sh` on POSIX), not against the shell command line - and the exact path this check approves is what actually launches: it's passed to the real spawn as a literal executable, never re-derived from your job's own environment, so a shell command only ever runs once you've allowlisted the shell that will actually execute it. A denied command comes back as a failed job with a diagnostic saying so, rather than running or throwing. This is server configuration, not something a tool call can supply or widen: nothing in `command`'s own arguments is ever read as policy, and a missing or malformed policy file denies everything rather than falling open.
+
+Allowlisting an interpreter (a shell, `env`, `node`, and the like) is a real decision, not a convenience default - ghantika ships nothing on the allowlist itself, and once you do add an interpreter, anything it's asked to run is on you the same way it would be if you ran that interpreter directly outside ghantika.
+
+On Windows, that platform shell is resolved from this server's own `ComSpec` (falling back to a PATH search for `cmd.exe` against this server's own trusted `PATH` when unset - never a job's own environment) - this repository's CI has no Windows leg at all right now, so that resolution, and the fact that the resolved path is what actually launches, are verified by reading and by a platform-mocked unit test, not by real execution on a Windows host.
+
 `status`, `output`, and `tail` all take `job_id`. `tail` also takes an optional `stream` (`stdout`/`stderr`/`both`) and `lines`; `output` takes `stream` plus `after_cursor` and `limit` for paging through a long job incrementally. `kill` takes `job_id`. Every tool's full input schema is advertised over `tools/list`, so an agent (or you) can always ask ghantika directly rather than trusting a doc that's drifted out of date.
 
 ## Roadmap

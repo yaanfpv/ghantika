@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 /**
- * Guards the frozen module ownership for `src/`: exactly ten
- * internal modules (`server.ts`, `registry.ts`, `jobStore.ts`,
- * `process.ts`, and the six `tools/*.ts` handler files), no more, no
- * fewer - `src/index.ts` is deliberately excluded, since it's the
- * package's public entry point (`package.json`'s `"main"`/`"types"`), not
- * one of the six-tool architecture's internal modules.
+ * Guards the frozen module ownership for `src/`: exactly the modules
+ * named in FROZEN_MODULES below (`server.ts`, `registry.ts`, `jobStore.ts`,
+ * `process.ts`, `policy.ts`, `tasksAdapter.ts`, and the six `tools/*.ts`
+ * handler files), no more, no fewer - `src/index.ts` is deliberately
+ * excluded, since it's the package's public entry point (`package.json`'s
+ * `"main"`/`"types"`), not one of the six-tool architecture's internal
+ * modules.
  *
  * Three checks, matching this repo's established guard style (see
  * scripts/check-npm-ci-usage.mjs): pure, exported functions that operate
@@ -84,6 +85,7 @@ const SRC_DIR = path.join(REPO_ROOT, "src");
 // it once it does.
 export const FROZEN_MODULES = [
   "jobStore.ts",
+  "policy.ts",
   "process.ts",
   "registry.ts",
   "server.ts",

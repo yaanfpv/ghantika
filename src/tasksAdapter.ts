@@ -265,14 +265,18 @@ export function isTaskStatusValue(value: unknown): value is TaskStatusValue {
  * status); `exited` is `completed` REGARDLESS of the job's real exit code
  * (a task that ran to completion is a completed task - the actual
  * `exitCode` travels separately in the result, see `buildTaskResult`,
- * never folded into the status itself); `failed` (this codebase's own
- * spawn-error class - a cwd/executable preflight rejection or a genuine
- * async spawn failure, see `src/jobStore.ts`'s `JobDiagnosticReason` docs)
- * is the task-level `failed` (the task itself never ran, distinct from a
- * completed task whose command happened to exit non-zero); `killed` is
- * `cancelled` (an explicit kill, whether via the `kill` tool today or a
- * real cooperative cancel layered on top of `tasks/cancel` later, is a
- * cancellation at the task level).
+ * never folded into the status itself); `failed` is the task-level
+ * `failed` - see `src/jobStore.ts`'s `JobDiagnosticReason` docs for the
+ * full reason set. Most `failed` jobs never spawned at all (a cwd/executable
+ * preflight rejection, a genuine async spawn failure, or a command the
+ * policy gate denied), but `watcher/runtime-error` is a legal producer of
+ * `failed` too for a command that DID genuinely spawn and run - e.g. one
+ * terminated by its own execution deadline before finishing naturally (see
+ * `run.ts`'s deadline handling). `failed` at the task level therefore means
+ * "the task did not run to natural completion", not "the task never ran";
+ * `killed` is `cancelled` (an explicit kill, whether via the `kill` tool
+ * today or a real cooperative cancel layered on top of `tasks/cancel`
+ * later, is a cancellation at the task level).
  */
 function mapJobStateToTaskStatus(state: JobState): TaskStatusValue {
   switch (state) {
@@ -379,10 +383,11 @@ function taskNotFound(taskId: string): TaskNotFound {
 /**
  * How long a TERMINAL task's record is retained before a task-layer TTL
  * purge REMOVES it from `jobStore` entirely - a completely SEPARATE
- * concept from a job's own execution timeout (this codebase has no such
- * timeout today; if one is added later, it kills the JOB, transitioning it
- * to `failed`, which is an entirely different effect than this purge's
- * "remove the now-stale completed record"). NEVER an 'expired' task
+ * concept from a job's own execution timeout (`run()`'s optional
+ * `deadline_ms`, see `run.ts`): that timeout kills a still-running JOB,
+ * transitioning it to `failed`, which is an entirely different effect than
+ * this purge's "remove the now-stale, already-terminal completed record".
+ * NEVER an 'expired' task
  * status: a still-`working` task is NEVER purged regardless of age (see
  * `isExpiredTerminalRecord`'s own terminal-only guard, which is what makes
  * that true) - only a genuinely completed/terminal record is reclaimed,
