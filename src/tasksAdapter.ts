@@ -555,13 +555,13 @@ export function taskIdParamsSchema(): StandardSchemaV1<unknown, TaskIdParams> {
 // for that job may never run again.
 // ---------------------------------------------------------------------------
 
-/** Stdout lines arriving within this many ms of each other collapse into ONE wake - the sole batching mechanism (never lifecycle-based: a long-running command gets one wake per closed window, for its whole life, not a single end-of-run wake). */
+/** Output lines - stdout or stderr, on the SAME shared window - arriving within this many ms of each other collapse into ONE wake, carrying both streams together when both produced lines in that window - the sole batching mechanism (never lifecycle-based: a long-running command gets one wake per closed window, for its whole life, not a single end-of-run wake). */
 export const WAKE_COALESCE_WINDOW_MS = 200;
 
 /** The wake-emission rate this adapter never exceeds - implied by construction (1000 / WAKE_COALESCE_WINDOW_MS = 5): at most one wake fires per coalescing window, so at most one every 200ms. Named separately because it is independently pinned and asserted against. */
 export const WAKE_MAX_RATE_PER_SEC = 5;
 
-/** A sustained stdout line-arrival rate above this many lines/sec is a "firehose". */
+/** A sustained line-arrival rate above this many lines/sec, combined across stdout and stderr, is a "firehose". */
 export const FIREHOSE_LINES_PER_SEC = 5000;
 
 /** How long a firehose-rate stream must sustain before the notification WATCH (never the job) auto-stops. */
@@ -573,7 +573,7 @@ export const WATCH_STOP_REASON_FIREHOSE = "firehose";
 /** The extension's real notification method name - exact-string wire identity, never a substring/prefix a client should match against. Optional: a client MUST NOT rely on receiving it and continues to poll `tasks/get`/`output`/`tail` regardless (see this section's own docs on the poll floor). */
 export const TASKS_STATUS_NOTIFICATION_METHOD = "notifications/tasks/status";
 
-/** One stdout line as carried in a wake notification's payload - the SAME shape (seq/text/partial) `src/tools/output.ts`'s own `OutputEvent` uses for stdout, so the wake never carries state the poll floor can't independently surface. */
+/** One output line (stdout or stderr) as carried in a wake notification's payload - the SAME shape (seq/text/partial) `src/tools/output.ts`'s own `OutputEvent` uses for either stream, so the wake never carries state the poll floor can't independently surface. */
 export interface TaskWakeLine {
   readonly seq: number;
   readonly text: string;
@@ -600,14 +600,25 @@ function toWakeLine(line: StreamLineEntry): TaskWakeLine {
     : { seq: line.seq, text: line.text };
 }
 
+/**
+ * Builds one wake notification's params from whatever this closed window
+ * actually produced. `stdout`/`stderr` are each included only when THIS
+ * batch carries at least one line for that stream - mirroring `TaskResult`'s
+ * own optional-field house style (`exitCode`/`output`/`watchStopped` above)
+ * rather than always emitting an empty array a client would have to filter
+ * out. A window that saw only stdout carries `stdout` alone, exactly as
+ * before this adapter also woke on stderr; a mixed window carries both.
+ */
 function buildWakeParams(
   taskId: string,
-  lines: readonly StreamLineEntry[]
+  stdoutLines: readonly StreamLineEntry[],
+  stderrLines: readonly StreamLineEntry[]
 ): Record<string, unknown> {
   return {
     extension: TASKS_EXTENSION_URI,
     taskId,
-    stdout: lines.map(toWakeLine),
+    ...(stdoutLines.length > 0 ? { stdout: stdoutLines.map(toWakeLine) } : {}),
+    ...(stderrLines.length > 0 ? { stderr: stderrLines.map(toWakeLine) } : {}),
   };
 }
 
@@ -618,22 +629,24 @@ function buildWakeParams(
  * about - see that function's own call site). Subscribes to jobStore's two
  * generic hooks and drives, for the life of the watch:
  *
- * - stdout-only, time-window batching. stderr lines are ignored
- *   by this watch entirely (captured elsewhere, via the ordinary output
- *   buffer - this watch never touches that). Every stdout line pushes
- *   onto the CURRENT open window's pending batch and (re-)arms a single
+ * - stdout AND stderr, time-window batching on ONE shared window per
+ *   stream pair. Every line from either stream pushes onto that stream's
+ *   own CURRENT open-window pending batch and (re-)arms a single
  *   `WAKE_COALESCE_WINDOW_MS` timer if one isn't already armed; the timer
- *   firing is what flushes the batch as one wake.
+ *   firing is what flushes both batches together as one wake (see
+ *   `buildWakeParams` for how a window that only ever saw one stream still
+ *   carries just that stream's key).
  * - firehose detection - `checkFirehose` (below) tracks a rolling
  *   "since when has the sustained rate held at/above FIREHOSE_LINES_PER_SEC"
- *   window; once that span reaches FIREHOSE_SUSTAINED_MS, the watch
- *   auto-stops (unsubscribes, records the stop reason) - the job itself is
- *   NEVER touched.
+ *   window, COMBINED across both streams (a firehose on either stream, or
+ *   split across both, trips the same guard); once that span reaches
+ *   FIREHOSE_SUSTAINED_MS, the watch auto-stops (unsubscribes, records the
+ *   stop reason) - the job itself is NEVER touched.
  * - terminal flush ordering - `onJobTerminal` flushes any
- *   pending open-window lines as one final wake BEFORE marking the watch
- *   stopped, so no line is lost to the window merely closing, and nothing
- *   wakes after (the watch is unsubscribed synchronously, in the SAME
- *   terminal callback, before returning).
+ *   pending open-window lines (either stream) as one final wake BEFORE
+ *   marking the watch stopped, so no line is lost to the window merely
+ *   closing, and nothing wakes after (the watch is unsubscribed
+ *   synchronously, in the SAME terminal callback, before returning).
  *
  * TTL scheduling is NOT handled here - it's read-time, in `getTask`,
  * entirely independent of whether a watch was ever started for a job (a
@@ -641,7 +654,8 @@ function buildWakeParams(
  * terminal record is still subject to the same TTL purge on read).
  */
 function startTaskWatch(taskId: string, notifier: TaskWakeNotifier): void {
-  let pendingLines: StreamLineEntry[] = [];
+  let pendingStdoutLines: StreamLineEntry[] = [];
+  let pendingStderrLines: StreamLineEntry[] = [];
   let windowTimer: NodeJS.Timeout | undefined;
   let stopped = false;
   let totalLinesSeen = 0;
@@ -657,10 +671,12 @@ function startTaskWatch(taskId: string, notifier: TaskWakeNotifier): void {
 
   const flush = (): void => {
     clearWindowTimer();
-    if (pendingLines.length === 0) return;
-    const lines = pendingLines;
-    pendingLines = [];
-    notifier(buildWakeParams(taskId, lines));
+    if (pendingStdoutLines.length === 0 && pendingStderrLines.length === 0) return;
+    const stdoutLines = pendingStdoutLines;
+    const stderrLines = pendingStderrLines;
+    pendingStdoutLines = [];
+    pendingStderrLines = [];
+    notifier(buildWakeParams(taskId, stdoutLines, stderrLines));
   };
 
   const scheduleWindow = (): void => {
@@ -719,7 +735,6 @@ function startTaskWatch(taskId: string, notifier: TaskWakeNotifier): void {
 
   const unsubscribeOutput = jobStore.onOutputArrival(taskId, (event) => {
     if (stopped) return;
-    if (event.stream !== "stdout") return; // stderr is captured elsewhere, never wakes
     totalLinesSeen += 1;
     if (checkFirehose(Date.now())) {
       // The WATCH auto-stops; the job is never killed by this - it
@@ -727,7 +742,8 @@ function startTaskWatch(taskId: string, notifier: TaskWakeNotifier): void {
       // simply dropped (a firehose has already produced far more than any
       // wake could usefully carry - the poll floor remains the honest way
       // to read it all back).
-      pendingLines = [];
+      pendingStdoutLines = [];
+      pendingStderrLines = [];
       stopWatch();
       jobStore.recordOutputWatchStopped(
         taskId,
@@ -736,7 +752,8 @@ function startTaskWatch(taskId: string, notifier: TaskWakeNotifier): void {
       );
       return;
     }
-    pendingLines.push(event.line);
+    if (event.stream === "stdout") pendingStdoutLines.push(event.line);
+    else pendingStderrLines.push(event.line);
     scheduleWindow();
   });
 
@@ -746,8 +763,8 @@ function startTaskWatch(taskId: string, notifier: TaskWakeNotifier): void {
     stopWatch(); // also unsubscribes this same terminal listener - see its own docs
     // No wake fires for the terminal transition itself - the terminal
     // status is observable via tasks/get / the poll floor; this
-    // watch's whole job is the stdout-delta accelerator, not a
-    // status announcement of its own.
+    // watch's whole job is the output-delta accelerator (stdout and
+    // stderr both), not a status announcement of its own.
   });
 }
 
