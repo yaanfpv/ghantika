@@ -112,6 +112,12 @@ jobs:
   # The test job is the one that actually proves the package works, so it
   # runs an operating-system by Node-version matrix rather than a single
   # representative leg the way build/typecheck/lint do.
+  #
+  # LOCKSTEP WARNING: main-verify.yml's own `test` job is a DELIBERATE,
+  # DISCLOSED duplicate of this one (see that file's header for why it is a
+  # duplicate rather than a shared `workflow_call`). test/main-verify-workflow.test.js
+  # asserts the two stay identical - keep them in sync, or fix that test's
+  # own expectation if the divergence is intentional.
   test:
     name: test (${{ matrix.os }}, node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
