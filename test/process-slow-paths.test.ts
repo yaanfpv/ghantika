@@ -139,7 +139,9 @@ test(
     skip:
       process.platform === "win32"
         ? "shadows a resistant ps on PATH and traps SIGTERM in a real shell, POSIX-only"
-        : false,
+        : process.platform === "linux"
+          ? "captureBirthIdentityPosixAsync never shells out to ps on Linux (it reads /proc/<pid>/stat directly) - this fixture cannot exercise anything there; see the GHANTIKA_TEST_DEGRADE_PROC_READ sibling test below for the Linux-equivalent proof"
+          : false,
   },
   async () => {
     const realPath = process.env.PATH;
@@ -234,6 +236,61 @@ test(
       stillAlive,
       false,
       "expected the resistant observer to have actually been force-reaped (SIGKILLed), not merely abandoned as a leaked process while this codebase moved on"
+    );
+  }
+);
+
+// The Linux equivalent of the test above: captureBirthIdentityPosixAsync
+// never shells out to ps there, so a resistant observer has to be simulated
+// via GHANTIKA_TEST_DEGRADE_PROC_READ=hang (see src/process.ts's own docs
+// for the hatch) rather than a fake ps on PATH. Proves the identical
+// property - a resistant/hung observer still settles to undefined within
+// this codebase's own bound, without blocking the event loop - against the
+// REAL code path Linux dispatches to (readLinuxStartTimeTicksAsync's own
+// external-bound race), not a fixture that never gets invoked. There is no
+// separate observer PROCESS to reap afterward here (a /proc read is direct,
+// not a subprocess), so the "genuinely gone afterward" half of the sibling
+// test above has no analogue - which is a structurally STRONGER property,
+// not a gap: nothing exists here that could ever leak.
+test(
+  "captureBirthIdentityPosixAsync (Linux): a hung /proc observer (GHANTIKA_TEST_DEGRADE_PROC_READ=hang) still settles within this codebase's own bound and does not block the event loop while doing so",
+  { skip: process.platform !== "linux" ? "exercises the Linux-only /proc capture path" : false },
+  async () => {
+    const realDegrade = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+
+    let eventLoopTicks = 0;
+    const ticker = setInterval(() => {
+      eventLoopTicks += 1;
+    }, 5);
+
+    let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
+    let elapsedMs: number;
+    try {
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "hang";
+      const before = Date.now();
+      identity = await captureBirthIdentityPosixAsync(process.pid, RESISTANT_OBSERVER_BOUND_MS);
+      elapsedMs = Date.now() - before;
+    } finally {
+      if (realDegrade === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegrade;
+      clearInterval(ticker);
+    }
+
+    assert.equal(
+      identity,
+      undefined,
+      "a hung /proc observer must still resolve to undefined (unavailable) via this codebase's own settlement bound, never fabricate a value"
+    );
+    assert.ok(
+      elapsedMs < RESISTANT_OBSERVER_ELAPSED_ASSERTION_MS,
+      `expected this codebase's OWN caller-side timer to force settlement well before the observer's hang would ever end on its own - took ${elapsedMs}ms`
+    );
+    // THE assertion that actually tests the product's non-blocking promise,
+    // not merely this call's own latency - see the sibling ps-based test's
+    // identical assertion for the full rationale.
+    assert.ok(
+      eventLoopTicks >= 10,
+      `expected an independent event-loop timer to keep firing while the hung observer was pending (proves the single Node event loop was never blocked) - only saw ${eventLoopTicks} ticks in ${elapsedMs}ms`
     );
   }
 );

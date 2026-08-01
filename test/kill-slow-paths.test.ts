@@ -399,13 +399,22 @@ test(
 
     // Make `ps` genuinely unavailable to this process for the duration of
     // the kill() call only - a real fault injection (an ENOENT execFileSync
-    // failure), not a mock.
+    // failure), not a mock. Also engages the Linux-only degrade hatch
+    // (src/process.ts's GHANTIKA_TEST_DEGRADE_PROC_READ) to the same
+    // "observer-failure" outcome - checkProcessIdentity's Linux branch
+    // re-reads /proc directly at kill time, never consulting PATH, so
+    // breaking PATH alone would have zero effect there; on every other
+    // platform this var is simply never read, so setting it is inert.
+    const realDegrade = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
     process.env.PATH = "/tmp/does-not-exist-ghantika-empty-path-dir";
+    process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "observer-failure";
     let result: Awaited<ReturnType<typeof killTool.handler>>;
     try {
       result = await killTool.handler({ job_id: record.job_id });
     } finally {
       process.env.PATH = realPath;
+      if (realDegrade === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegrade;
     }
 
     assert.notEqual(

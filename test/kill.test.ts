@@ -17,6 +17,7 @@ import {
   isProcessGroupAlive,
   spawnManaged,
 } from "../dist/process.js";
+import type { ProcessBirthIdentity } from "../dist/process.js";
 
 // Explicit ".ts" extension - this helper has no relative imports of its
 // own (only node: builtins), so Node's native TypeScript support can load
@@ -377,12 +378,12 @@ test(
     // test/process.test.ts's identical simulation on checkProcessIdentity
     // directly) - this constructs the ESSENCE of the scenario instead: our
     // own bookkeeping still points at this pid, but the captured birth
-    // identity now claims capture happened wildly long ago, relative to the
-    // REAL, currently-alive process `ps` reports. There is no public API to
-    // override an already-attached child's recorded birth identity, so this
-    // reaches into JobStore's own private `children` map directly - the
-    // only way to test the CALLER's wiring (does kill.ts's handler actually
-    // consult and honor a mismatch) rather than only the pure
+    // identity now claims something that could never be true of the REAL,
+    // currently-alive process the observer reports. There is no public API
+    // to override an already-attached child's recorded birth identity, so
+    // this reaches into JobStore's own private `children` map directly -
+    // the only way to test the CALLER's wiring (does kill.ts's handler
+    // actually consult and honor a mismatch) rather than only the pure
     // `checkProcessIdentity` function in isolation, which
     // test/process.test.ts already covers exhaustively.
     const internals = jobStore as unknown as {
@@ -392,19 +393,37 @@ test(
           child: unknown;
           pid: number;
           spawnedAtMs: number;
-          birthIdentity: { capturedAtMs: number; elapsedSecondsAtCapture: number } | undefined;
+          birthIdentity: ProcessBirthIdentity | undefined;
         }
       >;
     };
     const tracked = internals.children.get(record.job_id)!;
     assert.notEqual(tracked, undefined);
     assert.notEqual(tracked.birthIdentity, undefined);
+    // The corruption technique is PLATFORM-SPECIFIC, because the two
+    // ProcessBirthIdentity variants are compared completely differently
+    // (see checkProcessIdentity's own docs): on macOS, push the captured
+    // wall-clock moment 10 minutes into the past so the etime comparison
+    // reads as impossible drift; on Linux, there is no wall-clock/tolerance
+    // math to skew at all - the comparison is EXACT STRING equality against
+    // a raw kernel counter, so corrupting it means producing a DIFFERENT
+    // well-formed digit string (appending a digit always changes the value
+    // while staying a valid token, exactly the shape a genuine pid-reuse
+    // scenario would produce).
+    const corruptedIdentity: ProcessBirthIdentity =
+      tracked.birthIdentity!.platform === "linux-starttime-ticks"
+        ? {
+            platform: "linux-starttime-ticks",
+            startTimeTicks: `${tracked.birthIdentity!.startTimeTicks}0`,
+          }
+        : {
+            platform: "posix-elapsed",
+            capturedAtMs: tracked.birthIdentity!.capturedAtMs - 10 * 60 * 1000, // 10 minutes "ago" - impossible for a process that just started
+            elapsedSecondsAtCapture: tracked.birthIdentity!.elapsedSecondsAtCapture,
+          };
     internals.children.set(record.job_id, {
       ...tracked,
-      birthIdentity: {
-        ...tracked.birthIdentity!,
-        capturedAtMs: tracked.birthIdentity!.capturedAtMs - 10 * 60 * 1000, // 10 minutes "ago" - impossible for a process that just started
-      },
+      birthIdentity: corruptedIdentity,
     });
 
     const result = await killTool.handler({ job_id: record.job_id });
