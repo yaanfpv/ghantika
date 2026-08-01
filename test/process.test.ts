@@ -23,6 +23,7 @@ import {
   GROUP_CONFIRMATION_TIMEOUT_MS,
   POSIX_KILL_GRACE_PERIOD_MS,
   PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS,
+  type ProcStatAsyncReader,
   captureBirthIdentityPosix,
   captureBirthIdentityPosixAsync,
   captureEscalationIdentitySnapshot,
@@ -37,7 +38,9 @@ import {
   killProcessGroupPosix,
   killProcessTreeWindows,
   parseEtime,
+  parseLinuxStatStartTimeTicks,
   parsePidLstartRow,
+  readLinuxStartTimeTicksAsync,
   readPidStartTimesBatchPosix,
   signalProcessGroupPosix,
   throwUnlessBenignAlreadyGoneRace,
@@ -66,6 +69,46 @@ import {
 const POSIX_PROCESS_GROUP_SKIP =
   process.platform === "win32"
     ? "exercises a real POSIX process-group primitive (ps/pgrep/negative-pid kill) with no win32 equivalent path here"
+    : false;
+
+// The captureBirthIdentityPosixAsync tests below prove the ETIME-based
+// observer's own retry/timeout/aggregate-cap machinery by shadowing a fake
+// `ps` binary on PATH - a fixture that only exercises anything on the
+// platform that mechanism actually runs on. `captureBirthIdentityPosixAsync`
+// never shells out to `ps` at all on Linux (it reads `/proc/<pid>/stat`
+// directly instead - see src/process.ts's own docs for
+// `readLinuxStartTimeTicksAsync`), so a fake `ps` placed on PATH is simply
+// never invoked there: these tests would either observe a real, genuinely
+// found identity almost instantly (the fake ps never gets the chance to
+// run at all) or throw reading an invocation marker the fake ps never got
+// the chance to write - neither proves anything about the mechanism this
+// fixture exists to exercise. This is a TEST-HARNESS gap for THIS
+// mechanism, not a product scope decision: the Linux capture path's own
+// real behavior is covered separately (see the platform-branched
+// real-capture tests, the dedicated Linux-only tests, and
+// `readLinuxStartTimeTicksAsync`'s own bounded-read test elsewhere in this
+// file).
+const SHADOWS_PS_LINUX_SKIP =
+  process.platform === "win32"
+    ? "shadows ps on PATH to test the etime observer's own retry/timeout logic, POSIX-only"
+    : process.platform === "linux"
+      ? "captureBirthIdentityPosixAsync never shells out to ps on Linux (it reads /proc/<pid>/stat directly) - this fixture cannot exercise anything there"
+      : false;
+
+// A handful of tests need a REAL, currently-alive process's genuine
+// /proc/<pid>/stat entry (the "found" case) - macOS has no /proc filesystem
+// at all, so every read against it fails with the identical ENOENT a
+// genuinely-missing pid produces on Linux, which would make a "found"
+// assertion read as a false "not-found" there rather than exercising
+// anything real. This dev machine is macOS, so these run only in CI's
+// ubuntu-latest legs - see this file's own header docs and this story's
+// hand-back for exactly which tests this does and does not gate (the
+// not-found-only cases below are deliberately left UNGATED, since ENOENT is
+// ENOENT on either platform and they genuinely exercise the same code path
+// everywhere).
+const LINUX_ONLY_SKIP =
+  process.platform !== "linux"
+    ? "needs a real, currently-alive process's genuine /proc/<pid>/stat entry - Linux-only"
     : false;
 
 // A structural guarantee: a real child's stdout must never
@@ -672,7 +715,7 @@ test(
 // own production handler actually calls - see src/tools/run.ts's docs) ---
 
 test(
-  "captureBirthIdentityPosixAsync: a successful real capture reads a near-zero elapsed age for a freshly spawned process, same as the sync version",
+  "captureBirthIdentityPosixAsync: a successful real capture reads a near-zero elapsed age for a freshly spawned process, same as the sync version (or, on Linux, a well-formed raw start-time tick token)",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async () => {
     const child = spawnManaged(
@@ -684,17 +727,28 @@ test(
       "captureBirthIdentityPosixAsync"
     );
     assert.notEqual(identity, undefined, "expected a real captured identity");
-    assert.equal(typeof identity!.capturedAtMs, "number");
-    assert.ok(
-      identity!.elapsedSecondsAtCapture >= 0 && identity!.elapsedSecondsAtCapture < 5,
-      `expected a near-zero elapsed age, got ${identity!.elapsedSecondsAtCapture}`
-    );
+    if (identity!.platform === "linux-starttime-ticks") {
+      // Linux: a raw /proc/<pid>/stat field-22 token, never an elapsed
+      // duration - see ProcessBirthIdentity's own docs for why.
+      assert.equal(typeof identity!.startTimeTicks, "string");
+      assert.match(
+        identity!.startTimeTicks,
+        /^\d+$/,
+        `expected a well-formed non-negative integer string, got ${JSON.stringify(identity!.startTimeTicks)}`
+      );
+    } else {
+      assert.equal(typeof identity!.capturedAtMs, "number");
+      assert.ok(
+        identity!.elapsedSecondsAtCapture >= 0 && identity!.elapsedSecondsAtCapture < 5,
+        `expected a near-zero elapsed age, got ${identity!.elapsedSecondsAtCapture}`
+      );
+    }
     process.kill(-child!.pid!, "SIGKILL"); // cleanup
   }
 );
 
 test(
-  "captureBirthIdentityPosixAsync: projects forward to the same real elapsed time an independent SYNC captureBirthIdentityPosix reading observes moments later - proving both are the same genuine external observation, not two different mechanisms",
+  "captureBirthIdentityPosixAsync: projects forward to the same real elapsed time an independent SYNC captureBirthIdentityPosix reading observes moments later - proving both are the same genuine external observation, not two different mechanisms (on Linux: the two readings must report the EXACT SAME raw start-time token, since there is nothing to project)",
   { skip: POSIX_PROCESS_GROUP_SKIP },
   async () => {
     const child = spawnManaged(
@@ -711,22 +765,41 @@ test(
       "captureBirthIdentityPosix"
     );
     assert.notEqual(syncIdentity, undefined);
-    const projected =
-      asyncIdentity!.elapsedSecondsAtCapture +
-      (syncIdentity!.capturedAtMs - asyncIdentity!.capturedAtMs) / 1000;
-    assert.ok(
-      Math.abs(projected - syncIdentity!.elapsedSecondsAtCapture) <= 5,
-      `expected the async capture to project forward to the same real elapsed time the sync capture just observed - async: ${JSON.stringify(asyncIdentity)}, sync: ${JSON.stringify(syncIdentity)}`
-    );
+
+    if (asyncIdentity!.platform === "linux-starttime-ticks") {
+      // Linux: no projection needed or possible - the same real process's
+      // start-time ticks are a fixed kernel counter, so two independent
+      // reads moments apart must report the EXACT SAME token, never merely
+      // a close one (see readLinuxStartTimeTicks's own docs: stable across
+      // repeated reads of the same live process).
+      assert.equal(
+        syncIdentity!.platform,
+        "linux-starttime-ticks",
+        "both readings of the same real pid must agree on which platform branch captured them"
+      );
+      if (syncIdentity!.platform === "linux-starttime-ticks") {
+        assert.equal(
+          syncIdentity!.startTimeTicks,
+          asyncIdentity!.startTimeTicks,
+          `expected the same real process's start-time ticks to read identically on both an async and a sync capture moments apart - async: ${JSON.stringify(asyncIdentity)}, sync: ${JSON.stringify(syncIdentity)}`
+        );
+      }
+    } else {
+      const projected =
+        asyncIdentity!.elapsedSecondsAtCapture +
+        (syncIdentity!.capturedAtMs - asyncIdentity!.capturedAtMs) / 1000;
+      assert.ok(
+        Math.abs(projected - syncIdentity!.elapsedSecondsAtCapture) <= 5,
+        `expected the async capture to project forward to the same real elapsed time the sync capture just observed - async: ${JSON.stringify(asyncIdentity)}, sync: ${JSON.stringify(syncIdentity)}`
+      );
+    }
     process.kill(-child!.pid!, "SIGKILL"); // cleanup
   }
 );
 
 test(
   "captureBirthIdentityPosixAsync: a genuinely HUNG ps observer is forcibly killed once the bound elapses and resolves to undefined - never left unsettled indefinitely",
-  {
-    skip: process.platform === "win32" ? "shadows a slow ps on PATH, POSIX-only" : false,
-  },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async () => {
     const realPath = process.env.PATH;
     // A ps that sleeps far longer (5s) than the short custom timeout this
@@ -778,7 +851,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: an initial not-found observation retries and succeeds once ps starts answering",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async () => {
     const realPath = process.env.PATH;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-notfound-then-found-ps-"));
@@ -828,7 +901,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: the SHIPPED DEFAULT not-found retry bound - called with no bound arguments at all - still retries through to a real captured identity",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async () => {
     // Takes NO bound argument at all, so the shipped
     // BIRTH_IDENTITY_NOT_FOUND_RETRY_BOUND_MS default has to be generous
@@ -877,7 +950,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: OWNER 1 - a zero retry budget still performs exactly the initial observation, never a retry",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async () => {
     const realPath = process.env.PATH;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-zero-budget-ps-"));
@@ -919,7 +992,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: OWNER 2 - a retry started before its retry deadline may settle found after that deadline, and is accepted",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async () => {
     const realPath = process.env.PATH;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-late-found-ps-"));
@@ -959,7 +1032,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: OWNER 3 - a retry whose earliest permitted start is at or after the retry deadline never starts",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async () => {
     const realPath = process.env.PATH;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-retry-never-starts-ps-"));
@@ -1021,7 +1094,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: an observer-failure makes exactly ONE attempt and is never retried",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async () => {
     const realPath = process.env.PATH;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-observer-failure-ps-"));
@@ -1056,7 +1129,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: repeated not-found outcomes stop at the bounded deadline, never retrying forever",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async () => {
     const realPath = process.env.PATH;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-always-notfound-ps-"));
@@ -1129,7 +1202,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: OWNER 5 - the aggregate cap force-reaps an observer that is still active when it expires",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async () => {
     const realPath = process.env.PATH;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-aggregate-active-observer-ps-"));
@@ -1148,15 +1221,26 @@ test(
     // A generous real timeoutMs (matching production's own default) gives
     // attempt 1's real fork/exec all the headroom this suite's other tests
     // rely on. The injected clock, not a tiny real bound, is what makes the
-    // aggregate window nearly exhausted by the time the retry starts: once
-    // the marker file exists (attempt 1 has genuinely completed), `now()`
-    // jumps forward so only ~100ms of aggregate budget remains - enough for
-    // the retry to be legitimately started, but too little for the
-    // resistant observer's own 5s sleep to ever complete voluntarily.
+    // aggregate window nearly exhausted by the time the retry starts.
+    //
+    // The clock advances on a CALL COUNT, never on an observation of the
+    // marker file: captureBirthIdentityPosixAsync calls `now()` exactly
+    // twice before attempt 1's result is known (once at entry to compute
+    // `aggregateDeadline`, once at the top of the first loop iteration to
+    // compute `remainingAggregate`) - both must read "no time has passed"
+    // (0). Every call after that point runs once attempt 1 has already
+    // resolved, so from the third call on the clock jumps forward, leaving
+    // ~100ms of aggregate budget - enough for the retry to be legitimately
+    // started, but too little for the resistant observer's own 5s sleep to
+    // ever complete voluntarily. A prior version of this clock inferred
+    // "attempt 1 has resolved" from `fs.existsSync` on the fixture's own
+    // marker file - reading the outcome of an async subprocess write is
+    // itself a race, and calling `now()` is not.
     const timeoutMs = ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS;
     const aggregateDeadline = timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS;
+    let nowCalls = 0;
     const clock = {
-      now: () => (fs.existsSync(invocationMarker) ? aggregateDeadline - 350 : 0),
+      now: () => (nowCalls++ < 2 ? 0 : aggregateDeadline - 350),
       sleep: async (ms: number) => {
         await new Promise((resolve) => setTimeout(resolve, Math.min(ms, 20)));
       },
@@ -1197,7 +1281,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: OWNER 6 - the aggregate cap expiring between attempts (no observer active) settles immediately, with no new observer started",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async () => {
     const realPath = process.env.PATH;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-aggregate-scheduler-wait-ps-"));
@@ -1209,17 +1293,25 @@ test(
     // A generous real timeoutMs gives attempt 1's real fork/exec the same
     // headroom production uses. The injected clock - not a tiny real bound
     // - is what makes the aggregate window nearly exhausted the moment
-    // attempt 1's not-found registers (once the marker file exists,
-    // `now()` jumps forward to leave only 10ms of aggregate budget). The
-    // declared retry-poll delay (500ms) is deliberately far longer than
-    // that remaining budget, so the sleep must be capped short of the
-    // aggregate deadline - and the very next loop iteration must then
-    // settle without ever starting a second observer.
+    // attempt 1's not-found registers.
+    //
+    // The clock advances on a CALL COUNT, never on an observation of the
+    // marker file (see the sibling "OWNER 5" test above for the full
+    // reasoning): captureBirthIdentityPosixAsync calls `now()` exactly
+    // twice before attempt 1's result is known, both of which must read
+    // "no time has passed" (0); every call after that runs once attempt 1
+    // has already resolved, so from the third call on the clock jumps
+    // forward to leave only 10ms of aggregate budget. The declared
+    // retry-poll delay (500ms) is deliberately far longer than that
+    // remaining budget, so the sleep must be capped short of the aggregate
+    // deadline - and the very next loop iteration must then settle
+    // without ever starting a second observer.
     const timeoutMs = ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS;
     const aggregateDeadline = timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS;
     const declaredRetryDelayMs = 500;
+    let nowCalls = 0;
     const clock = {
-      now: () => (fs.existsSync(invocationMarker) ? aggregateDeadline - 10 : 0),
+      now: () => (nowCalls++ < 2 ? 0 : aggregateDeadline - 10),
       sleep: async (ms: number) => {
         await new Promise((resolve) => setTimeout(resolve, Math.min(ms, 20)));
       },
@@ -1555,6 +1647,193 @@ test("parseEtime rejects an implausibly large leading days field, even when ever
   assert.equal(parseEtime("100-00:00:00"), 100 * 86_400);
 });
 
+// --- parseLinuxStatStartTimeTicks (pure, no real process needed - the
+// LINUX counterpart of parseEtime above, run on EVERY platform since it is
+// a pure string parser with no OS dependency at all: a synthetic, injected
+// /proc/<pid>/stat-shaped string is all it needs). ---
+
+test("parseLinuxStatStartTimeTicks: extracts field 22 (starttime) from an ordinary, simple comm field", () => {
+  // A realistic (abbreviated - only the fields up to and including
+  // starttime are load-bearing here, everything after is never read)
+  // /proc/<pid>/stat line: pid (comm) state ppid pgrp session tty_nr
+  // tpgid flags minflt cminflt majflt cmajflt utime stime cutime cstime
+  // priority nice num_threads itrealvalue starttime ...
+  const raw =
+    "123 (bash) S 1 123 123 0 -1 4194304 100 200 0 0 10 20 5 3 20 0 1 0 12345 10000000 500";
+  assert.equal(parseLinuxStatStartTimeTicks(raw), "12345");
+});
+
+test("parseLinuxStatStartTimeTicks: a comm field containing its OWN spaces and a nested parenthesis is handled correctly via the LAST ')' in the line, never the first", () => {
+  // `comm` (field 2) can contain almost any byte the kernel allows in a
+  // process name, including spaces and parens - a real, legal
+  // /proc/<pid>/stat line, not a contrived edge case (see this function's
+  // own docs: the standard technique `man proc` itself documents). A naive
+  // first-')'-wins parser would stop at the ")" after "weird", leaving a
+  // garbage tail that starts mid-comm rather than at the real field 3.
+  const raw =
+    "456 (my (weird) program name) S 1 456 456 0 -1 4194304 100 200 0 0 10 20 5 3 20 0 1 0 67890";
+  assert.equal(parseLinuxStatStartTimeTicks(raw), "67890");
+});
+
+test("parseLinuxStatStartTimeTicks: a leading-zero digit string is accepted as-is (never parsed to a number, so no octal/precision concern)", () => {
+  const raw = "123 (bash) S 1 123 123 0 -1 4194304 100 200 0 0 10 20 5 3 20 0 1 0 007";
+  assert.equal(parseLinuxStatStartTimeTicks(raw), "007");
+});
+
+test("parseLinuxStatStartTimeTicks: returns undefined for a line with no ')' at all - never guessed at", () => {
+  assert.equal(parseLinuxStatStartTimeTicks(""), undefined);
+  assert.equal(parseLinuxStatStartTimeTicks("123 no-parens-here-at-all S 1 2 3"), undefined);
+});
+
+test("parseLinuxStatStartTimeTicks: returns undefined when the tail after ')' has fewer than 20 fields - a truncated or malformed read, never a fabricated value", () => {
+  assert.equal(parseLinuxStatStartTimeTicks("123 (bash) S 1 2 3"), undefined);
+});
+
+test("parseLinuxStatStartTimeTicks: returns undefined when the field-22 position holds a non-digit token - a malformed/corrupted read fails closed, exactly like parseEtime's own equivalent discipline", () => {
+  const raw = "123 (bash) S 1 123 123 0 -1 4194304 100 200 0 0 10 20 5 3 20 0 1 0 not-a-number";
+  assert.equal(parseLinuxStatStartTimeTicks(raw), undefined);
+});
+
+// --- readLinuxStartTimeTicksAsync's own bound (a real, confirmed defect: this
+// function used to `await` its `/proc/<pid>/stat` read directly, with no
+// timeout/AbortController/race at all - a reader that never settles left the
+// whole promise permanently pending, past every deadline
+// captureBirthIdentityPosixAsync's own aggregate-cap bookkeeping claimed to
+// enforce). This test injects a reader that never settles - the one case a
+// portable test can force deterministically, since a real `/proc` read
+// cannot be made to hang on demand - and proves the function's own returned
+// promise still settles within its caller-supplied bound regardless. Pure
+// and platform-agnostic like `parseLinuxStatStartTimeTicks`'s own tests
+// above: the injected reader means this needs no real Linux host or `/proc`
+// entry to exercise the exact code path production dispatches to on Linux. ---
+
+test("readLinuxStartTimeTicksAsync: a /proc read that never settles is still forced to resolve as an observer-failure within the caller's own bound, never left pending", async () => {
+  const neverSettles: ProcStatAsyncReader = () => new Promise(() => {});
+  const timeoutMs = 100;
+  const before = Date.now();
+  const result = await readLinuxStartTimeTicksAsync(process.pid, timeoutMs, neverSettles);
+  const elapsedMs = Date.now() - before;
+
+  assert.equal(
+    result.status,
+    "observer-failure",
+    "a /proc/<pid>/stat read that never settles must resolve as an observer-failure once the bound expires, never hang indefinitely - reverting the caller-side race this test guards leaves this promise pending forever"
+  );
+  if (result.status === "observer-failure") {
+    assert.match(
+      result.reason,
+      /did not settle within 100ms/,
+      "the diagnostic must attribute the failure to this exact bound, not a generic/unrelated message"
+    );
+  }
+  assert.ok(
+    elapsedMs < 1000,
+    `expected the caller-side bound to force settlement close to the ${timeoutMs}ms timeout, not hang - took ${elapsedMs}ms`
+  );
+});
+
+// --- GHANTIKA_TEST_DEGRADE_PROC_READ: the test-only, failure-only hatch on
+// the REAL reader (no injected reader passed below - this exercises the
+// production default, `REAL_PROC_STAT_ASYNC_READER`, exactly as run()'s own
+// real spawn-time capture and checkProcessIdentity's own kill-time
+// re-verify would). This is the removal-detects-it control the hatch's own
+// safety claim needs: it uses `process.pid` - a REAL, currently-alive
+// process whose genuine /proc entry a normal read WOULD find - so if a
+// future change ever let an engaged degrade mode fall through to a real or
+// fabricated "found" result, this is exactly the scenario that would catch
+// it. Every mode must produce "not-found" or "observer-failure", NEVER
+// "found", across the whole mode space - not just the modes each
+// individual test above happens to reach. ---
+
+test("GHANTIKA_TEST_DEGRADE_PROC_READ: every degrade mode degrades a REAL, currently-alive pid's read - none can ever produce found", async () => {
+  const realPath = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+  const realMarker = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
+  try {
+    delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
+
+    process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "not-found";
+    const notFound = await readLinuxStartTimeTicksAsync(process.pid, 200);
+    assert.equal(
+      notFound.status,
+      "not-found",
+      `"not-found" mode must classify a real, alive pid's read as not-found, never found - got ${JSON.stringify(notFound)}`
+    );
+
+    process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "observer-failure";
+    const observerFailure = await readLinuxStartTimeTicksAsync(process.pid, 200);
+    assert.equal(
+      observerFailure.status,
+      "observer-failure",
+      `"observer-failure" mode must never produce found - got ${JSON.stringify(observerFailure)}`
+    );
+
+    process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "hang";
+    const before = Date.now();
+    const hung = await readLinuxStartTimeTicksAsync(process.pid, 100);
+    const elapsedMs = Date.now() - before;
+    assert.equal(
+      hung.status,
+      "observer-failure",
+      `"hang" mode must settle to observer-failure via the caller's own bound, never found - got ${JSON.stringify(hung)}`
+    );
+    assert.ok(
+      elapsedMs < 1000,
+      `expected "hang" to settle near its 100ms bound, took ${elapsedMs}ms`
+    );
+
+    // "not-found-then-hang" tells its first invocation from a later one by
+    // reading this marker file's own line count (no in-memory counter - see
+    // countPriorProcStatDegradeInvocations's own docs for why), so this
+    // sub-case is the one mode that REQUIRES a real marker to exercise
+    // correctly - without one every invocation looks like the first.
+    const degradeMarkerDir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-degrade-marker-"));
+    const degradeMarkerPath = path.join(degradeMarkerDir, "invocations.txt");
+    process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = degradeMarkerPath;
+    process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "not-found-then-hang";
+    const firstAttempt = await readLinuxStartTimeTicksAsync(process.pid, 100);
+    assert.equal(
+      firstAttempt.status,
+      "not-found",
+      `"not-found-then-hang" mode's first invocation must be not-found - got ${JSON.stringify(firstAttempt)}`
+    );
+    const secondAttempt = await readLinuxStartTimeTicksAsync(process.pid, 100);
+    assert.equal(
+      secondAttempt.status,
+      "observer-failure",
+      `"not-found-then-hang" mode's second invocation must hang-then-degrade to observer-failure, never found - got ${JSON.stringify(secondAttempt)}`
+    );
+  } finally {
+    if (realPath === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+    else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realPath;
+    if (realMarker === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
+    else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = realMarker;
+  }
+});
+
+// mutation control: an unrecognized value must be IGNORED entirely (falls
+// through to the real read), never treated as some other implicit mode -
+// this is what keeps the hatch's surface exactly the four literals above,
+// not "anything truthy".
+test(
+  "GHANTIKA_TEST_DEGRADE_PROC_READ: an unrecognized value is ignored - the real read still runs, still finds a real alive pid",
+  { skip: LINUX_ONLY_SKIP },
+  async () => {
+    const realPath = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+    try {
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "success"; // not a real mode - must not be accepted as one
+      const result = await readLinuxStartTimeTicksAsync(process.pid, 200);
+      assert.equal(
+        result.status,
+        "found",
+        `an unrecognized value must fall through to the real read (which finds this real, alive pid), not be treated as a degrade mode - got ${JSON.stringify(result)}`
+      );
+    } finally {
+      if (realPath === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realPath;
+    }
+  }
+);
+
 // --- identityElapsedTimesMatch (pure comparison, checkProcessIdentity's building block) ---
 
 test("identityElapsedTimesMatch: within tolerance is a match", () => {
@@ -1583,8 +1862,9 @@ test("identityElapsedTimesMatch defaults to IDENTITY_TOLERANCE_SECONDS when no t
 // spawn), or construct one directly for the synthetic not-found/mismatch
 // cases below.
 
-test("checkProcessIdentity: not-found for a pid that plainly doesn't exist", async () => {
+test("checkProcessIdentity: not-found for a pid that plainly doesn't exist (posix-elapsed identity)", async () => {
   const result = await checkProcessIdentity(999_999, {
+    platform: "posix-elapsed",
     capturedAtMs: Date.now(),
     elapsedSecondsAtCapture: 0,
   });
@@ -1636,6 +1916,7 @@ test(
     );
     await waitFor(() => rec.spawned > 0);
     const fakeBirthIdentity = {
+      platform: "posix-elapsed" as const,
       capturedAtMs: Date.now() - 10 * 60 * 1000, // 10 minutes "ago"
       elapsedSecondsAtCapture: 0,
     };
@@ -1681,6 +1962,7 @@ test("evaluatePreSignalIdentityGate: no captured identity at all (undefined) -> 
 
 test("evaluatePreSignalIdentityGate: a genuinely gone pid -> skip (nothing to signal)", async () => {
   const gate = await evaluatePreSignalIdentityGate(999_999, {
+    platform: "posix-elapsed",
     capturedAtMs: Date.now(),
     elapsedSecondsAtCapture: 0,
   });
@@ -1699,8 +1981,137 @@ test(
     );
     await waitFor(() => rec.spawned > 0);
     const fakeBirthIdentity = {
+      platform: "posix-elapsed" as const,
       capturedAtMs: Date.now() - 10 * 60 * 1000,
       elapsedSecondsAtCapture: 0,
+    };
+    const gate = await evaluatePreSignalIdentityGate(child!.pid!, fakeBirthIdentity);
+    assert.equal(gate.action, "refuse");
+    if (gate.action === "refuse") assert.match(gate.reason, /reused pid/);
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
+
+// --- The Linux birth-identity path end to end, against a REAL process -
+// mirrors the posix-elapsed coverage above exactly, just for the other
+// branch of the discriminated union. Gated LINUX_ONLY (see that constant's
+// own docs): the "found" case needs a genuine /proc/<pid>/stat entry, which
+// only exists on a real Linux host - this dev machine is macOS, so these
+// run only in CI's ubuntu-latest legs. ---
+
+test(
+  "checkProcessIdentity (LINUX): alive-confirmed for a real process whose ACTUAL captured start-time ticks match",
+  { skip: LINUX_ONLY_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "3"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const birthIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosix(child!.pid!),
+      "captureBirthIdentityPosix"
+    );
+    assert.notEqual(birthIdentity, undefined, "expected a real, successful capture");
+    assert.equal(birthIdentity!.platform, "linux-starttime-ticks");
+    const result = await checkProcessIdentity(child!.pid!, birthIdentity!);
+    assert.equal(result.status, "alive-confirmed");
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
+
+test(
+  "checkProcessIdentity (LINUX): REFUSES to confirm a real, currently-alive process when the captured start-time ticks do not match - a convincing simulation of PID reuse, with NO tolerance window at all (unlike the posix-elapsed branch)",
+  { skip: LINUX_ONLY_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "3"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    // A real capture, then deliberately corrupted to a DIFFERENT well-formed
+    // digit string - appending a digit always changes the value while
+    // staying a valid /^\d+$/ token, exactly the shape a genuine pid-reuse
+    // scenario would produce (a different real process, a different real
+    // start-time tick count).
+    const realIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosix(child!.pid!),
+      "captureBirthIdentityPosix"
+    );
+    assert.notEqual(realIdentity, undefined);
+    assert.equal(realIdentity!.platform, "linux-starttime-ticks");
+    const fakeBirthIdentity = {
+      platform: "linux-starttime-ticks" as const,
+      startTimeTicks:
+        realIdentity!.platform === "linux-starttime-ticks"
+          ? `${realIdentity!.startTimeTicks}0`
+          : "0",
+    };
+    const result = await checkProcessIdentity(child!.pid!, fakeBirthIdentity);
+    assert.equal(result.status, "identity-mismatch");
+    if (result.status === "identity-mismatch") {
+      assert.match(result.reason, /reused pid/);
+    }
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
+
+test("checkProcessIdentity (LINUX): not-found for a pid that plainly doesn't exist - UNGATED, since ENOENT is ENOENT on any platform (macOS has no /proc filesystem at all, so this exercises the identical code path there too)", async () => {
+  const result = await checkProcessIdentity(999_999, {
+    platform: "linux-starttime-ticks",
+    startTimeTicks: "12345",
+  });
+  assert.equal(result.status, "not-found");
+});
+
+test(
+  "evaluatePreSignalIdentityGate (LINUX): alive-confirmed identity -> proceed with identityConfirmed: true",
+  { skip: LINUX_ONLY_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "3"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const birthIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosix(child!.pid!),
+      "captureBirthIdentityPosix"
+    );
+    assert.notEqual(birthIdentity, undefined);
+    const gate = await evaluatePreSignalIdentityGate(child!.pid!, birthIdentity);
+    assert.deepEqual(gate, { action: "proceed", identityConfirmed: true });
+    process.kill(-child!.pid!, "SIGKILL"); // cleanup
+  }
+);
+
+test(
+  "evaluatePreSignalIdentityGate (LINUX): a real identity mismatch -> refuse, with an honest reason",
+  { skip: LINUX_ONLY_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "3"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const realIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosix(child!.pid!),
+      "captureBirthIdentityPosix"
+    );
+    assert.notEqual(realIdentity, undefined);
+    const fakeBirthIdentity = {
+      platform: "linux-starttime-ticks" as const,
+      startTimeTicks:
+        realIdentity!.platform === "linux-starttime-ticks"
+          ? `${realIdentity!.startTimeTicks}0`
+          : "0",
     };
     const gate = await evaluatePreSignalIdentityGate(child!.pid!, fakeBirthIdentity);
     assert.equal(gate.action, "refuse");
