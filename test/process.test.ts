@@ -1433,10 +1433,16 @@ test(
 
     const errorSpy = t.mock.method(console, "error");
 
+    // The clock advances on a CALL COUNT, never on an observation of the
+    // marker file - see the identical fix and its rationale on the
+    // SIGTERM-resistant force-reap scenario above: reading the outcome of
+    // an async subprocess write via fs.existsSync is itself a race, and
+    // calling now() is not.
     const timeoutMs = ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS;
     const aggregateDeadline = timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS;
+    let nowCalls = 0;
     const clock = {
-      now: () => (fs.existsSync(invocationMarker) ? aggregateDeadline - 350 : 0),
+      now: () => (nowCalls++ < 2 ? 0 : aggregateDeadline - 350),
       sleep: async (ms: number) => {
         await new Promise((resolve) => setTimeout(resolve, Math.min(ms, 20)));
       },
@@ -1502,10 +1508,16 @@ test(
     // own, and short enough that execFile's own cooperative SIGTERM (at
     // this ~100ms effective timeout) arrives and ends the script well
     // before the external bound's much later deadline.
+    // The clock advances on a CALL COUNT, never on an observation of the
+    // marker file - see the identical fix and its rationale on the
+    // SIGTERM-resistant force-reap scenario above: reading the outcome of
+    // an async subprocess write via fs.existsSync is itself a race, and
+    // calling now() is not.
     const timeoutMs = ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS;
     const aggregateDeadline = timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS;
+    let nowCalls = 0;
     const clock = {
-      now: () => (fs.existsSync(invocationMarker) ? aggregateDeadline - 350 : 0),
+      now: () => (nowCalls++ < 2 ? 0 : aggregateDeadline - 350),
       sleep: async (ms: number) => {
         await new Promise((resolve) => setTimeout(resolve, Math.min(ms, 20)));
       },
