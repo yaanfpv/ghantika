@@ -31,6 +31,10 @@
     "test/kill.test.ts::kill: a REAL setsid-class escaped descendant (detached:true + unref()) survives kill() and is honestly out of scope - the original process group is confirmed gone, the escapee is not claimed to be",
     "test/kill.test.ts::root-exits-first: the eager reap collects real, live descendants automatically at leader-exit, with NO kill() call at all - a later kill() against the already-reaped record stays a clean, idempotent no-op",
     "test/output-tail.test.ts::non-blocking snapshot consistency, HARDENED: real PGID-alive assertions bracketing both output() and tail(), a per-call deadline, and full seq-integrity checks within every response - never a torn/corrupted/out-of-order event",
+    "test/policy.test.ts::OS resolution: PATH lookup, an absolute path, mismatched case, a redundant separator, and a symlink all resolve to the same allowed target; a denied wrapper/interpreter binary itself stays denied (nothing on the default empty allowlist to launder through), and shell: true is judged on the resolved shell binary, not the caller's command string",
+    "test/policy.test.ts::a denied command settles failed and never spawns, proven live: an allowed sentinel's marker file appears, a denied sentinel's marker file never does",
+    "test/policy.test.ts::a malformed or missing policy source fails closed (denies everything, never falls open), and nothing in the tool call's own arguments can supply or widen the policy",
+    "test/policy.test.ts::a properly configured policy is not vacuous - it keeps ordinary allowed commands running normally alongside every denial class exercised above",
     "test/process-slow-paths.test.ts::captureBirthIdentityPosixAsync: a SIGTERM-RESISTANT ps observer (installs a handler and ignores it) still settles within this codebase's own bound, does not block the event loop while doing so, and is genuinely gone afterward - not merely a slow-but-cooperative child",
     "test/process-slow-paths.test.ts::confirmProcessGroupReapedPosix: a SIGTERM-RESISTANT pgrep observer (installs a handler and ignores it) still settles within this codebase's own bound, does not block the event loop while doing so, and is genuinely gone afterward - not merely a slow-but-cooperative child",
     "test/process-slow-paths.test.ts::evaluateEscalationIdentityGate: a resistant ps observer at ESCALATION TIME does not hang the gate; it completes/refuses within the named budget, force-reaps the resistant child, and the event loop demonstrably progresses meanwhile",
@@ -131,7 +135,9 @@
     "test/process.test.ts::checkProcessIdentity (LINUX): alive-confirmed for a real process whose ACTUAL captured start-time ticks match",
     "test/process.test.ts::evaluatePreSignalIdentityGate (LINUX): a real identity mismatch -> refuse, with an honest reason",
     "test/process.test.ts::evaluatePreSignalIdentityGate (LINUX): alive-confirmed identity -> proceed with identityConfirmed: true",
-    "test/run.test.ts::run(): on Windows, birth-identity capture is never even attempted - birthIdentity is always undefined there"
+    "test/run.test.ts::run(): on Windows, birth-identity capture is never even attempted - birthIdentity is always undefined there",
+    "test/policy.test.ts::two distinct real files differing only by case are never conflated by the allowlist, on a filesystem that genuinely keeps them apart",
+    "test/policy.test.ts::a case-variant PARENT directory with a case-free executable leaf is never conflated by the allowlist, on a filesystem that genuinely keeps the two parents apart"
   ],
   "linux": [
     "test/process-slow-paths.test.ts::captureBirthIdentityPosixAsync: a SIGTERM-RESISTANT ps observer (installs a handler and ignores it) still settles within this codebase's own bound, does not block the event loop while doing so, and is genuinely gone afterward - not merely a slow-but-cooperative child",

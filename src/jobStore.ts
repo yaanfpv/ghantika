@@ -100,23 +100,20 @@ export function isJobDiagnosticReason(value: unknown): value is JobDiagnosticRea
  *   called from `src/tools/run.ts` before ever attempting a real spawn) or
  *   a genuine async OS-level spawn failure (`markSpawnFailed`, called from
  *   `src/process.ts`'s `spawnManaged` `onError` callback).
- * - `policy-denied`: reserved for a future command allowlist/denylist
- *   policy gate - this codebase has no such gate today, so nothing ever
- *   produces this value yet. Declared now so the type is closed over its
- *   full legal range from the start, rather than every future producer
- *   needing to widen an already-shipped union.
+ * - `policy-denied`: the resolved command (or, with `shell: true`, the
+ *   resolved platform shell binary) was rejected by the command allowlist
+ *   gate - `createFailedJob`, called from `src/tools/run.ts` with this
+ *   reason when `src/policy.ts`'s `decideRunPolicy`/`decideShellPolicy`
+ *   returns `allowed: false`, before ever attempting a real spawn. See
+ *   `src/policy.ts`'s own docs for how that decision is made.
  * - `watcher/runtime-error`: a background timer watching over a job's own
  *   optional run deadline (`markDeadlineExceeded`, wired from
- *   `src/tools/run.ts` - see that file's own docs) - this is exactly the
- *   "background watcher/supervisor" class this value was originally
- *   reserved for, distinct from a spawn-time failure: the command started
+ *   `src/tools/run.ts` - see that file's own docs) - the command started
  *   fine and ran for a while, then this codebase itself decided it had run
- *   long enough.
+ *   long enough. Distinct from a spawn-time failure, and from the
+ *   pre-flight `policy-denied` rejection above.
  *
- * `policy-denied` alone remains reserved and currently unproduced -
- * deliberately not wiring a real producer for it would mean inventing a
- * scenario this codebase doesn't actually have, which is worse than an
- * honestly-reserved, closed, currently-unused value.
+ * All three values have a real producer; none is reserved-but-unused.
  */
 export interface JobDiagnostic {
   readonly reason: JobDiagnosticReason;
@@ -1034,6 +1031,15 @@ interface CreateJobInput {
 
 interface CreateFailedJobInput extends CreateJobInput {
   readonly diagnosticMessage: string;
+  /**
+   * Defaults to `"spawn-error"` - the reason every call site had before the
+   * command-policy gate existed. `src/tools/run.ts` passes
+   * `"policy-denied"` explicitly for a job rejected by
+   * `src/policy.ts`'s `decideRunPolicy`/`decideShellPolicy`; every other
+   * existing call site (a bad `cwd`, an unresolvable executable) is
+   * unchanged and keeps relying on this default.
+   */
+  readonly diagnosticReason?: JobDiagnosticReason;
 }
 
 /**
@@ -1237,7 +1243,10 @@ export class JobStore {
       state: "failed",
       started_at: now,
       ended_at: now,
-      diagnostic: { reason: "spawn-error", message: input.diagnosticMessage },
+      diagnostic: {
+        reason: input.diagnosticReason ?? "spawn-error",
+        message: input.diagnosticMessage,
+      },
       label: input.label,
       seq: this.nextSeq(),
       is_shell: input.isShell,

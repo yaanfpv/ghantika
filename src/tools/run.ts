@@ -22,15 +22,23 @@
  * deliberately slow `ps` observer - a synchronous capture used to block
  * this exact response on however long `ps` took.
  *
- * ## Two ways a job can be `failed` before this handler even returns
+ * ## Three ways a job can be `failed` before this handler even returns
  *
- * A `cwd` that doesn't exist (or isn't a directory), or a command that
- * doesn't resolve to a real executable file, are validated BEFORE ever
+ * A `cwd` that doesn't exist (or isn't a directory), a command that
+ * doesn't resolve to a real executable file, or a resolved command/shell
+ * binary the configured policy denies, are all validated BEFORE ever
  * calling `spawnManaged` - this handler explicitly forbids silently
- * defaulting a bad `cwd`, and requires that both failure classes produce a
- * job that starts already in a terminal state, rather than either
- * throwing a protocol error or racing an async OS-level failure. See
- * `src/process.ts`'s `resolveCwd`/`resolveExecutable`.
+ * defaulting a bad `cwd`, and requires that every one of the three failure
+ * classes produce a job that starts already in a terminal state, rather
+ * than either throwing a protocol error or racing an async OS-level
+ * failure. See `src/process.ts`'s `resolveCwd`/`resolveExecutable` for the
+ * first two, and `src/policy.ts`'s `decideRunPolicy`/`decideShellPolicy`
+ * for the policy gate - run last, on the already-resolved target. A
+ * concurrent filesystem change in the narrow window between that decision
+ * and the real spawn (`spawnManaged`'s own OS-level resolution runs again,
+ * independently) is a disclosed, unclosed TOCTOU limitation, not something
+ * this ordering closes - see `decideRunPolicy`'s own docs in
+ * `src/policy.ts`.
  *
  * ## Birth-identity capture, at spawn time - ASYNC, never on the response path
  *
@@ -62,21 +70,7 @@
  */
 import type { CallToolResult, Tool } from "@modelcontextprotocol/server";
 
-/**
- * Node's `setTimeout`/`setInterval` only support a delay up to this value
- * (2^31 - 1, the largest signed 32-bit integer millisecond count the
- * underlying libuv timer can represent). Anything at or above
- * `MAX_TIMER_DELAY_MS + 1` is silently CLAMPED by Node itself to a 1ms
- * timer (with a `TimeoutOverflowWarning`) rather than firing after the
- * requested delay - so an unvalidated `deadline_ms` above this value would
- * not fail to schedule, it would fire almost immediately, killing the job
- * within milliseconds while claiming the full requested deadline had
- * elapsed. `validateDeadlineMs` rejects anything above this before a job
- * is ever spawned, rather than letting `setTimeout` silently reinterpret
- * the caller's request.
- */
-const MAX_TIMER_DELAY_MS = 2_147_483_647;
-
+import { type PolicyDecision, decideRunPolicy, decideShellPolicy } from "../policy.js";
 import {
   type PublicJobProjection,
   isTerminalJobState,
@@ -95,10 +89,25 @@ import {
   spawnManaged,
 } from "../process.js";
 
+/**
+ * Node's `setTimeout`/`setInterval` only support a delay up to this value
+ * (2^31 - 1, the largest signed 32-bit integer millisecond count the
+ * underlying libuv timer can represent). Anything at or above
+ * `MAX_TIMER_DELAY_MS + 1` is silently CLAMPED by Node itself to a 1ms
+ * timer (with a `TimeoutOverflowWarning`) rather than firing after the
+ * requested delay - so an unvalidated `deadline_ms` above this value would
+ * not fail to schedule, it would fire almost immediately, killing the job
+ * within milliseconds while claiming the full requested deadline had
+ * elapsed. `validateDeadlineMs` rejects anything above this before a job
+ * is ever spawned, rather than letting `setTimeout` silently reinterpret
+ * the caller's request.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
 export const name = "run";
 
 export const description =
-  "Start a command in the background without blocking the calling agent. Returns a job_id immediately; use that id with status to check whether the job is still running, output to read its lines from a cursor, and tail to read just the last N. command is an argv array by default (never shell-interpreted) - pass shell: true to run a real shell command line instead.";
+  "Start a command in the background without blocking the calling agent. Returns a job_id immediately; use that id with status to check whether the job is still running, output to read its lines from a cursor, and tail to read just the last N. command is an argv array by default (never shell-interpreted) - pass shell: true to run a real shell command line instead. The resolved command (or, with shell: true, the platform shell itself) must be on the operator's configured allowlist; anything else settles as a failed job rather than running.";
 
 const MAX_LABEL_LENGTH = 64;
 
@@ -234,6 +243,27 @@ type ValidationResult<T> =
   { readonly ok: true; readonly value: T } | { readonly ok: false; readonly message: string };
 
 /**
+ * The one wiring decision that closes the shell trust-domain gap: what value
+ * `spawnManaged` receives as `shellExecutable`. For a shell job, this is
+ * `policyDecision.resolvedShellBinary` - the EXACT path `decideShellPolicy`
+ * already approved - and NOTHING else: never re-derived from the job's own
+ * `cwd`/`env`, never re-resolved. For a non-shell (argv) job there is no
+ * shell binary to disclose at all. Exported and pure precisely so this one
+ * line can be asserted on directly, in isolation from `handler`'s own
+ * control flow - see `test/policy.test.ts`'s "threads decideShellPolicy's
+ * resolvedShellBinary VERBATIM" test for why a fix that only worked "in
+ * practice" here was not enough on its own: a policy check that resolves
+ * the right identity is worthless if a LATER line re-derives a different
+ * one before the real spawn ever sees it.
+ */
+export function shellExecutableForSpawn(
+  isShell: boolean,
+  policyDecision: PolicyDecision
+): string | undefined {
+  return isShell ? policyDecision.resolvedShellBinary : undefined;
+}
+
+/**
  * @param args - the raw `tools/call` arguments, exactly as the client sent
  *   them (unvalidated - validating against `inputSchema` is this handler's
  *   own job, per the server's error-class distinction: a schema-invalid
@@ -263,6 +293,7 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
     return toolSuccess(toPublicProjection(record, jobStore.getOutputCounts(record.job_id)));
   }
 
+  let policyDecision: ReturnType<typeof decideRunPolicy>;
   if (!isShell) {
     const resolvedBinary = resolveExecutable(argv[0]!, cwdResult.resolvedCwd, resolvedEnv);
     if (resolvedBinary === undefined) {
@@ -276,6 +307,41 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
       });
       return toolSuccess(toPublicProjection(record, jobStore.getOutputCounts(record.job_id)));
     }
+    // The policy check runs on the RESOLVED executable (never re-derived -
+    // this is the exact same resolution result the "command not found"
+    // check just above already computed), and as late as possible before
+    // the real spawn below. A concurrent filesystem change in the narrow
+    // window between this decision and the real spawn (spawnManaged's own
+    // OS-level resolution runs again, independently) is a disclosed,
+    // unclosed TOCTOU limitation - see decideRunPolicy's own docs in
+    // src/policy.ts - not something this ordering closes.
+    policyDecision = decideRunPolicy(resolvedBinary);
+  } else {
+    // A shell job has no caller-named executable to resolve at all -
+    // decideShellPolicy resolves the FIXED platform shell binary and
+    // judges THAT, never anything from shellCommand itself. This is the
+    // same gate a direct invocation gets, run at the same "as late as
+    // possible" point. The decision's own resolvedShellBinary (see
+    // policy.ts) is threaded verbatim into spawnManaged below as
+    // shellExecutable - never re-derived - which is what makes "a shell
+    // job is never a bypass route" actually hold: see decideShellPolicy's
+    // own docs for why passing that exact value, rather than letting
+    // Node re-resolve a bare shell name from the job's own env, is the
+    // property this depends on.
+    policyDecision = decideShellPolicy();
+  }
+
+  if (!policyDecision.allowed) {
+    const record = jobStore.createFailedJob({
+      argv: internalArgv,
+      cwd: cwdResult.resolvedCwd,
+      env: resolvedEnv,
+      label,
+      isShell,
+      diagnosticReason: "policy-denied",
+      diagnosticMessage: policyDecision.reason ?? "denied by policy",
+    });
+    return toolSuccess(toPublicProjection(record, jobStore.getOutputCounts(record.job_id)));
   }
 
   const record = jobStore.createJob({
@@ -288,7 +354,13 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
   const jobId = record.job_id;
 
   const child = spawnManaged(
-    { argv, shellCommand, cwd: cwdResult.resolvedCwd, env: resolvedEnv },
+    {
+      argv,
+      shellCommand,
+      shellExecutable: shellExecutableForSpawn(isShell, policyDecision),
+      cwd: cwdResult.resolvedCwd,
+      env: resolvedEnv,
+    },
     {
       onSpawn: () => jobStore.markRunning(jobId),
       onError: (message) => jobStore.markSpawnFailed(jobId, message),

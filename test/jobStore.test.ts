@@ -1173,7 +1173,7 @@ test("isJobDiagnosticReason accepts exactly the three real reasons and rejects a
   assert.equal(isJobDiagnosticReason(undefined), false);
 });
 
-test("createFailedJob/markSpawnFailed both produce a diagnostic.reason from the closed set (spawn-error) - the only value this codebase's real code paths actually produce", () => {
+test("createFailedJob/markSpawnFailed both default to a spawn-error diagnostic.reason when no other reason is given", () => {
   const store = new JobStore();
   const failed = store.createFailedJob({
     argv: ["bad"],
