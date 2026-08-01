@@ -780,79 +780,454 @@ function readProcessElapsedSecondsAsync(
 }
 
 /**
- * A managed job leader's real, OS-readable birth identity, captured once
- * via a real `ps -o etime=` read as close to the actual OS-level spawn as
- * this codebase can get (see `captureBirthIdentityPosix`'s own docs) -
- * NOT a fresh `Date.now()`-derived guess, and never re-derived later.
- * `elapsedSecondsAtCapture` is the real, `ps`-observed elapsed age at the
- * moment of capture (typically ~0s, but never assumed to be exactly 0);
- * `capturedAtMs` is this codebase's own wall-clock reading of when that
- * capture happened, which is what lets a LATER identity check compute how
- * much more time should have elapsed since then and compare it against a
- * fresh real `ps` reading - see `checkProcessIdentity`'s own docs.
+ * The real outcome of one `/proc/<pid>/stat` read - the LINUX counterpart of
+ * `ElapsedSecondsReadResult` above, and deliberately the identical
+ * three-way shape (`found` / `not-found` / `observer-failure`) so every
+ * caller of either keeps the same handling pattern. `startTimeTicks` is
+ * field 22 of that file (`starttime`, clock ticks since boot) - a raw,
+ * unconverted kernel counter, never an elapsed DURATION derived from it
+ * (see `ProcessBirthIdentity`'s own docs for why that distinction is the
+ * entire point of this Linux-specific path).
  */
-export interface ProcessBirthIdentity {
-  readonly capturedAtMs: number;
-  readonly elapsedSecondsAtCapture: number;
+export type LinuxStartTimeTicksReadResult =
+  | { readonly status: "found"; readonly startTimeTicks: string }
+  | { readonly status: "not-found" }
+  | { readonly status: "observer-failure"; readonly reason: string };
+
+/**
+ * Parses ONE `/proc/<pid>/stat` file's raw contents into its field-22
+ * (`starttime`) token, as a STRING - never converted to a number here (see
+ * `ProcessBirthIdentity`'s own docs for why a string is the right shape for
+ * this value everywhere in this codebase). Exported as its own small, PURE
+ * function specifically so this exact extraction can be unit-tested
+ * directly with a synthetic, injected `/proc/<pid>/stat`-shaped string, on
+ * any host OS - mirroring `parseEtime`'s own role for the macOS/`ps` path.
+ *
+ * The kernel's own documented grammar (`man proc`) is
+ * `pid (comm) state ppid ...` - space-separated, EXCEPT that `comm` (field
+ * 2) is wrapped in parens and can itself contain literally anything a
+ * process's argv[0]/`prctl(PR_SET_NAME)` puts there: spaces, parens, even
+ * newlines. A naive whitespace split therefore cannot reliably locate field
+ * 22 by position alone when `comm` contains its own spaces or parens. The
+ * standard, documented technique (what `man proc` itself recommends, and
+ * what libraries such as `psutil` implement) is instead to find the LAST
+ * `)` in the line - `comm` is the only field that can contain a `)`, and
+ * the kernel itself guarantees no field after it does either, so the last
+ * `)` in the whole line is unambiguously the end of `comm` regardless of
+ * what it contains - and treat everything after it as a plain
+ * space-separated tail starting at field 3 (`state`). Field 22
+ * (`starttime`) is therefore that tail's `22 - 3 = 19`th zero-indexed
+ * token.
+ *
+ * Returns `undefined` - never a fabricated value - for: no `)` found at
+ * all; fewer than 20 tokens in the tail; or a token at that position that
+ * isn't a well-formed non-negative integer string (`/^\d+$/`). Matches this
+ * file's own established "never silently treat a malformed read as usable"
+ * discipline (see `parseEtime`'s own docs for the identical rationale
+ * applied to the macOS/`ps` path).
+ */
+export function parseLinuxStatStartTimeTicks(raw: string): string | undefined {
+  const lastParen = raw.lastIndexOf(")");
+  if (lastParen === -1) return undefined;
+  const tail = raw
+    .slice(lastParen + 1)
+    .trim()
+    .split(/\s+/);
+  // tail[0] is field 3 (state) - the first field after the parenthesized
+  // comm - so field 22 (starttime) is tail[22 - 3] = tail[19].
+  const startTimeTicks = tail[19];
+  if (startTimeTicks === undefined || !/^\d+$/.test(startTimeTicks)) return undefined;
+  return startTimeTicks;
 }
 
 /**
+ * Interprets a `/proc/<pid>/stat` read's real contents, once the file has
+ * actually been read successfully - the one piece of parsing logic BOTH the
+ * sync (`readLinuxStartTimeTicks`) and async (`readLinuxStartTimeTicksAsync`)
+ * observers share, factored out here for the identical reason
+ * `interpretPsOutput` above is factored out of the etime path: a change to
+ * how malformed output is classified can never drift between the two call
+ * paths.
+ */
+function interpretProcStatOutput(raw: string): LinuxStartTimeTicksReadResult {
+  const startTimeTicks = parseLinuxStatStartTimeTicks(raw);
+  if (startTimeTicks === undefined) {
+    return {
+      status: "observer-failure",
+      reason: `/proc/<pid>/stat produced output this codebase could not parse: ${JSON.stringify(raw)}`,
+    };
+  }
+  return { status: "found", startTimeTicks };
+}
+
+/**
+ * Turns a failed `/proc/<pid>/stat` read into the right outcome - shared by
+ * both the sync and async observers below, the identical factoring
+ * `interpretPsOutput` gets for the shared SUCCESS path, just for the
+ * failure path instead (the two observers don't share a single failure
+ * call site the way they share `interpretProcStatOutput`, since one throws
+ * synchronously and the other rejects a promise, but the CLASSIFICATION
+ * logic is one piece of logic either way).
+ */
+function classifyProcStatReadFailure(error: unknown): LinuxStartTimeTicksReadResult {
+  const err = error as NodeJS.ErrnoException;
+  if (err.code === "ENOENT") {
+    // `/proc/<pid>` not existing is Linux's own confident "no such
+    // process" signal - exactly analogous to `ps`'s own "no such pid"
+    // exit code elsewhere in this file. Never itself an observer failure.
+    return { status: "not-found" };
+  }
+  return {
+    status: "observer-failure",
+    reason:
+      err.code !== undefined
+        ? `/proc/<pid>/stat read failed (${err.code})`
+        : `/proc/<pid>/stat read failed unexpectedly: ${err instanceof Error ? err.message : String(error)}`,
+  };
+}
+
+/**
+ * Reads `pid`'s real `starttime` (`/proc/<pid>/stat` field 22) via a
+ * BLOCKING `fs.readFileSync` - the Linux counterpart of
+ * `readProcessElapsedSeconds` above, used by the SYNC capture primitive
+ * (`captureBirthIdentityPosix`). Unlike every `ps`/`pgrep`-shelling
+ * observer elsewhere in this file, this has no bounded-timeout/SIGKILL
+ * machinery at all: it ASSUMES a read against an in-kernel virtual
+ * filesystem like `/proc` cannot hang the way a spawned child process
+ * can, but that assumption is not enforced or verified here - unlike
+ * `readLinuxStartTimeTicksAsync` below, which races its own read against
+ * a caller-supplied bound instead of relying on the assumption alone. A
+ * plain try/catch around a synchronous read is what this primitive
+ * offers; nothing here would recover if the assumption ever proved
+ * wrong for a given host or kernel.
+ */
+function readLinuxStartTimeTicks(pid: number): LinuxStartTimeTicksReadResult {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+  } catch (error) {
+    return classifyProcStatReadFailure(error);
+  }
+  return interpretProcStatOutput(raw);
+}
+
+/**
+ * The real `/proc/<pid>/stat` read `readLinuxStartTimeTicksAsync` performs,
+ * factored into its own injectable type for exactly one reason: proving the
+ * bound below actually holds requires a reader that never settles at all,
+ * and there is no way to make a REAL `/proc` read hang on demand from a
+ * portable test. `signal` is passed straight through to `fs.promises.readFile`
+ * so the real implementation can react to the timeout below; an injected
+ * fake is free to ignore it, and the wrapper's own bound holds regardless -
+ * see `readLinuxStartTimeTicksAsync`'s own docs for why that has to be true.
+ */
+export type ProcStatAsyncReader = (pid: number, signal: AbortSignal) => Promise<string>;
+
+/**
+ * The finite set of ways a test may force the real reader below to fail -
+ * deliberately NOT a generic override: no path, no content, no way to
+ * supply an alternate `stat` line at all. Every member of this type
+ * degrades the read; none can satisfy it. `"not-found"` rejects with the
+ * same `ENOENT` shape a genuinely-missing pid produces (see
+ * `classifyProcStatReadFailure` below); `"observer-failure"` rejects with
+ * an unrelated error (any non-`ENOENT` code); `"hang"` never settles on its
+ * own, leaving `readLinuxStartTimeTicksAsync`'s own external bound to
+ * resolve it, exactly as a genuinely-stuck read would; `"not-found-then-hang"`
+ * is `"not-found"` on the first invocation of the current degrade session
+ * and `"hang"` on every one after - the shape a retry-then-force-reap test
+ * needs to prove a retry genuinely started before the aggregate cap fires.
+ */
+type ProcStatTestDegradeMode = "not-found" | "observer-failure" | "hang" | "not-found-then-hang";
+
+function isProcStatTestDegradeMode(value: string): value is ProcStatTestDegradeMode {
+  return (
+    value === "not-found" ||
+    value === "observer-failure" ||
+    value === "hang" ||
+    value === "not-found-then-hang"
+  );
+}
+
+function resolveProcStatTestDegradeMode(): ProcStatTestDegradeMode | undefined {
+  const raw = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+  if (raw === undefined || !isProcStatTestDegradeMode(raw)) return undefined;
+  return raw;
+}
+
+/**
+ * How many prior invocations this degrade session has recorded - derived
+ * fresh from the marker file itself EVERY call, never from an in-memory
+ * counter: this codebase's own architecture reserves persistent module
+ * state to `jobStore.ts` alone (see `test/module-boundaries.test.ts`), so
+ * `"not-found-then-hang"`'s only real requirement - tell its first
+ * invocation from a later one - is answered by reading the same external
+ * artifact `recordProcStatDegradeInvocation` writes, exactly the technique
+ * the `ps`-shadowing fixtures elsewhere in this test suite already use
+ * (`makeFakePsDir`'s own marker file) rather than this codebase's own
+ * internal bookkeeping. No marker set means no way to count, so
+ * `"not-found-then-hang"` requires `GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER`
+ * - every other mode ignores this entirely.
+ */
+function countPriorProcStatDegradeInvocations(marker: string | undefined): number {
+  if (marker === undefined) return 0;
+  try {
+    return fs
+      .readFileSync(marker, "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0).length;
+  } catch {
+    return 0;
+  }
+}
+
+function recordProcStatDegradeInvocation(marker: string | undefined): void {
+  if (marker !== undefined) fs.appendFileSync(marker, "x\n");
+}
+
+/**
+ * TEST-ONLY, FAILURE-ONLY hatch for the real reader below - the Linux
+ * analogue of the PATH-shadowing this codebase's own POSIX tests already
+ * use to simulate a missing/resistant/failing `ps` (see e.g. `makeFakePsDir`
+ * in the test suite): Linux capture never shells out to anything on PATH,
+ * so there is no equivalent environment lever for it without this.
+ *
+ * Deliberately NOT a generic root/content override: `GHANTIKA_TEST_DEGRADE_PROC_READ`
+ * only accepts the four literal failure-mode strings above, and every one
+ * of them only ever REJECTS the read or leaves it hanging for the caller's
+ * own bound to time out - there is no way to make a degraded read come back
+ * as a value this codebase would accept as a confirmed identity. A process
+ * with this var set gains only a forced degrade to `unavailable`/
+ * `unconfirmed`, never a spoofed confirm - see `test/process.test.ts`'s own
+ * removal-detects-it control for the mutation-strong proof of this
+ * property, and this file's `classifyProcStatReadFailure`/
+ * `interpretProcStatOutput` for why a rejection can only ever produce
+ * `"not-found"` or `"observer-failure"`, never `"found"`.
+ */
+const REAL_PROC_STAT_ASYNC_READER: ProcStatAsyncReader = (pid, signal) => {
+  const degradeMode = resolveProcStatTestDegradeMode();
+  if (degradeMode !== undefined) {
+    const marker = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
+    const isFirstInvocation = countPriorProcStatDegradeInvocations(marker) === 0;
+    recordProcStatDegradeInvocation(marker);
+    if (
+      degradeMode === "not-found" ||
+      (degradeMode === "not-found-then-hang" && isFirstInvocation)
+    ) {
+      const err = new Error(
+        "ENOENT: simulated by GHANTIKA_TEST_DEGRADE_PROC_READ"
+      ) as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      return Promise.reject(err);
+    }
+    if (degradeMode === "observer-failure") {
+      return Promise.reject(
+        new Error("simulated observer failure (GHANTIKA_TEST_DEGRADE_PROC_READ=observer-failure)")
+      );
+    }
+    // "hang" and every attempt after the first under "not-found-then-hang" -
+    // never resolves or rejects on its own; readLinuxStartTimeTicksAsync's
+    // own external bound is what settles this, exactly as it would for a
+    // real hung read (see that function's own docs: an injected reader
+    // that ignores the signal entirely still cannot hold its promise open
+    // past the bound).
+    return new Promise(() => {});
+  }
+  return fs.promises.readFile(`/proc/${pid}/stat`, { encoding: "utf8", signal });
+};
+
+/**
+ * The ASYNC counterpart of `readLinuxStartTimeTicks` above, built on
+ * `fs.promises.readFile` instead of the blocking sync call - used by the
+ * ASYNC capture primitive (`captureBirthIdentityPosixAsync`) and by
+ * `checkProcessIdentity`'s Linux branch.
+ *
+ * BOUNDED by `timeoutMs`, exactly like `readProcessElapsedSecondsAsync`
+ * above - `readLinuxStartTimeTicks`'s own doc comment names an assumption
+ * that an underlying `/proc` read cannot hang; this function does not rely
+ * on that assumption holding, because a slow or contended host (a starved
+ * thread pool, a virtualized guest under heavy
+ * I/O pressure) can leave `fs.promises.readFile`'s promise unsettled for far
+ * longer than a normal `/proc` read takes, and `run()`'s own documented
+ * "never blocks the caller" contract (see this function's own callers'
+ * docs) depends on EVERY observer on this path actually honoring a bound,
+ * not on the common case being fast. An unbounded `await` here left
+ * `captureBirthIdentityPosixAsync`'s own aggregate deadline unenforced on
+ * Linux specifically - the one platform this function exists for - which is
+ * exactly the gap a caller-side race closes: an `AbortController` fired by
+ * an independent `setTimeout` forces this function's own returned promise to
+ * settle at `timeoutMs` regardless of whether the underlying read ever
+ * does, mirroring `readProcessElapsedSecondsAsync`'s `settled`-flag race
+ * against its external bound (no settlement grace is needed here the way
+ * that function needs one for a resistant child process to actually die
+ * from SIGKILL - aborting a promise is immediate, there is no second
+ * process to force-kill).
+ */
+export async function readLinuxStartTimeTicksAsync(
+  pid: number,
+  timeoutMs: number,
+  reader: ProcStatAsyncReader = REAL_PROC_STAT_ASYNC_READER
+): Promise<LinuxStartTimeTicksReadResult> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const controller = new AbortController();
+    reader(pid, controller.signal).then(
+      (raw) => {
+        if (settled) return; // the external bound below already resolved this promise
+        settled = true;
+        clearTimeout(externalBound);
+        resolve(interpretProcStatOutput(raw));
+      },
+      (error) => {
+        if (settled) return; // the external bound below already resolved this promise
+        settled = true;
+        clearTimeout(externalBound);
+        resolve(classifyProcStatReadFailure(error));
+      }
+    );
+    const externalBound = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // Best-effort: a real `fs.promises.readFile` reacts to this and
+      // rejects with an AbortError (harmlessly swallowed by the `settled`
+      // guard above, since this branch has already resolved). An injected
+      // reader that ignores `signal` entirely still cannot hold this
+      // function's own promise open past this point.
+      controller.abort();
+      resolve({
+        status: "observer-failure",
+        reason: `/proc/<pid>/stat did not settle within ${timeoutMs}ms`,
+      });
+    }, timeoutMs);
+  });
+}
+
+/**
+ * A managed job leader's real, OS-readable birth identity, captured once as
+ * close to the actual OS-level spawn as this codebase can get (see
+ * `captureBirthIdentityPosix`'s own docs) - NOT a fresh `Date.now()`-derived
+ * guess, and never re-derived later.
+ *
+ * A DISCRIMINATED UNION on `platform`, not a single POSIX-uniform shape -
+ * this is the fix for a real, confirmed class of bug (see the CHANGELOG
+ * entry for this fix): `ps -o etime=` does not read an elapsed time, it
+ * COMPUTES one from `/proc/<pid>/stat`'s own `starttime` field converted
+ * against `/proc/uptime`, and in a virtualized guest those two values can
+ * come from mismatched sources, producing a wildly wrong elapsed-time
+ * reading even though `ps` itself ran and parsed cleanly. A raw, unconverted,
+ * directly-comparable token has no
+ * such dependency, which is why the Linux variant below reads and compares
+ * one directly instead of ever deriving a duration. Keeping the two
+ * variants as a discriminated union (rather than a single shape with
+ * optional fields, or silently unifying them) makes it IMPOSSIBLE to
+ * accidentally compare a Linux-captured identity against a macOS-shaped
+ * comparison, or vice versa - a caller must narrow on `platform` before it
+ * can read either variant's own fields at all (see `checkProcessIdentity`'s
+ * own docs for exactly how it does that).
+ *
+ * - `"posix-elapsed"` (macOS, and every non-Linux, non-Windows POSIX
+ *   platform this codebase runs on): `elapsedSecondsAtCapture` is the real,
+ *   `ps`-observed elapsed age at the moment of capture (typically ~0s, but
+ *   never assumed to be exactly 0); `capturedAtMs` is this codebase's own
+ *   wall-clock reading of when that capture happened, which is what lets a
+ *   LATER identity check compute how much more time should have elapsed
+ *   since then and compare it against a fresh real `ps` reading.
+ * - `"linux-starttime-ticks"`: `startTimeTicks` is `/proc/<pid>/stat` field
+ *   22 (`starttime`, in clock ticks since boot since the kernel booted) -
+ *   read directly, never converted, and compared later for EXACT STRING
+ *   equality, never an elapsed-time derivation. Kept as a STRING rather
+ *   than a `number`: it is a raw kernel counter that can in principle
+ *   exceed `Number.MAX_SAFE_INTEGER` on a sufficiently long-uptime host,
+ *   and since this codebase only ever compares it for exact equality
+ *   (never arithmetic), a string comparison is both safe and simpler than
+ *   parsing it to a number at all - see `parseLinuxStatStartTimeTicks`'s
+ *   own docs for how it is extracted and validated as a well-formed digit
+ *   string.
+ */
+export type ProcessBirthIdentity =
+  | { readonly platform: "linux-starttime-ticks"; readonly startTimeTicks: string }
+  | {
+      readonly platform: "posix-elapsed";
+      readonly capturedAtMs: number;
+      readonly elapsedSecondsAtCapture: number;
+    };
+
+/**
  * Captures a freshly spawned leader's real birth identity via a BLOCKING
- * `ps` read (`execFileSync`). NULLABLE by design, matching this repo's own
+ * read (`ps -o etime=` on non-Linux POSIX, a direct `/proc/<pid>/stat` read
+ * on Linux - see `ProcessBirthIdentity`'s own docs for why the two need to
+ * be different shapes). NULLABLE by design, matching this repo's own
  * established principle that `run()` does NOT fail on a capture failure: a
  * job must still be created and remain killable even when this capture
- * itself fails (`ps` unavailable, unparseable output, or the process
- * already gone by the time this runs - genuinely possible for an extremely
- * short-lived command). `undefined` here is the signal every downstream
- * kill/shutdown caller must treat as "identity was never established for
- * this job" and take the honest, disclosed DEGRADED path (pgid-only
- * signaling, no identity confirmation attempted) rather than silently
- * proceeding as if identity had been confirmed - see
+ * itself fails (the observer unavailable, unparseable output, or the
+ * process already gone by the time this runs - genuinely possible for an
+ * extremely short-lived command). `undefined` here is the signal every
+ * downstream kill/shutdown caller must treat as "identity was never
+ * established for this job" and take the honest, disclosed DEGRADED path
+ * (pgid-only signaling, no identity confirmation attempted) rather than
+ * silently proceeding as if identity had been confirmed - see
  * `evaluatePreSignalIdentityGate`'s own docs for exactly how.
  *
- * NOT what `run()`'s own production handler calls - a synchronous `ps`
- * shell-out on `run()`'s response path blocks the whole MCP call on
- * however long that one invocation takes, with no bound at all, which
+ * NOT what `run()`'s own production handler calls - a synchronous
+ * shell-out/file-read on `run()`'s response path blocks the whole MCP call
+ * on however long that one invocation takes, with no bound at all, which
  * defeats `run()`'s own documented "returns immediately, no blocking"
- * contract the instant `ps` is slow or hung (see `src/tools/run.ts`'s own
- * docs). `run()` calls `captureBirthIdentityPosixAsync` below instead,
- * fired off without ever being awaited. This synchronous primitive is kept
- * because it's still directly useful wherever a real, immediately-available
- * birth identity is needed to compare against or seed a fixture with, and
- * because `captureBirthIdentityPosixAsync`'s own success path is built by
- * awaiting the identical `ps -o etime=` observation this function makes
- * synchronously - the two are the same real read, just via `execFileSync`
- * vs. a bounded `execFile`.
+ * contract the instant the observer is slow or hung (see
+ * `src/tools/run.ts`'s own docs). `run()` calls
+ * `captureBirthIdentityPosixAsync` below instead, fired off without ever
+ * being awaited. This synchronous primitive is kept because it's still
+ * directly useful wherever a real, immediately-available birth identity is
+ * needed to compare against or seed a fixture with, and because
+ * `captureBirthIdentityPosixAsync`'s own success path is built by awaiting
+ * the identical real observation this function makes synchronously - the
+ * two are the same real read on either platform, just via a blocking call
+ * vs. an async one.
  *
  * POSIX only, matching every other identity-check primitive in this file:
  * Windows has no equivalent birth-identity model today (see
  * `killProcessTreeWindows`'s own docs), so this always returns `undefined`
- * there rather than attempting a `ps` call that doesn't exist on that
+ * there rather than attempting an observation that doesn't exist on that
  * platform.
  */
 export function captureBirthIdentityPosix(pid: number): ProcessBirthIdentity | undefined {
   if (process.platform === "win32") return undefined;
+  if (process.platform === "linux") {
+    const observed = readLinuxStartTimeTicks(pid);
+    if (observed.status !== "found") return undefined;
+    return { platform: "linux-starttime-ticks", startTimeTicks: observed.startTimeTicks };
+  }
   const observed = readProcessElapsedSeconds(pid);
   if (observed.status !== "found") return undefined;
-  return { capturedAtMs: Date.now(), elapsedSecondsAtCapture: observed.elapsedSeconds };
+  return {
+    platform: "posix-elapsed",
+    capturedAtMs: Date.now(),
+    elapsedSecondsAtCapture: observed.elapsedSeconds,
+  };
 }
 
 /**
- * How long the ASYNC birth-identity capture's own `ps` invocation is given
- * to answer before this codebase forcibly kills it (`execFile`'s own
- * `timeout` option sends SIGTERM to the child once this elapses) and
- * treats the attempt as a genuine observer failure - a few real seconds,
- * generous enough that an ordinarily-slow `ps` still succeeds, but bounded
- * so a truly hung one can never leave a capture unsettled indefinitely.
- * This bound is what makes `captureBirthIdentityPosixAsync` safe to fire
- * off from `run()`'s handler WITHOUT ever being awaited there (see
- * `src/tools/run.ts`'s own docs), and it's the same bound that caps how
- * long `kill()`/the shutdown reaper can ever wait when they find a capture
- * still genuinely PENDING at the moment they need it (see
- * `src/jobStore.ts`'s `resolveBirthIdentityForKill` and
+ * How long the ASYNC birth-identity capture's own `ps` invocation (the
+ * non-Linux path) is given to answer before this codebase forcibly kills it
+ * (`execFile`'s own `timeout` option sends SIGTERM to the child once this
+ * elapses) and treats the attempt as a genuine observer failure - a few
+ * real seconds, generous enough that an ordinarily-slow `ps` still
+ * succeeds, but bounded so a truly hung one can never leave a capture
+ * unsettled indefinitely. This bound is what makes
+ * `captureBirthIdentityPosixAsync` safe to fire off from `run()`'s handler
+ * WITHOUT ever being awaited there (see `src/tools/run.ts`'s own docs), and
+ * it's the same bound that caps how long `kill()`/the shutdown reaper can
+ * ever wait when they find a capture still genuinely PENDING at the moment
+ * they need it (see `src/jobStore.ts`'s `resolveBirthIdentityForKill` and
  * `src/tools/kill.ts`'s own docs) - awaiting an in-flight capture can never
  * take longer than this, however slow or hung the real `ps` process
  * actually is.
+ *
+ * On Linux this value bounds the OVERALL capture identically to the
+ * non-Linux path (the aggregate deadline `captureBirthIdentityPosixAsync`
+ * computes from it applies to both), AND each individual Linux attempt too:
+ * `readLinuxStartTimeTicksAsync` races its own `/proc/<pid>/stat` read
+ * against this same effective timeout (see that function's own docs for why
+ * this codebase's PROMISE around the read needs a caller-side bound even
+ * though the underlying kernel read itself is ordinarily near-instant).
  */
 export const ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS = 3000;
 
@@ -860,8 +1235,9 @@ export const ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS = 3000;
  * How long a `not-found` observation is given to resolve into `found`
  * before `captureBirthIdentityPosixAsync` schedules no further retry.
  * Absorbs the fork-visibility race where a just-forked child is not yet
- * visible to `ps` at the exact instant a capture call runs immediately
- * after `spawnManaged()` returns. This is a RETRY-SCHEDULING budget, not a
+ * visible to `ps` (or, on Linux, does not yet have a `/proc/<pid>` entry)
+ * at the exact instant a capture call runs immediately after
+ * `spawnManaged()` returns. This is a RETRY-SCHEDULING budget, not a
  * total capture window: the first observation always runs regardless of
  * this value (even zero), and the deadline it produces starts only once
  * that first observation actually returns `not-found` - never at function
@@ -897,16 +1273,70 @@ const REAL_CAPTURE_RETRY_CLOCK: CaptureRetryClock = {
 };
 
 /**
+ * The real outcome of ONE birth-identity observation attempt, whichever
+ * platform-specific observer produced it - the small, platform-BLIND shape
+ * `captureBirthIdentityPosixAsync`'s own retry loop is built against, so
+ * that loop's aggregate-deadline/retry-budget bookkeeping never has to
+ * know or care which real observer is underneath it. `identity` on
+ * `"found"` is already the fully-shaped `ProcessBirthIdentity` (tagged with
+ * the right `platform`), never a bare platform-specific reading the loop
+ * would have to wrap itself.
+ */
+type BirthIdentityAttemptResult =
+  | { readonly status: "found"; readonly identity: ProcessBirthIdentity }
+  | { readonly status: "not-found" }
+  | { readonly status: "observer-failure"; readonly reason: string };
+
+/**
+ * Makes ONE real birth-identity observation attempt for `pid`, dispatching
+ * to the right platform-specific observer - `readLinuxStartTimeTicksAsync`
+ * (a `/proc` read bounded by `effectiveTimeoutMs`, same as the other branch -
+ * see that function's own docs) on Linux, `readProcessElapsedSecondsAsync`
+ * (a bounded, force-reaped `execFile` of `ps`) everywhere else - and
+ * wrapping whichever one answers into the identical
+ * `BirthIdentityAttemptResult` shape `captureBirthIdentityPosixAsync`'s
+ * retry loop consumes. This is the ONLY place that loop's platform
+ * dispatch happens; every bound/retry/deadline decision below it is
+ * platform-independent bookkeeping over this result.
+ */
+async function attemptBirthIdentityCaptureAsync(
+  pid: number,
+  effectiveTimeoutMs: number
+): Promise<BirthIdentityAttemptResult> {
+  if (process.platform === "linux") {
+    const observed = await readLinuxStartTimeTicksAsync(pid, effectiveTimeoutMs);
+    if (observed.status !== "found") return observed;
+    return {
+      status: "found",
+      identity: { platform: "linux-starttime-ticks", startTimeTicks: observed.startTimeTicks },
+    };
+  }
+  const observed = await readProcessElapsedSecondsAsync(pid, effectiveTimeoutMs);
+  if (observed.status !== "found") return observed;
+  return {
+    status: "found",
+    identity: {
+      platform: "posix-elapsed",
+      capturedAtMs: Date.now(),
+      elapsedSecondsAtCapture: observed.elapsedSeconds,
+    },
+  };
+}
+
+/**
  * The ASYNC counterpart of `captureBirthIdentityPosix` above - the one
  * `run()`'s real production handler actually calls (see
  * `src/tools/run.ts`'s handler): the identical real observation and
- * nullable-by-design contract, but built on `readProcessElapsedSecondsAsync`
- * (a bounded, non-blocking `execFile`) so a slow or hung `ps` can never
- * hold up `run()`'s own response. `run()` fires this off without ever
- * awaiting it - see `src/jobStore.ts`'s `attachPendingIdentityCapture`.
- * POSIX only, matching the synchronous version.
+ * nullable-by-design contract, but built on a bounded, non-blocking
+ * observer (`attemptBirthIdentityCaptureAsync`, dispatching per-platform -
+ * see that function's own docs) so a slow or hung observer can never hold
+ * up `run()`'s own response. `run()` fires this off without ever awaiting
+ * it - see `src/jobStore.ts`'s `attachPendingIdentityCapture`. POSIX only,
+ * matching the synchronous version.
  *
- * Two independent bounds, never collapsed into one:
+ * Two independent bounds, never collapsed into one, and identical on both
+ * platforms - the platform split lives entirely inside
+ * `attemptBirthIdentityCaptureAsync`, never in this bookkeeping:
  *
  * - The AGGREGATE cap, `timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS`
  *   from function entry, moved by nothing below it. This is the pre-existing
@@ -917,11 +1347,17 @@ const REAL_CAPTURE_RETRY_CLOCK: CaptureRetryClock = {
  *   observer timeout is capped to whatever remains of this budget (minus
  *   `ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS`, since
  *   `readProcessElapsedSecondsAsync` adds that grace on top of whatever
- *   timeout it is given), so a retry can never itself run past this
- *   deadline - `readProcessElapsedSecondsAsync`'s own force-SIGKILL is what
- *   actually reaps a still-running observer at that point, surfacing as an
- *   ordinary `observer-failure`. This is what keeps the retry addition from
- *   silently widening a latency bound other code already relies on.
+ *   timeout it is given - the Linux attempt honors this same effective
+ *   timeout directly, via `readLinuxStartTimeTicksAsync`'s own caller-side
+ *   race, no grace added, since aborting a promise needs no second
+ *   force-kill phase the way a resistant child process does), so a retry
+ *   can never itself run past this deadline on EITHER path -
+ *   `readProcessElapsedSecondsAsync`'s own force-SIGKILL reaps a
+ *   still-running `ps` observer, `readLinuxStartTimeTicksAsync`'s own
+ *   `AbortController` race reaps a still-unsettled `/proc` read, both
+ *   surfacing as an ordinary `observer-failure`. This is what keeps the
+ *   retry addition from silently widening a latency bound other code
+ *   already relies on.
  * - The RETRY budget, `BIRTH_IDENTITY_NOT_FOUND_RETRY_BOUND_MS` starting
  *   from the first `not-found`, governs only whether ANOTHER retry is
  *   allowed to START. It never gates whether an already-started attempt's
@@ -929,7 +1365,15 @@ const REAL_CAPTURE_RETRY_CLOCK: CaptureRetryClock = {
  *   may resolve `found` after that budget has technically expired, and it
  *   is honored, because a valid, already-obtained observation is worth more
  *   than the schedule that produced it (the aggregate cap above is what
- *   still bounds how late "late" can be).
+ *   still bounds how late "late" can be). Kept wired on the Linux path too
+ *   (not skipped just because a fresh `/proc` entry is typically populated
+ *   synchronously at fork time, likely faster than this race needs) -
+ *   deliberately: this codebase has no way to verify that timing claim
+ *   against a genuinely contended CI host from here, and keeping the same
+ *   cheap, already-proven retry shape costs nothing if it turns out to be
+ *   unnecessary on Linux, while removing it and being wrong about the
+ *   timing would reintroduce exactly the race this budget exists to
+ *   absorb.
  */
 export type BirthIdentityCaptureFailureBranch =
   | "aggregate-exhausted-before-attempt"
@@ -1047,12 +1491,12 @@ export async function captureBirthIdentityPosixAsync(
       timeoutMs,
       remainingAggregate - ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS
     );
-    const observed = await readProcessElapsedSecondsAsync(pid, effectiveTimeoutMs);
+    const attempt = await attemptBirthIdentityCaptureAsync(pid, effectiveTimeoutMs);
 
-    if (observed.status === "found") {
-      return { capturedAtMs: Date.now(), elapsedSecondsAtCapture: observed.elapsedSeconds };
+    if (attempt.status === "found") {
+      return attempt.identity;
     }
-    if (observed.status !== "not-found") {
+    if (attempt.status !== "not-found") {
       // A genuine execution error (ps missing, a real nonzero exit) is a
       // true observer-genuine-failure regardless of how much time this
       // attempt had. But when THIS attempt's own bounded wait is what
@@ -1066,15 +1510,15 @@ export async function captureBirthIdentityPosixAsync(
       // out of time" - are never collapsed into one.
       const cutShortByAggregateBudget =
         effectiveTimeoutMs < timeoutMs &&
-        observed.reason.startsWith(OBSERVER_TIMEOUT_REASON_PREFIX);
+        attempt.reason.startsWith(OBSERVER_TIMEOUT_REASON_PREFIX);
       logCaptureUndefined(
         pid,
         cutShortByAggregateBudget
           ? "aggregate-exhausted-mid-observation"
           : "observer-genuine-failure",
         cutShortByAggregateBudget
-          ? `the observer's own wait was capped to ${effectiveTimeoutMs}ms (below its ${timeoutMs}ms allowance) by the remaining aggregate budget and did not settle in time - ${observed.reason}`
-          : observed.reason,
+          ? `the observer's own wait was capped to ${effectiveTimeoutMs}ms (below its ${timeoutMs}ms allowance) by the remaining aggregate budget and did not settle in time - ${attempt.reason}`
+          : attempt.reason,
         getConcurrencyContext
       );
       return undefined;
@@ -1117,21 +1561,48 @@ export async function captureBirthIdentityPosixAsync(
  * was - i.e. that it is genuinely still the SAME process this codebase
  * spawned, not an unrelated process that happens to have been assigned the
  * same (recycled) pid after the original child already exited. Never
- * trusts this codebase's own internal bookkeeping alone - shells out to
- * the real `ps` utility (present on both macOS and Linux) for an
+ * trusts this codebase's own internal bookkeeping alone - always makes an
  * independent, external read of the OS's own process table, and compares
- * it against a REAL prior `ps` observation (`birthIdentity`), never a
- * value derived purely from this codebase's own `Date.now()` math.
+ * it against a REAL prior observation (`birthIdentity`), never a value
+ * derived purely from this codebase's own `Date.now()` math.
  *
- * Honest limitation, stated plainly rather than overclaimed: this is a
- * best-effort, probabilistic defense (a seconds-resolution comparison via
- * a shelled-out `ps`), not a cryptographic guarantee - a true kernel-level
- * "same process" identity token (Linux's `pidfd`, e.g.) needs a native
- * binding this zero-runtime-dependency codebase deliberately does not add
- * (see `killProcessTreeWindows`'s docs for the same trade-off stated for
+ * Branches on `birthIdentity.platform`, never on the live `process.platform`
+ * directly (see `ProcessBirthIdentity`'s own docs for why the discriminant
+ * lives on the captured value itself): the two branches are genuinely
+ * different comparisons, not the same math with a different observer
+ * underneath.
+ *
+ * - `"linux-starttime-ticks"`: re-reads `/proc/<pid>/stat` field 22
+ *   directly (`readLinuxStartTimeTicksAsync`) and compares it against the
+ *   captured `startTimeTicks` for EXACT STRING EQUALITY - no tolerance, no
+ *   arithmetic against `now`/`capturedAtMs` at all, because there is
+ *   nothing to derive: both sides are the same raw kernel counter, so they
+ *   either match exactly (the same process) or they don't (a different one
+ *   now holds this pid). `now` is accepted but genuinely unused on this
+ *   path - kept as a parameter only because the macOS/`posix-elapsed`
+ *   branch below still needs it.
+ * - `"posix-elapsed"` (every other POSIX platform): shells out to the real
+ *   `ps` utility for a fresh elapsed-time reading and compares it, within
+ *   `IDENTITY_TOLERANCE_SECONDS`, against how much MORE time should have
+ *   elapsed since `birthIdentity.capturedAtMs` - the same best-effort,
+ *   probabilistic comparison this function has always made on this
+ *   platform (see below for its honest limitations).
+ *
+ * Honest limitation of the `posix-elapsed` branch, stated plainly rather
+ * than overclaimed: it is a best-effort, probabilistic defense
+ * (a seconds-resolution comparison via a shelled-out `ps`), not a
+ * cryptographic guarantee - a true kernel-level "same process" identity
+ * token (Linux's `pidfd`, e.g.) needs a native binding this
+ * zero-runtime-dependency codebase deliberately does not add (see
+ * `killProcessTreeWindows`'s docs for the same trade-off stated for
  * Windows). It closes the realistic, common case (a long-dead job's pid
  * recycled by an unrelated later process) without pretending to close
- * every theoretical one.
+ * every theoretical one. The Linux branch's exact-token comparison is
+ * strictly STRONGER than this (no tolerance window at all, no elapsed-time
+ * derivation to be wrong about), but it is not a cryptographic guarantee
+ * either: pid recycling itself is still possible in principle, this only
+ * closes the "our own bookkeeping's derived elapsed time drifted" class of
+ * false confirmation that motivated this whole fix.
  *
  * `birthIdentity` is required (non-nullable) here on purpose: a caller
  * with no captured identity at all has nothing to compare against and
@@ -1145,6 +1616,24 @@ export async function checkProcessIdentity(
   birthIdentity: ProcessBirthIdentity,
   now: number = Date.now()
 ): Promise<IdentityCheckResult> {
+  if (birthIdentity.platform === "linux-starttime-ticks") {
+    const observed = await readLinuxStartTimeTicksAsync(
+      pid,
+      ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS
+    );
+    if (observed.status === "not-found") return { status: "not-found" };
+    if (observed.status === "observer-failure") {
+      return { status: "observer-failure", reason: observed.reason };
+    }
+    if (observed.startTimeTicks !== birthIdentity.startTimeTicks) {
+      return {
+        status: "identity-mismatch",
+        reason: `pid ${pid} reports a start-time of ${observed.startTimeTicks} ticks since boot, expected exactly ${birthIdentity.startTimeTicks} - this looks like a reused pid, not the process we originally spawned`,
+      };
+    }
+    return { status: "alive-confirmed" };
+  }
+
   const observed = await readProcessElapsedSecondsAsync(
     pid,
     ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS

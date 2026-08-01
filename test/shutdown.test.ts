@@ -22,6 +22,7 @@ import { parsesAsPgid, waitForFile } from "./harness.ts";
 import { Client } from "@modelcontextprotocol/client";
 import { InMemoryTransport } from "@modelcontextprotocol/server";
 import { isProcessAlive } from "../dist/process.js";
+import type { ProcessBirthIdentity } from "../dist/process.js";
 import { createServer } from "../dist/server.js";
 import { jobStore } from "../dist/jobStore.js";
 
@@ -482,7 +483,11 @@ test(
       const jobId = callResult.structuredContent?.job_id as string;
       assert.equal(typeof jobId, "string");
 
-      await new Promise((resolve) => setTimeout(resolve, 100)); // let the spawn event actually land
+      // Awaits the same real settlement `resolveBirthIdentityForKill`'s own
+      // production callers already await, rather than racing a fixed
+      // wall-clock delay against the async capture - see test/run.test.ts's
+      // waitForIdentityCaptureSettled for the full rationale.
+      await jobStore.resolveBirthIdentityForKill(jobId);
 
       const handle = jobStore.getChildHandle(jobId);
       assert.notEqual(handle, undefined, "expected a real attached child for this job");
@@ -512,18 +517,31 @@ test(
             child: unknown;
             pid: number;
             spawnedAtMs: number;
-            birthIdentity: { capturedAtMs: number; elapsedSecondsAtCapture: number } | undefined;
+            birthIdentity: ProcessBirthIdentity | undefined;
           }
         >;
       };
       const tracked = internals.children.get(jobId)!;
       assert.notEqual(tracked, undefined);
+      // Platform-specific corruption technique - see test/kill.test.ts's
+      // identical comment for the full rationale: the two
+      // ProcessBirthIdentity variants are compared completely differently
+      // (checkProcessIdentity's own docs), so there is no single mutation
+      // that produces a mismatch on both.
+      const corruptedIdentity: ProcessBirthIdentity =
+        tracked.birthIdentity!.platform === "linux-starttime-ticks"
+          ? {
+              platform: "linux-starttime-ticks",
+              startTimeTicks: `${tracked.birthIdentity!.startTimeTicks}0`,
+            }
+          : {
+              platform: "posix-elapsed",
+              capturedAtMs: tracked.birthIdentity!.capturedAtMs - 10 * 60 * 1000, // 10 minutes "ago" - impossible for a process that just started
+              elapsedSecondsAtCapture: tracked.birthIdentity!.elapsedSecondsAtCapture,
+            };
       internals.children.set(jobId, {
         ...tracked,
-        birthIdentity: {
-          ...tracked.birthIdentity!,
-          capturedAtMs: tracked.birthIdentity!.capturedAtMs - 10 * 60 * 1000, // 10 minutes "ago" - impossible for a process that just started
-        },
+        birthIdentity: corruptedIdentity,
       });
 
       await client.close();
@@ -591,13 +609,25 @@ test(
     );
     fs.chmodSync(psPath, 0o755);
 
+    const realDegrade = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+    const realDegradeMarker = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
     let realPid: number | undefined;
     try {
       process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      // Engages the Linux-only degrade hatch (src/process.ts's
+      // GHANTIKA_TEST_DEGRADE_PROC_READ) to the same not-found-then-hang
+      // shape as the fake ps script above, writing to the SAME
+      // invocationMarker so the assertion below reads one real external
+      // artifact regardless of which platform actually ran - see the
+      // sibling OWNER 7 test in test/jobStore.test.ts for the full
+      // rationale.
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "not-found-then-hang";
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = invocationMarker;
 
       // The real `run()` handler fires its own captureBirthIdentityPosixAsync
-      // call with the shipped defaults - our fake ps on PATH is what forces
-      // that real, unmodified production call toward its own aggregate cap.
+      // call with the shipped defaults - our fake ps on PATH (or, on Linux,
+      // the degrade hatch above) is what forces that real, unmodified
+      // production call toward its own aggregate cap.
       const callResult = (await client.callTool({
         name: "run",
         arguments: { command: ["sleep", "30"], label: "shutdown-aggregate-cap-check" },
@@ -649,6 +679,11 @@ test(
       realPid = undefined;
     } finally {
       process.env.PATH = realPath;
+      if (realDegrade === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegrade;
+      if (realDegradeMarker === undefined)
+        delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = realDegradeMarker;
       if (realPid !== undefined) {
         try {
           process.kill(-realPid, "SIGKILL");

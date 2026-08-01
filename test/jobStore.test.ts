@@ -762,13 +762,26 @@ test(
     );
     fs.chmodSync(psPath, 0o755);
 
+    const realDegrade = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+    const realDegradeMarker = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
     let realPid: number | undefined;
     try {
       process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      // Engages the Linux-only degrade hatch (src/process.ts's
+      // GHANTIKA_TEST_DEGRADE_PROC_READ) to the same not-found-then-hang
+      // shape as the fake ps script above, writing to the SAME
+      // invocationMarker so the assertion below reads one real external
+      // artifact regardless of which platform actually ran - captureBirthIdentityPosixAsync
+      // never shells out to ps on Linux, so the fake-ps-on-PATH lever above
+      // has zero effect there; on every other platform this hatch is simply
+      // never read, so setting it is inert.
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "not-found-then-hang";
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = invocationMarker;
 
       // The real run() handler fires its own captureBirthIdentityPosixAsync
-      // call with the shipped defaults - our fake ps on PATH is what forces
-      // that real, unmodified production call toward its own aggregate cap.
+      // call with the shipped defaults - our fake ps on PATH (or, on Linux,
+      // the degrade hatch above) is what forces that real, unmodified
+      // production call toward its own aggregate cap.
       const runResult = (await client.callTool({
         name: "run",
         arguments: { command: ["sleep", "30"], label: "kill-aggregate-cap-check" },
@@ -825,6 +838,11 @@ test(
       realPid = undefined;
     } finally {
       process.env.PATH = realPath;
+      if (realDegrade === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegrade;
+      if (realDegradeMarker === undefined)
+        delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = realDegradeMarker;
       await client.close();
       if (realPid !== undefined) {
         try {
