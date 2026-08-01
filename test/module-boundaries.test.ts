@@ -37,12 +37,13 @@ test("the real src/ tree has zero module-boundary violations", () => {
   assert.deepEqual(checkModuleBoundaries(), []);
 });
 
-test("FROZEN_MODULES lists exactly eleven modules: five core files plus six tool handlers", () => {
-  assert.equal(FROZEN_MODULES.length, 11);
+test("FROZEN_MODULES lists exactly twelve modules: six core files plus six tool handlers", () => {
+  assert.equal(FROZEN_MODULES.length, 12);
   const core = FROZEN_MODULES.filter((f) => !f.startsWith("tools/"));
   const tools = FROZEN_MODULES.filter((f) => f.startsWith("tools/"));
   assert.deepEqual([...core].sort(), [
     "jobStore.ts",
+    "policy.ts",
     "process.ts",
     "registry.ts",
     "server.ts",
@@ -75,7 +76,7 @@ const CLEAN_FIXTURE_FILES: Record<string, string> = Object.fromEntries(
 );
 CLEAN_FIXTURE_FILES["index.ts"] = "// entry point, excluded from the frozen set\n";
 
-test("an exact eleven-file fixture (matching FROZEN_MODULES) is reported clean", () => {
+test("an exact fixture matching FROZEN_MODULES is reported clean", () => {
   const dir = buildFixtureSrc(CLEAN_FIXTURE_FILES);
   try {
     assert.deepEqual(checkFrozenModuleSet(dir), { extra: [], missing: [] });

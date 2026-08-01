@@ -575,7 +575,7 @@ test("spawnManaged's shell branch: the same non-null-piped-streams shape holds f
   const rec = recorder();
   const env = buildChildEnv("merge", {});
   const child = spawnManaged(
-    { argv: [], shellCommand: "echo x", cwd: process.cwd(), env },
+    { argv: [], shellCommand: "echo x", shellExecutable: "/bin/sh", cwd: process.cwd(), env },
     callbacksFor(rec)
   );
   assert.notEqual(child, undefined);
@@ -630,12 +630,90 @@ test("spawnManaged wires shellCommand through the platform shell (pipes/interpre
   const rec = recorder();
   const env = buildChildEnv("merge", {});
   spawnManaged(
-    { argv: [], shellCommand: "echo shell-one && echo shell-two", cwd: process.cwd(), env },
+    {
+      argv: [],
+      shellCommand: "echo shell-one && echo shell-two",
+      shellExecutable: "/bin/sh",
+      cwd: process.cwd(),
+      env,
+    },
     callbacksFor(rec)
   );
   await waitFor(() => rec.exits.length > 0);
   assert.equal(rec.exits[0]!.code, 0);
   assert.equal(Buffer.concat(rec.stdout).toString("utf8").trim(), "shell-one\nshell-two");
+});
+
+test("spawnManaged refuses to spawn a shell job without an explicit shellExecutable - a non-spawn regression proving the vulnerable implicit shell:true resolution path (which would have let a job's own env pick the shell binary) is structurally unreachable, never merely avoided by callers agreeing to pass the right thing", async () => {
+  const rec = recorder();
+  const env = buildChildEnv("merge", {});
+  const child = spawnManaged(
+    // Deliberately omits shellExecutable - the exact shape the pre-fix
+    // code always used (shell: true with no separately-approved
+    // identity). See test/policy.test.ts's "a trusted PATH and a job's
+    // own PATH genuinely resolve... to DIFFERENT real executables" for
+    // the complementary proof that this shape was genuinely exploitable
+    // (env-dependent resolution really does diverge), not merely a
+    // theoretical concern.
+    { argv: [], shellCommand: "echo should-never-run", cwd: process.cwd(), env },
+    callbacksFor(rec)
+  );
+  // No child, no spawn, no OS-level attempt at all - the contract
+  // violation is caught before child_process.spawn is ever called, so
+  // this settles via the SAME onError path spawnManaged already uses for
+  // a real OS-level spawn failure (see its own docs), never a real spawn
+  // that then gets killed or ignored.
+  assert.equal(child, undefined);
+  await waitFor(() => rec.errors.length > 0);
+  assert.match(rec.errors[0]!, /shellExecutable is required/);
+  assert.equal(rec.spawned, 0, "no spawn event may ever fire for this job");
+  assert.equal(rec.exits.length, 0, "no exit event may ever fire - there is no child to exit");
+});
+
+test("spawnManaged actually invokes the LITERAL shellExecutable path given - never silently falls back to the OS default shell - proven live: a custom shell wrapper, not named /bin/sh and not on PATH, must be the one that runs", async () => {
+  // The prior tests prove (a) omitting shellExecutable is refused, and (b)
+  // a shellCommand runs correctly when shellExecutable happens to be
+  // "/bin/sh" - but "/bin/sh" IS shell:true's own POSIX default, so neither
+  // test can tell "spawn used our literal shellExecutable string" apart
+  // from "spawn silently used shell:true and got the same binary by luck".
+  // This test uses a DIFFERENT real executable - not /bin/sh, not
+  // discoverable via PATH - and proves it specifically is what ran, which
+  // is only possible if `shell: options.shellExecutable` is a real string
+  // passed through to spawn(), not a stale `shell: true` regression.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-custom-shell-"));
+  const customShell = path.join(dir, "not-named-sh");
+  const marker = path.join(dir, "custom-shell-was-invoked");
+  // Node's shell-invocation contract calls the shell as `<shell> -c
+  // "<command>"` - this wrapper records that IT was the one invoked, then
+  // delegates to a real shell so the actual command still runs normally.
+  fs.writeFileSync(customShell, `#!/bin/sh\ntouch '${marker}'\nexec /bin/sh "$@"\n`);
+  fs.chmodSync(customShell, 0o755);
+
+  const rec = recorder();
+  const env = buildChildEnv("merge", {});
+  spawnManaged(
+    {
+      argv: [],
+      shellCommand: "echo via-custom-shell",
+      shellExecutable: customShell,
+      cwd: process.cwd(),
+      env,
+    },
+    callbacksFor(rec)
+  );
+  await waitFor(() => rec.exits.length > 0);
+
+  assert.equal(
+    fs.existsSync(marker),
+    true,
+    "the custom shellExecutable's own marker must exist - if spawn() had used shell: true (or any default) instead of this literal path, this exact binary would never have run and the marker would never appear"
+  );
+  assert.equal(rec.exits[0]!.code, 0);
+  assert.equal(
+    Buffer.concat(rec.stdout).toString("utf8").trim(),
+    "via-custom-shell",
+    "the actual command must still have run correctly, delegated through the custom shell to a real one"
+  );
 });
 
 test("spawnManaged: stdout/stderr end events fire for a real completed process", async () => {
