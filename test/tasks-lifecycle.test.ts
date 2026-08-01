@@ -407,7 +407,7 @@ test("TTL purge removes a completed record past TASK_TTL_MS while a still-workin
 
 // ---------------------------------------------------------------------------
 // The output-driven wake: exact notification method name,
-// stdout-only, per-batch delta, stderr never wakes, time-window batching.
+// output-driven per-batch delta on either stream, time-window batching.
 // All driven via DIRECT jobStore.appendOutput calls on a real, minted,
 // idle-backed task - deterministic content and timing, never real process
 // scheduling jitter.
@@ -553,41 +553,66 @@ test("with the wake handler entirely unregistered on a capable connection, tasks
   }
 });
 
-test("stderr is captured (observable via the output cursor) but fires ZERO wakes; an interleaved stdout line in the SAME run DOES wake", async () => {
+test("a stderr-only batch wakes on its own carrying ONLY the stderr key; a batch mixing both streams in the SAME window wakes once carrying BOTH keys", async () => {
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, { command: IDLE_COMMAND, label: "stderr-silent" });
+    const minted = await runJob(pair.client, { command: IDLE_COMMAND, label: "stderr-wakes" });
     jobId = minted.taskId as string;
     const received = registerWakeSpy(pair.client);
 
     mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
     try {
       jobStore.appendOutput(jobId, "stderr", line("stderr-only-line"));
-      mock.timers.tick(WAKE_COALESCE_WINDOW_MS * 2);
-      assert.equal(received.length, 0, "stderr alone must fire ZERO wakes");
-
-      jobStore.appendOutput(jobId, "stdout", line("stdout-after-stderr"));
       mock.timers.tick(WAKE_COALESCE_WINDOW_MS);
     } finally {
       mock.timers.reset();
     }
     await new Promise((resolve) => setImmediate(resolve));
 
-    assert.equal(received.length, 1, "the interleaved stdout line must wake exactly once");
-    const wakeStdout = received[0]!.params.stdout as Array<{ text: string }>;
+    assert.equal(received.length, 1, "a stderr-only batch must wake exactly once, on its own");
+    assert.equal(
+      received[0]!.params.stdout,
+      undefined,
+      "a stderr-only wake must not carry a stdout key at all"
+    );
+    const wakeStderr = received[0]!.params.stderr as Array<{ text: string }>;
     assert.deepEqual(
-      wakeStdout.map((entry) => entry.text),
-      ["stdout-after-stderr"]
+      wakeStderr.map((entry) => entry.text),
+      ["stderr-only-line"]
     );
 
-    // stderr IS captured, just never woke - observable via the poll floor.
+    // stderr is ALSO observable via the poll floor - the wake is additive,
+    // never a substitute for it.
     const outputResult = (await pair.client.callTool({
       name: "output",
       arguments: { job_id: jobId, stream: "stderr" },
     })) as { structuredContent?: { events?: Array<{ text: string }> } };
     const stderrTexts = (outputResult.structuredContent?.events ?? []).map((event) => event.text);
     assert.deepEqual(stderrTexts, ["stderr-only-line"]);
+
+    // A batch mixing both streams within the SAME open window collapses
+    // into ONE wake carrying both keys, not two separate wakes.
+    mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    try {
+      jobStore.appendOutput(jobId, "stdout", line("mixed-stdout-line"));
+      jobStore.appendOutput(jobId, "stderr", line("mixed-stderr-line"));
+      mock.timers.tick(WAKE_COALESCE_WINDOW_MS);
+    } finally {
+      mock.timers.reset();
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(received.length, 2, "the mixed batch must add exactly one more wake");
+    const mixedWake = received[1]!.params;
+    assert.deepEqual(
+      (mixedWake.stdout as Array<{ text: string }>).map((entry) => entry.text),
+      ["mixed-stdout-line"]
+    );
+    assert.deepEqual(
+      (mixedWake.stderr as Array<{ text: string }>).map((entry) => entry.text),
+      ["mixed-stderr-line"]
+    );
   } finally {
     if (jobId !== undefined) await killAndReapRealChild(jobId);
     await pair.close();
@@ -967,8 +992,9 @@ test("the wake path is proven here via a SIMULATED/mock capable client and the p
   //   PROVEN HERE (simulated/mock):
   //     - a mock @modelcontextprotocol/client, driven entirely by this
   //       test file, receives notifications/tasks/status wakes with the
-  //       exact stdout delta, never wakes on stderr alone, respects the
-  //       coalescing window, rate-limits and auto-stops under a firehose,
+  //       exact delta on either stream (stdout, stderr, or both together
+  //       in one window), respects the coalescing window, rate-limits and
+  //       auto-stops under a firehose,
   //       and the poll floor (tasks/get + output/tail) surfaces
   //       everything regardless of whether the wake handler is
   //       registered at all.
