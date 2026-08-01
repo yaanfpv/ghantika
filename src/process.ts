@@ -316,8 +316,27 @@ function windowsExtensionCandidates(command: string): string[] {
 export interface SpawnManagedOptions {
   /** Ignored when `shellCommand` is set. Otherwise `argv[0]` is the program, `argv.slice(1)` its arguments - no shell interpretation. */
   readonly argv: readonly string[];
-  /** When set, spawn this full command line via the platform shell instead of `argv` (the `shell: true` escape hatch). */
+  /** When set, spawn this full command line via the platform shell instead of `argv` (the shell escape hatch). */
   readonly shellCommand?: string;
+  /**
+   * REQUIRED whenever `shellCommand` is set - the exact, already-resolved
+   * absolute path of the platform shell binary `src/policy.ts`'s
+   * `decideShellPolicy` already approved. Passed to `child_process.spawn`
+   * as a literal `shell: <path>` string, never the bare boolean
+   * `shell: true`: a path-separator-containing value is used by Node/the
+   * OS exactly as given, with no further bare-name PATH search of any
+   * environment, so this is what makes the identity the policy check
+   * judged and the identity that actually launches the SAME value, by
+   * construction. `shell: true` alone would let Node re-resolve a bare
+   * shell name on its own at spawn time from `env` below - the JOB's own,
+   * caller-influenced environment (see `effectivePathForLookup`'s own
+   * docs for the documented Node behavior this exploits) - a resolution
+   * the policy check never sees and, on Windows, one that can land on a
+   * completely different executable than the one just approved. Ignored
+   * (and unused) when `shellCommand` is unset - an ordinary argv job has
+   * no separate shell binary to disclose.
+   */
+  readonly shellExecutable?: string;
   readonly cwd: string;
   readonly env: Readonly<Record<string, string>>;
 }
@@ -377,7 +396,11 @@ const CONTAIN_IN_OWN_PROCESS_GROUP = process.platform !== "win32";
  * `run.ts`'s own pre-flight `resolveCwd` is expected to catch that case
  * before ever reaching here, but this catch is the backstop that turns any
  * gap in that pre-check into a normal `onError` callback instead of an
- * uncaught exception.
+ * uncaught exception. The same catch also covers a distinct, non-OS
+ * failure: a `shellCommand` given with no `shellExecutable` (see
+ * `SpawnManagedOptions.shellExecutable`'s own docs) throws before `spawn`
+ * is ever called at all, so a caller-side wiring bug in our own code fails
+ * that one job rather than crashing the server.
  *
  * Returns the real `ChildProcess` on success (so the caller can retain it
  * for a future `kill`), or `undefined` if the synchronous throw
@@ -391,12 +414,21 @@ export function spawnManaged(
   let child: ChildProcess;
   try {
     if (options.shellCommand !== undefined) {
-      // nosemgrep: javascript.lang.security.audit.spawn-shell-true.spawn-shell-true -- running a caller-supplied shell command via a real shell is this tool's documented, intentional purpose (`run`'s `shell: true` opt-in), not an oversight.
+      if (options.shellExecutable === undefined) {
+        // A caller-contract violation (see SpawnManagedOptions.shellExecutable's
+        // own docs), not a real OS-level spawn failure - this codebase never
+        // spawns a shell job without an already-approved, exact executable
+        // identity. Thrown inside this try/catch so it is reported through
+        // the same onError path as any other spawn-time failure, rather than
+        // crashing the whole server process over a wiring bug in our own code.
+        throw new Error("spawnManaged: shellExecutable is required whenever shellCommand is set");
+      }
+      // nosemgrep: javascript.lang.security.audit.spawn-shell-true.spawn-shell-true -- running a caller-supplied shell command via a real shell is this tool's documented, intentional purpose (`run`'s shell escape hatch), not an oversight. `shell` here is `options.shellExecutable`, an already-resolved, policy-approved absolute path - never the bare `true` that would let Node re-resolve a shell name against the job's own env (see `decideShellPolicy`'s docs in src/policy.ts).
       child = spawn(options.shellCommand, {
         cwd: options.cwd,
         env: options.env,
         stdio: MANAGED_CHILD_STDIO,
-        shell: true,
+        shell: options.shellExecutable,
         windowsHide: true,
         detached: CONTAIN_IN_OWN_PROCESS_GROUP,
       });

@@ -1,0 +1,3 @@
+{
+  "allow": ["/bin/sh", "node", "echo", "ls", "true", "sleep"]
+}
