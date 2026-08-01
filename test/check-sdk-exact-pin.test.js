@@ -610,7 +610,7 @@ test("mutation control: a COORDINATED downgrade of the whole package family (ser
     for (const problem of problems) {
       assert.match(
         problem,
-        /requires exactly "2\.0\.0-beta\.5"/,
+        /requires exactly "2\.0\.0"/,
         `expected every problem to name the required version, got: ${problem}`
       );
     }
@@ -624,7 +624,12 @@ test("mutation control: a COORDINATED downgrade of the whole package family (ser
 
 test("mutation control: everything at the correct required version EXCEPT one package (server) bumped to a newer exact version (an UPGRADE, not a downgrade) is flagged - the rule is 'equals the required version', not 'at least the required version', so drifting UP is exactly as wrong as drifting down", () => {
   withScratchDir((dir) => {
-    const NEWER_VERSION = "2.0.0-beta.6";
+    // A bare prerelease identifier (e.g. "2.0.0-beta.6") has LOWER semver
+    // precedence than the plain "2.0.0" release it would follow, so it
+    // would not actually exercise the "drifting UP" mutation this test is
+    // named for now that the required version is a GA release rather than
+    // a prerelease - "2.0.1" is a genuine upgrade past it.
+    const NEWER_VERSION = "2.0.1";
     writeFixture(dir, {
       ...CLEAN_FIXTURE,
       serverManifestSpec: NEWER_VERSION,
@@ -636,7 +641,7 @@ test("mutation control: everything at the correct required version EXCEPT one pa
       "a single package upgraded past the required version, even self-consistently, must still be flagged"
     );
     for (const problem of problems) {
-      assert.match(problem, /requires exactly "2\.0\.0-beta\.5"/);
+      assert.match(problem, /requires exactly "2\.0\.0"/);
     }
     assert.ok(
       problems.every((p) => !p.includes(CORE)),
