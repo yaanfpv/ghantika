@@ -38,12 +38,26 @@
  * there is no SDK-provided task-registration mechanism this adapter could
  * delegate to even if it wanted one: this adapter's own method set
  * (`tasks/get` / `tasks/update` / `tasks/cancel`, never `tasks/list` or
- * `tasks/result`) is this repo's OWN forward-looking design against the
- * not-yet-finalized upcoming spec revision, pinned here as a vendored,
- * digest-verified schema (`schema/tasks-extension.schema.json`,
+ * `tasks/result`) was chosen as a forward-looking design against a spec
+ * revision that had not yet finalized at the time, pinned here as a
+ * vendored, digest-verified schema (`schema/tasks-extension.schema.json`,
  * `config/tasks-schema-digest.json`) rather than borrowed from the SDK's
- * own deprecated shape. This is a disclosed, deliberate design choice,
- * re-verified against the real spec once it finalizes.
+ * own deprecated shape.
+ *
+ * **The Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663)
+ * finalized on 2026-07-28.** This adapter's METHOD SET independently
+ * matches the finalized extension's own method-set change on all four of
+ * its points: `tasks/get` retained, `tasks/update` added (we have it),
+ * `tasks/list` removed (we omit it), `tasks/result` replaced (we omit it).
+ * That is a narrower claim than full wire compatibility, and it is
+ * deliberately stated that narrowly: this adapter's capability
+ * negotiation, result shapes, status vocabulary, and notification/
+ * subscription protocol were designed before finalization and have not
+ * been reconciled against the finalized extension's own shapes yet. The
+ * decision on what to do about that is already made, not open: bring this
+ * adapter into official wire conformance with the released extension. This
+ * file has not yet been rewritten to match; that rewrite is separate,
+ * tracked work this comment does not resolve.
  *
  * ## Capability advertisement: `capabilities.extensions`, not the SDK's
  * deprecated `capabilities.tasks`
@@ -62,10 +76,13 @@
  * not implement at all) keeps this adapter honestly forward-compatible
  * instead of borrowing a field name whose real shape means something else.
  * `isConnectionTasksCapable` reads BOTH `extensions` and the older
- * `experimental` bag when checking what a CLIENT declared, since the
- * not-yet-finalized spec leaves genuinely open which bag a real Tasks-
- * capable host will use - advertising is narrow (this server always
- * advertises under `extensions` only), detection is lenient.
+ * `experimental` bag when checking what a CLIENT declared. The finalized
+ * extension designates `extensions` as the correct bag, and this server's
+ * own advertisement follows that: it always advertises under `extensions`
+ * only, never `experimental`. Detection stays lenient on the CLIENT side
+ * regardless, since a real client built before finalization (or against
+ * an SDK that predates it) may still declare under the older free-form
+ * `experimental` bag - advertising is narrow, detection is lenient.
  *
  * ## The six-tool mint rule and the universal poll floor
  *
