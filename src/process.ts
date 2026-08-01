@@ -841,10 +841,15 @@ function classifyProcStatReadFailure(error: unknown): LinuxStartTimeTicksReadRes
  * BLOCKING `fs.readFileSync` - the Linux counterpart of
  * `readProcessElapsedSeconds` above, used by the SYNC capture primitive
  * (`captureBirthIdentityPosix`). Unlike every `ps`/`pgrep`-shelling
- * observer elsewhere in this file, this needs no bounded-timeout/SIGKILL
- * machinery at all: `/proc` is an in-kernel virtual filesystem, so a read
- * against it cannot hang the way a spawned child process can - a plain
- * try/catch around a synchronous read is genuinely sufficient here.
+ * observer elsewhere in this file, this has no bounded-timeout/SIGKILL
+ * machinery at all: it ASSUMES a read against an in-kernel virtual
+ * filesystem like `/proc` cannot hang the way a spawned child process
+ * can, but that assumption is not enforced or verified here - unlike
+ * `readLinuxStartTimeTicksAsync` below, which races its own read against
+ * a caller-supplied bound instead of relying on the assumption alone. A
+ * plain try/catch around a synchronous read is what this primitive
+ * offers; nothing here would recover if the assumption ever proved
+ * wrong for a given host or kernel.
  */
 function readLinuxStartTimeTicks(pid: number): LinuxStartTimeTicksReadResult {
   let raw: string;
@@ -987,10 +992,10 @@ const REAL_PROC_STAT_ASYNC_READER: ProcStatAsyncReader = (pid, signal) => {
  * `checkProcessIdentity`'s Linux branch.
  *
  * BOUNDED by `timeoutMs`, exactly like `readProcessElapsedSecondsAsync`
- * above - this file previously claimed a `/proc` read "cannot hang" and
- * needs no timeout machinery at all, which is true of the underlying KERNEL
- * READ but not of this codebase's own PROMISE around it: a slow or
- * contended host (a starved thread pool, a virtualized guest under heavy
+ * above - `readLinuxStartTimeTicks`'s own doc comment names an assumption
+ * that an underlying `/proc` read cannot hang; this function does not rely
+ * on that assumption holding, because a slow or contended host (a starved
+ * thread pool, a virtualized guest under heavy
  * I/O pressure) can leave `fs.promises.readFile`'s promise unsettled for far
  * longer than a normal `/proc` read takes, and `run()`'s own documented
  * "never blocks the caller" contract (see this function's own callers'
