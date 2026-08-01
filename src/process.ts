@@ -1509,8 +1509,7 @@ export async function captureBirthIdentityPosixAsync(
       // causes - "ps itself is broken" vs. "ps was still working, just
       // out of time" - are never collapsed into one.
       const cutShortByAggregateBudget =
-        effectiveTimeoutMs < timeoutMs &&
-        attempt.reason.startsWith(OBSERVER_TIMEOUT_REASON_PREFIX);
+        effectiveTimeoutMs < timeoutMs && attempt.reason.startsWith(OBSERVER_TIMEOUT_REASON_PREFIX);
       logCaptureUndefined(
         pid,
         cutShortByAggregateBudget
