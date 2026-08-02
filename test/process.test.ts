@@ -95,6 +95,17 @@ const SHADOWS_PS_LINUX_SKIP =
       ? "captureBirthIdentityPosixAsync never shells out to ps on Linux (it reads /proc/<pid>/stat directly) - this fixture cannot exercise anything there"
       : false;
 
+// win32-only skip, for a test whose body itself branches on
+// process.platform === "linux" to exercise the same production property
+// (a hook fires, a diagnostic branch names a given cause, etc.) via
+// GHANTIKA_TEST_DEGRADE_PROC_READ on Linux rather than via ps-PATH-shadow -
+// see this codebase's own SHADOWS_PS_LINUX_SKIP docs above for why the
+// latter technique alone cannot reach the Linux capture path at all.
+const POSIX_ONLY_SKIP =
+  process.platform === "win32"
+    ? "birth-identity capture is POSIX-only; see captureBirthIdentityPosix's own docs"
+    : false;
+
 // A handful of tests need a REAL, currently-alive process's genuine
 // /proc/<pid>/stat entry (the "found" case) - macOS has no /proc filesystem
 // at all, so every read against it fails with the identical ENOENT a
@@ -1475,44 +1486,56 @@ test(
 );
 
 test(
-  "captureBirthIdentityPosixAsync: an observer cooperatively killed by execFile's OWN timeout (never reaching the external force-reap timer) is still classified as aggregate-exhausted-mid-observation, not observer-genuine-failure",
-  { skip: SHADOWS_PS_LINUX_SKIP },
+  "captureBirthIdentityPosixAsync: an observer cut short mid-observation by the aggregate budget (execFile's OWN cooperative timeout on POSIX; the /proc reader's own external bound on Linux) is still classified as aggregate-exhausted-mid-observation, not observer-genuine-failure - REGRESSION for the platform-neutral timedOut classifier (a prior version matched a POSIX-only string prefix, silently misclassifying every Linux occurrence of this exact scenario)",
+  { skip: POSIX_ONLY_SKIP },
   async (t) => {
     const realPath = process.env.PATH;
+    const realDegradeMode = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+    const realDegradeMarker = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
     const dir = fs.mkdtempSync(
       path.join(os.tmpdir(), "ghantika-aggregate-cooperative-timeout-ps-")
     );
     const invocationMarker = path.join(dir, "invocations.txt");
-    const psPath = path.join(dir, "ps");
-    // Same two-attempt shape as the SIGTERM-resistant force-reap scenario
-    // above, but this fake ps installs NO trap - the ordinary, ungoverned
-    // default for a real observer. execFile's own `timeout` option sends
-    // SIGTERM once the retry's short effective timeout elapses, this
-    // script dies from it immediately (the common, cooperative case), and
-    // the exec callback reports that death BEFORE the external force-reap
-    // timer ever gets a chance to fire. A regression here reported this
-    // exact scenario as observer-genuine-failure, pointing a future fix at
-    // ps itself when the real cause is the aggregate budget's own
-    // arithmetic shortening this attempt's allowance.
     const errorSpy = t.mock.method(console, "error");
-    fs.writeFileSync(
-      psPath,
-      `#!/bin/sh\ncount=$(wc -l < '${invocationMarker}' 2>/dev/null || echo 0)\necho x >> '${invocationMarker}'\nif [ "$count" -eq 0 ]; then\n  exit 1\nfi\nsleep 5\necho '00:01'\n`
-    );
-    fs.chmodSync(psPath, 0o755);
 
-    // Identical clock shape to the SIGTERM-resistant scenario: attempt 1
-    // is fast (real not-found), then `now()` jumps forward so only ~100ms
-    // of aggregate budget remains for the retry - enough to legitimately
-    // start, too little for the resistant 5s sleep to ever finish on its
-    // own, and short enough that execFile's own cooperative SIGTERM (at
-    // this ~100ms effective timeout) arrives and ends the script well
-    // before the external bound's much later deadline.
-    // The clock advances on a CALL COUNT, never on an observation of the
-    // marker file - see the identical fix and its rationale on the
-    // SIGTERM-resistant force-reap scenario above: reading the outcome of
-    // an async subprocess write via fs.existsSync is itself a race, and
-    // calling now() is not.
+    // Same two-attempt shape on both platforms: attempt 1 reports a real,
+    // fast not-found; attempt 2 is set up to never finish on its own, so
+    // whichever platform-specific bound fires first (execFile's own
+    // cooperative SIGTERM on POSIX, the /proc reader's own external
+    // AbortController bound on Linux) is what actually ends it - never a
+    // genuine observer error. A regression here once reported this exact
+    // scenario as observer-genuine-failure on Linux specifically (see this
+    // test's own title), pointing a future fix at the wrong thing when the
+    // real cause is the aggregate budget's own arithmetic shortening this
+    // attempt's allowance.
+    if (process.platform === "linux") {
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = invocationMarker;
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "not-found-then-hang";
+    } else {
+      const psPath = path.join(dir, "ps");
+      // This fake ps installs NO trap - the ordinary, ungoverned default
+      // for a real observer, so execFile's own `timeout` option ends it
+      // cooperatively via SIGTERM well before the external force-reap
+      // timer ever gets a chance to fire.
+      fs.writeFileSync(
+        psPath,
+        `#!/bin/sh\ncount=$(wc -l < '${invocationMarker}' 2>/dev/null || echo 0)\necho x >> '${invocationMarker}'\nif [ "$count" -eq 0 ]; then\n  exit 1\nfi\nsleep 5\necho '00:01'\n`
+      );
+      fs.chmodSync(psPath, 0o755);
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+    }
+
+    // Identical clock shape on both platforms: attempt 1 is fast (real
+    // not-found), then `now()` jumps forward so only ~100ms of aggregate
+    // budget remains for the retry - enough to legitimately start, too
+    // little for the resistant second attempt to ever finish on its own,
+    // and short enough that whichever platform's own cooperative bound
+    // fires does so well before any much-later external/force-reap
+    // deadline. The clock advances on a CALL COUNT, never on an
+    // observation of the marker file - see the identical fix and its
+    // rationale on the SIGTERM-resistant force-reap scenario above:
+    // reading the outcome of an async subprocess write via fs.existsSync
+    // is itself a race, and calling now() is not.
     const timeoutMs = ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS;
     const aggregateDeadline = timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS;
     let nowCalls = 0;
@@ -1525,16 +1548,20 @@ test(
 
     let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
     try {
-      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
       identity = await captureBirthIdentityPosixAsync(process.pid, timeoutMs, 3000, 20, clock);
     } finally {
       process.env.PATH = realPath;
+      if (realDegradeMode === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegradeMode;
+      if (realDegradeMarker === undefined)
+        delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = realDegradeMarker;
     }
 
     assert.equal(
       identity,
       undefined,
-      "an observer cooperatively killed by execFile's own timeout must still settle unavailable, never hang or fabricate a value"
+      "an observer cut short mid-observation by the aggregate budget must still settle unavailable, never hang or fabricate a value"
     );
     const misclassified = errorSpy.mock.calls.filter((call) =>
       String(call.arguments[0]).includes("branch: observer-genuine-failure")
@@ -1542,7 +1569,7 @@ test(
     assert.equal(
       misclassified.length,
       0,
-      `a cooperative execFile-timeout kill must never be misclassified as observer-genuine-failure - that points a future fix at ps itself when the real cause is the aggregate budget's own arithmetic, got: ${JSON.stringify(
+      `an observer cut short mid-observation by the aggregate budget must never be misclassified as observer-genuine-failure - that points a future fix at the observer itself when the real cause is the aggregate budget's own arithmetic, got: ${JSON.stringify(
         errorSpy.mock.calls.map((c) => c.arguments.map(String))
       )}`
     );
@@ -1561,23 +1588,30 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: a not-found retry budget that is already exhausted the instant it is established (a zero or already-elapsed notFoundRetryBoundMs) settles via not-found-retry-exhausted-first-pass, never attempting a retry",
-  { skip: SHADOWS_PS_LINUX_SKIP },
+  { skip: POSIX_ONLY_SKIP },
   async (t) => {
     const realPath = process.env.PATH;
+    const realDegradeMode = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+    const realDegradeMarker = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-retry-exhausted-first-pass-ps-"));
     const invocationMarker = path.join(dir, "invocations.txt");
-    const psPath = path.join(dir, "ps");
     // A fast, real not-found on the very first attempt - the retry budget
     // is established at exactly that moment, so a zero notFoundRetryBoundMs
     // means it is already spent the instant it exists, before any second
     // attempt could even be considered.
-    fs.writeFileSync(psPath, `#!/bin/sh\necho x >> '${invocationMarker}'\nexit 1\n`);
-    fs.chmodSync(psPath, 0o755);
+    if (process.platform === "linux") {
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = invocationMarker;
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "not-found";
+    } else {
+      const psPath = path.join(dir, "ps");
+      fs.writeFileSync(psPath, `#!/bin/sh\necho x >> '${invocationMarker}'\nexit 1\n`);
+      fs.chmodSync(psPath, 0o755);
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+    }
 
     const errorSpy = t.mock.method(console, "error");
     let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
     try {
-      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
       identity = await captureBirthIdentityPosixAsync(
         process.pid,
         ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS,
@@ -1585,6 +1619,11 @@ test(
       );
     } finally {
       process.env.PATH = realPath;
+      if (realDegradeMode === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegradeMode;
+      if (realDegradeMarker === undefined)
+        delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = realDegradeMarker;
     }
 
     assert.equal(identity, undefined);
@@ -1610,13 +1649,19 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: the aggregate budget running out AFTER a not-found result establishes real retry room, but BEFORE the retry's own sleep can begin, settles via aggregate-exhausted-before-sleep - distinct from the retry budget itself ever running out",
-  { skip: SHADOWS_PS_LINUX_SKIP },
+  { skip: POSIX_ONLY_SKIP },
   async (t) => {
     const realPath = process.env.PATH;
+    const realDegradeMode = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-aggregate-before-sleep-ps-"));
-    const psPath = path.join(dir, "ps");
-    fs.writeFileSync(psPath, "#!/bin/sh\nexit 1\n");
-    fs.chmodSync(psPath, 0o755);
+    if (process.platform === "linux") {
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "not-found";
+    } else {
+      const psPath = path.join(dir, "ps");
+      fs.writeFileSync(psPath, "#!/bin/sh\nexit 1\n");
+      fs.chmodSync(psPath, 0o755);
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+    }
 
     // An injected clock, call-count based rather than time-based, since
     // this scenario needs the aggregate deadline to have already passed by
@@ -1646,10 +1691,11 @@ test(
     const errorSpy = t.mock.method(console, "error");
     let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
     try {
-      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
       identity = await captureBirthIdentityPosixAsync(process.pid, timeoutMs, 3000, 20, clock);
     } finally {
       process.env.PATH = realPath;
+      if (realDegradeMode === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegradeMode;
     }
 
     assert.equal(identity, undefined);
@@ -1757,13 +1803,19 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: an injected concurrency-context hook is called and its result reaches the diagnostic, so a failure can reveal what else was running, without this module owning any state of its own (only jobStore.ts may - see logCaptureUndefined's own docs)",
-  { skip: SHADOWS_PS_LINUX_SKIP },
+  { skip: POSIX_ONLY_SKIP },
   async (t) => {
     const realPath = process.env.PATH;
+    const realDegradeMode = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-concurrency-context-ps-"));
-    const psPath = path.join(dir, "ps");
-    fs.writeFileSync(psPath, `#!/bin/sh\nexit 2\n`);
-    fs.chmodSync(psPath, 0o755);
+    if (process.platform === "linux") {
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "observer-failure";
+    } else {
+      const psPath = path.join(dir, "ps");
+      fs.writeFileSync(psPath, `#!/bin/sh\nexit 2\n`);
+      fs.chmodSync(psPath, 0o755);
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+    }
 
     const errorSpy = t.mock.method(console, "error");
     let hookCallCount = 0;
@@ -1773,7 +1825,6 @@ test(
     };
 
     try {
-      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
       await captureBirthIdentityPosixAsync(
         process.pid,
         undefined,
@@ -1784,6 +1835,8 @@ test(
       );
     } finally {
       process.env.PATH = realPath;
+      if (realDegradeMode === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegradeMode;
     }
 
     assert.equal(
@@ -1806,13 +1859,19 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: a THROWING concurrency-context hook cannot escape or change the outcome - the capture still settles undefined (never rejects), and the hook's own failure is disclosed in the diagnostic rather than silently swallowed",
-  { skip: SHADOWS_PS_LINUX_SKIP },
+  { skip: POSIX_ONLY_SKIP },
   async (t) => {
     const realPath = process.env.PATH;
+    const realDegradeMode = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-throwing-concurrency-context-ps-"));
-    const psPath = path.join(dir, "ps");
-    fs.writeFileSync(psPath, `#!/bin/sh\nexit 2\n`);
-    fs.chmodSync(psPath, 0o755);
+    if (process.platform === "linux") {
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "observer-failure";
+    } else {
+      const psPath = path.join(dir, "ps");
+      fs.writeFileSync(psPath, `#!/bin/sh\nexit 2\n`);
+      fs.chmodSync(psPath, 0o755);
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+    }
 
     const errorSpy = t.mock.method(console, "error");
     const getConcurrencyContext = (): string => {
@@ -1822,7 +1881,6 @@ test(
     let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
     let rejected: unknown;
     try {
-      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
       identity = await captureBirthIdentityPosixAsync(
         process.pid,
         undefined,
@@ -1835,6 +1893,8 @@ test(
       rejected = error;
     } finally {
       process.env.PATH = realPath;
+      if (realDegradeMode === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegradeMode;
     }
 
     assert.equal(
@@ -1867,15 +1927,21 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: OWNS THE CLASS, not the instance - a hook that throws a value whose OWN Symbol.toPrimitive itself throws still settles undefined, never rejects, because the catch handler performs no coercion of the thrown value at all",
-  { skip: SHADOWS_PS_LINUX_SKIP },
+  { skip: POSIX_ONLY_SKIP },
   async (t) => {
     const realPath = process.env.PATH;
+    const realDegradeMode = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
     const dir = fs.mkdtempSync(
       path.join(os.tmpdir(), "ghantika-throwing-hook-noncoercible-primitive-ps-")
     );
-    const psPath = path.join(dir, "ps");
-    fs.writeFileSync(psPath, `#!/bin/sh\nexit 2\n`);
-    fs.chmodSync(psPath, 0o755);
+    if (process.platform === "linux") {
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "observer-failure";
+    } else {
+      const psPath = path.join(dir, "ps");
+      fs.writeFileSync(psPath, `#!/bin/sh\nexit 2\n`);
+      fs.chmodSync(psPath, 0o755);
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+    }
 
     const errorSpy = t.mock.method(console, "error");
     // A legal JS thrown value that is not an Error and cannot be coerced to
@@ -1896,7 +1962,6 @@ test(
     let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
     let rejected: unknown;
     try {
-      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
       identity = await captureBirthIdentityPosixAsync(
         process.pid,
         undefined,
@@ -1909,6 +1974,8 @@ test(
       rejected = error;
     } finally {
       process.env.PATH = realPath;
+      if (realDegradeMode === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegradeMode;
     }
 
     assert.equal(
@@ -1930,15 +1997,21 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: OWNS THE CLASS, not the instance - a hook that throws a value whose OWN toString itself throws still settles undefined, never rejects",
-  { skip: SHADOWS_PS_LINUX_SKIP },
+  { skip: POSIX_ONLY_SKIP },
   async (t) => {
     const realPath = process.env.PATH;
+    const realDegradeMode = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
     const dir = fs.mkdtempSync(
       path.join(os.tmpdir(), "ghantika-throwing-hook-noncoercible-tostring-ps-")
     );
-    const psPath = path.join(dir, "ps");
-    fs.writeFileSync(psPath, `#!/bin/sh\nexit 2\n`);
-    fs.chmodSync(psPath, 0o755);
+    if (process.platform === "linux") {
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "observer-failure";
+    } else {
+      const psPath = path.join(dir, "ps");
+      fs.writeFileSync(psPath, `#!/bin/sh\nexit 2\n`);
+      fs.chmodSync(psPath, 0o755);
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+    }
 
     const errorSpy = t.mock.method(console, "error");
     // The sibling shape to the Symbol.toPrimitive case above: a thrown
@@ -1958,7 +2031,6 @@ test(
     let identity: Awaited<ReturnType<typeof captureBirthIdentityPosixAsync>>;
     let rejected: unknown;
     try {
-      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
       identity = await captureBirthIdentityPosixAsync(
         process.pid,
         undefined,
@@ -1971,6 +2043,8 @@ test(
       rejected = error;
     } finally {
       process.env.PATH = realPath;
+      if (realDegradeMode === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegradeMode;
     }
 
     assert.equal(
@@ -1992,21 +2066,28 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: omitting the concurrency-context hook is fully supported - the diagnostic still names the branch, just without a context clause",
-  { skip: SHADOWS_PS_LINUX_SKIP },
+  { skip: POSIX_ONLY_SKIP },
   async (t) => {
     const realPath = process.env.PATH;
+    const realDegradeMode = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-no-concurrency-context-ps-"));
-    const psPath = path.join(dir, "ps");
-    fs.writeFileSync(psPath, `#!/bin/sh\nexit 2\n`);
-    fs.chmodSync(psPath, 0o755);
+    if (process.platform === "linux") {
+      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "observer-failure";
+    } else {
+      const psPath = path.join(dir, "ps");
+      fs.writeFileSync(psPath, `#!/bin/sh\nexit 2\n`);
+      fs.chmodSync(psPath, 0o755);
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+    }
 
     const errorSpy = t.mock.method(console, "error");
 
     try {
-      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
       await captureBirthIdentityPosixAsync(process.pid);
     } finally {
       process.env.PATH = realPath;
+      if (realDegradeMode === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegradeMode;
     }
 
     assert.equal(errorSpy.mock.calls.length, 1);

@@ -565,25 +565,41 @@ export function identityElapsedTimesMatch(
   return Math.abs(actualElapsedSeconds - expectedElapsedSeconds) <= toleranceSeconds;
 }
 
-/** The real outcome of one `ps -p <pid> -o etime=` read - see `readProcessElapsedSeconds`'s own docs for why this is a three-way discrimination, not the `number | undefined` shape this used to return. */
+/**
+ * The real outcome of one `ps -p <pid> -o etime=` read - see
+ * `readProcessElapsedSeconds`'s own docs for why this is a three-way
+ * discrimination, not the `number | undefined` shape this used to return.
+ * `observer-failure`'s `timedOut` is a STRUCTURAL discriminator, set
+ * explicitly by whichever call site produced the failure, never inferred
+ * from `reason`'s own wording elsewhere - see `BirthIdentityAttemptResult`'s
+ * own docs for why a text-matching classifier was the wrong tool here.
+ */
 export type ElapsedSecondsReadResult =
   | { readonly status: "found"; readonly elapsedSeconds: number }
   | { readonly status: "not-found" }
-  | { readonly status: "observer-failure"; readonly reason: string };
+  | { readonly status: "observer-failure"; readonly reason: string; readonly timedOut: boolean };
 
 /**
- * The exact, unique prefix `readProcessElapsedSecondsAsync` uses for an
+ * The human-readable prefix `readProcessElapsedSecondsAsync` uses in an
  * `observer-failure` reason produced by `timeoutMs` itself running out,
  * whichever of that function's TWO timeout paths actually ends the
  * observer: `execFile`'s own internal timeout killing it cooperatively
  * (the common case - the observer dies from the signal, and the exec
  * callback reports it), or, only if the observer ignores that signal, the
  * external-bound timer's own forced SIGKILL. Never produced by a genuine
- * `ps` execution error. `captureBirthIdentityPosixAsync` checks for this
- * prefix to tell "the observer's own bounded wait genuinely expired"
- * apart from a different kind of `observer-failure` (`ps` missing, or a
- * real execution error) - see that function's own docs on why the
- * distinction matters for which branch it reports.
+ * `ps` execution error.
+ *
+ * TEXT ONLY - `captureBirthIdentityPosixAsync` does NOT match against this
+ * (or any) prefix to classify a timeout; it reads the structural
+ * `observer-failure.timedOut` field each observer sets explicitly instead.
+ * A prior version of this codebase DID classify by matching this exact
+ * prefix, which worked only for this POSIX/`ps` observer - the Linux
+ * `/proc` observer's own timeout reason never started with it (a different
+ * string, "/proc/<pid>/stat did not settle within..."), so every Linux
+ * aggregate-shortened timeout was silently misclassified as a genuine
+ * observer failure instead of aggregate-exhausted-mid-observation. This
+ * constant is kept only so both of this function's own timeout sites emit
+ * the same readable wording; it carries no behavioral meaning anymore.
  */
 const OBSERVER_TIMEOUT_REASON_PREFIX = "ps did not settle within";
 
@@ -623,13 +639,14 @@ function interpretPsOutput(output: string): ElapsedSecondsReadResult {
     // observed against a real `ps` in this codebase's own testing, but
     // this is still an unusable/ambiguous result, not a confident
     // "not-found" - treated the same as unparseable output below.
-    return { status: "observer-failure", reason: "ps produced no output" };
+    return { status: "observer-failure", reason: "ps produced no output", timedOut: false };
   }
   const elapsedSeconds = parseEtime(output);
   if (elapsedSeconds === undefined) {
     return {
       status: "observer-failure",
       reason: `ps produced output this codebase could not parse: ${JSON.stringify(output)}`,
+      timedOut: false,
     };
   }
   return { status: "found", elapsedSeconds };
@@ -652,6 +669,7 @@ function readProcessElapsedSeconds(pid: number): ElapsedSecondsReadResult {
         err.code !== undefined
           ? `ps failed to execute (${err.code})`
           : `ps failed unexpectedly: ${err.message ?? String(error)}`,
+      timedOut: false,
     };
   }
   return interpretPsOutput(output);
@@ -782,6 +800,7 @@ function readProcessElapsedSecondsAsync(
           settle({
             status: "observer-failure",
             reason: `${OBSERVER_TIMEOUT_REASON_PREFIX} ${timeoutMs}ms (observer killed by its own timeout signal: ${err.signal ?? "unknown"})`,
+            timedOut: true,
           });
           return;
         }
@@ -791,6 +810,7 @@ function readProcessElapsedSecondsAsync(
             typeof err.code === "string"
               ? `ps failed to execute (${err.code})`
               : `ps failed unexpectedly: ${err.message ?? String(error)}`,
+          timedOut: false,
         });
       }
     );
@@ -806,6 +826,7 @@ function readProcessElapsedSecondsAsync(
       settle({
         status: "observer-failure",
         reason: `${OBSERVER_TIMEOUT_REASON_PREFIX} ${timeoutMs}ms (observer unresponsive to SIGTERM)`,
+        timedOut: true,
       });
     }, timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS);
   });
@@ -824,7 +845,7 @@ function readProcessElapsedSecondsAsync(
 export type LinuxStartTimeTicksReadResult =
   | { readonly status: "found"; readonly startTimeTicks: string }
   | { readonly status: "not-found" }
-  | { readonly status: "observer-failure"; readonly reason: string };
+  | { readonly status: "observer-failure"; readonly reason: string; readonly timedOut: boolean };
 
 /**
  * Parses ONE `/proc/<pid>/stat` file's raw contents into its field-22
@@ -887,6 +908,7 @@ function interpretProcStatOutput(raw: string): LinuxStartTimeTicksReadResult {
     return {
       status: "observer-failure",
       reason: `/proc/<pid>/stat produced output this codebase could not parse: ${JSON.stringify(raw)}`,
+      timedOut: false,
     };
   }
   return { status: "found", startTimeTicks };
@@ -915,6 +937,7 @@ function classifyProcStatReadFailure(error: unknown): LinuxStartTimeTicksReadRes
       err.code !== undefined
         ? `/proc/<pid>/stat read failed (${err.code})`
         : `/proc/<pid>/stat read failed unexpectedly: ${err instanceof Error ? err.message : String(error)}`,
+    timedOut: false,
   };
 }
 
@@ -1128,6 +1151,7 @@ export async function readLinuxStartTimeTicksAsync(
       resolve({
         status: "observer-failure",
         reason: `/proc/<pid>/stat did not settle within ${timeoutMs}ms`,
+        timedOut: true,
       });
     }, timeoutMs);
   });
@@ -1317,7 +1341,7 @@ const REAL_CAPTURE_RETRY_CLOCK: CaptureRetryClock = {
 type BirthIdentityAttemptResult =
   | { readonly status: "found"; readonly identity: ProcessBirthIdentity }
   | { readonly status: "not-found" }
-  | { readonly status: "observer-failure"; readonly reason: string };
+  | { readonly status: "observer-failure"; readonly reason: string; readonly timedOut: boolean };
 
 /**
  * Makes ONE real birth-identity observation attempt for `pid`, dispatching
@@ -1532,16 +1556,22 @@ export async function captureBirthIdentityPosixAsync(
       // A genuine execution error (ps missing, a real nonzero exit) is a
       // true observer-genuine-failure regardless of how much time this
       // attempt had. But when THIS attempt's own bounded wait is what
-      // actually fired - named by its own unique reason prefix - and that
-      // wait was itself capped short of the observer's normal timeoutMs
-      // because the aggregate budget was running out, the real cause is
-      // the aggregate cap, not the observer: the observer never got the
-      // chance to answer within its own ordinary allowance. Reported as
+      // actually fired - named by the platform-neutral, STRUCTURAL
+      // `timedOut` field every observer sets explicitly, never by matching
+      // any particular wording in `reason` - and that wait was itself
+      // capped short of the observer's normal timeoutMs because the
+      // aggregate budget was running out, the real cause is the aggregate
+      // cap, not the observer: the observer never got the chance to answer
+      // within its own ordinary allowance. Reported as
       // aggregate-exhausted-mid-observation so the two genuinely different
       // causes - "ps itself is broken" vs. "ps was still working, just
-      // out of time" - are never collapsed into one.
-      const cutShortByAggregateBudget =
-        effectiveTimeoutMs < timeoutMs && attempt.reason.startsWith(OBSERVER_TIMEOUT_REASON_PREFIX);
+      // out of time" - are never collapsed into one. A prior version of
+      // this check matched `reason` against a POSIX/`ps`-specific prefix,
+      // which silently misclassified every Linux aggregate-shortened
+      // timeout as observer-genuine-failure instead (the Linux `/proc`
+      // observer's own timeout reason never started with that prefix) -
+      // see `OBSERVER_TIMEOUT_REASON_PREFIX`'s own docs for the full story.
+      const cutShortByAggregateBudget = effectiveTimeoutMs < timeoutMs && attempt.timedOut;
       logCaptureUndefined(
         pid,
         cutShortByAggregateBudget
