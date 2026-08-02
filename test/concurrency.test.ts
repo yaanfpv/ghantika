@@ -117,8 +117,8 @@ test('normalizeNonNegativeInteger falls back to the default for an absent, blank
   // A normal positive value, unaffected by either guard.
   assert.equal(normalizeNonNegativeInteger("5", fallback), 5);
 
-  // Already-correctly-rejected shapes (QA's own reproduction) - confirm
-  // these still fall back after this fix, i.e. no regression.
+  // Already-correctly-rejected shapes - confirm these still fall back
+  // after this fix, i.e. no regression.
   assert.equal(
     normalizeNonNegativeInteger("1.5", fallback),
     fallback,
@@ -485,10 +485,9 @@ test("releaseSlot fails CLOSED on an unconfirmed reap decision: the slot stays h
   });
 
   // The exact shape a genuinely-unconfirmed reap produces once mapped
-  // through reapOutcomeToReleaseDecision - the counterexample QA's own
-  // Stage 1.5b HOLD named directly: "reapProcessGroupOnce resolves
-  // normally with kill_confirmed=false ... releaseSlot then decrements
-  // and dequeues regardless."
+  // through reapOutcomeToReleaseDecision: reapProcessGroupOnce resolves
+  // normally with kill_confirmed=false, and a fail-open release path
+  // would decrement and dequeue regardless.
   await store.releaseSlot(a.job_id, Promise.resolve("unconfirmed"));
 
   assert.equal(
@@ -522,9 +521,8 @@ test("releaseSlot fails CLOSED on an errored reap decision, identically to an un
 
   // The exact shape src/tools/run.ts's own onExit wiring produces for a
   // real signal-send failure: the raw reapProcessGroupOnce rejection is
-  // caught and mapped to the explicit "errored" decision - QA's own
-  // second named path ("run.ts also catches a thrown reap into a
-  // resolved promise"), which the OLD code silently treated as safe.
+  // caught and mapped to the explicit "errored" decision, which the OLD
+  // code silently treated as safe.
   await store.releaseSlot(a.job_id, Promise.resolve("errored"));
 
   assert.equal(dequeued, false, "an errored reap must never hand a's slot to the next queued job");
@@ -593,9 +591,10 @@ test("lowering the cap to zero then raising it back up proactively drains the qu
   });
   assert.equal(store.get(b.job_id)!.queue_position, 1);
 
-  // Lower the cap to zero, then release a - the exact repro QA's own
-  // Stage 1.5b HOLD gave: "active=1 + queued=1, lower cap to 0, release
-  // active, then restore cap to 1 leaves active=0/queued=1 forever."
+  // Lower the cap to zero, then release a: with active=1 and queued=1,
+  // lowering the cap to zero and releasing the active job must never
+  // silently admit the queued one - there is no room for anyone while
+  // the cap sits at zero.
   store.setConcurrencyConfig({ maxConcurrentJobs: 0, maxQueueDepth: 1 });
   await store.releaseSlot(a.job_id);
   assert.equal(

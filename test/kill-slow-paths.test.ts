@@ -800,7 +800,7 @@ test(
 );
 
 test(
-  "kill: A STRANDED COMBINED-DEGRADED KILL NEVER RECEIVES A SECOND SIGNAL, even once ps/pgrep are available again - a SECOND kill() call against the same job re-checks EXISTENCE ONLY and leaves a genuinely-still-alive group unconfirmed (negative control); once the group has since genuinely emptied by an external means, a THIRD call recovers it via that same existence-only re-check, still without ever sending it a second signal (legitimate recovery control)",
+  "kill: A STRANDED COMBINED-DEGRADED KILL NEVER RECEIVES A SECOND SIGNAL, even once ps/pgrep are available again - a SECOND kill() call against the same job re-checks EXISTENCE ONLY and leaves a genuinely-still-alive group unconfirmed; once the group has since genuinely emptied by an external means, a THIRD call recovers it via that same existence-only re-check, still without ever sending it a second signal",
   {
     skip:
       process.platform === "win32"

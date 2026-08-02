@@ -179,13 +179,12 @@ export async function runStrandedRetryScenario(
     );
 
     // SECOND call, same job_id, real ps/pgrep available this time (PATH
-    // is already restored). NEGATIVE CONTROL FOR THE RETRY-SAFETY
-    // CONTRACT: `hasReapBeenAttempted` is still false (the first call's
-    // outcome was UNCONFIRMED, never marked), so `reapProcessGroupOnce`
-    // genuinely re-consults - but by the fail-closed retry-safety
-    // contract, ownership continuity over the tracked numeric pid is no
-    // longer guaranteed at this point, so it re-checks EXISTENCE ONLY and
-    // never signals again. The real process is STILL genuinely alive
+    // is already restored). `hasReapBeenAttempted` is still false (the
+    // first call's outcome was UNCONFIRMED, never marked), so
+    // `reapProcessGroupOnce` genuinely re-consults - but ownership
+    // continuity over the tracked numeric pid is no longer guaranteed at
+    // this point, so it re-checks EXISTENCE ONLY and never signals again.
+    // The real process is STILL genuinely alive
     // (this fixture ignores SIGTERM and neither call above ever reached
     // it), so that existence check correctly reports "still alive" -
     // proving this codebase never sent it a further signal, whether or
@@ -222,9 +221,8 @@ export async function runStrandedRetryScenario(
       "expected the external SIGKILL (sent by this test, not by kill()) to have actually ended the real process group"
     );
 
-    // THIRD call, same job_id: LEGITIMATE RECOVERY CONTROL, the
-    // counterpart to the negative control above. The retry's own
-    // existence-only re-check now correctly observes the group is
+    // THIRD call, same job_id: the retry's own existence-only re-check
+    // now correctly observes the group is
     // genuinely gone and confirms it - real recovery, through the real
     // `kill()` handler, still without this codebase ever having sent
     // that group a second signal of its own.

@@ -468,7 +468,7 @@ test(
 );
 
 test(
-  "reapProcessGroupOnce genuinely re-consults on a second DIRECT call after an UNCONFIRMED first attempt, but that retry NEVER signals again - NEGATIVE CONTROL for PGID reuse: even when the existence check still reports the pgid as alive (an inconclusive first attempt could mean the group is genuinely still alive, OR that it has since emptied and the numeric id was handed to an unrelated later group), the signal-capable reaper is never invoked a second time",
+  "reapProcessGroupOnce genuinely re-consults on a second DIRECT call after an UNCONFIRMED first attempt, but that retry NEVER signals again, even when the existence check still reports the pgid as alive - an inconclusive first attempt could mean the group is genuinely still alive, or that it has since emptied and the numeric id was handed to an unrelated later group, and the signal-capable reaper is never invoked a second time either way",
   {
     skip:
       process.platform === "win32"
@@ -575,7 +575,7 @@ test(
 );
 
 test(
-  "reapProcessGroupOnce's retry CAN still recover via existence-only confirmation - LEGITIMATE RECOVERY control, the counterpart to the negative control above: when the group has genuinely become empty since the first unconfirmed attempt (e.g. a transient observer failure that has since resolved), the retry confirms it WITHOUT ever sending a second signal",
+  "reapProcessGroupOnce's retry CAN still recover via existence-only confirmation: when the group has genuinely become empty since the first unconfirmed attempt (e.g. a transient observer failure that has since resolved), the retry confirms it WITHOUT ever sending a second signal",
   {
     skip:
       process.platform === "win32"
@@ -640,6 +640,96 @@ test(
       store.hasReapBeenAttempted(record.job_id),
       true,
       "a confirmed retry marks the reap-once guard, exactly like a confirmed first attempt does"
+    );
+
+    // No cleanup kill here - same reasoning as the sibling tests above:
+    // `true` exits almost immediately and forks nothing, so the real
+    // group is already gone by this point.
+  }
+);
+
+test(
+  "reapProcessGroupOnce's retry never re-enters the signal-capable reaper after a THROWING first attempt: an exception leaving execution before the result is recorded must still be treated as an entered attempt, exactly like an ordinary unconfirmed return, so a numeric pgid recycled between the two calls is never signaled twice",
+  {
+    skip:
+      process.platform === "win32"
+        ? "process-group reap-once tracking is POSIX-only - no pgid concept to reuse-guard against on Windows"
+        : false,
+  },
+  async () => {
+    const store = new JobStore();
+    const record = store.createJob({ argv: ["true"], cwd: "/tmp", env: {}, isShell: false });
+    const child = spawnManaged(
+      { argv: ["true"], cwd: process.cwd(), env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } },
+      {
+        onSpawn: () => {},
+        onError: () => {},
+        onExit: () => {},
+        onStdoutChunk: () => {},
+        onStderrChunk: () => {},
+        onStdoutEnd: () => {},
+        onStderrEnd: () => {},
+      }
+    );
+    store.attachChild(record.job_id, child!);
+    store.markExited(record.job_id, 0, null);
+
+    let signalCapableReaperCalls = 0;
+    const throwingReaper = async (): Promise<{ confirmed: boolean }> => {
+      signalCapableReaperCalls += 1;
+      throw new Error("forced-first-reaper-error");
+    };
+
+    await assert.rejects(
+      () => store.reapProcessGroupOnce(record.job_id, 100, throwingReaper),
+      /forced-first-reaper-error/,
+      "the caller must still see the thrown error - see src/tools/run.ts's own explicit 'errored' release decision, which depends on this rejection reaching it"
+    );
+    assert.equal(
+      signalCapableReaperCalls,
+      1,
+      "expected the injected signal-capable reaper to run on the FIRST reap attempt"
+    );
+    assert.equal(
+      store.hasReapBeenAttempted(record.job_id),
+      false,
+      "a thrown first attempt never confirmed, so it must leave the job eligible for a further retry, exactly like an ordinary unconfirmed outcome"
+    );
+    assert.equal(
+      store.get(record.job_id)!.kill_confirmed,
+      false,
+      "a thrown first attempt must still be recorded as an entered-but-unconfirmed signal-capable attempt, or the retry below would misread it as a genuine first attempt and signal again"
+    );
+
+    // A SECOND direct call must go through the EXISTENCE-ONLY path,
+    // never the signal-capable one - the same retry-safety property
+    // proven above for an ordinary unconfirmed return, now proven for
+    // the throwing case.
+    let existenceOnlyCalls = 0;
+    const stillReadsAliveExistenceCheck = async (): Promise<boolean> => {
+      existenceOnlyCalls += 1;
+      return false;
+    };
+    const unreachedSignalCapableReaperOnRetry = async (): Promise<{ confirmed: boolean }> => {
+      signalCapableReaperCalls += 1;
+      return { confirmed: false };
+    };
+    const second = await store.reapProcessGroupOnce(
+      record.job_id,
+      100,
+      unreachedSignalCapableReaperOnRetry,
+      stillReadsAliveExistenceCheck
+    );
+    assert.deepEqual(second, { kind: "unconfirmed" });
+    assert.equal(
+      existenceOnlyCalls,
+      1,
+      "expected the retry to consult the existence-only oracle exactly once"
+    );
+    assert.equal(
+      signalCapableReaperCalls,
+      1,
+      "expected the signal-capable reaper to NEVER be invoked again on the retry - a real reused pgid must never receive a second signal after a throwing first attempt, whatever the existence check reports"
     );
 
     // No cleanup kill here - same reasoning as the sibling tests above:

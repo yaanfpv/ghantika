@@ -408,8 +408,7 @@ test("TTL purge removes a completed record past TASK_TTL_MS while a still-workin
 
 // ---------------------------------------------------------------------------
 // TTL purge must NEVER reclaim a job whose concurrency slot is still
-// stranded - the P1 lifecycle/operability defect a Stage 1.5b review
-// caught: deleteJob cannot touch activeSlots (a store-wide counter, not
+// stranded: deleteJob cannot touch activeSlots (a store-wide counter, not
 // part of any one job's own record), so purging a stranded job's record
 // erases the only durable, attributable trace of a held slot while the
 // slot itself stays held forever with no path back. Driven directly

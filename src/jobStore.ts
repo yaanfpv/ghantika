@@ -2511,7 +2511,22 @@ export class JobStore {
       return { kind: "unconfirmed" };
     }
 
-    const result = await reaper(handle.pid, graceMs);
+    let result: { readonly confirmed: boolean };
+    try {
+      result = await reaper(handle.pid, graceMs);
+    } catch (err) {
+      // A thrown first signal-capable attempt still counts as "entered"
+      // for retry-safety purposes: it never confirmed, exactly like an
+      // ordinary `confirmed: false` return, so it gets the same
+      // `kill_confirmed: false` before the error propagates. Without
+      // this, `kill_confirmed` would stay `undefined`, the next call's
+      // `isRetry` check above would read it as a genuine first attempt,
+      // and it would re-enter the signal-capable `reaper` against a
+      // numeric pgid that may since have been recycled by an unrelated
+      // process group.
+      this.setKillConfirmation(jobId, false);
+      throw err;
+    }
     this.setKillConfirmation(jobId, result.confirmed);
     if (result.confirmed) {
       this.markReapAttempted(jobId);
