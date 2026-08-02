@@ -32,6 +32,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/server";
 import { ALL_JOB_STATES, JobStore, type ReapReleaseDecision, jobStore } from "../dist/jobStore.js";
 import { loadConcurrencyConfigFromEnv, normalizeNonNegativeInteger } from "../dist/scheduler.js";
 import { createServer } from "../dist/server.js";
+import * as tasksAdapter from "../dist/tasksAdapter.js";
 import * as killTool from "../dist/tools/kill.js";
 import * as listTool from "../dist/tools/list.js";
 import * as runTool from "../dist/tools/run.js";
@@ -925,6 +926,124 @@ test("kill() on a preflight-failed record that never held a concurrency slot mus
       jobStore.getActiveSlotCount(),
       1,
       "the real owner's slot is still the only one ever held, after all three preflight-failure classes"
+    );
+  } finally {
+    await cleanUpSharedJobs(ownerJobId ? [ownerJobId] : []);
+    assert.equal(
+      jobStore.getActiveSlotCount(),
+      0,
+      "cleanup released the real owner's slot exactly once"
+    );
+  }
+});
+
+test("double-cancelling a QUEUED (never-dequeued) job must never release a different job's reservation, across both real cancellation surfaces", async () => {
+  jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 1 });
+  let ownerJobId: string | undefined;
+  try {
+    const owner = runTool.handler({
+      command: ["sleep", "30"],
+      label: "queued-double-cancel-owner",
+    });
+    assert.notEqual(owner.isError, true);
+    ownerJobId = structured(owner).job_id as string;
+    assert.equal(jobStore.getActiveSlotCount(), 1, "the real owner holds the only slot");
+
+    // Both real entry points that can ever cancel a still-queued job -
+    // `kill.ts`'s own handler, and `tasksAdapter.cancelTask`, which
+    // delegates to that same handler internally (see its own docs) but is
+    // still a distinct, real caller worth exercising directly rather than
+    // trusting by construction.
+    const cancelSurfaces: Array<{
+      readonly name: string;
+      readonly cancel: (jobId: string) => Promise<{ isError?: boolean } | { error: unknown }>;
+    }> = [
+      { name: "kill", cancel: (jobId) => killTool.handler({ job_id: jobId }) },
+      { name: "tasks/cancel", cancel: (jobId) => tasksAdapter.cancelTask(jobId) },
+    ];
+
+    for (const { name, cancel } of cancelSurfaces) {
+      const queued = runTool.handler({
+        command: ["sleep", "1"],
+        label: `queued-double-cancel-${name.replace("/", "-")}`,
+      });
+      assert.notEqual(
+        queued.isError,
+        true,
+        `${name}: run() itself must still succeed with a queued record`
+      );
+      const queuedStructured = structured(queued);
+      assert.equal(
+        queuedStructured.queue_position,
+        1,
+        `${name}: cap is full - this job must queue, not run`
+      );
+      const queuedJobId = queuedStructured.job_id as string;
+
+      const first = await cancel(queuedJobId);
+      assert.notEqual(
+        "isError" in first ? first.isError : undefined,
+        true,
+        `${name}: cancelling a still-queued job must succeed`
+      );
+      assert.equal(
+        jobStore.getActiveSlotCount(),
+        1,
+        `${name}: cancelling a QUEUED job must never touch the owner's slot`
+      );
+
+      // THE regression: a second cancellation of the SAME now-terminal
+      // record reaches the terminal late-recovery path, not the queue
+      // path - this is exactly where the old bug decremented a slot this
+      // job never held.
+      const second = await cancel(queuedJobId);
+      assert.notEqual(
+        "isError" in second ? second.isError : undefined,
+        true,
+        `${name}: a second cancellation of the now-terminal record must be a no-op success`
+      );
+      assert.equal(
+        jobStore.getActiveSlotCount(),
+        1,
+        `${name}: a SECOND cancellation of the same queued-then-cancelled job must still never free the owner's slot`
+      );
+
+      // The property a user would feel: with the queue now empty again,
+      // a probe job must be QUEUED behind the still-running owner, never
+      // admitted as a second live child under a cap of one. Checking
+      // `getActiveSlotCount()` immediately after creating it is the
+      // direct assertion - an admitted (rather than queued) probe would
+      // increment it to 2 right here, on the same synchronous call.
+      const probe = runTool.handler({
+        command: ["sleep", "1"],
+        label: `queued-double-cancel-probe-${name.replace("/", "-")}`,
+      });
+      assert.notEqual(
+        probe.isError,
+        true,
+        `${name}: the probe must still be accepted (queued), not rejected`
+      );
+      assert.equal(
+        structured(probe).queue_position,
+        1,
+        `${name}: the probe must be QUEUED behind the owner, never admitted directly - a cap-of-one breach reads as an immediate admission here`
+      );
+      assert.equal(
+        jobStore.getActiveSlotCount(),
+        1,
+        `${name}: creating the probe must not itself increment activeSlots - the owner's slot is still the only one held`
+      );
+
+      // Clear the probe out of the queue before the next surface's own
+      // pass reuses the one queue slot.
+      const probeCancelled = await killTool.handler({ job_id: structured(probe).job_id as string });
+      assert.notEqual(probeCancelled.isError, true);
+    }
+
+    assert.equal(
+      jobStore.getActiveSlotCount(),
+      1,
+      "the real owner's slot is still the only one ever held, after both cancellation surfaces' double-cancel"
     );
   } finally {
     await cleanUpSharedJobs(ownerJobId ? [ownerJobId] : []);

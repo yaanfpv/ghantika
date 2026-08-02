@@ -1244,15 +1244,37 @@ export class JobStore {
   /** Job ids whose concurrency slot has already been released once - see `releaseSlot`'s own docs for why a SECOND release for the same id must be a no-op rather than a real second decrement/dequeue. */
   private readonly slotReleased = new Set<string>();
   /**
-   * Job ids that genuinely hold (or held) a reserved concurrency slot -
-   * added by `createJob` itself (the one call that means "this job passed
-   * admission control"), and checked by `releaseSlot`'s own ownership
-   * guard before it ever decrements `activeSlots` on a job's behalf. A job
-   * id absent from this set never took a slot in the first place: a
-   * preflight failure in `src/tools/run.ts` - invalid cwd, missing
-   * executable, or a policy denial - creates a terminal record via
-   * `createFailedJob` before admission control ever runs, and that
-   * constructor never touches this set.
+   * Job ids that GENUINELY, RIGHT NOW, hold a reserved concurrency slot -
+   * checked by `releaseSlot`'s own ownership guard before it ever
+   * decrements `activeSlots` on a job's behalf. The two are meant to move
+   * together exactly: a job id is added here at the same moment
+   * `activeSlots` is incremented for it, and there are only two such
+   * moments - an immediate `"admit"` (via `createJob`, since `run()`'s
+   * handler calls it right after `requestSlot()` returns `"admit"`, with
+   * no `await` in between - see `src/tools/run.ts`'s own docs) and a
+   * later dequeue-promotion (`dequeueNext`, at its own `activeSlots += 1`).
+   *
+   * A job admitted with `{kind: "queue"}` is the one wrinkle: `createJob`
+   * cannot yet know, at the moment it runs, whether ITS caller's
+   * `requestSlot()` returned `"admit"` or `"queue"` (the two are separate,
+   * uncoupled calls - see `requestSlot`'s own docs), so it marks every job
+   * id optimistically, on the assumption it is being admitted right now.
+   * `enqueueJob` - which is called if and only if the real answer was
+   * `"queue"` - corrects that assumption immediately, in the same
+   * synchronous step as the job's own admission decision, by removing the
+   * id again (see that method's own docs for why nothing can ever observe
+   * the job as reserved in between). `dequeueNext` then re-adds it later,
+   * at the exact point this job actually takes a slot. Net effect: a
+   * queued-but-not-yet-dequeued job is never a member of this set, so
+   * `removeFromQueue` and `drainQueueOnShutdown` - the two ways such a job
+   * can be cancelled before ever reaching `dequeueNext` - have nothing of
+   * their own to revoke here (see their own docs).
+   *
+   * A job id absent from this set never holds a slot: a preflight failure
+   * in `src/tools/run.ts` - invalid cwd, missing executable, or a policy
+   * denial - creates a terminal record via `createFailedJob`, which never
+   * touches this set at all; a queued job is absent for as long as it
+   * remains queued, by the mechanism above.
    */
   private readonly slotReserved = new Set<string>();
   /**
@@ -1353,15 +1375,16 @@ export class JobStore {
       is_shell: input.isShell,
     };
     this.jobs.set(record.job_id, record);
-    // This is the ONE place a job id ever enters `slotReserved` - see that
-    // field's own docs for why `createJob` (never `createFailedJob`) is
-    // the exact boundary: `src/tools/run.ts`'s only production call site
-    // is immediately after `requestSlot()` returns `"admit"` or `"queue"`,
-    // i.e. only once admission control has genuinely cleared this job (a
-    // `"queue"` admission does not yet increment `activeSlots`, but a
-    // queued-then-killed job is cancelled via `removeFromQueue`, which
-    // never calls `releaseSlot` - see that method's own docs - so marking
-    // it reserved here, before it is ever actually dequeued, is safe).
+    // Optimistically marks this job reserved, on the assumption it is
+    // being admitted right now - true whenever the caller's own
+    // `requestSlot()` returned `"admit"`, since `run()`'s handler never
+    // calls `createJob` at all except after that decision (see
+    // `slotReserved`'s own field doc for the full contract). When the
+    // real answer was `"queue"` instead, `enqueueJob` corrects this in
+    // the same synchronous step, immediately after - this store cannot
+    // know which answer applies AT this exact call, since `createJob` and
+    // `requestSlot` are two separate, uncoupled calls (see `requestSlot`'s
+    // own docs), so it marks first and the very next step corrects it.
     this.slotReserved.add(record.job_id);
     // ONE shared JobSeqCounter for this job's stdout and stderr - see its
     // own docs for why sharing it is what makes StreamLineEntry.seq a real
@@ -1565,11 +1588,30 @@ export class JobStore {
    * performs the actual deferred `spawnManaged` call for this exact job at
    * that moment; this store has no opinion on what "actually running the
    * job" means, only on WHEN it becomes this job's turn.
+   *
+   * ALSO removes `jobId` from `slotReserved` - `createJob` marks every job
+   * reserved optimistically, on the assumption it is being admitted right
+   * now, and this call is the caller telling this store that assumption
+   * was wrong for THIS job (the caller only reaches here after its own
+   * `requestSlot()` returned `"queue"`, never `"admit"`). This is the
+   * ONE place that correction happens, and it happens immediately: nothing
+   * can observe `jobId` as reserved in the gap between `createJob` and
+   * this call, since production and every test call them back to back
+   * with no `await` in between (see `src/tools/run.ts`'s own docs on why
+   * `run()`'s handler is synchronous end to end). `dequeueNext` re-adds
+   * this exact id the moment it actually promotes this job, at the exact
+   * point it increments `activeSlots` for it - so a queued job is in
+   * `slotReserved` only for as long as it is actually true that this job
+   * holds, or is about to hold, a slot; never while it is merely waiting.
+   * `removeFromQueue`/`drainQueueOnShutdown` need no matching cleanup of
+   * their own as a result: whichever of them a still-queued job's
+   * cancellation reaches, the entry was already gone from here.
    */
   enqueueJob(jobId: string, onDequeued: () => void): void {
     this.queue.push({ jobId, onDequeued });
     const record = this.jobs.get(jobId);
     if (record) record.queue_position = this.queue.length;
+    this.slotReserved.delete(jobId);
   }
 
   /**
@@ -1586,6 +1628,15 @@ export class JobStore {
    * own `onDequeued` closure either - that closure performs the deferred
    * spawn `enqueueJob`'s caller supplied, and cancelling a queued job is
    * the opposite of ever giving it that spawn.
+   *
+   * Never touches `slotReserved` either, and needs no such cleanup: a
+   * still-queued job's `slotReserved` entry was already removed by
+   * `enqueueJob` the moment it was queued (see that method's own docs), so
+   * this call - like every other cancellation of a queued job - has
+   * nothing left to revoke there. That is what makes a later, mistaken
+   * second `kill`/`tasks.cancel` against the now-terminal record
+   * correctly refused by `releaseSlot`'s own ownership guard, without this
+   * method having to know that guard exists.
    *
    * Returns `false`, a pure no-op, when `jobId` is not currently in the
    * queue (never queued, already dequeued, or already removed by an
@@ -1877,6 +1928,14 @@ export class JobStore {
    * dequeued job's own `onDequeued` closure, which performs the actual
    * deferred spawn for it (see `enqueueJob`'s own docs). A no-op when the
    * queue is empty OR the cap does not currently allow another active job.
+   *
+   * Also re-adds this job's id to `slotReserved`, right alongside the
+   * `activeSlots` increment - `enqueueJob` removed it the moment this job
+   * was queued (see that method's own docs), and THIS is the moment it
+   * becomes true again: the job now genuinely holds a slot. Skipping this
+   * would leave a promoted job permanently unmarked, so its own eventual
+   * `releaseSlot` call would be wrongly refused by the ownership guard and
+   * `activeSlots` would never come back down for it.
    */
   private dequeueNext(): void {
     if (this.queue.length === 0) return;
@@ -1886,6 +1945,7 @@ export class JobStore {
     if (record) record.queue_position = undefined;
     this.renumberQueuePositions();
     this.activeSlots += 1;
+    this.slotReserved.add(next.jobId);
     next.onDequeued();
   }
 
@@ -1941,6 +2001,12 @@ export class JobStore {
    * signal - the same pattern `src/tools/kill.ts`'s own Windows path
    * already uses (`"SIGKILL-equiv"`) for a termination that never
    * involved sending an actual signal to a real process.
+   *
+   * Never touches `slotReserved`, and needs no such cleanup: every job
+   * still in the queue at this point had its `slotReserved` entry removed
+   * already, by `enqueueJob`, the moment it was queued (see that method's
+   * own docs) - so, like `removeFromQueue`, there is nothing here left to
+   * revoke.
    */
   drainQueueOnShutdown(): void {
     while (this.queue.length > 0) {
@@ -2717,14 +2783,16 @@ export class JobStore {
    * (`createFailedJob`) or one that was rejected outright never gets a
    * `slotReserved` entry in the first place, and `Set.delete`/`Map.delete`
    * on a missing entry is already a harmless no-op; a job admitted into
-   * the queue but killed before ever being dequeued DOES carry a
-   * `slotReserved` entry - `createJob` adds it unconditionally, since
-   * admission control already cleared the job before it - but never a
-   * `slotReleased` or `strandedSlots` entry, since `removeFromQueue`,
-   * never `releaseSlot`, is what cancels it). All three matter on a
-   * long-running server: `slotReserved`/`slotReleased` are add-only
-   * everywhere else (`createJob`'s and `releaseSlot`'s own docs) and
-   * `strandedSlots` likewise only grows via `markSlotStranded`, so
+   * the queue but cancelled before ever being dequeued does NOT carry a
+   * `slotReserved` entry by the time it reaches here either - `enqueueJob`
+   * already removed it, the moment the job was queued, for exactly this
+   * reason (see its own docs) - and it never carries a `slotReleased` or
+   * `strandedSlots` entry, since a later `releaseSlot` call against it is
+   * refused by the now-absent `slotReserved` entry). All three matter on
+   * a long-running server: `slotReleased` is add-only everywhere but here,
+   * `slotReserved` moves between `createJob`/`enqueueJob`/`dequeueNext`
+   * (see their own docs) besides this method, and `strandedSlots` likewise
+   * only grows via `markSlotStranded`, so
    * this is the ONE place anything is ever removed from any of them - without it,
    * every job that ever ran and was later purged would leave a permanent
    * entry behind (unbounded linear growth in exactly the store whose
