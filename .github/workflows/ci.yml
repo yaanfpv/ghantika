@@ -217,9 +217,11 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
-      # Pinned to a specific version so this job's findings stay stable
-      # across runs rather than shifting whenever pip resolves a newer
-      # release.
+      # Pinned to a specific version so pip installs the exact same
+      # engine on every run rather than whatever it would otherwise
+      # resolve. This pins the ENGINE only - --config auto below still
+      # pulls its rule set from the Semgrep Registry, which can change
+      # independently of this version.
       - run: pip install semgrep==1.172.0
       - run: semgrep --config auto --error
 
