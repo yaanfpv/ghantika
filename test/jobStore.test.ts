@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 // Real client, real in-process transport, real server - the end-to-end
 // jobStore-singleton-sharing regression coverage below drives an actual
@@ -737,6 +738,45 @@ test(
     // group is already gone by this point.
   }
 );
+
+test("the bounded automatic retry a stranded slot's own timer runs calls the exact same reap method the tests above exercise directly, never a separate or duplicated implementation - so a throwing first attempt is handled identically whether the second call comes from that timer or from a direct call", () => {
+  const repoRoot = fileURLToPath(new URL("..", import.meta.url));
+  const jobStoreSource = fs.readFileSync(path.join(repoRoot, "src", "jobStore.ts"), "utf8");
+
+  const methodStart = jobStoreSource.indexOf("private async retryStrandedSlot(");
+  assert.notEqual(
+    methodStart,
+    -1,
+    "expected to find retryStrandedSlot's method signature in src/jobStore.ts"
+  );
+
+  const bodyStart = jobStoreSource.indexOf("{", methodStart);
+  let depth = 0;
+  let bodyEnd = bodyStart;
+  for (let i = bodyStart; i < jobStoreSource.length; i += 1) {
+    if (jobStoreSource[i] === "{") depth += 1;
+    if (jobStoreSource[i] === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        bodyEnd = i;
+        break;
+      }
+    }
+  }
+  const body = jobStoreSource.slice(bodyStart, bodyEnd + 1);
+
+  const reapCalls = body.match(/this\.reapProcessGroupOnce\(/g) ?? [];
+  assert.equal(
+    reapCalls.length,
+    1,
+    "expected the timer's own retry to call the shared reap method exactly once"
+  );
+  assert.doesNotMatch(
+    body,
+    /killProcessGroupPosix|process\.kill\(/,
+    "the timer's own retry must never send a signal directly - only through the shared reap method whose retry-safety this file's other tests already prove"
+  );
+});
 
 test("otherLiveChildCount excludes an exited child's job - markExited transitions its state to terminal without ever removing its entry from `children`, so a plain count of that map would still count it", async () => {
   // `[process.execPath, "-e", "process.exit(0)"]` - the same cross-platform
