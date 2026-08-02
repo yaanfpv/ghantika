@@ -1200,10 +1200,14 @@ export class JobStore {
    *   terminal-record fallback a `kill()`/shutdown call reaching an
    *   already-terminal record now also routes through) CHECKS this set
    *   before ever signaling, and marks it as part of the same call - this
-   *   is the actual "at most one cleanup-reap attempt per job" guarantee,
-   *   and it is what a later attempt against a recycled pgid cannot
-   *   re-trigger (see `src/tools/kill.ts`'s own docs for the disclosed
-   *   PGID-reuse residual this narrows).
+   *   is the actual "at most one SIGNAL-CAPABLE cleanup-reap attempt per
+   *   job" guarantee, and it is what a later attempt against a recycled
+   *   pgid cannot re-trigger. An unconfirmed first attempt does NOT set
+   *   this marker, so a later call still reaches `reapProcessGroupOnce`
+   *   again - it just takes that method's own existence-only retry
+   *   branch instead of re-entering the signal-capable one (see
+   *   `src/tools/kill.ts`'s own docs for the disclosed PGID-reuse
+   *   residual this narrows).
    * - A LIVE job's own explicit `kill()` signal marks this set too (so a
    *   later terminal-record reap knows a cleanup attempt already covered
    *   this job), but does NOT check it first - a live signal is a
