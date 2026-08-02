@@ -415,7 +415,21 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
     // jobStore.resolveBirthIdentityForKill's own docs).
     jobStore.attachChild(jobId, child, undefined);
     if (child.pid !== undefined) {
-      const identityCapture = captureBirthIdentityPosixAsync(child.pid);
+      // The trailing explicit `undefined`s take every timing default
+      // unchanged; only the concurrency-context hook is supplied, reading
+      // `jobStore`'s own already-owned state (see `logCaptureUndefined`'s
+      // own docs on why this module cannot hold that state itself). It
+      // reports real spawned-child load excluding this job itself - not
+      // `jobStore.size()`'s plain job-record count, which is inflated by
+      // the job under test and by retained terminal history.
+      const identityCapture = captureBirthIdentityPosixAsync(
+        child.pid,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        () => `${jobStore.otherLiveChildCount(jobId)} other spawned child(ren) tracked`
+      );
       jobStore.attachPendingIdentityCapture(jobId, identityCapture);
     }
     if (deadlineMs !== undefined) {

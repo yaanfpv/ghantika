@@ -565,11 +565,43 @@ export function identityElapsedTimesMatch(
   return Math.abs(actualElapsedSeconds - expectedElapsedSeconds) <= toleranceSeconds;
 }
 
-/** The real outcome of one `ps -p <pid> -o etime=` read - see `readProcessElapsedSeconds`'s own docs for why this is a three-way discrimination, not the `number | undefined` shape this used to return. */
+/**
+ * The real outcome of one `ps -p <pid> -o etime=` read - see
+ * `readProcessElapsedSeconds`'s own docs for why this is a three-way
+ * discrimination, not the `number | undefined` shape this used to return.
+ * `observer-failure`'s `timedOut` is a STRUCTURAL discriminator, set
+ * explicitly by whichever call site produced the failure, never inferred
+ * from `reason`'s own wording elsewhere - see `BirthIdentityAttemptResult`'s
+ * own docs for why a text-matching classifier was the wrong tool here.
+ */
 export type ElapsedSecondsReadResult =
   | { readonly status: "found"; readonly elapsedSeconds: number }
   | { readonly status: "not-found" }
-  | { readonly status: "observer-failure"; readonly reason: string };
+  | { readonly status: "observer-failure"; readonly reason: string; readonly timedOut: boolean };
+
+/**
+ * The human-readable prefix `readProcessElapsedSecondsAsync` uses in an
+ * `observer-failure` reason produced by `timeoutMs` itself running out,
+ * whichever of that function's TWO timeout paths actually ends the
+ * observer: `execFile`'s own internal timeout killing it cooperatively
+ * (the common case - the observer dies from the signal, and the exec
+ * callback reports it), or, only if the observer ignores that signal, the
+ * external-bound timer's own forced SIGKILL. Never produced by a genuine
+ * `ps` execution error.
+ *
+ * TEXT ONLY - `captureBirthIdentityPosixAsync` does NOT match against this
+ * (or any) prefix to classify a timeout; it reads the structural
+ * `observer-failure.timedOut` field each observer sets explicitly instead.
+ * A prior version of this codebase DID classify by matching this exact
+ * prefix, which worked only for this POSIX/`ps` observer - the Linux
+ * `/proc` observer's own timeout reason never started with it (a different
+ * string, "/proc/<pid>/stat did not settle within..."), so every Linux
+ * aggregate-shortened timeout was silently misclassified as a genuine
+ * observer failure instead of aggregate-exhausted-mid-observation. This
+ * constant is kept only so both of this function's own timeout sites emit
+ * the same readable wording; it carries no behavioral meaning anymore.
+ */
+const OBSERVER_TIMEOUT_REASON_PREFIX = "ps did not settle within";
 
 /**
  * Reads `pid`'s real elapsed wall-clock time from the OS via a real `ps`
@@ -607,13 +639,14 @@ function interpretPsOutput(output: string): ElapsedSecondsReadResult {
     // observed against a real `ps` in this codebase's own testing, but
     // this is still an unusable/ambiguous result, not a confident
     // "not-found" - treated the same as unparseable output below.
-    return { status: "observer-failure", reason: "ps produced no output" };
+    return { status: "observer-failure", reason: "ps produced no output", timedOut: false };
   }
   const elapsedSeconds = parseEtime(output);
   if (elapsedSeconds === undefined) {
     return {
       status: "observer-failure",
       reason: `ps produced output this codebase could not parse: ${JSON.stringify(output)}`,
+      timedOut: false,
     };
   }
   return { status: "found", elapsedSeconds };
@@ -636,6 +669,7 @@ function readProcessElapsedSeconds(pid: number): ElapsedSecondsReadResult {
         err.code !== undefined
           ? `ps failed to execute (${err.code})`
           : `ps failed unexpectedly: ${err.message ?? String(error)}`,
+      timedOut: false,
     };
   }
   return interpretPsOutput(output);
@@ -651,7 +685,11 @@ function readProcessElapsedSeconds(pid: number): ElapsedSecondsReadResult {
  * collapse `code`'s type back down to `string`, silently losing the
  * numeric exit-code case entirely).
  */
-type ExecFileCallbackError = Error & { readonly code?: string | number | null };
+type ExecFileCallbackError = Error & {
+  readonly code?: string | number | null;
+  readonly killed?: boolean;
+  readonly signal?: NodeJS.Signals | null;
+};
 
 /**
  * How much longer than the caller's own `timeoutMs` this function waits,
@@ -715,6 +753,9 @@ function readProcessElapsedSecondsAsync(
 ): Promise<ElapsedSecondsReadResult> {
   return new Promise((resolve) => {
     let settled = false;
+    const settle = (result: ElapsedSecondsReadResult): void => {
+      resolve(result);
+    };
     const child = execFile(
       "ps",
       ["-p", String(pid), "-o", "etime="],
@@ -724,7 +765,7 @@ function readProcessElapsedSecondsAsync(
         settled = true;
         clearTimeout(externalBound);
         if (error === null) {
-          resolve(interpretPsOutput(stdout));
+          settle(interpretPsOutput(stdout));
           return;
         }
         const err = error as ExecFileCallbackError;
@@ -732,15 +773,44 @@ function readProcessElapsedSecondsAsync(
           // ps's own documented "no such pid" exit code, surfaced as a
           // NUMBER on this callback-error shape (see this function's own
           // docs) - a real, confident "genuinely not alive" result.
-          resolve({ status: "not-found" });
+          settle({ status: "not-found" });
           return;
         }
-        resolve({
+        if (err.killed === true) {
+          // `execFile`'s OWN internal `timeout` option fired and sent its
+          // kill signal (SIGTERM by default) before this observer answered
+          // - the COMMON, cooperative case `ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS`'s
+          // own docs already call out. This branch settles through the
+          // callback, strictly before `externalBound` below ever gets a
+          // chance to fire (that timer's own delay only starts once this
+          // SAME `timeoutMs` has already elapsed, plus this identical
+          // grace), so reaching this branch is itself proof that
+          // `timeoutMs` - not a genuine `ps` execution error - is what
+          // ended this attempt. Node only sets `killed: true` on an error
+          // produced by ITS OWN call to the child's `.kill()`; the
+          // `externalBound` handler below sets `settled = true`
+          // synchronously before it ever calls `child.kill()` itself, so
+          // this branch can never be reached for that path - only for
+          // `execFile`'s own internal timeout enforcement. Uses the
+          // IDENTICAL `OBSERVER_TIMEOUT_REASON_PREFIX` the external bound
+          // uses, because `captureBirthIdentityPosixAsync` must treat both
+          // kill paths as the same underlying cause: the observer's own
+          // `timeoutMs` allowance ran out, never that `ps` itself is
+          // broken.
+          settle({
+            status: "observer-failure",
+            reason: `${OBSERVER_TIMEOUT_REASON_PREFIX} ${timeoutMs}ms (observer killed by its own timeout signal: ${err.signal ?? "unknown"})`,
+            timedOut: true,
+          });
+          return;
+        }
+        settle({
           status: "observer-failure",
           reason:
             typeof err.code === "string"
               ? `ps failed to execute (${err.code})`
               : `ps failed unexpectedly: ${err.message ?? String(error)}`,
+          timedOut: false,
         });
       }
     );
@@ -753,9 +823,10 @@ function readProcessElapsedSecondsAsync(
       // unblockable, so this genuinely ends it rather than sending yet
       // another request the observer could also ignore.
       child.kill("SIGKILL");
-      resolve({
+      settle({
         status: "observer-failure",
-        reason: `ps did not settle within ${timeoutMs}ms (observer unresponsive to SIGTERM)`,
+        reason: `${OBSERVER_TIMEOUT_REASON_PREFIX} ${timeoutMs}ms (observer unresponsive to SIGTERM)`,
+        timedOut: true,
       });
     }, timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS);
   });
@@ -774,7 +845,7 @@ function readProcessElapsedSecondsAsync(
 export type LinuxStartTimeTicksReadResult =
   | { readonly status: "found"; readonly startTimeTicks: string }
   | { readonly status: "not-found" }
-  | { readonly status: "observer-failure"; readonly reason: string };
+  | { readonly status: "observer-failure"; readonly reason: string; readonly timedOut: boolean };
 
 /**
  * Parses ONE `/proc/<pid>/stat` file's raw contents into its field-22
@@ -837,6 +908,7 @@ function interpretProcStatOutput(raw: string): LinuxStartTimeTicksReadResult {
     return {
       status: "observer-failure",
       reason: `/proc/<pid>/stat produced output this codebase could not parse: ${JSON.stringify(raw)}`,
+      timedOut: false,
     };
   }
   return { status: "found", startTimeTicks };
@@ -865,6 +937,7 @@ function classifyProcStatReadFailure(error: unknown): LinuxStartTimeTicksReadRes
       err.code !== undefined
         ? `/proc/<pid>/stat read failed (${err.code})`
         : `/proc/<pid>/stat read failed unexpectedly: ${err instanceof Error ? err.message : String(error)}`,
+    timedOut: false,
   };
 }
 
@@ -1078,6 +1151,7 @@ export async function readLinuxStartTimeTicksAsync(
       resolve({
         status: "observer-failure",
         reason: `/proc/<pid>/stat did not settle within ${timeoutMs}ms`,
+        timedOut: true,
       });
     }, timeoutMs);
   });
@@ -1267,7 +1341,7 @@ const REAL_CAPTURE_RETRY_CLOCK: CaptureRetryClock = {
 type BirthIdentityAttemptResult =
   | { readonly status: "found"; readonly identity: ProcessBirthIdentity }
   | { readonly status: "not-found" }
-  | { readonly status: "observer-failure"; readonly reason: string };
+  | { readonly status: "observer-failure"; readonly reason: string; readonly timedOut: boolean };
 
 /**
  * Makes ONE real birth-identity observation attempt for `pid`, dispatching
@@ -1357,12 +1431,92 @@ async function attemptBirthIdentityCaptureAsync(
  *   timing would reintroduce exactly the race this budget exists to
  *   absorb.
  */
+export type BirthIdentityCaptureFailureBranch =
+  | "aggregate-exhausted-before-attempt"
+  | "not-found-retry-closed-on-resume"
+  | "observer-genuine-failure"
+  | "aggregate-exhausted-mid-observation"
+  | "not-found-retry-exhausted-first-pass"
+  | "aggregate-exhausted-before-sleep";
+
+/**
+ * Every place `captureBirthIdentityPosixAsync` settles `undefined` on a
+ * labelled POSIX failure names exactly which of its six distinct labels
+ * produced that outcome, to stderr only (`console.error`, never
+ * `console.log` - `src/server.ts`'s own docs on why stdout is reserved
+ * for the MCP protocol apply equally here). This is diagnostic-only: it
+ * changes no return value or control flow, and never fires on the
+ * `found` path, so an ordinary successful capture is silent exactly as
+ * before. It also never fires for this function's separate, unlabelled
+ * `if (process.platform === "win32") return undefined;` guard at entry -
+ * that guard is a real, additional way this function settles
+ * `undefined`, entirely outside the POSIX failure family this
+ * diagnostic instruments.
+ *
+ * Six labels from five labelled POSIX failure-return LOCATIONS, not six -
+ * two of the six read similarly but are not: a budget exhausted before
+ * another observation could even be attempted differs from the same
+ * budget exhausted mid-observation, and a not-found retry window closing
+ * on resume differs from one exhausted immediately after establishing
+ * itself - each pair shares a return location's general shape but means
+ * something different depending on WHEN in the iteration it fires. The
+ * sixth distinction is sharper still: a single literal return location
+ * can settle either `observer-genuine-failure` or
+ * `aggregate-exhausted-mid-observation` depending on whether
+ * `cutShortByAggregateBudget` says the shrinking aggregate budget - not a
+ * real `ps` failure - is what actually cut this attempt's own timeout
+ * short. Collapsing any of these distinctions into one label would make a
+ * future occurrence unable to say which of two different situations
+ * actually happened, which is the exact failure this diagnostic exists to
+ * prevent. This function makes no claim about which label actually fires
+ * in production; it only allows a real occurrence to say which one did.
+ *
+ * Also reports whatever `getConcurrencyContext` returns, if the caller
+ * supplied one - this module owns no persistent state of its own (only
+ * `jobStore.ts` may, per this codebase's own module-boundary rule), so a
+ * caller that DOES hold relevant state passes a snapshot of it in at call
+ * time instead. Never required, and its absence changes nothing about the
+ * diagnostic's own correctness. Calling it is CONTAINED: a throwing hook
+ * can never escape this function or change what it does - this stays a
+ * diagnostic `console.error` and nothing else, exactly as promised,
+ * regardless of what a caller's hook does. This is a claim about the
+ * WHOLE CLASS of things a hook can throw, not merely `throw new Error(...)`:
+ * JS permits throwing any value, including one whose own `toString` or
+ * `Symbol.toPrimitive` itself throws, so the catch handler below performs
+ * NO operation on the thrown value that could itself throw - it never
+ * coerces, inspects, or stringifies it. A hook failure is disclosed with a
+ * fixed, literal message carrying no data derived from what was thrown, so
+ * there is nothing left in this path that JS could refuse to convert to a
+ * string. A diagnostic that risked the operation it observes in order to
+ * describe a failure would be worth less than no diagnostic at all.
+ */
+function logCaptureUndefined(
+  pid: number,
+  branch: BirthIdentityCaptureFailureBranch,
+  detail: string,
+  getConcurrencyContext: (() => string) | undefined
+): void {
+  let contextClause = "";
+  if (getConcurrencyContext !== undefined) {
+    try {
+      contextClause = ` - ${getConcurrencyContext()}`;
+    } catch {
+      contextClause = " - concurrency-context hook threw";
+    }
+  }
+  // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- pid is a real OS pid (a number), and detail/contextClause are this codebase's own literal/computed text, never attacker-supplied; this is a diagnostic console.error to stderr, not a format-string sink.
+  console.error(
+    `[ghantika] captureBirthIdentityPosixAsync(pid=${pid}) settled undefined - branch: ${branch} - ${detail}${contextClause}`
+  );
+}
+
 export async function captureBirthIdentityPosixAsync(
   pid: number,
   timeoutMs: number = ASYNC_BIRTH_IDENTITY_CAPTURE_TIMEOUT_MS,
   notFoundRetryBoundMs: number = BIRTH_IDENTITY_NOT_FOUND_RETRY_BOUND_MS,
   notFoundRetryPollIntervalMs: number = BIRTH_IDENTITY_NOT_FOUND_RETRY_POLL_INTERVAL_MS,
-  clock: CaptureRetryClock = REAL_CAPTURE_RETRY_CLOCK
+  clock: CaptureRetryClock = REAL_CAPTURE_RETRY_CLOCK,
+  getConcurrencyContext?: () => string
 ): Promise<ProcessBirthIdentity | undefined> {
   if (process.platform === "win32") return undefined;
   const aggregateDeadline = clock.now() + timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS;
@@ -1370,8 +1524,24 @@ export async function captureBirthIdentityPosixAsync(
 
   for (;;) {
     const remainingAggregate = aggregateDeadline - clock.now();
-    if (remainingAggregate <= ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS) return undefined;
-    if (retryDeadline !== undefined && clock.now() >= retryDeadline) return undefined;
+    if (remainingAggregate <= ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS) {
+      logCaptureUndefined(
+        pid,
+        "aggregate-exhausted-before-attempt",
+        `only ${remainingAggregate}ms of the ${timeoutMs}ms+${ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS}ms grace aggregate budget remained at loop entry, before another observation could even be attempted this iteration`,
+        getConcurrencyContext
+      );
+      return undefined;
+    }
+    if (retryDeadline !== undefined && clock.now() >= retryDeadline) {
+      logCaptureUndefined(
+        pid,
+        "not-found-retry-closed-on-resume",
+        `the ${notFoundRetryBoundMs}ms not-found retry deadline had already passed by the time a later iteration resumed after sleeping`,
+        getConcurrencyContext
+      );
+      return undefined;
+    }
 
     const effectiveTimeoutMs = Math.min(
       timeoutMs,
@@ -1379,15 +1549,64 @@ export async function captureBirthIdentityPosixAsync(
     );
     const attempt = await attemptBirthIdentityCaptureAsync(pid, effectiveTimeoutMs);
 
-    if (attempt.status === "found") return attempt.identity;
-    if (attempt.status !== "not-found") return undefined;
+    if (attempt.status === "found") {
+      return attempt.identity;
+    }
+    if (attempt.status !== "not-found") {
+      // A genuine execution error (ps missing, a real nonzero exit) is a
+      // true observer-genuine-failure regardless of how much time this
+      // attempt had. But when THIS attempt's own bounded wait is what
+      // actually fired - named by the platform-neutral, STRUCTURAL
+      // `timedOut` field every observer sets explicitly, never by matching
+      // any particular wording in `reason` - and that wait was itself
+      // capped short of the observer's normal timeoutMs because the
+      // aggregate budget was running out, the real cause is the aggregate
+      // cap, not the observer: the observer never got the chance to answer
+      // within its own ordinary allowance. Reported as
+      // aggregate-exhausted-mid-observation so the two genuinely different
+      // causes - "ps itself is broken" vs. "ps was still working, just
+      // out of time" - are never collapsed into one. A prior version of
+      // this check matched `reason` against a POSIX/`ps`-specific prefix,
+      // which silently misclassified every Linux aggregate-shortened
+      // timeout as observer-genuine-failure instead (the Linux `/proc`
+      // observer's own timeout reason never started with that prefix) -
+      // see `OBSERVER_TIMEOUT_REASON_PREFIX`'s own docs for the full story.
+      const cutShortByAggregateBudget = effectiveTimeoutMs < timeoutMs && attempt.timedOut;
+      logCaptureUndefined(
+        pid,
+        cutShortByAggregateBudget
+          ? "aggregate-exhausted-mid-observation"
+          : "observer-genuine-failure",
+        cutShortByAggregateBudget
+          ? `the observer's own wait was capped to ${effectiveTimeoutMs}ms (below its ${timeoutMs}ms allowance) by the remaining aggregate budget and did not settle in time - ${attempt.reason}`
+          : attempt.reason,
+        getConcurrencyContext
+      );
+      return undefined;
+    }
 
     if (retryDeadline === undefined) retryDeadline = clock.now() + notFoundRetryBoundMs;
     const remainingRetry = retryDeadline - clock.now();
-    if (remainingRetry <= 0) return undefined;
+    if (remainingRetry <= 0) {
+      logCaptureUndefined(
+        pid,
+        "not-found-retry-exhausted-first-pass",
+        `no time remained in the ${notFoundRetryBoundMs}ms not-found retry budget immediately after this attempt's own first not-found result established the retry deadline`,
+        getConcurrencyContext
+      );
+      return undefined;
+    }
 
     const remainingAggregateForSleep = aggregateDeadline - clock.now();
-    if (remainingAggregateForSleep <= 0) return undefined;
+    if (remainingAggregateForSleep <= 0) {
+      logCaptureUndefined(
+        pid,
+        "aggregate-exhausted-before-sleep",
+        `no time remained in the aggregate budget to sleep before the next not-found retry`,
+        getConcurrencyContext
+      );
+      return undefined;
+    }
 
     await clock.sleep(
       Math.min(notFoundRetryPollIntervalMs, remainingRetry, remainingAggregateForSleep)
@@ -2050,6 +2269,42 @@ export type PidBatchReadResult =
   | { readonly status: "ok"; readonly rows: readonly RecordedGroupMember[] }
   | { readonly status: "observer-failure"; readonly reason: string };
 
+/**
+ * Which of `readPidStartTimesBatchPosix`'s two `observer-failure` return
+ * sites produced a given outcome - the real `ps` execution failing outright
+ * (a missing binary, a non-zero exit this function does not otherwise
+ * recognize) versus this function's own external timeout force-reaping a
+ * `ps` that never settled. Named separately for the same reason
+ * `BirthIdentityCaptureFailureBranch` names its own sites separately: they
+ * are different situations even though both surface as one `status`.
+ */
+export type PidBatchReadFailureBranch = "exec-failure" | "timeout";
+
+/**
+ * Every `readPidStartTimesBatchPosix` `observer-failure` outcome, logged to
+ * stderr only, diagnostic-only exactly like `logCaptureUndefined` above -
+ * changes no return value, fires on every caller (the pre-SIGTERM
+ * escalation snapshot's leader and descendant reads, and the escalation
+ * gate's own later re-read alike) without threading a separate caller
+ * label through this shared, low-level function. The logged `pids` does
+ * NOT reliably name which of the three call sites fired it: the
+ * snapshot's leader read always passes `[leaderPid]`, and the escalation
+ * gate's own re-read passes the SAME single-element `[leaderPid]` array
+ * whenever the snapshot recorded no descendants - the two are
+ * indistinguishable by this list alone in that case. A real occurrence
+ * still tells the reader THAT one of these callers failed and why; it
+ * does not by itself say which one.
+ */
+function logPidBatchReadObserverFailure(
+  pids: readonly number[],
+  branch: PidBatchReadFailureBranch,
+  reason: string
+): void {
+  console.error(
+    `[ghantika] readPidStartTimesBatchPosix(pids=${pids.join(",")}) observer-failure - branch: ${branch} - ${reason}`
+  );
+}
+
 /** Looks up `pid`'s start time in a `PidBatchReadResult`'s (or a snapshot's) `readonly RecordedGroupMember[]` rows - a plain linear scan over a small, per-call, never-persisted array (see this module's own "no persistent state outside jobStore.ts" boundary), not a `Map`. */
 function findRecordedStartTime(
   rows: readonly RecordedGroupMember[],
@@ -2224,23 +2479,37 @@ export function readPidStartTimesBatchPosix(
           resolve({ status: "ok", rows: [] });
           return;
         }
-        resolve({
-          status: "observer-failure",
-          reason:
-            typeof err.code === "string"
-              ? `ps failed to execute (${err.code})`
-              : `ps failed unexpectedly: ${err.message ?? String(error)}`,
-        });
+        if (err.killed === true) {
+          // `execFile`'s OWN internal `timeout` option fired and sent its
+          // kill signal cooperatively before this observer answered - the
+          // same real cause the `externalBound` timer below reports as
+          // `timeout`, just settled through the callback rather than the
+          // external force-SIGKILL (see `readProcessElapsedSecondsAsync`'s
+          // identical distinction and its own docs on why `err.killed` can
+          // only mean this path here, never this function's own later
+          // external kill). Reported as `timeout`, never `exec-failure`,
+          // so a real occurrence never sends a future fix at `ps` itself
+          // when the true cause is this call's own timeout budget.
+          const reason = `ps did not settle within ${timeoutMs}ms (observer killed by its own timeout signal: ${err.signal ?? "unknown"})`;
+          logPidBatchReadObserverFailure(pids, "timeout", reason);
+          resolve({ status: "observer-failure", reason });
+          return;
+        }
+        const reason =
+          typeof err.code === "string"
+            ? `ps failed to execute (${err.code})`
+            : `ps failed unexpectedly: ${err.message ?? String(error)}`;
+        logPidBatchReadObserverFailure(pids, "exec-failure", reason);
+        resolve({ status: "observer-failure", reason });
       }
     );
     const externalBound = setTimeout(() => {
       if (settled) return;
       settled = true;
       child.kill("SIGKILL");
-      resolve({
-        status: "observer-failure",
-        reason: `ps did not settle within ${timeoutMs}ms (observer unresponsive to SIGTERM)`,
-      });
+      const reason = `ps did not settle within ${timeoutMs}ms (observer unresponsive to SIGTERM)`;
+      logPidBatchReadObserverFailure(pids, "timeout", reason);
+      resolve({ status: "observer-failure", reason });
     }, timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS);
   });
 }
@@ -2352,6 +2621,44 @@ export interface EscalationIdentitySnapshot {
 }
 
 /**
+ * Every one of `captureEscalationIdentitySnapshot`'s seven distinct
+ * `degraded`-producing sites - named separately for the same reason
+ * `BirthIdentityCaptureFailureBranch` names its own six sites separately:
+ * "budget exhausted before this step could even run" and "this step ran
+ * and its own observer reported a failure" are different situations even
+ * within the same step, and collapsing either pair - or the three steps
+ * themselves - into one label would make a real occurrence unable to say
+ * which one actually happened.
+ */
+export type EscalationSnapshotDegradedBranch =
+  | "leader-read-budget-exhausted"
+  | "leader-read-observer-failure"
+  | "enumeration-budget-exhausted"
+  | "enumeration-observer-failure"
+  | "descendant-read-budget-exhausted"
+  | "descendant-read-observer-failure"
+  | "zero-usable-records";
+
+/**
+ * `captureEscalationIdentitySnapshot`'s own `degraded` outcome, logged to
+ * stderr only, diagnostic-only exactly like `logCaptureUndefined` above -
+ * changes no return value. This is THE pre-SIGTERM snapshot on the real
+ * kill path (see `killProcessGroupPosix`'s own call site), so a real
+ * occurrence here says which of the three capture steps - not merely that
+ * "the snapshot degraded" - left the later escalation gate with nothing
+ * positive to work with.
+ */
+function logEscalationSnapshotDegraded(
+  leaderPid: number,
+  branch: EscalationSnapshotDegradedBranch,
+  reason: string
+): void {
+  console.error(
+    `[ghantika] captureEscalationIdentitySnapshot(leaderPid=${leaderPid}) degraded - branch: ${branch} - ${reason}`
+  );
+}
+
+/**
  * Captures `EscalationIdentitySnapshot` for `leaderPid`'s process group -
  * the ORIGINAL membership the escalation identity gate later re-reads and
  * compares against. Three real observations, in order, ALL sharing ONE
@@ -2383,28 +2690,41 @@ export interface EscalationIdentitySnapshot {
  * being recorded. Zero usable records after an otherwise-clean read is
  * ALSO `degraded` (there is nothing to compare against later, regardless
  * of whether every step "succeeded").
+ *
+ * `now` is an injectable time source, defaulting to the real `Date.now`,
+ * that this function's own budget arithmetic reads exclusively - never a
+ * raw `Date.now()` call scattered through the body. Production behavior
+ * is unchanged (the default IS `Date.now`); the seam exists so a test can
+ * deterministically force a budget-exhausted branch (`*-budget-exhausted`)
+ * without depending on a real, host-speed-sensitive sleep race, matching
+ * `captureBirthIdentityPosixAsync`'s own injectable-clock pattern above
+ * for exactly the same reason.
  */
 export async function captureEscalationIdentitySnapshot(
   leaderPid: number,
-  timeoutMs: number = PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS
+  timeoutMs: number = PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS,
+  now: () => number = Date.now
 ): Promise<EscalationIdentitySnapshot> {
-  const deadline = Date.now() + timeoutMs;
-  const remainingBudget = (): number => Math.max(0, deadline - Date.now());
+  const deadline = now() + timeoutMs;
+  const remainingBudget = (): number => Math.max(0, deadline - now());
 
   let sawObserverFailure = false;
   let observerFailureReason: string | undefined;
+  let degradedBranch: EscalationSnapshotDegradedBranch | undefined;
   const recorded: RecordedGroupMember[] = [];
 
   // Step 1: the initial leader read - independently observable from step 2's own timeout/failure below.
   const leaderBudget = remainingBudget();
   if (leaderBudget <= 0) {
     sawObserverFailure = true;
+    degradedBranch = "leader-read-budget-exhausted";
     observerFailureReason =
       "pre-SIGTERM snapshot budget exhausted before the initial leader read could run";
   } else {
     const leaderRead = await readPidStartTimesBatchPosix([leaderPid], leaderBudget);
     if (leaderRead.status === "observer-failure") {
       sawObserverFailure = true;
+      degradedBranch = "leader-read-observer-failure";
       observerFailureReason = `the initial leader read failed: ${leaderRead.reason}`;
     } else {
       const leaderStart = findRecordedStartTime(leaderRead.rows, leaderPid);
@@ -2417,12 +2737,14 @@ export async function captureEscalationIdentitySnapshot(
   let descendantPids: readonly number[] = [];
   if (enumerationBudget <= 0) {
     sawObserverFailure = true;
+    degradedBranch ??= "enumeration-budget-exhausted";
     observerFailureReason ??=
       "pre-SIGTERM snapshot budget exhausted before member enumeration could run";
   } else {
     const enumeration = await enumerateProcessGroupMembersPosixAsync(leaderPid, enumerationBudget);
     if (enumeration.status === "observer-failure") {
       sawObserverFailure = true;
+      degradedBranch ??= "enumeration-observer-failure";
       observerFailureReason ??= `member enumeration failed: ${enumeration.reason}`;
     } else {
       descendantPids = enumeration.pids.filter((candidate) => candidate !== leaderPid);
@@ -2434,12 +2756,14 @@ export async function captureEscalationIdentitySnapshot(
     const readBudget = remainingBudget();
     if (readBudget <= 0) {
       sawObserverFailure = true;
+      degradedBranch ??= "descendant-read-budget-exhausted";
       observerFailureReason ??=
         "pre-SIGTERM snapshot budget exhausted before the descendant start-time read could run";
     } else {
       const descendantRead = await readPidStartTimesBatchPosix(descendantPids, readBudget);
       if (descendantRead.status === "observer-failure") {
         sawObserverFailure = true;
+        degradedBranch ??= "descendant-read-observer-failure";
         observerFailureReason ??= `descendant start-time read failed: ${descendantRead.reason}`;
       } else {
         for (const candidate of descendantPids) {
@@ -2451,13 +2775,11 @@ export async function captureEscalationIdentitySnapshot(
   }
 
   if (sawObserverFailure || recorded.length === 0) {
-    return {
-      members: [],
-      degraded: true,
-      degradedReason:
-        observerFailureReason ??
-        "zero usable identity records captured (every candidate pid was gone, unreadable, or malformed)",
-    };
+    const reason =
+      observerFailureReason ??
+      "zero usable identity records captured (every candidate pid was gone, unreadable, or malformed)";
+    logEscalationSnapshotDegraded(leaderPid, degradedBranch ?? "zero-usable-records", reason);
+    return { members: [], degraded: true, degradedReason: reason };
   }
   return { members: recorded, degraded: false };
 }
