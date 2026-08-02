@@ -1456,3 +1456,65 @@ test("WAKE PROOF (SIMULATED/mock client only - never a real installed host): a d
     await pair.close();
   }
 });
+
+test("STDERR WAKE PROOF (real spawned process, zero stdout): a command that writes ONLY to stderr and produces no stdout at all still wakes a capable client through the real adapter path - not a mixed-stream command, which would pass on the stdout path alone and prove nothing about this change", async () => {
+  const pair = await startPair(true);
+  let jobId: string | undefined;
+  try {
+    const received = registerWakeSpy(pair.client);
+    const minted = await runJob(pair.client, {
+      command: [process.execPath, "-e", "process.stderr.write('real-stderr-only-line\\n');"],
+      label: "stderr-wake-proof",
+    });
+    jobId = minted.taskId as string;
+
+    // Real wall-clock wait, not a mocked clock: a genuinely spawned child's
+    // stderr write travels through a real OS pipe, so this cannot be driven
+    // by mock.timers the way the synthetic jobStore.appendOutput proofs
+    // above are. Bounded polling for the wake to arrive, well past
+    // WAKE_COALESCE_WINDOW_MS on each attempt.
+    for (let attempt = 0; received.length === 0 && attempt < 100; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    assert.equal(
+      received.length,
+      1,
+      `expected exactly one real wake from a genuinely stderr-only command, got ${JSON.stringify(received)}`
+    );
+    assert.equal(
+      received[0]!.params.stdout,
+      undefined,
+      "a genuinely stderr-only command's wake must carry no stdout key at all - proves this is not the stdout path passing incidentally"
+    );
+    const wakeStderr = received[0]!.params.stderr as Array<{ text: string }>;
+    assert.deepEqual(
+      wakeStderr.map((entry) => entry.text),
+      ["real-stderr-only-line"]
+    );
+
+    // Confirm, independently of the wake, that the real command genuinely
+    // produced zero stdout - the negative half of "stderr-only": without
+    // this, a bug that silently duplicated the line onto stdout too would
+    // still pass the assertions above.
+    await pollTaskUntilTerminal(pair.client, jobId);
+    const stdoutResult = (await pair.client.callTool({
+      name: "output",
+      arguments: { job_id: jobId, stream: "stdout" },
+    })) as { structuredContent?: { events?: Array<{ text: string }> } };
+    assert.deepEqual(
+      stdoutResult.structuredContent?.events ?? [],
+      [],
+      "expected genuinely zero stdout events from a command that only ever wrote to stderr"
+    );
+    const stderrResult = (await pair.client.callTool({
+      name: "output",
+      arguments: { job_id: jobId, stream: "stderr" },
+    })) as { structuredContent?: { events?: Array<{ text: string }> } };
+    const stderrTexts = (stderrResult.structuredContent?.events ?? []).map((event) => event.text);
+    assert.ok(stderrTexts.includes("real-stderr-only-line"));
+  } finally {
+    if (jobId !== undefined) await killAndReapRealChild(jobId);
+    await pair.close();
+  }
+});
