@@ -55,6 +55,21 @@ const POSIX_ONLY_SKIP =
     ? "birth-identity capture is a real `ps -o etime=` read, POSIX-only - see captureBirthIdentityPosix's own docs"
     : false;
 
+// The Linux counterpart of POSIX_ONLY_SKIP, for the one test below that
+// forces a capture failure by breaking `process.env.PATH` so the server's
+// own `ps` lookup fails - captureBirthIdentityPosixAsync never shells out
+// to `ps` on Linux (it reads /proc/<pid>/stat directly, see
+// src/process.ts), so a broken PATH has no effect there and the real,
+// still-alive spawned child's identity is simply captured successfully
+// instead of failing as this test needs. Same gap and same fix as
+// test/process.test.ts's own SHADOWS_PS_LINUX_SKIP, which this mirrors.
+const SHADOWS_PS_LINUX_SKIP =
+  process.platform === "win32"
+    ? "shadows ps on PATH to break the server's own observer lookup, POSIX-only"
+    : process.platform === "linux"
+      ? "captureBirthIdentityPosixAsync never shells out to ps on Linux (it reads /proc/<pid>/stat directly) - this fixture cannot exercise anything there"
+      : false;
+
 /**
  * The upper bound `run()`'s own response time must stay under for it to
  * count as "returned independently of the identity observer" - shared by
@@ -384,7 +399,7 @@ test(
 
 test(
   "run(): a spawn-time capture failure's diagnostic carries run()'s own context-hook argument, not just captureBirthIdentityPosixAsync's generic hook mechanism exercised in isolation",
-  { skip: POSIX_ONLY_SKIP },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async (t) => {
     const errorSpy = t.mock.method(console, "error");
 

@@ -1476,7 +1476,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: an observer cooperatively killed by execFile's OWN timeout (never reaching the external force-reap timer) is still classified as aggregate-exhausted-mid-observation, not observer-genuine-failure",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async (t) => {
     const realPath = process.env.PATH;
     const dir = fs.mkdtempSync(
@@ -1561,7 +1561,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: a not-found retry budget that is already exhausted the instant it is established (a zero or already-elapsed notFoundRetryBoundMs) settles via not-found-retry-exhausted-first-pass, never attempting a retry",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async (t) => {
     const realPath = process.env.PATH;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-retry-exhausted-first-pass-ps-"));
@@ -1610,7 +1610,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: the aggregate budget running out AFTER a not-found result establishes real retry room, but BEFORE the retry's own sleep can begin, settles via aggregate-exhausted-before-sleep - distinct from the retry budget itself ever running out",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async (t) => {
     const realPath = process.env.PATH;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-aggregate-before-sleep-ps-"));
@@ -1757,7 +1757,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: an injected concurrency-context hook is called and its result reaches the diagnostic, so a failure can reveal what else was running, without this module owning any state of its own (only jobStore.ts may - see logCaptureUndefined's own docs)",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async (t) => {
     const realPath = process.env.PATH;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-concurrency-context-ps-"));
@@ -1806,7 +1806,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: a THROWING concurrency-context hook cannot escape or change the outcome - the capture still settles undefined (never rejects), and the hook's own failure is disclosed in the diagnostic rather than silently swallowed",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async (t) => {
     const realPath = process.env.PATH;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-throwing-concurrency-context-ps-"));
@@ -1867,7 +1867,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: OWNS THE CLASS, not the instance - a hook that throws a value whose OWN Symbol.toPrimitive itself throws still settles undefined, never rejects, because the catch handler performs no coercion of the thrown value at all",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async (t) => {
     const realPath = process.env.PATH;
     const dir = fs.mkdtempSync(
@@ -1930,7 +1930,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: OWNS THE CLASS, not the instance - a hook that throws a value whose OWN toString itself throws still settles undefined, never rejects",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async (t) => {
     const realPath = process.env.PATH;
     const dir = fs.mkdtempSync(
@@ -1992,7 +1992,7 @@ test(
 
 test(
   "captureBirthIdentityPosixAsync: omitting the concurrency-context hook is fully supported - the diagnostic still names the branch, just without a context clause",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+  { skip: SHADOWS_PS_LINUX_SKIP },
   async (t) => {
     const realPath = process.env.PATH;
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-no-concurrency-context-ps-"));
