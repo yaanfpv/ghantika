@@ -220,7 +220,7 @@ jobs:
       # Pinned to the exact version everything else in this project's
       # toolchain is pinned to, so a local run and this job see the same
       # rule engine and the same findings.
-      - run: pip install semgrep==1.171.0
+      - run: pip install semgrep==1.172.0
       - run: semgrep --config auto --error
 
   zizmor:
