@@ -849,6 +849,90 @@ test("kill() on a still-queued job dequeues it, renumbers the survivors, settles
 });
 
 // ---------------------------------------------------------------------------
+// releaseSlot ownership: a preflight-failed record that never reserved a
+// slot must never be able to release another job's reservation
+// ---------------------------------------------------------------------------
+
+test("kill() on a preflight-failed record that never held a concurrency slot must never release another job's reservation - covers invalid cwd, missing executable, and policy-denied", async () => {
+  jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 0 });
+  let ownerJobId: string | undefined;
+  try {
+    const owner = runTool.handler({ command: ["sleep", "30"], label: "unslotted-kill-owner" });
+    assert.notEqual(owner.isError, true);
+    ownerJobId = structured(owner).job_id as string;
+    assert.equal(jobStore.getActiveSlotCount(), 1, "the real owner holds the only slot");
+
+    // "cat" resolves to a real executable but is not on the test policy
+    // allow-list (test/fixtures/policy-allow.json), so it is denied AFTER
+    // resolution - distinct from the missing-executable case below, which
+    // never resolves at all.
+    const preflightCases: Array<{ readonly name: string; readonly command: string[] }> = [
+      { name: "invalid cwd", command: ["sleep", "1"] },
+      {
+        name: "missing executable",
+        command: ["this-command-definitely-does-not-exist-ghantika-unslotted-kill"],
+      },
+      { name: "policy-denied", command: ["cat"] },
+    ];
+
+    for (const { name, command } of preflightCases) {
+      const args: Record<string, unknown> = { command, label: `unslotted-kill-${name}` };
+      if (name === "invalid cwd") args.cwd = "/this-dir-does-not-exist-ghantika-unslotted-kill";
+
+      const failed = runTool.handler(args);
+      assert.notEqual(
+        failed.isError,
+        true,
+        `${name}: run() itself must still succeed with a terminal failed record`
+      );
+      const failedStructured = structured(failed);
+      assert.equal(failedStructured.state, "failed", `${name}: must be a terminal preflight failure`);
+      const failedJobId = failedStructured.job_id as string;
+
+      const killResult = await killTool.handler({ job_id: failedJobId });
+      assert.notEqual(
+        killResult.isError,
+        true,
+        `${name}: kill on an already-terminal record must be a no-op success`
+      );
+
+      assert.equal(
+        jobStore.getActiveSlotCount(),
+        1,
+        `${name}: killing an unslotted preflight-failed record must NOT touch the real owner's reservation`
+      );
+
+      // Cap=1, depth=0: a subsequent valid run() must still be REJECTED,
+      // never admitted - the exact symptom the P1 produces when the
+      // counter is wrongly decremented by an unslotted job's kill.
+      const shouldReject = runTool.handler({
+        command: ["sleep", "1"],
+        label: `unslotted-kill-probe-${name}`,
+      });
+      assert.equal(
+        shouldReject.isError,
+        true,
+        `${name}: cap must still read full - a second real job must not be admitted`
+      );
+      assert.equal(structured(shouldReject).reason, "queue-full");
+    }
+
+    assert.equal(
+      jobStore.getActiveSlotCount(),
+      1,
+      "the real owner's slot is still the only one ever held, after all three preflight-failure classes"
+    );
+  } finally {
+    await cleanUpSharedJobs(ownerJobId ? [ownerJobId] : []);
+    assert.equal(
+      jobStore.getActiveSlotCount(),
+      0,
+      "cleanup released the real owner's slot exactly once"
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
 // releaseSlot idempotency
 // ---------------------------------------------------------------------------
 

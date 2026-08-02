@@ -1244,6 +1244,17 @@ export class JobStore {
   /** Job ids whose concurrency slot has already been released once - see `releaseSlot`'s own docs for why a SECOND release for the same id must be a no-op rather than a real second decrement/dequeue. */
   private readonly slotReleased = new Set<string>();
   /**
+   * Job ids that genuinely hold (or held) a reserved concurrency slot - see
+   * `markSlotReserved`'s own docs for the two real call sites and
+   * `releaseSlot`'s own ownership guard for why this set exists at all. A
+   * job id absent from this set never took a slot in the first place (a
+   * preflight failure in `src/tools/run.ts` - invalid cwd, missing
+   * executable, or a policy denial - creates a terminal failed record
+   * before admission control ever runs), and `releaseSlot` must never
+   * decrement `activeSlots` on its behalf, however it is called.
+   */
+  private readonly slotReserved = new Set<string>();
+  /**
    * Job ids whose concurrency slot `releaseSlot` refused to free because
    * the reap that would have justified freeing it never confirmed zero
    * survivors (or errored outright) - see `releaseSlot`'s own fail-closed
@@ -1551,6 +1562,25 @@ export class JobStore {
   }
 
   /**
+   * Records that `jobId` genuinely holds a reserved concurrency slot - the
+   * source of truth `releaseSlot`'s ownership guard checks before it ever
+   * decrements `activeSlots` on this job's behalf. Called exactly once per
+   * job that actually reaches `src/tools/run.ts`'s `beginSpawn` - the one
+   * common choke point for BOTH a slot a job holds because `requestSlot()`
+   * admitted it immediately, and one it holds because it was dequeued
+   * later (see `enqueueJob`'s own docs on `onDequeued`) - and BEFORE
+   * `beginSpawn` calls `spawnManaged`, since a synchronous spawn failure
+   * can call `releaseSlot` before `beginSpawn` itself returns. Never
+   * called for a preflight-failed record (`src/tools/run.ts` creates those
+   * before admission control ever runs), which is exactly what makes a
+   * job id's ABSENCE from this set the correct signal that it never took a
+   * slot in the first place.
+   */
+  markSlotReserved(jobId: string): void {
+    this.slotReserved.add(jobId);
+  }
+
+  /**
    * Removes `jobId` from the FIFO queue if it is still sitting there -
    * `src/tools/kill.ts`'s own path for cancelling a job that has not yet
    * spawned, distinct from `drainQueueOnShutdown`'s bulk drain of the
@@ -1659,6 +1689,25 @@ export class JobStore {
    * drifting negative under a future bug).
    */
   async releaseSlot(jobId: string, reapPromise?: Promise<ReapReleaseDecision>): Promise<void> {
+    if (!this.slotReserved.has(jobId)) {
+      // Ownership guard: `jobId` never reserved a slot in the first place
+      // (a preflight failure in `src/tools/run.ts` - invalid cwd, missing
+      // executable, or a policy denial - creates a terminal failed record
+      // before admission control ever runs, so it never reaches
+      // `markSlotReserved`). Every real caller of this method (a spawn
+      // failure or a confirmed exit in `beginSpawn`, the automatic
+      // stranded-slot retry, `src/tools/kill.ts`'s manual late-recovery
+      // branch) can still be called against a job in this state - a
+      // terminal record's own state gives no signal about whether it ever
+      // held a slot - so this guard, not caller discipline, is what keeps
+      // `activeSlots` honest: decrementing it here would free a DIFFERENT
+      // job's reservation. A no-op, not an error: from this job's own
+      // point of view there was never a slot to release.
+      console.error(
+        `[ghantika] releaseSlot called for job "${jobId}", which never reserved a concurrency slot - ignoring, since decrementing activeSlots here would free a different job's reservation`
+      );
+      return;
+    }
     if (this.slotReleased.has(jobId)) {
       console.error(
         `[ghantika] releaseSlot called more than once for job "${jobId}" - ignoring the duplicate release, since this job's slot was already freed`
@@ -2670,16 +2719,16 @@ export class JobStore {
    * - the job record itself, its tracked child handle (if any), both
    * stream buffers, every registered output-arrival/job-terminal
    * listener, any recorded output-watch-stop annotation, its
-   * `slotReleased` dedupe entry, and its `strandedSlots` entry INCLUDING
-   * clearing any pending automatic-retry timer (if the job ever actually
-   * held a concurrency slot, or was ever stranded, at all - a job that
-   * was rejected or that never got past `queue` never has either entry,
-   * and `Set.delete`/`Map.delete` on a missing entry is already a
-   * harmless no-op). Both matter on a long-running server: `slotReleased`
-   * is add-only everywhere else (`releaseSlot`'s own docs explain why a
-   * duplicate release must stay a no-op for a still-live job) and
-   * `strandedSlots` likewise only grows via `markSlotStranded`, so this
-   * is the ONE place anything is ever removed from either - without it,
+   * `slotReserved`/`slotReleased` dedupe entries, and its `strandedSlots`
+   * entry INCLUDING clearing any pending automatic-retry timer (if the job
+   * ever actually held a concurrency slot, or was ever stranded, at all -
+   * a preflight-failed job, or one that was rejected or never got past
+   * `queue`, never has any of these entries, and `Set.delete`/`Map.delete`
+   * on a missing entry is already a harmless no-op). All three matter on a
+   * long-running server: `slotReserved`/`slotReleased` are add-only
+   * everywhere else (`markSlotReserved`'s and `releaseSlot`'s own docs)
+   * and `strandedSlots` likewise only grows via `markSlotStranded`, so
+   * this is the ONE place anything is ever removed from any of them - without it,
    * every job that ever ran and was later purged would leave a permanent
    * entry behind (unbounded linear growth in exactly the store whose
    * whole purpose is bounding resource use), and an uncleared retry timer
@@ -2720,6 +2769,7 @@ export class JobStore {
     this.jobTerminalListeners.delete(jobId);
     this.outputWatchStops.delete(jobId);
     this.slotReleased.delete(jobId);
+    this.slotReserved.delete(jobId);
     const stranded = this.strandedSlots.get(jobId);
     if (stranded?.retryTimer !== undefined) clearTimeout(stranded.retryTimer);
     this.strandedSlots.delete(jobId);

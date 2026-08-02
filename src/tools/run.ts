@@ -452,6 +452,18 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
  * `releaseSlot` does not actually free the slot at all: it marks it
  * stranded instead, with its own bounded automatic retry (see
  * `releaseSlot`'s own fail-closed docs).
+ *
+ * Because every terminal outcome above ends in a `releaseSlot` call, this
+ * function marks `jobId` as genuinely holding a slot (`markSlotReserved`)
+ * BEFORE calling `spawnManaged` - never after - since a synchronous spawn
+ * failure can call `onError`, and therefore `releaseSlot`, before
+ * `spawnManaged` itself returns. This is the ONE call site for both real
+ * ways a job ever holds a slot (see this function's own header above), so
+ * it is also the one place that call needs to happen; a preflight-failed
+ * record (`handler`'s own three early-return branches above) never
+ * reaches here at all, which is what makes this job id's absence from
+ * `slotReserved` the correct signal to `releaseSlot`'s own ownership
+ * guard.
  */
 function beginSpawn(
   jobId: string,
@@ -462,6 +474,7 @@ function beginSpawn(
   env: Record<string, string>,
   deadlineMs: number | undefined
 ): void {
+  jobStore.markSlotReserved(jobId);
   const child = spawnManaged(
     { argv, shellCommand, shellExecutable, cwd, env },
     {
