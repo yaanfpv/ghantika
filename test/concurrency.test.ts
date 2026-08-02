@@ -886,7 +886,11 @@ test("kill() on a preflight-failed record that never held a concurrency slot mus
         `${name}: run() itself must still succeed with a terminal failed record`
       );
       const failedStructured = structured(failed);
-      assert.equal(failedStructured.state, "failed", `${name}: must be a terminal preflight failure`);
+      assert.equal(
+        failedStructured.state,
+        "failed",
+        `${name}: must be a terminal preflight failure`
+      );
       const failedJobId = failedStructured.job_id as string;
 
       const killResult = await killTool.handler({ job_id: failedJobId });
