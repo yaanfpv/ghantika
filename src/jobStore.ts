@@ -1295,6 +1295,33 @@ export class JobStore {
   }
 
   /**
+   * How many OTHER jobs currently have a real, tracked spawned child AND
+   * are still genuinely live - not yet terminal - excluding the one job
+   * named by `excludeJobId`. A proxy for "spawned-process load" distinct
+   * from `size()`'s plain job-record count: a job record can exist with no
+   * live child at all (capture never reached that point, or the child was
+   * already reaped), and `markExited`/`markKilled`/`markSpawnFailed` all
+   * transition a job's `state` to terminal WITHOUT removing its child
+   * handle from `this.children` - the handle is retained for later reads
+   * (output, tail, status) even after the process itself is long gone. So
+   * a plain count of `this.children` entries counts every job that ever
+   * had a child, including ones that exited minutes ago, which is not
+   * "live" by any definition this signal needs. This counts only entries
+   * whose job record is both present and non-terminal, and never counts
+   * the job under test against itself.
+   */
+  otherLiveChildCount(excludeJobId: string): number {
+    let count = 0;
+    for (const jobId of this.children.keys()) {
+      if (jobId === excludeJobId) continue;
+      const record = this.jobs.get(jobId);
+      if (record === undefined || isTerminalJobState(record.state)) continue;
+      count += 1;
+    }
+    return count;
+  }
+
+  /**
    * Registers a fresh job in `starting` state and initializes its (empty)
    * stdout/stderr buffers. Used for a job that IS about to be (or just was)
    * handed to `process.spawnManaged` - never for a job that's already known
