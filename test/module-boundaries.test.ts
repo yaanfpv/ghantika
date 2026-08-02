@@ -37,8 +37,8 @@ test("the real src/ tree has zero module-boundary violations", () => {
   assert.deepEqual(checkModuleBoundaries(), []);
 });
 
-test("FROZEN_MODULES lists exactly twelve modules: six core files plus six tool handlers", () => {
-  assert.equal(FROZEN_MODULES.length, 12);
+test("FROZEN_MODULES lists exactly thirteen modules: seven core files plus six tool handlers", () => {
+  assert.equal(FROZEN_MODULES.length, 13);
   const core = FROZEN_MODULES.filter((f) => !f.startsWith("tools/"));
   const tools = FROZEN_MODULES.filter((f) => f.startsWith("tools/"));
   assert.deepEqual([...core].sort(), [
@@ -46,6 +46,7 @@ test("FROZEN_MODULES lists exactly twelve modules: six core files plus six tool 
     "policy.ts",
     "process.ts",
     "registry.ts",
+    "scheduler.ts",
     "server.ts",
     "tasksAdapter.ts",
   ]);

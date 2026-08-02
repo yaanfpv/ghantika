@@ -2659,7 +2659,7 @@ test(
   }
 );
 
-// --- the combined-degraded cell is RETRYABLE, at the real handler/wire level ---
+// --- the combined-degraded cell's retry-safety contract, at the real handler/wire level: never re-signals, but can still recover via existence-only confirmation ---
 
 test(
   "kill: CONTROL - a forced mid-scenario failure still leaves no survivor leader or process group behind, verified via a real process-table lookup, never merely assumed",

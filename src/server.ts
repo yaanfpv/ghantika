@@ -144,6 +144,16 @@ export interface GhantikaServer {
  *   boundary `test/helpers/spawnServer.ts` otherwise uses).
  */
 export function createServer(transport: Transport = createStdioTransport()): GhantikaServer {
+  // A freshly constructed server is not itself shutting down - reopens
+  // whatever an earlier server built against this same shared `jobStore`
+  // singleton already closed. Harmless, and a genuine no-op, in real
+  // production use (a real process calls createServer() exactly once,
+  // before its own single shutdown); it only does real work once more
+  // than one createServer() call shares this one process-lifetime
+  // singleton, which is exactly what this codebase's own test suite does.
+  // See JobStore.clearShutdownGate's own docs.
+  jobStore.clearShutdownGate();
+
   const server = new Server(
     { name: SERVER_NAME, version: SERVER_VERSION },
     {
@@ -342,7 +352,25 @@ export function createServer(transport: Transport = createStdioTransport()): Gha
 }
 
 async function performShutdown(transport: Transport, reason: string): Promise<void> {
+  // Closes admission before anything else below - including the queue
+  // drain two lines down - so a run() call arriving anywhere in this
+  // function's own async tail (particularly the awaited live-job reap,
+  // which can take a while against many jobs) is rejected outright rather
+  // than admitted or queued into a queue this function is never going to
+  // drain again. See JobStore.beginShutdown's own docs.
+  jobStore.beginShutdown();
   console.error(`[ghantika] shutting down (${reason})`);
+  try {
+    // Any job still sitting in the concurrency queue never got a real
+    // child attached at all (see `JobStore.drainQueueOnShutdown`'s own
+    // docs), so it is killed and cleared here, BEFORE the live-job reap
+    // below - which only ever has real process-group work to do for a job
+    // that actually spawned. Deterministic: this always fully empties the
+    // queue before shutdown proceeds.
+    jobStore.drainQueueOnShutdown();
+  } catch (error) {
+    console.error("[ghantika] error while draining the concurrency queue during shutdown:", error);
+  }
   try {
     await reapLiveJobsOnShutdown();
   } catch (error) {

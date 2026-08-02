@@ -67,14 +67,34 @@
  * `kill()`/shutdown reap for this job takes the honest, disclosed
  * DEGRADED path instead of a confirmed one. See
  * `captureBirthIdentityPosixAsync`'s own docs.
+ *
+ * ## Concurrency cap + FIFO queue, checked AFTER pre-flight validation
+ *
+ * Once a `cwd`/executable pre-flight check above has passed (a job that
+ * fails either is already terminal and never touches the scheduler at
+ * all - it never needed a concurrency slot to begin with), this handler
+ * asks `jobStore.requestSlot()` for an admission decision before ever
+ * creating a running/queued job record: `"admit"` spawns right now (this
+ * call already reserved the slot); `"queue"` mints the job in `starting`
+ * state with a `queue_position` and defers the actual spawn to whenever
+ * `jobStore` calls back once this job reaches the front of the queue and
+ * a slot frees; `"reject"` returns a typed, `isError: true` diagnostic and
+ * never creates a job at all - there was no capacity to admit it, so
+ * there is nothing to track. All three paths return synchronously/
+ * instantly: queuing and rejecting are never slower than an immediate
+ * admission from `run()`'s own point of view. See `src/scheduler.ts` for
+ * the admission policy itself and `src/jobStore.ts`'s `requestSlot`/
+ * `enqueueJob`/`releaseSlot` for the state this handler commits it to.
  */
 import type { CallToolResult, Tool } from "@modelcontextprotocol/server";
 
 import { type PolicyDecision, decideRunPolicy, decideShellPolicy } from "../policy.js";
 import {
   type PublicJobProjection,
+  type ReapReleaseDecision,
   isTerminalJobState,
   jobStore,
+  reapOutcomeToReleaseDecision,
   toPublicProjection,
 } from "../jobStore.js";
 import {
@@ -344,6 +364,22 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
     return toolSuccess(toPublicProjection(record, jobStore.getOutputCounts(record.job_id)));
   }
 
+  // Resolved once, here, from the SAME policyDecision the gate above just
+  // approved - never re-derived at either real spawn call site below, which
+  // is what keeps a shell job's actual launch target identical to the one
+  // decideShellPolicy already judged (see shellExecutableForSpawn's own
+  // docs).
+  const shellExecutable = shellExecutableForSpawn(isShell, policyDecision);
+
+  // Admission control: checked only once the command itself is known to
+  // be valid (a bad cwd/executable never needed a concurrency slot at
+  // all - see this file's own "Concurrency cap + FIFO queue" docs above).
+  // A rejection never creates a job - there was no capacity to admit it.
+  const admission = jobStore.requestSlot();
+  if (admission.kind === "reject") {
+    return toolRejected(admission.reason, admission.message);
+  }
+
   const record = jobStore.createJob({
     argv: internalArgv,
     cwd: cwdResult.resolvedCwd,
@@ -353,17 +389,99 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
   });
   const jobId = record.job_id;
 
+  if (admission.kind === "queue") {
+    // No slot free right now - this job stays in `starting` state with a
+    // `queue_position`, and the real spawn is deferred to whenever
+    // `jobStore` calls this closure back (see `beginSpawn`'s own docs and
+    // `JobStore.enqueueJob`'s contract for exactly when that is).
+    jobStore.enqueueJob(jobId, () =>
+      beginSpawn(
+        jobId,
+        argv,
+        shellCommand,
+        shellExecutable,
+        cwdResult.resolvedCwd,
+        resolvedEnv,
+        deadlineMs
+      )
+    );
+    return toolSuccess(toPublicProjection(jobStore.get(jobId)!, jobStore.getOutputCounts(jobId)));
+  }
+
+  // admission.kind === "admit" - a slot was free and is already reserved
+  // (requestSlot() committed that above) - spawn right now.
+  beginSpawn(
+    jobId,
+    argv,
+    shellCommand,
+    shellExecutable,
+    cwdResult.resolvedCwd,
+    resolvedEnv,
+    deadlineMs
+  );
+
+  // Re-read from the store rather than reusing `record`: spawnManaged's
+  // synchronous try/catch path (see its docs) can already have called
+  // `onError` by the time it returns, so the freshest state may already
+  // differ from what `createJob` originally returned.
+  return toolSuccess(toPublicProjection(jobStore.get(jobId)!, jobStore.getOutputCounts(jobId)));
+}
+
+/**
+ * Performs the actual `spawnManaged` call + full callback wiring for
+ * `jobId`, shared by BOTH real code paths that ever spawn a job: an
+ * immediate admission (called synchronously from `handler` above) and a
+ * deferred, dequeued spawn (called later, from inside `jobStore`'s own
+ * `dequeueNext`, once this job reaches the front of the queue and a slot
+ * has just been reserved for it - see `JobStore.enqueueJob`'s docs). Byte-
+ * for-byte the same spawn/callback wiring `handler` used to perform
+ * inline before the concurrency cap existed - factored out here purely so
+ * the SAME wiring can be triggered from either call site, without
+ * duplicating it.
+ *
+ * Every real terminal outcome CALLS `releaseSlot` for this job's
+ * concurrency slot exactly once (see `JobStore.releaseSlot`'s own docs
+ * for the exactly-once-call/awaited-decision/fail-closed contract - a
+ * call does not always mean an immediate real release, see below): a
+ * spawn failure (`onError`, sync or async) releases immediately, since no
+ * real child is ever attached for one to reap; a real exit/kill
+ * (`onExit`) releases only once the SAME reap decision this callback
+ * already kicks off via `reapProcessGroupOnce` (mapped through the one
+ * shared `reapOutcomeToReleaseDecision`) has been awaited to completion,
+ * never merely kicked off - and, if that decision is not `"confirmed"`,
+ * `releaseSlot` does not actually free the slot at all: it marks it
+ * stranded instead, with its own bounded automatic retry (see
+ * `releaseSlot`'s own fail-closed docs).
+ */
+function beginSpawn(
+  jobId: string,
+  argv: string[],
+  shellCommand: string | undefined,
+  shellExecutable: string | undefined,
+  cwd: string,
+  env: Record<string, string>,
+  deadlineMs: number | undefined
+): void {
   const child = spawnManaged(
-    {
-      argv,
-      shellCommand,
-      shellExecutable: shellExecutableForSpawn(isShell, policyDecision),
-      cwd: cwdResult.resolvedCwd,
-      env: resolvedEnv,
-    },
+    { argv, shellCommand, shellExecutable, cwd, env },
     {
       onSpawn: () => jobStore.markRunning(jobId),
-      onError: (message) => jobStore.markSpawnFailed(jobId, message),
+      onError: (message) => {
+        jobStore.markSpawnFailed(jobId, message);
+        // No real child was ever attached for a genuine spawn failure -
+        // there is nothing to reap, so this job's concurrency slot is
+        // freed immediately rather than waiting on a reap that will never
+        // happen. The SAME release path whether this job was admitted
+        // immediately or reached this point via a dequeue - a dequeue
+        // spawn failure must never leak a slot.
+        jobStore.releaseSlot(jobId).catch((error: unknown) => {
+          console.error(
+            "[ghantika] error releasing job's concurrency slot after a spawn failure:",
+            jobId,
+            error
+          );
+        });
+      },
       onExit: (code, signal) => {
         jobStore.markExited(jobId, code, signal);
         // The PRIMARY reap path for the root-exits-first case: fired the
@@ -375,16 +493,38 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
         // `kill()` call reaching an already-terminal record cannot
         // recover that fact by checking. Still fire-and-forget (never
         // awaited here - onExit itself is a synchronous callback with no
-        // caller waiting on this), but a real signal-send failure inside
-        // it is a genuine promise rejection, not merely an unconfirmed
-        // result - caught and logged here so it surfaces as a diagnostic
-        // rather than an unhandled rejection.
-        jobStore.reapProcessGroupOnce(jobId).catch((error: unknown) => {
-          // jobId passed as its own argument, never interpolated into the
-          // format string itself - the static literal below carries no
-          // format specifiers for jobId to forge, regardless of its value.
+        // caller waiting on this). The raw `ReapOutcome` is mapped to a
+        // release decision via the ONE shared `reapOutcomeToReleaseDecision`
+        // function every real caller must use (never re-derived here ad
+        // hoc); a real signal-send failure inside the reap itself is
+        // mapped to the explicit `"errored"` decision - never left as an
+        // unhandled rejection, and never silently treated as safe-to-
+        // release (see `jobStore.releaseSlot`'s own fail-closed docs for
+        // why an errored reap must NOT free the slot) - logged here too so
+        // it surfaces as a diagnostic.
+        const reapDecision: Promise<ReapReleaseDecision> = jobStore
+          .reapProcessGroupOnce(jobId)
+          .then(reapOutcomeToReleaseDecision)
+          .catch((error: unknown): ReapReleaseDecision => {
+            // jobId passed as its own argument, never interpolated into the
+            // format string itself - the static literal below carries no
+            // format specifiers for jobId to forge, regardless of its value.
+            console.error(
+              "[ghantika] error reaping job's process group at leader-exit:",
+              jobId,
+              error
+            );
+            return "errored";
+          });
+        // The slot releases only once THIS reap decision has been awaited
+        // to completion, never merely kicked off - a slow/delayed reap
+        // must not release it early, and a non-"confirmed" decision does
+        // not release it at all (`jobStore.releaseSlot`'s own fail-closed
+        // handling takes over from there: the slot is marked stranded and
+        // gets its own bounded automatic retry).
+        jobStore.releaseSlot(jobId, reapDecision).catch((error: unknown) => {
           console.error(
-            "[ghantika] error reaping job's process group at leader-exit:",
+            "[ghantika] error releasing job's concurrency slot after its reap:",
             jobId,
             error
           );
@@ -438,12 +578,6 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
       jobStore.attachDeadlineTimer(jobId, deadlineTimer);
     }
   }
-
-  // Re-read from the store rather than reusing `record`: spawnManaged's
-  // synchronous try/catch path (see its docs) can already have called
-  // `onError` by the time it returns, so the freshest state may already
-  // differ from what `createJob` originally returned.
-  return toolSuccess(toPublicProjection(jobStore.get(jobId)!, jobStore.getOutputCounts(jobId)));
 }
 
 /**
@@ -696,6 +830,24 @@ function validateDeadlineMs(deadlineMs: unknown): ValidationResult<number | unde
 
 function toolError(message: string): CallToolResult {
   return { content: [{ type: "text", text: message }], isError: true };
+}
+
+/**
+ * The concurrency-cap/queue-depth admission rejection response - a typed
+ * diagnostic (`structuredContent.reason`, one of `scheduler.ts`'s own
+ * `AdmissionRejectionReason` values) alongside the human-readable
+ * `message`, so a caller can distinguish "no capacity is configured at
+ * all" from "the cap and queue are both currently full" programmatically,
+ * not just by parsing text. No job is ever created for a rejection -
+ * there was no capacity to admit it, so there is nothing to track (see
+ * this file's own "Concurrency cap + FIFO queue" docs above).
+ */
+function toolRejected(reason: string, message: string): CallToolResult {
+  return {
+    content: [{ type: "text", text: message }],
+    isError: true,
+    structuredContent: { rejected: true, reason },
+  };
 }
 
 function toolSuccess(projection: PublicJobProjection): CallToolResult {
