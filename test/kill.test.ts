@@ -2700,7 +2700,7 @@ test(
 );
 
 test(
-  "two CONCURRENT public kill() calls against the same already-terminal job produce exactly ONE real signal-capable reap entry: two independently-dispatched tools/call requests can both observe jobStore's own pre-await guard as not-yet-set and both take the signal-capable branch, each genuinely sending a real signal",
+  "two CONCURRENT public kill() calls against the same already-terminal job produce exactly ONE real signal-capable reap entry, guarding against the race where two independently-dispatched tools/call requests could both observe jobStore's own pre-await guard as not-yet-set and both take the signal-capable branch, each sending a real signal",
   {
     skip:
       process.platform === "win32"
@@ -2713,9 +2713,12 @@ test(
     // directly against the SAME singleton `jobStore` kill.ts itself
     // imports - exactly like the sibling "genuinely re-consults" test in
     // test/jobStore.test.ts) so hasReapBeenAttempted stays false and BOTH
-    // calls below reach reapProcessGroupOnce's signal-capable branch,
-    // instead of one of them being short-circuited by an eager reap that
-    // already ran.
+    // calls below reach reapProcessGroupOnce itself, rather than one being
+    // short-circuited by an eager reap that already ran. Which ONE of the
+    // two actually takes the signal-capable branch is exactly what this
+    // test proves is bounded: the synchronous reapEntered marker this
+    // guards against being written twice determines it, so the other call
+    // correctly falls back to the existence-only retry path instead.
     const dir = makeTempDir();
     const sigtermLog = path.join(dir, "sigterm-log.txt");
     // GENUINELY SIGTERM-RESISTANT, not merely trapping-and-continuing: an

@@ -575,6 +575,53 @@ test(
   }
 );
 
+test("deleteJob reclaims a job's reapEntered entry, mirroring its existing strandedSlots/slotReleased-reclamation discipline: without this, every job that ever reached reapProcessGroupOnce's signal-capable branch and was later purged would leave a permanent, unbounded entry behind", async () => {
+  const store = new JobStore();
+  const record = store.createJob({ argv: ["true"], cwd: "/tmp", env: {}, isShell: false });
+  const child = spawnManaged(
+    { argv: ["true"], cwd: process.cwd(), env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } },
+    {
+      onSpawn: () => {},
+      onError: () => {},
+      onExit: () => {},
+      onStdoutChunk: () => {},
+      onStderrChunk: () => {},
+      onStdoutEnd: () => {},
+      onStderrEnd: () => {},
+    }
+  );
+  store.attachChild(record.job_id, child!);
+  store.markExited(record.job_id, 0, null);
+
+  assert.equal(
+    store.getReapEnteredCount(),
+    0,
+    "a job that never reached reapProcessGroupOnce at all must not be counted"
+  );
+
+  const alwaysUnconfirmedReaper = async (): Promise<{ confirmed: boolean }> => ({
+    confirmed: false,
+  });
+  await store.reapProcessGroupOnce(record.job_id, 100, alwaysUnconfirmedReaper);
+  assert.equal(
+    store.getReapEnteredCount(),
+    1,
+    "reapProcessGroupOnce's signal-capable branch must mark this job's own reapEntered entry"
+  );
+
+  const existed = store.deleteJob(record.job_id);
+  assert.equal(existed, true);
+  assert.equal(
+    store.getReapEnteredCount(),
+    0,
+    "deleteJob must reclaim the reapEntered entry too, not just the job record itself - otherwise this Set grows without bound across a long-running server's whole job history"
+  );
+
+  // No cleanup kill here - same reasoning as the sibling tests in this
+  // file: `true` exits almost immediately and forks nothing, so the real
+  // group is already gone by this point.
+});
+
 test(
   "reapProcessGroupOnce's retry CAN still recover via existence-only confirmation: when the group has genuinely become empty since the first unconfirmed attempt (e.g. a transient observer failure that has since resolved), the retry confirms it WITHOUT ever sending a second signal",
   {

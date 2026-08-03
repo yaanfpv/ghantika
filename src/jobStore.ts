@@ -1954,6 +1954,21 @@ export class JobStore {
   }
 
   /**
+   * How many jobs currently have an entry in `reapEntered` - exposed for
+   * the same observability/testing reason as `getSlotReleasedCount` and
+   * `getStrandedSlotCount` above. `reapEntered` only ever grows (via
+   * `reapProcessGroupOnce`'s own signal-capable branch) and is reclaimed
+   * only by `deleteJob`, so this count returning to (or staying at) its
+   * pre-purge-cycle value across repeated create/reap/delete cycles is
+   * the real oracle proving it does not grow without bound on a
+   * long-running server, exactly the same shape `getSlotReleasedCount`'s
+   * own docs describe for `slotReleased`.
+   */
+  getReapEnteredCount(): number {
+    return this.reapEntered.size;
+  }
+
+  /**
    * Gives a just-freed slot to the NEXT queued job (FIFO - the queue
    * array's own order IS insertion order), if any are waiting AND the
    * CURRENTLY configured cap actually has room for one more active job.
@@ -2856,22 +2871,25 @@ export class JobStore {
    * - the job record itself, its tracked child handle (if any), both
    * stream buffers, every registered output-arrival/job-terminal
    * listener, any recorded output-watch-stop annotation, its
-   * `slotReserved`/`slotReleased` dedupe entries, and its `strandedSlots`
-   * entry INCLUDING clearing any pending automatic-retry timer (if any of
-   * these was ever set for `jobId` at all - a preflight-failed job
+   * `slotReserved`/`slotReleased` dedupe entries, its `strandedSlots`
+   * entry INCLUDING clearing any pending automatic-retry timer, and its
+   * `reapEntered` entry (if any of these was ever set for `jobId` at all - a preflight-failed job
    * (`createFailedJob`) or one that was rejected outright never gets a
    * `slotReserved` entry in the first place, and `Set.delete`/`Map.delete`
    * on a missing entry is already a harmless no-op; a job admitted into
    * the queue but cancelled before ever being dequeued does NOT carry a
    * `slotReserved` entry by the time it reaches here either - `enqueueJob`
    * already removed it, the moment the job was queued, for exactly this
-   * reason (see its own docs) - and it never carries a `slotReleased` or
-   * `strandedSlots` entry, since a later `releaseSlot` call against it is
-   * refused by the now-absent `slotReserved` entry). All three matter on
-   * a long-running server: `slotReleased` is add-only everywhere but here,
-   * `slotReserved` moves between `createJob`/`enqueueJob`/`dequeueNext`
-   * (see their own docs) besides this method, and `strandedSlots` likewise
-   * only grows via `markSlotStranded`, so
+   * reason (see its own docs) - and it never carries a `slotReleased`,
+   * `strandedSlots`, or `reapEntered` entry, since a later `releaseSlot`
+   * call against it is refused by the now-absent `slotReserved` entry).
+   * All four matter on a long-running server: `slotReleased` is add-only
+   * everywhere but here, `slotReserved` moves between
+   * `createJob`/`enqueueJob`/`dequeueNext` (see their own docs) besides
+   * this method, `strandedSlots` likewise only grows via
+   * `markSlotStranded`, and `reapEntered` only ever grows via
+   * `reapProcessGroupOnce`'s own signal-capable branch - never cleared by
+   * anything else this store does - so
    * this is the ONE place anything is ever removed from any of them - without it,
    * every job that ever ran and was later purged would leave a permanent
    * entry behind (unbounded linear growth in exactly the store whose
@@ -2882,8 +2900,8 @@ export class JobStore {
    * real, needless work this store can just as easily cancel here). A
    * one-way reclamation primitive: after this call,
    * `has`/`get`/`getStreamSnapshot`/`getOutputCounts`/`getSlotReleasedCount`/
-   * `getStrandedSlotCount` all behave EXACTLY as if `jobId` had never
-   * existed. Generic - this store has no opinion on WHY a caller reclaims
+   * `getStrandedSlotCount`/`getReapEnteredCount` all behave EXACTLY as if
+   * `jobId` had never existed. Generic - this store has no opinion on WHY a caller reclaims
    * a job (a task-layer TTL purge is the one real caller today, see
    * `src/tasksAdapter.ts`'s `getTask`, but nothing here is Tasks-
    * specific). Returns whether a job actually existed to remove.
@@ -2917,6 +2935,7 @@ export class JobStore {
     const stranded = this.strandedSlots.get(jobId);
     if (stranded?.retryTimer !== undefined) clearTimeout(stranded.retryTimer);
     this.strandedSlots.delete(jobId);
+    this.reapEntered.delete(jobId);
     return existed;
   }
 
