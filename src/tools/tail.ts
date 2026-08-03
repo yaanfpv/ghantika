@@ -27,8 +27,10 @@
  * old exact-range design suppressed when a window didn't reach the
  * retained floor, since a mere trim isn't a loss), this file's
  * `dropped`/`droppedBeforeCursor` disclosure is a simple historical fact
- * about the stream (has it EVER dropped any of its own lines, and where is
- * its current floor) - it is disclosed whenever `dropped > 0`, regardless
+ * about the stream (has it EVER suffered a discrete loss event - an
+ * evicted line, a discarded pending fragment, or a post-reclaim arrival,
+ * not just an evicted line - and where is its current floor) - it is
+ * disclosed whenever `dropped > 0`, regardless
  * of whether this particular `lines` window happens to reach that floor.
  *
  * `truncated` covers two distinct causes, neither masking the other: this
@@ -49,7 +51,7 @@ import {
 export const name = "tail";
 
 export const description =
-  'Get the most recent output a background job has produced, for polling without re-reading everything already seen. Returns the last N real events of stdout, stderr, or both (merged in real line-materialization order, default). Once a selected stream has dropped its own old lines under the byte/line retention cap, the response discloses a bounded "dropped" count for that stream (how many of its own lines were ever dropped) plus "droppedBeforeCursor" (the boundary before which that happened) - never which specific lines were lost. For stream:"stdout"/"stderr" this is a scalar pair at the top level; for stream:"both" it is a nested object keyed by stream ({stdout?:{...}, stderr?:{...}}), since each stream\'s own loss is independent. Three distinct signals, never conflate them: "dropped" means this stream lost lines forever; "truncated" means this specific call\'s own response window (from lines being smaller than what is available, or from that same lifetime loss) does not contain everything currently available; "next_cursor" is simply where to resume paging - it carries no information about loss on its own.';
+  'Get the most recent output a background job has produced, for polling without re-reading everything already seen. Returns the last N real events of stdout, stderr, or both (merged in real line-materialization order, default). Once a selected stream has lost some of its own history - either under its own byte/line window cap while the job is still running, or because the job finished and its output later became eligible for job-output retention (see GHANTIKA_JOB_RETENTION_MS/GHANTIKA_MAX_RETAINED_JOBS) - the response discloses a bounded "dropped" count for that stream plus "droppedBeforeCursor" (the lowest seq still retained, or the stream\'s highest-ever-assigned seq - possibly 0 if no line was ever materialized - when nothing survives) - never which specific lines were lost, and never which of the two causes applied. "dropped" is ordinarily a count of complete lines, but it also counts two narrower events the same way: a not-yet-newline-terminated fragment discarded on reclaim, and a chunk arriving for a stream after its job is already reclaimed - neither is a materialized line, but each is real, permanent loss, so both count too rather than leaving the stream falsely indistinguishable from one that never received anything. For stream:"stdout"/"stderr" this is a scalar pair at the top level; for stream:"both" it is a nested object keyed by stream ({stdout?:{...}, stderr?:{...}}), since each stream\'s own loss is independent. Three distinct signals, never conflate them: "dropped" means this stream lost something forever; "truncated" means this specific call\'s own response window (from lines being smaller than what is available, or from that same loss) does not contain everything currently available; "next_cursor" is simply where to resume paging - it carries no information about loss on its own.';
 
 const DEFAULT_TAIL_LINES = 100;
 
