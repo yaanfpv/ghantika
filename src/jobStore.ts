@@ -1199,14 +1199,22 @@ export class JobStore {
    * - `reapProcessGroupOnce` (the eager reap at leader-exit, and the
    *   terminal-record fallback a `kill()`/shutdown call reaching an
    *   already-terminal record now also routes through) CHECKS this set
-   *   before ever signaling, and marks it as part of the same call - this
-   *   is the actual "at most one SIGNAL-CAPABLE cleanup-reap attempt per
-   *   job" guarantee, and it is what a later attempt against a recycled
-   *   pgid cannot re-trigger. An unconfirmed first attempt does NOT set
-   *   this marker, so a later call still reaches `reapProcessGroupOnce`
-   *   again - it just takes that method's own existence-only retry
-   *   branch instead of re-entering the signal-capable one (see
-   *   `src/tools/kill.ts`'s own docs for the disclosed PGID-reuse
+   *   before ever signaling, and marks it as part of the same call. This
+   *   set alone is NOT what makes "at most one SIGNAL-CAPABLE cleanup-reap
+   *   attempt per job" true under concurrency - it is written only AFTER
+   *   `reapProcessGroupOnce`'s own signal-capable attempt has already
+   *   resolved, which is too late to stop two calls reaching that method
+   *   for the same job at once from both taking the signal-capable branch
+   *   (see `reapEntered`'s own docs for the pre-await marker that
+   *   actually closes that window). What this set DOES guarantee is
+   *   idempotence across calls that are NOT racing: once a signal-capable
+   *   attempt has genuinely CONFIRMED the group empty, no later call -
+   *   concurrent or not - re-signals a recycled pgid. An unconfirmed
+   *   first attempt does NOT set this marker, so a later call still
+   *   reaches `reapProcessGroupOnce` again - it just takes that method's
+   *   own existence-only retry branch instead of re-entering the signal-
+   *   capable one (see `src/tools/kill.ts`'s own docs for the disclosed
+   *   PGID-reuse
    *   residual this narrows).
    * - A LIVE job's own explicit `kill()` signal marks this set too (so a
    *   later terminal-record reap knows a cleanup attempt already covered
@@ -1228,6 +1236,32 @@ export class JobStore {
    *   for whenever the leader eventually exits on its own.
    */
   private readonly reapAttempted = new Set<string>();
+  /**
+   * Tracks, independently of `reapAttempted`/`kill_confirmed`, whether a
+   * SIGNAL-CAPABLE `reapProcessGroupOnce` attempt has already BEGUN for
+   * this job - set synchronously, in the same tick as the guard that
+   * reads it, before that method's own `await`. This is a distinct
+   * question from either existing marker: `kill_confirmed` answers "did
+   * the reap CONFIRM", and only gets written after the awaited reaper
+   * settles; `reapAttempted` answers "did a signal-capable attempt
+   * CONFIRM zero survivors" and has other writers besides this method.
+   * Neither can double as "has an attempt been ENTERED", because both are
+   * written too late (after an `await`) to close the window this set
+   * exists for: two callers reaching `reapProcessGroupOnce` for the same
+   * job at once - genuinely reachable from two ordinary public `kill`
+   * `tools/call` requests, since the installed MCP SDK dispatches each
+   * inbound request independently rather than awaiting the previous one -
+   * could otherwise both read `kill_confirmed` as still `undefined` and
+   * both take the signal-capable branch, each sending a real signal. A
+   * synchronous, pre-await entry marker closes that: JS's own run-to-
+   * completion semantics mean whichever call's synchronous prologue runs
+   * first sets this before yielding at its `await`, so the second call -
+   * however soon after - sees it already set and takes the existence-only
+   * retry path instead. Never cleared and never used for anything but
+   * that one guard read; `hasReapBeenAttempted`/`markReapAttempted` above
+   * remain the outward-facing "did cleanup already run" answer.
+   */
+  private readonly reapEntered = new Set<string>();
   private seqCounter = 0;
 
   /**
@@ -1723,7 +1757,13 @@ export class JobStore {
    * On a CONFIRMED release: frees the slot, clears any `strandedSlots`
    * entry for this job (a job can only reach a confirmed release here
    * once - either directly, or via `markSlotStranded`'s own retry path -
-   * so any stale stranded-tracking is stale by construction), then drains
+   * so any stale stranded-tracking is stale by construction) - including
+   * cancelling that entry's own pending `retryTimer` first, exactly as
+   * `deleteJob` does, so a confirmed release reached ahead of a scheduled
+   * automatic retry (the manual `kill()` late-recovery path can win this
+   * race) doesn't leave that retry's timer running for
+   * `STRANDED_SLOT_RETRY_DELAY_MS` past the point its own entry is gone -
+   * then drains
    * the queue (`drainQueue`) - handing the freed capacity to every
    * currently-eligible queued job in FIFO order, not just the first one
    * (a single release can free room for more than one queued job at once
@@ -1749,8 +1789,12 @@ export class JobStore {
       // held a slot - so this guard, not caller discipline, is what keeps
       // `activeSlots` honest: decrementing it here would free a DIFFERENT
       // job's reservation. A no-op, not an error: from this job's own
-      // point of view there was never a slot to release.
-      console.error(
+      // point of view there was never a slot to release, so this logs at
+      // `warn`, not `error` (both reach the same stderr diagnostic channel
+      // every log call in this codebase uses, since stdout is reserved for
+      // the MCP stdio protocol stream - this is the one call site in the
+      // codebase that isn't actually reporting a failure).
+      console.warn(
         `[ghantika] releaseSlot called for job "${jobId}", which never reserved a concurrency slot - ignoring, since decrementing activeSlots here would free a different job's reservation`
       );
       return;
@@ -1773,6 +1817,8 @@ export class JobStore {
       return;
     }
     this.slotReleased.add(jobId);
+    const stranded = this.strandedSlots.get(jobId);
+    if (stranded?.retryTimer !== undefined) clearTimeout(stranded.retryTimer);
     this.strandedSlots.delete(jobId);
     this.activeSlots = Math.max(0, this.activeSlots - 1);
     this.drainQueue();
@@ -2482,27 +2528,27 @@ export class JobStore {
    * see `reapAttempted`'s own docs for exactly which signals qualify.
    * Idempotent: setting it again for the same job id is a harmless no-op.
    *
-   * DISCLOSED RESIDUAL: `reapProcessGroupOnce` now marks this only AFTER
-   * awaiting its own reaper call (so an unconfirmed outcome correctly
-   * leaves it unset - see that method's own docs), which reopens a
-   * narrow synchronous-guard window this set's `hasReapBeenAttempted`
-   * check cannot close: two concurrent DIRECT `reapProcessGroupOnce`
-   * calls for the SAME job (not the ordinary single-eager-call path) can
-   * both pass the pre-await guard check before either one's own call
-   * marks this set, so both genuinely send a real signal. This does not
-   * threaten the concurrency-cap invariant `releaseSlot`'s own fail-
-   * closed handling protects - a duplicate signal to an already-dead or
-   * already-signaled group is harmless - but it does narrow the "at most
-   * one real signal-send attempt per job" property this set's own class-
-   * level docs describe, for this specific narrow window. Accepted as a
-   * documented, narrower residual rather than building new
-   * synchronization machinery around it (this codebase's own convention
-   * for a real but non-cap-threatening residual - see `reapAttempted`'s
-   * own docs for the PGID-reuse residual it already discloses the same
-   * way).
+   * `reapProcessGroupOnce` marks this only AFTER awaiting its own reaper
+   * call, so an unconfirmed outcome correctly leaves it unset - see that
+   * method's own docs. The concurrent-double-signal window this
+   * previously reopened (two direct calls for the same job both passing
+   * a pre-await guard keyed off this set, or off `kill_confirmed`) is now
+   * closed by `reapEntered`, a separate marker written synchronously
+   * BEFORE that same `await` - see that field's own docs for why one
+   * marker cannot answer both "entered" and "confirmed".
    */
   markReapAttempted(jobId: string): void {
     this.reapAttempted.add(jobId);
+  }
+
+  /** See `reapEntered`'s own class-level docs. */
+  private hasReapEntered(jobId: string): boolean {
+    return this.reapEntered.has(jobId);
+  }
+
+  /** See `reapEntered`'s own class-level docs. */
+  private markReapEntered(jobId: string): void {
+    this.reapEntered.add(jobId);
   }
 
   /**
@@ -2633,12 +2679,33 @@ export class JobStore {
     const handle = this.getChildHandle(jobId);
     if (handle === undefined) return { kind: "no-child" };
 
-    // See this method's own "RETRY SAFETY" docs: `kill_confirmed` already
-    // being set (to anything, including `false`) means a real signal-
-    // capable attempt already ran for this job elsewhere and did not
-    // confirm - this call is a RETRY, never the guaranteed-continuity
-    // first attempt, so it must never signal again.
-    const isRetry = this.jobs.get(jobId)?.kill_confirmed !== undefined;
+    // TWO conditions, ORed, because they close two DIFFERENT gaps and
+    // neither alone covers both: `hasReapEntered` is set SYNCHRONOUSLY
+    // below, before the `await reaper(...)` a few lines down, so two
+    // calls reaching THIS method for the same job at once (two
+    // independently-dispatched public `kill` requests, per the installed
+    // MCP SDK's own dispatch - see `reapEntered`'s own class-level docs)
+    // cannot both read it as `false`: whichever call's synchronous
+    // prologue runs first marks it before yielding, so the second always
+    // takes the existence-only retry branch instead of also signaling.
+    // But this method is NOT the only signal-capable caller in this
+    // codebase - `src/tools/kill.ts`'s own default SIGTERM/escalation
+    // path and its custom-signal branch, `src/tools/run.ts`'s
+    // `deadline_ms` enforcement, and `src/server.ts`'s shutdown reap each
+    // call `killProcessGroupPosix` DIRECTLY, never through this method,
+    // and each records its own outcome via `setKillConfirmation` - so
+    // `reapEntered` alone is blind to an attempt that already happened
+    // through one of THOSE call sites before this call ever ran (the
+    // combined-degraded-retry scenario: a live job's first `kill()` call
+    // signals via kill.ts's own direct path and settles unconfirmed, the
+    // job goes terminal, and a SECOND `kill()` call reaches this method
+    // for the first time - `reapEntered` is empty for this job, but a
+    // genuine signal-capable attempt already happened). `kill_confirmed
+    // !== undefined` is what catches that: every one of those direct
+    // callers sets it, confirmed or not, the moment their own attempt
+    // resolves.
+    const isRetry =
+      this.hasReapEntered(jobId) || this.jobs.get(jobId)?.kill_confirmed !== undefined;
     if (isRetry) {
       const confirmed = await existenceOnlyReaper(handle.pid);
       this.setKillConfirmation(jobId, confirmed);
@@ -2649,19 +2716,27 @@ export class JobStore {
       return { kind: "unconfirmed" };
     }
 
+    // Marked HERE - synchronously, before the `await` below, in the same
+    // tick as the `hasReapEntered` read above - so a concurrent second
+    // call sees this immediately rather than only after this call's own
+    // reaper settles. This is what actually closes the double-signal
+    // window; moving `setKillConfirmation` earlier would not, since
+    // `kill_confirmed` also has to keep meaning "confirmed", not
+    // "entered" (see `reapEntered`'s own docs for why one field cannot
+    // answer both).
+    this.markReapEntered(jobId);
+
     let result: { readonly confirmed: boolean };
     try {
       result = await reaper(handle.pid, graceMs);
     } catch (err) {
-      // A thrown first signal-capable attempt still counts as "entered"
-      // for retry-safety purposes: it never confirmed, exactly like an
-      // ordinary `confirmed: false` return, so it gets the same
-      // `kill_confirmed: false` before the error propagates. Without
-      // this, `kill_confirmed` would stay `undefined`, the next call's
-      // `isRetry` check above would read it as a genuine first attempt,
-      // and it would re-enter the signal-capable `reaper` against a
-      // numeric pgid that may since have been recycled by an unrelated
-      // process group.
+      // A thrown first signal-capable attempt already marked `reapEntered`
+      // above, so a concurrent or later call still correctly takes the
+      // retry branch. It still gets `kill_confirmed: false` here too,
+      // exactly like an ordinary `confirmed: false` return, so
+      // `getStrandedSlotCount` and everything else that reads
+      // `kill_confirmed` sees the same "attempted, unconfirmed" shape
+      // either way.
       this.setKillConfirmation(jobId, false);
       throw err;
     }

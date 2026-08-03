@@ -2698,3 +2698,124 @@ test(
     );
   }
 );
+
+test(
+  "two CONCURRENT public kill() calls against the same already-terminal job produce exactly ONE real signal-capable reap entry: two independently-dispatched tools/call requests can both observe jobStore's own pre-await guard as not-yet-set and both take the signal-capable branch, each genuinely sending a real signal",
+  {
+    skip:
+      process.platform === "win32"
+        ? "process-group reap-once tracking is POSIX-only - no pgid concept to double-signal on Windows"
+        : false,
+  },
+  async () => {
+    // The record is made terminal WITHOUT ever routing through run()'s own
+    // eager-reap-at-exit wiring (createJob/attachChild/markExited called
+    // directly against the SAME singleton `jobStore` kill.ts itself
+    // imports - exactly like the sibling "genuinely re-consults" test in
+    // test/jobStore.test.ts) so hasReapBeenAttempted stays false and BOTH
+    // calls below reach reapProcessGroupOnce's signal-capable branch,
+    // instead of one of them being short-circuited by an eager reap that
+    // already ran.
+    const dir = makeTempDir();
+    const sigtermLog = path.join(dir, "sigterm-log.txt");
+    // GENUINELY SIGTERM-RESISTANT, not merely trapping-and-continuing: an
+    // earlier draft of this fixture (`trap ...; sleep 60`) let the
+    // group's own `sleep` child die from its own copy of the broadcast
+    // SIGTERM, which unblocked the shell's `wait` and let it fall off the
+    // end of its script and exit within milliseconds - so by the time a
+    // second concurrent call's own reaper ever checked liveness, the
+    // group was ALREADY gone, and the test passed for the wrong reason
+    // (nothing left to signal) even against the unfixed jobStore.ts,
+    // proving nothing about the actual race. This loop re-spawns `sleep 1`
+    // forever, so the LEADER survives indefinitely regardless of how many
+    // SIGTERMs land - long enough for two concurrent calls to both
+    // genuinely reach their own real signal-send point while the group is
+    // still alive, which is the only way a duplicate delivery becomes
+    // observable at all.
+    const child = spawnManaged(
+      {
+        argv: ["sh", "-c", `trap "echo x >> ${sigtermLog}" TERM; while true; do sleep 1; done`],
+        cwd: process.cwd(),
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+      },
+      {
+        onSpawn: () => {},
+        onError: () => {},
+        onExit: () => {},
+        onStdoutChunk: () => {},
+        onStderrChunk: () => {},
+        onStdoutEnd: () => {},
+        onStderrEnd: () => {},
+      }
+    );
+    const record = jobStore.createJob({ argv: ["sh"], cwd: "/tmp", env: {}, isShell: false });
+    jobStore.attachChild(record.job_id, child!);
+    jobStore.markExited(record.job_id, 0, null);
+
+    const realPid: number | undefined = child!.pid;
+    try {
+      // Give the shell a moment to actually install its trap before
+      // either kill() call fires - a false pass here (the shell dying, or
+      // its trap not yet installed) would make a below-one sigterm-log
+      // count meaningless. Real elapsed time, not a file-arrival wait:
+      // nothing this fixture writes proves "trap installed" any more
+      // cheaply than just giving the shell a moment to start.
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(
+        isProcessAlive(realPid),
+        true,
+        "expected the real trapping leader to be alive before either kill() call"
+      );
+
+      // Fired back-to-back, NEITHER awaited before the other starts - this
+      // is what reproduces the race: both handler() calls run their
+      // synchronous prologue (validate -> look up -> confirm terminal ->
+      // begin reapProcessGroupOnce) before either yields at its first real
+      // await, exactly matching the installed MCP SDK's own independent-
+      // dispatch behavior (Promise.resolve().then(handler), no awaiting
+      // the previous tools/call).
+      const call1 = killTool.handler({ job_id: record.job_id });
+      const call2 = killTool.handler({ job_id: record.job_id });
+      const [result1, result2] = await Promise.all([call1, call2]);
+
+      assert.notEqual(
+        (result1 as CallToolResult).isError,
+        true,
+        `first concurrent kill() must succeed: ${JSON.stringify(result1)}`
+      );
+      assert.notEqual(
+        (result2 as CallToolResult).isError,
+        true,
+        `second concurrent kill() must succeed: ${JSON.stringify(result2)}`
+      );
+
+      // THE ASSERTION: a real, external log of SIGTERM deliveries - not
+      // this codebase's own kill_confirmed/reapAttempted bookkeeping,
+      // which the prior design could not be trusted to report honestly
+      // (the race this test guards against ran through exactly that
+      // bookkeeping). Exactly one line means exactly one real
+      // signal-capable reap entry occurred; more than one means the
+      // concurrency window this test guards against is still open.
+      await new Promise((r) => setTimeout(r, 200)); // let a would-be second signal's log write land
+      const deliveries = fs.existsSync(sigtermLog)
+        ? fs
+            .readFileSync(sigtermLog, "utf8")
+            .split("\n")
+            .filter((line) => line.trim().length > 0).length
+        : 0;
+      assert.equal(
+        deliveries,
+        1,
+        `expected exactly one real SIGTERM delivered across both concurrent kill() calls, saw ${deliveries} - a second delivery means the pre-await entry guard did not close the concurrent-double-signal window`
+      );
+    } finally {
+      if (realPid !== undefined && isProcessAlive(realPid)) {
+        try {
+          process.kill(-realPid, "SIGKILL");
+        } catch {
+          // already gone - fine
+        }
+      }
+    }
+  }
+);

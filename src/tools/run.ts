@@ -1,6 +1,10 @@
 /**
  * `run` - starts a command in the background without blocking the calling
- * agent, and returns a job id immediately. This file owns
+ * agent. Never blocks on capacity either: this call always returns
+ * synchronously, with a job id for a job that's admitted (running or
+ * queued behind the concurrency cap) or an outright rejection with no job
+ * id at all once the queue is full too - see this file's own `description`
+ * export for the exact three shapes. This file owns
  * `run`'s registration/schema/validation/orchestration logic; it imports
  * nothing from any sibling under `src/tools/` and holds no state of its
  * own - real job/output state lives in `src/jobStore.ts`'s `jobStore`
@@ -127,7 +131,7 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647;
 export const name = "run";
 
 export const description =
-  "Start a command in the background without blocking the calling agent. Returns a job_id immediately; use that id with status to check whether the job is still running, output to read its lines from a cursor, and tail to read just the last N. command is an argv array by default (never shell-interpreted) - pass shell: true to run a real shell command line instead. The resolved command (or, with shell: true, the platform shell itself) must be on the operator's configured allowlist; anything else settles as a failed job rather than running.";
+  'Start a command in the background without blocking the calling agent - never blocks on capacity either: this call always returns synchronously, in one of three shapes. If a concurrency slot is free, the command starts immediately and a job_id comes back for a job that is already running. If the concurrency cap is full but the queue has room, no process starts yet: a job_id still comes back, but the job sits in the existing "starting" state with a queue_position field showing its place in line, and the real spawn happens automatically once an earlier job frees a slot - poll status on that id to see it transition once it actually starts. If both the cap and the queue are full, the call returns isError: true with a rejected: true structured result and no job_id at all - nothing was created to track. Concurrency is configured via the GHANTIKA_MAX_CONCURRENT_JOBS (default 8) and GHANTIKA_MAX_QUEUE_DEPTH (default 32) environment variables; setting either to 0 disables that capacity outright (a cap of 0 rejects every command immediately, a queue depth of 0 means nothing is ever queued - only admitted or rejected). Once a job_id comes back in any of the first two shapes, use that id with status to check whether the job is still queued, running, or finished, output to read its lines from a cursor, and tail to read just the last N. command is an argv array by default (never shell-interpreted) - pass shell: true to run a real shell command line instead. The resolved command (or, with shell: true, the platform shell itself) must be on the operator\'s configured allowlist; anything else settles as a failed job rather than running.';
 
 const MAX_LABEL_LENGTH = 64;
 

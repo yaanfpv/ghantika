@@ -10,7 +10,7 @@
 
 Ask an AI agent to do something that takes a while (a build, a render, a big upload, a training run) and today it does one of two annoying things. It either checks in on the job every few seconds, burning tokens on every single check, or it just blocks and sits there doing nothing else until the command finally exits.
 
-Ghantika fixes that. Hand it a command, and it starts running in the background immediately, no blocking. The agent gets a job id back and is free to do other things. The moment that command produces output, ghantika rings, and the agent picks the thread back up exactly where it left off.
+Ghantika fixes that. Hand it a command, and ghantika hands back a job id right away, no blocking - the command usually starts running in the background immediately, and if every concurrency slot is already busy it queues instead, starting on its own the moment one frees up. Either way the agent is free to do other things. The moment that job produces output, ghantika rings, and the agent picks the thread back up exactly where it left off.
 
 **Set it up once, use it everywhere.** It's a standard [MCP](https://modelcontextprotocol.io) server over stdio, so every client that speaks MCP can start jobs and read them back with the same six tools, by polling. A client that declares the reserved `io.modelcontextprotocol/tasks` extension key in its `capabilities.extensions` bag gets more than that: ghantika wakes it directly as new output arrives on either stream, stdout or stderr, instead of it having to ask. Declaring only the older, SDK-deprecated `capabilities.tasks` shape does not reach this - polling is what that client has. Every client reads the same jobs the same way, and the job runs regardless of whether anything is watching.
 
@@ -34,7 +34,7 @@ And plenty more, across every kind of user:
 
 ## How it works
 
-You give ghantika a command, the same way you'd type it in a terminal: an argv array, or a shell string if you need pipes and redirects. It starts that command as a real background process and hands back a job id right away, before the command has necessarily produced anything at all. Nothing about calling `run` blocks.
+You give ghantika a command, the same way you'd type it in a terminal: an argv array, or a shell string if you need pipes and redirects. Nothing about calling `run` blocks - it always returns synchronously, in one of three shapes. Usually a concurrency slot is free, so the command starts as a real background process immediately and a job id comes back right away, before the command has necessarily produced anything at all. If every slot allowed by `GHANTIKA_MAX_CONCURRENT_JOBS` is already busy but the queue allowed by `GHANTIKA_MAX_QUEUE_DEPTH` has room, no process starts yet - you still get a job id back, but the job sits queued with a `queue_position`, and it starts on its own once an earlier job frees a slot. If both the cap and the queue are full, the call fails outright with `rejected: true` and no job id at all: nothing was created to track.
 
 From there the agent stays in sync with the job by polling: `status` for the job's current state and exit info, `output` or `tail` for what it's written so far. On a Tasks-capable connection, ghantika also rings directly the moment the job produces output, instead of the agent having to ask - the poll floor sits underneath it unchanged either way (`status`/`output`/`tail` behave identically whether or not a client is watching for the wake, aside from job ids, timestamps, and a handful of fields whose presence depends on timing regardless of the wake). The terminal transition itself fires no notification; a client learns a job is done the same way it learns anything else, by polling. Either way the job itself is real and unaffected: it's running under ghantika's management from the moment `run` returns, whether or not anything is currently watching it.
 
@@ -183,7 +183,7 @@ Those `seq` values are the real per-line numbers, and they stay real whether you
 
 Some agent runtimes ship a plain "run a command" tool. Here's what ghantika adds on top:
 
-- A plain run-command tool blocks the whole turn until the process exits. Ghantika returns a job id immediately and the process keeps running regardless of whether anything is watching it.
+- A plain run-command tool blocks the whole turn until the process exits. Ghantika never blocks: it returns synchronously either way, with a job id for a job that's already running, a job id for one that's queued behind the concurrency cap and starts on its own once a slot frees up, or an outright rejection with no job id at all once the queue is full too. Whichever job actually gets created keeps running regardless of whether anything is watching it.
 - Backgrounding a process without a way to check on it later means the moment it finishes is lost the second your attention moves elsewhere. On the plain poll path, ghantika keeps a job's state and output addressable by id for as long as the server is up, so `status`/`output`/`tail` answer correctly whenever you actually ask. The one narrowing: a job's own record can be reclaimed once it's both finished and at least 24 hours past its own end, but only if something reads it through the Tasks extension's `tasks/get`, `tasks/update`, or `tasks/cancel` at that point - a still-running job is never touched by this at any age, and a job you only ever read through `status`/`output`/`tail` is never subject to it either.
 - A fixed sleep-and-recheck loop burns a full round trip on every guess at how long something takes. Ghantika answers on the job's real state, not on a timer you had to estimate up front, and a client declaring the Tasks extension URI (see above) gets rung as new output arrives on either stream instead of having to ask.
 
@@ -203,6 +203,10 @@ The `run` tool takes:
 | `deadline_ms` | number             | no       | If the job is still running once this many milliseconds have elapsed, it's terminated the same way `kill` would terminate it and its state becomes `failed`. Omitted (the default): no deadline, and the job runs to its own natural completion.                                  |
 
 Ghantika never hands a job its own full environment. Even in `merge` mode the child starts from that minimal base and nothing else, so anything a command needs, it gets because you passed it.
+
+### Concurrency
+
+`run` admits jobs against a concurrency cap, configured via the `GHANTIKA_MAX_CONCURRENT_JOBS` environment variable (default 8). Once that many jobs are running at once, a further job queues instead of starting, up to a queue depth configured via `GHANTIKA_MAX_QUEUE_DEPTH` (default 32); a queued job starts on its own once an earlier job frees a slot, and `status`/`list` expose its `queue_position` while it waits. Once both the cap and the queue are full, `run` rejects the call outright (`isError: true`, `rejected: true`, no job id) rather than creating anything to track. Setting `GHANTIKA_MAX_CONCURRENT_JOBS` to `0` rejects every command immediately; setting `GHANTIKA_MAX_QUEUE_DEPTH` to `0` means nothing is ever queued - once the cap is full, the next job is rejected instead of waiting.
 
 ### Command policy
 

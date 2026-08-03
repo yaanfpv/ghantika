@@ -43,7 +43,7 @@ import { type JobRecord, type JobState, jobStore, toPublicProjection } from "../
 export const name = "list";
 
 export const description =
-  "List every background job the server currently knows about, running or finished, most-recently-started first. Never blocks on any job's own execution.";
+  "List every background job the server currently knows about - queued, running, or finished - most-recently-started first. A queued job (admitted into the concurrency queue but not yet spawned - see run's own description) carries its queue_position; the current concurrency cap is included too. Never blocks on any job's own execution.";
 
 export const inputSchema: Tool["inputSchema"] = {
   type: "object",
