@@ -43,7 +43,7 @@ import { type JobRecord, type JobState, jobStore, toPublicProjection } from "../
 export const name = "list";
 
 export const description =
-  "List every background job the server currently knows about, running or finished, most-recently-started first. Never blocks on any job's own execution.";
+  "List every background job the server currently knows about - queued, running, or finished - most-recently-started first. A queued job (admitted into the concurrency queue but not yet spawned - see run's own description) carries its queue_position; the current concurrency cap is included too. Never blocks on any job's own execution.";
 
 export const inputSchema: Tool["inputSchema"] = {
   type: "object",
@@ -55,6 +55,8 @@ export interface ListedJob {
   readonly label: string;
   readonly state: JobState;
   readonly started_at: string;
+  /** See `JobRecord.queue_position`'s own docs - the same value, passed through verbatim (present only while this job is actually queued, waiting for a concurrency slot). */
+  readonly queue_position?: number;
 }
 
 /**
@@ -81,10 +83,15 @@ export function handler(): CallToolResult {
       label: projection.label,
       state: projection.state,
       started_at: projection.started_at,
+      queue_position: projection.queue_position,
     };
   });
   return {
     content: [{ type: "text", text: JSON.stringify(listed, null, 2) }],
-    structuredContent: { jobs: listed },
+    // `concurrency_cap` is the server-wide currently configured
+    // concurrency cap (see `JobStore.getConcurrencyCap`) - not a
+    // per-job field, so it sits alongside `jobs` rather than on each
+    // entry.
+    structuredContent: { jobs: listed, concurrency_cap: jobStore.getConcurrencyCap() },
   };
 }

@@ -38,8 +38,19 @@ import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 
-import { POSIX_KILL_GRACE_PERIOD_MS, killProcessGroupPosix } from "./process.js";
+import {
+  POSIX_KILL_GRACE_PERIOD_MS,
+  killProcessGroupPosix,
+  confirmProcessGroupReapedPosix,
+} from "./process.js";
 import type { ProcessBirthIdentity } from "./process.js";
+import {
+  type AdmissionDecision,
+  type ConcurrencyConfig,
+  decideAdmission,
+  loadConcurrencyConfigFromEnv,
+  normalizeConcurrencyConfig,
+} from "./scheduler.js";
 
 // ---------------------------------------------------------------------------
 // Frozen shapes
@@ -1043,6 +1054,15 @@ interface CreateFailedJobInput extends CreateJobInput {
 }
 
 /**
+ * One job waiting in the FIFO concurrency queue - see `JobStore.enqueueJob`'s
+ * own docs for the full contract `onDequeued` operates under.
+ */
+interface QueuedJob {
+  readonly jobId: string;
+  readonly onDequeued: () => void;
+}
+
+/**
  * What `JobStore` tracks about a job's real, live child process, alongside
  * the `ChildProcess` handle itself - the pid, the (approximate) real spawn
  * time, and the leader's real captured birth identity (nullable), the
@@ -1100,6 +1120,64 @@ interface TrackedChild {
 }
 
 /**
+ * The result of one `reapProcessGroupOnce` call. `"confirmed"` and
+ * `"no-child"` both mean there is nothing outstanding - safe to release a
+ * concurrency slot. `"unconfirmed"` means the reaper ran but could not
+ * externally confirm zero survivors within its bound - NOT safe to
+ * release (see `releaseSlot`'s fail-closed handling). `"already-attempted"`
+ * means the reap-once guard (`reapAttempted`) was already set for this job
+ * BEFORE this call - but that guard has more than one writer (this
+ * function's own confirmed path, `kill.ts`'s explicit-SIGKILL branch, and
+ * `server.ts`'s shutdown live-job branch), and the SIGKILL/shutdown
+ * writers mark it UNCONDITIONALLY, before any confirmation ever lands -
+ * so `already-attempted` alone does NOT mean "safe to release." Its own
+ * `confirmed` field reports the job's REAL, current `kill_confirmed`
+ * state at the moment of the short-circuit, so a caller can tell an
+ * already-attempted-and-confirmed reap from an already-attempted-but-
+ * still-unconfirmed one (see `reapOutcomeToReleaseDecision`, the single
+ * shared function every caller must use to turn this into a release
+ * decision - never re-derive that mapping ad hoc at a call site).
+ */
+export type ReapOutcome =
+  | { readonly kind: "confirmed" }
+  | { readonly kind: "unconfirmed" }
+  | { readonly kind: "no-child" }
+  | { readonly kind: "already-attempted"; readonly confirmed: boolean };
+
+/**
+ * What `releaseSlot` actually needs to know about a reap: `"confirmed"` -
+ * safe to free the slot; `"unconfirmed"` - the reap ran but did not
+ * confirm zero survivors; `"errored"` - the reap attempt itself threw
+ * (a real signal-send failure, not merely an inconclusive observation).
+ * `releaseSlot` treats `"unconfirmed"` and `"errored"` identically (both
+ * fail closed) but keeps them as distinct values so a caller's own
+ * diagnostic logging can say which one actually happened.
+ */
+export type ReapReleaseDecision = "confirmed" | "unconfirmed" | "errored";
+
+/**
+ * The ONE place a `ReapOutcome` becomes a release decision - every real
+ * caller (`src/tools/run.ts`'s eager onExit wrapper, this file's own
+ * automatic stranded-slot retry, `src/tools/kill.ts`'s manual late-
+ * recovery branch) must go through this function rather than each
+ * inventing its own mapping. This is deliberate: an earlier draft of this
+ * fix had two independently-reasoned mappings that silently disagreed on
+ * what `already-attempted` means, which is exactly the kind of drift a
+ * single shared function exists to prevent.
+ */
+export function reapOutcomeToReleaseDecision(outcome: ReapOutcome): "confirmed" | "unconfirmed" {
+  switch (outcome.kind) {
+    case "confirmed":
+    case "no-child":
+      return "confirmed";
+    case "already-attempted":
+      return outcome.confirmed ? "confirmed" : "unconfirmed";
+    case "unconfirmed":
+      return "unconfirmed";
+  }
+}
+
+/**
  * The sole owner of ghantika's job/output state. Tool handlers use the
  * `jobStore` singleton this module exports below - never construct their
  * own `JobStore` (see this file's header for why a singleton rather than a
@@ -1121,11 +1199,23 @@ export class JobStore {
    * - `reapProcessGroupOnce` (the eager reap at leader-exit, and the
    *   terminal-record fallback a `kill()`/shutdown call reaching an
    *   already-terminal record now also routes through) CHECKS this set
-   *   before ever signaling, and marks it as part of the same call - this
-   *   is the actual "at most one cleanup-reap attempt per job" guarantee,
-   *   and it is what a later attempt against a recycled pgid cannot
-   *   re-trigger (see `src/tools/kill.ts`'s own docs for the disclosed
-   *   PGID-reuse residual this narrows).
+   *   before ever signaling, and marks it as part of the same call. This
+   *   set alone is NOT what makes "at most one SIGNAL-CAPABLE cleanup-reap
+   *   attempt per job" true under concurrency - it is written only AFTER
+   *   `reapProcessGroupOnce`'s own signal-capable attempt has already
+   *   resolved, which is too late to stop two calls reaching that method
+   *   for the same job at once from both taking the signal-capable branch
+   *   (see `reapEntered`'s own docs for the pre-await marker that
+   *   actually closes that window). What this set DOES guarantee is
+   *   idempotence across calls that are NOT racing: once a signal-capable
+   *   attempt has genuinely CONFIRMED the group empty, no later call -
+   *   concurrent or not - re-signals a recycled pgid. An unconfirmed
+   *   first attempt does NOT set this marker, so a later call still
+   *   reaches `reapProcessGroupOnce` again - it just takes that method's
+   *   own existence-only retry branch instead of re-entering the signal-
+   *   capable one (see `src/tools/kill.ts`'s own docs for the disclosed
+   *   PGID-reuse
+   *   residual this narrows).
    * - A LIVE job's own explicit `kill()` signal marks this set too (so a
    *   later terminal-record reap knows a cleanup attempt already covered
    *   this job), but does NOT check it first - a live signal is a
@@ -1146,7 +1236,115 @@ export class JobStore {
    *   for whenever the leader eventually exits on its own.
    */
   private readonly reapAttempted = new Set<string>();
+  /**
+   * Tracks, independently of `reapAttempted`/`kill_confirmed`, whether a
+   * SIGNAL-CAPABLE `reapProcessGroupOnce` attempt has already BEGUN for
+   * this job - set synchronously, in the same tick as the guard that
+   * reads it, before that method's own `await`. This is a distinct
+   * question from either existing marker: `kill_confirmed` answers "did
+   * the reap CONFIRM", and only gets written after the awaited reaper
+   * settles; `reapAttempted` answers "did a signal-capable attempt
+   * CONFIRM zero survivors" and has other writers besides this method.
+   * Neither can double as "has an attempt been ENTERED", because both are
+   * written too late (after an `await`) to close the window this set
+   * exists for: two callers reaching `reapProcessGroupOnce` for the same
+   * job at once - genuinely reachable from two ordinary public `kill`
+   * `tools/call` requests, since the installed MCP SDK dispatches each
+   * inbound request independently rather than awaiting the previous one -
+   * could otherwise both read `kill_confirmed` as still `undefined` and
+   * both take the signal-capable branch, each sending a real signal. A
+   * synchronous, pre-await entry marker closes that: JS's own run-to-
+   * completion semantics mean whichever call's synchronous prologue runs
+   * first sets this before yielding at its `await`, so the second call -
+   * however soon after - sees it already set and takes the existence-only
+   * retry path instead. Never cleared and never used for anything but
+   * that one guard read; `hasReapBeenAttempted`/`markReapAttempted` above
+   * remain the outward-facing "did cleanup already run" answer.
+   */
+  private readonly reapEntered = new Set<string>();
   private seqCounter = 0;
+
+  /**
+   * The concurrency-cap + max-queue-depth policy this store enforces - see
+   * `src/scheduler.ts`'s own header for why the POLICY lives there (pure
+   * functions over plain numbers) while the actual COUNTS live here (this
+   * store is the sole designated owner of persistent state). Defaults to
+   * the real, production, environment-sourced config; a test constructs a
+   * fresh `JobStore` with an explicit small config instead, or calls
+   * `setConcurrencyConfig` to reconfigure an already-constructed store
+   * (e.g. the shared singleton) without a fresh instance.
+   */
+  private concurrencyConfig: ConcurrencyConfig;
+  /** How many jobs currently hold a concurrency slot - spawned and not yet reaped. See `releaseSlot`'s own docs for exactly when a slot is freed. */
+  private activeSlots = 0;
+  /** The FIFO queue of jobs admitted into the queue (the cap was full when they arrived, but queue depth allowed it) - this array's own push/shift order IS insertion order, the queue's own tie-break. */
+  private readonly queue: QueuedJob[] = [];
+  /** Job ids whose concurrency slot has already been released once - see `releaseSlot`'s own docs for why a SECOND release for the same id must be a no-op rather than a real second decrement/dequeue. */
+  private readonly slotReleased = new Set<string>();
+  /**
+   * Job ids that GENUINELY, RIGHT NOW, hold a reserved concurrency slot -
+   * checked by `releaseSlot`'s own ownership guard before it ever
+   * decrements `activeSlots` on a job's behalf. The two are meant to move
+   * together exactly: a job id is added here at the same moment
+   * `activeSlots` is incremented for it, and there are only two such
+   * moments - an immediate `"admit"` (via `createJob`, since `run()`'s
+   * handler calls it right after `requestSlot()` returns `"admit"`, with
+   * no `await` in between - see `src/tools/run.ts`'s own docs) and a
+   * later dequeue-promotion (`dequeueNext`, at its own `activeSlots += 1`).
+   *
+   * A job admitted with `{kind: "queue"}` is the one wrinkle: `createJob`
+   * cannot yet know, at the moment it runs, whether ITS caller's
+   * `requestSlot()` returned `"admit"` or `"queue"` (the two are separate,
+   * uncoupled calls - see `requestSlot`'s own docs), so it marks every job
+   * id optimistically, on the assumption it is being admitted right now.
+   * `enqueueJob` - which is called if and only if the real answer was
+   * `"queue"` - corrects that assumption immediately, in the same
+   * synchronous step as the job's own admission decision, by removing the
+   * id again (see that method's own docs for why nothing can ever observe
+   * the job as reserved in between). `dequeueNext` then re-adds it later,
+   * at the exact point this job actually takes a slot. Net effect: a
+   * queued-but-not-yet-dequeued job is never a member of this set, so
+   * `removeFromQueue` and `drainQueueOnShutdown` - the two ways such a job
+   * can be cancelled before ever reaching `dequeueNext` - have nothing of
+   * their own to revoke here (see their own docs).
+   *
+   * A job id absent from this set never holds a slot: a preflight failure
+   * in `src/tools/run.ts` - invalid cwd, missing executable, or a policy
+   * denial - creates a terminal record via `createFailedJob`, which never
+   * touches this set at all; a queued job is absent for as long as it
+   * remains queued, by the mechanism above.
+   */
+  private readonly slotReserved = new Set<string>();
+  /**
+   * Job ids whose concurrency slot `releaseSlot` refused to free because
+   * the reap that would have justified freeing it never confirmed zero
+   * survivors (or errored outright) - see `releaseSlot`'s own fail-closed
+   * docs and `markSlotStranded`/`retryStrandedSlot`. `attempts` counts
+   * real `reapProcessGroupOnce` cycles this store has run for the job so
+   * far (the initial one plus any AUTOMATIC retry - never a manual
+   * `kill()` retry, which is unbounded by design and does not touch this
+   * counter). `retryTimer` is the pending automatic-retry handle, or
+   * `undefined` once the retry budget (`MAX_STRANDED_SLOT_ATTEMPTS`) is
+   * exhausted or a retry has already fired and is awaiting its own
+   * result. `deleteJob` clears both the timer and this entry, the same
+   * discipline `getSlotReleasedCount`'s own docs establish for
+   * `slotReleased` - otherwise a TTL-purged job would leave an orphaned
+   * timer firing against a job no longer in the store.
+   */
+  private readonly strandedSlots = new Map<
+    string,
+    { attempts: number; retryTimer: NodeJS.Timeout | undefined }
+  >();
+  /** The total number of real `reapProcessGroupOnce` cycles a stranded job ever gets (the initial attempt plus automatic retries) before this store gives up and leaves it a permanent, disclosed residual - see `markSlotStranded`/`retryStrandedSlot`. Never bounds a manual `kill()` retry, which a caller can always attempt again by hand regardless of this budget. */
+  private static readonly MAX_STRANDED_SLOT_ATTEMPTS = 2;
+  /** How long `markSlotStranded`/`retryStrandedSlot` wait before running a stranded job's next automatic retry - long enough that a genuinely-in-progress kernel-level reap has a real chance to finish first, short enough that a real stranding resolves without the caller needing to notice and retry manually. */
+  private static readonly STRANDED_SLOT_RETRY_DELAY_MS = 3000;
+  /** Whether this store has begun shutting down - see `beginShutdown`'s own docs for exactly what that gates and why it is permanent on a real server. */
+  private shuttingDown = false;
+
+  constructor(concurrencyConfig: ConcurrencyConfig = loadConcurrencyConfigFromEnv()) {
+    this.concurrencyConfig = normalizeConcurrencyConfig(concurrencyConfig);
+  }
 
   /** True if a job with this id has ever been registered. */
   has(jobId: string): boolean {
@@ -1215,6 +1413,17 @@ export class JobStore {
       is_shell: input.isShell,
     };
     this.jobs.set(record.job_id, record);
+    // Optimistically marks this job reserved, on the assumption it is
+    // being admitted right now - true whenever the caller's own
+    // `requestSlot()` returned `"admit"`, since `run()`'s handler never
+    // calls `createJob` at all except after that decision (see
+    // `slotReserved`'s own field doc for the full contract). When the
+    // real answer was `"queue"` instead, `enqueueJob` corrects this in
+    // the same synchronous step, immediately after - this store cannot
+    // know which answer applies AT this exact call, since `createJob` and
+    // `requestSlot` are two separate, uncoupled calls (see `requestSlot`'s
+    // own docs), so it marks first and the very next step corrects it.
+    this.slotReserved.add(record.job_id);
     // ONE shared JobSeqCounter for this job's stdout and stderr - see its
     // own docs for why sharing it is what makes StreamLineEntry.seq a real
     // per-job GLOBAL event sequence.
@@ -1262,6 +1471,615 @@ export class JobStore {
       stderr: createStreamBufferState(eventSeq),
     });
     return record;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Concurrency cap + FIFO queue
+  // ---------------------------------------------------------------------------
+
+  /** The currently configured concurrency cap - `src/tools/list.ts`'s own response surfaces this. */
+  getConcurrencyCap(): number {
+    return this.concurrencyConfig.maxConcurrentJobs;
+  }
+
+  /** How many jobs are currently waiting in the FIFO queue - exposed for observability/testing, the same "real oracle" role `getJobTerminalListenerCount` already plays for its own subscriber count. */
+  getQueueLength(): number {
+    return this.queue.length;
+  }
+
+  /** How many concurrency slots are currently held (spawned and not yet reaped) - exposed for the same observability/testing reason as `getQueueLength`. */
+  getActiveSlotCount(): number {
+    return this.activeSlots;
+  }
+
+  /**
+   * How many job ids currently hold a `slotReleased` dedupe entry - exposed
+   * for the same observability/testing reason as `getQueueLength`/
+   * `getActiveSlotCount`. `deleteJob` reclaims a job's entry from
+   * `slotReleased` when it purges everything else this store holds for
+   * that job, so this count returning to (or staying at) its
+   * pre-purge-cycle value across repeated create/release/delete cycles is
+   * the real oracle proving `slotReleased` does not grow without bound on
+   * a long-running server, rather than merely trusting that the deletion
+   * line was added.
+   */
+  getSlotReleasedCount(): number {
+    return this.slotReleased.size;
+  }
+
+  /**
+   * Reconfigures the concurrency cap / max-queue-depth this store
+   * enforces, from this call onward. Never touches the CURRENT active
+   * count: lowering the cap below a currently-elevated active count just
+   * means no NEW slot opens up until enough jobs finish to bring it back
+   * under the new cap (nothing already running is ever killed just
+   * because the configured cap changed under it).
+   *
+   * Raising the cap DOES proactively drain the queue now (`drainQueue`) -
+   * a queued job never held a slot to release in the first place, so
+   * nothing calls `releaseSlot` on its behalf; only a DIFFERENT job's own
+   * release, or this reconfiguration itself, ever re-evaluates a queued
+   * entry. Without draining here, a cap lowered to (or started at) zero
+   * and then raised back up would leave every queued job waiting
+   * indefinitely for some unrelated job's release to notice the new
+   * room, rather than being admitted the moment room actually exists.
+   * Draining admits every now-eligible queued job immediately, in FIFO
+   * order, in one call.
+   *
+   * Exists so a long-lived server (or this store's own test suite) can
+   * retune without a restart - see `loadConcurrencyConfigFromEnv` for how
+   * the real, production singleton is normally configured once, at
+   * startup.
+   */
+  setConcurrencyConfig(config: ConcurrencyConfig): void {
+    this.concurrencyConfig = normalizeConcurrencyConfig(config);
+    this.drainQueue();
+  }
+
+  /**
+   * The whole admission decision for a NEW `run()` call, plus its
+   * corresponding state commit, as one step a caller can never split apart
+   * into "decide" without "commit" (this codebase is single-threaded end
+   * to end, so nothing else can interleave between the decision and the
+   * commit below). See `src/scheduler.ts`'s `decideAdmission` for the pure
+   * policy this wraps.
+   *
+   * - `"admit"`: a real slot was free - RESERVED here (this call already
+   *   incremented the active count); the caller should spawn the job
+   *   right now.
+   * - `"queue"`: no slot was free (or something is already ahead of this
+   *   job in line), but the queue has room - the caller must follow up
+   *   with `enqueueJob(jobId, onDequeued)` once it has a real `jobId` to
+   *   enqueue (this method alone can't do that: no job exists yet at
+   *   decision time).
+   * - `"reject"`: neither a slot nor queue room exists - the caller must
+   *   never create a running/queued job for this `run()` call at all.
+   */
+  requestSlot(): AdmissionDecision {
+    const decision = decideAdmission(
+      this.activeSlots,
+      this.queue.length,
+      this.concurrencyConfig,
+      this.shuttingDown
+    );
+    if (decision.kind === "admit") {
+      this.activeSlots += 1;
+    }
+    return decision;
+  }
+
+  /**
+   * Permanently closes admission - every `requestSlot()` call from this
+   * moment on rejects with `"shutting-down"`, regardless of the cap/queue's
+   * own state. Called once, as the very FIRST thing `src/server.ts`'s
+   * `performShutdown` does, strictly before it drains the queue or starts
+   * awaiting the live-job reap: a `run()` call that arrives during that
+   * later awaited reap must never be admitted or queued into a queue this
+   * shutdown is never going to drain again (`drainQueueOnShutdown` only
+   * ever runs once, earlier in the same function). Idempotent - a second
+   * call is a no-op.
+   *
+   * There is no legitimate way to reverse this on a real server: a real
+   * process shuts down once and exits. `clearShutdownGate` exists purely
+   * because this codebase's own test suite constructs several independent
+   * `createServer()` instances against this one process-lifetime singleton
+   * - see that method's own docs.
+   */
+  beginShutdown(): void {
+    this.shuttingDown = true;
+  }
+
+  /**
+   * Reopens admission - the inverse of `beginShutdown`. Called once, at
+   * the START of every `src/server.ts` `createServer()` call, since a
+   * freshly constructed server is by definition not itself shutting down,
+   * whatever an EARLIER server built against this same shared singleton
+   * already did to it. Harmless in real production use (a real process
+   * only ever calls `createServer()` once, before its own first and only
+   * shutdown), and is what keeps this codebase's own test suite - which
+   * constructs many independent servers against the one process-lifetime
+   * `jobStore` singleton - from having one test's real shutdown
+   * permanently poison every later test's own use of `requestSlot()`.
+   */
+  clearShutdownGate(): void {
+    this.shuttingDown = false;
+  }
+
+  /**
+   * Enqueues an ALREADY-admitted-to-the-queue job (the caller must have
+   * just received `{kind: "queue"}` from `requestSlot()`) onto the FIFO
+   * queue, in real insertion order - this array's own push order IS the
+   * insertion-sequence tie-break: two `run()` calls can only ever be
+   * enqueued one after the other, never simultaneously, since this
+   * codebase's handler is synchronous end to end with no `await` between
+   * validating one call and returning its result (see `src/tools/run.ts`'s
+   * own docs). Writes this job's own 1-based `queue_position` onto its
+   * `JobRecord` - appending to the tail never changes any EARLIER queued
+   * job's own distance from the front, so only this new entry's position
+   * needs setting here (contrast `dequeueNext`, which removes from the
+   * FRONT and therefore does renumber every remaining entry).
+   *
+   * `onDequeued` is called EXACTLY ONCE, later, whenever this entry
+   * reaches the front of the queue AND a slot has just been reserved for
+   * it (see `releaseSlot`/`dequeueNext`) - never before, and never more
+   * than once. The caller (`src/tools/run.ts`) supplies a closure that
+   * performs the actual deferred `spawnManaged` call for this exact job at
+   * that moment; this store has no opinion on what "actually running the
+   * job" means, only on WHEN it becomes this job's turn.
+   *
+   * ALSO removes `jobId` from `slotReserved` - `createJob` marks every job
+   * reserved optimistically, on the assumption it is being admitted right
+   * now, and this call is the caller telling this store that assumption
+   * was wrong for THIS job (the caller only reaches here after its own
+   * `requestSlot()` returned `"queue"`, never `"admit"`). This is the
+   * ONE place that correction happens, and it happens immediately: nothing
+   * can observe `jobId` as reserved in the gap between `createJob` and
+   * this call, since production and every test call them back to back
+   * with no `await` in between (see `src/tools/run.ts`'s own docs on why
+   * `run()`'s handler is synchronous end to end). `dequeueNext` re-adds
+   * this exact id the moment it actually promotes this job, at the exact
+   * point it increments `activeSlots` for it - so a queued job is in
+   * `slotReserved` only for as long as it is actually true that this job
+   * holds, or is about to hold, a slot; never while it is merely waiting.
+   * `removeFromQueue`/`drainQueueOnShutdown` need no matching cleanup of
+   * their own as a result: whichever of them a still-queued job's
+   * cancellation reaches, the entry was already gone from here.
+   */
+  enqueueJob(jobId: string, onDequeued: () => void): void {
+    this.queue.push({ jobId, onDequeued });
+    const record = this.jobs.get(jobId);
+    if (record) record.queue_position = this.queue.length;
+    this.slotReserved.delete(jobId);
+  }
+
+  /**
+   * Removes `jobId` from the FIFO queue if it is still sitting there -
+   * `src/tools/kill.ts`'s own path for cancelling a job that has not yet
+   * spawned, distinct from `drainQueueOnShutdown`'s bulk drain of the
+   * WHOLE queue at once. Clears the removed entry's own `queue_position`,
+   * then renumbers every STILL-queued job's position via
+   * `renumberQueuePositions` - removing from the MIDDLE of the queue (not
+   * just the front, which is all `dequeueNext` ever does) still moves
+   * every LATER entry one position closer to the front. Never touches
+   * `activeSlots`: a queued job never held a concurrency slot to begin
+   * with, so there is nothing to release. Never calls the removed entry's
+   * own `onDequeued` closure either - that closure performs the deferred
+   * spawn `enqueueJob`'s caller supplied, and cancelling a queued job is
+   * the opposite of ever giving it that spawn.
+   *
+   * Never touches `slotReserved` either, and needs no such cleanup: a
+   * still-queued job's `slotReserved` entry was already removed by
+   * `enqueueJob` the moment it was queued (see that method's own docs), so
+   * this call - like every other cancellation of a queued job - has
+   * nothing left to revoke there. That is what makes a later, mistaken
+   * second `kill`/`tasks.cancel` against the now-terminal record
+   * correctly refused by `releaseSlot`'s own ownership guard, without this
+   * method having to know that guard exists.
+   *
+   * Returns `false`, a pure no-op, when `jobId` is not currently in the
+   * queue (never queued, already dequeued, or already removed by an
+   * earlier call).
+   */
+  removeFromQueue(jobId: string): boolean {
+    const index = this.queue.findIndex((entry) => entry.jobId === jobId);
+    if (index === -1) return false;
+    this.queue.splice(index, 1);
+    const record = this.jobs.get(jobId);
+    if (record) record.queue_position = undefined;
+    this.renumberQueuePositions();
+    return true;
+  }
+
+  /**
+   * Releases exactly one concurrency slot - called once a job that
+   * previously held one (admitted immediately, or dequeued and actually
+   * spawned) reaches its real end: either a genuine exit/kill (after its
+   * reap decision has been awaited to completion - see `reapPromise`
+   * below) or a spawn failure (no reap needed at all, since no real child
+   * was ever attached for one). A slot is released exactly once, and only
+   * after the finishing job's own reap decision has been awaited to
+   * completion AND that decision is `"confirmed"` - see the fail-closed
+   * paragraph below for what happens otherwise.
+   *
+   * @param jobId - the finishing job this release belongs to. Every real
+   *   caller (`src/tools/run.ts`'s `beginSpawn`, this file's own
+   *   `retryStrandedSlot`, `src/tools/kill.ts`'s manual late-recovery
+   *   branch) already knows which job just finished, so this identity
+   *   costs nothing to supply and is what makes a DUPLICATE release for
+   *   the SAME job detectable at all: a second call for a jobId already
+   *   recorded in `slotReleased` is a no-op - it never decrements
+   *   `activeSlots` again and never advances the queue a second time.
+   *   Without this, two release calls for one finishing job (a bug
+   *   elsewhere, a retry, a race) each independently free "a" slot and
+   *   each independently dequeue the next waiting job - two jobs admitted
+   *   for one job's single freed slot, silently pushing real concurrency
+   *   above the configured cap while `activeSlots` itself under-reports
+   *   it (the net of two decrements against one real reservation). Logged
+   *   loudly to stderr rather than thrown: this codebase's own convention
+   *   (see every other `console.error` in `src/tools/run.ts`'s spawn-
+   *   callback wiring) is to surface an internal anomaly as a diagnostic
+   *   and keep the server alive, never to crash a long-running process
+   *   over a bug in its own bookkeeping. The guard is checked TWICE - once
+   *   synchronously up front (the common case: no `reapPromise`, or one
+   *   that resolves without ever truly yielding), and once again
+   *   immediately before the actual commit below, AFTER any real
+   *   `await` - a concurrent second caller for the same job (e.g. this
+   *   file's own automatic retry racing a manual `kill()` late-recovery
+   *   call) can only ever pass the first check while this call is
+   *   suspended at the `await`, and the second check is what stops BOTH
+   *   from reaching the commit once one of them already has.
+   * @param reapPromise - resolves to the release decision the finishing
+   *   job's reap actually produced - `"confirmed"` (safe to free the
+   *   slot), or `"unconfirmed"`/`"errored"` (NOT safe - see the fail-
+   *   closed paragraph below). Every real caller derives this via
+   *   `reapOutcomeToReleaseDecision`, never by inventing its own mapping.
+   *   Omit (or pass `undefined`) for a job that never had a real child
+   *   attached at all (a spawn failure, or a caller that already
+   *   confirmed the reap itself out of band, e.g. `kill.ts`'s late-
+   *   recovery branch) - there is nothing to await, so the decision is
+   *   treated as `"confirmed"` immediately and synchronously (this path
+   *   never actually suspends this async function at all).
+   *
+   * FAIL-CLOSED: a decision other than `"confirmed"` does NOT free the
+   * slot - `activeSlots` is left exactly as it was (still counting this
+   * job as active) and the job is handed to `markSlotStranded` instead,
+   * which schedules a bounded automatic retry (see that method's own
+   * docs). This is deliberate: a reap that could not confirm zero
+   * survivors means real child processes may still exist, and admitting
+   * a NEW job into a slot that a live process may still be occupying
+   * would let real concurrency exceed the configured cap - the exact
+   * hazard this store's whole cap-enforcement design exists to prevent.
+   * The slot stays held, disclosed via `getStrandedSlotCount`, until
+   * either the automatic retry confirms it, a manual `kill()` late-
+   * recovery call confirms it, or the retry budget runs out and it
+   * becomes a permanent, disclosed residual.
+   *
+   * On a CONFIRMED release: frees the slot, clears any `strandedSlots`
+   * entry for this job (a job can only reach a confirmed release here
+   * once - either directly, or via `markSlotStranded`'s own retry path -
+   * so any stale stranded-tracking is stale by construction) - including
+   * cancelling that entry's own pending `retryTimer` first, exactly as
+   * `deleteJob` does, so a confirmed release reached ahead of a scheduled
+   * automatic retry (the manual `kill()` late-recovery path can win this
+   * race) doesn't leave that retry's timer running for
+   * `STRANDED_SLOT_RETRY_DELAY_MS` past the point its own entry is gone -
+   * then drains
+   * the queue (`drainQueue`) - handing the freed capacity to every
+   * currently-eligible queued job in FIFO order, not just the first one
+   * (a single release can free room for more than one queued job at once
+   * now that a release is not guaranteed to happen exactly once per
+   * finishing job's first attempt - see `drainQueue`'s own docs). Never
+   * lets the active count go negative (a defensive floor - this method is
+   * the only writer that ever decrements it, and it is only ever meant to
+   * be called once per slot that `requestSlot`/`dequeueNext` reserved,
+   * but the floor costs nothing and removes any possibility of it
+   * drifting negative under a future bug).
+   */
+  async releaseSlot(jobId: string, reapPromise?: Promise<ReapReleaseDecision>): Promise<void> {
+    if (!this.slotReserved.has(jobId)) {
+      // Ownership guard: `jobId` never reserved a slot in the first place
+      // (a preflight failure in `src/tools/run.ts` - invalid cwd, missing
+      // executable, or a policy denial - creates a terminal failed record
+      // via `createFailedJob`, never `createJob`, before admission control
+      // ever runs). Every real caller of this method (a spawn
+      // failure or a confirmed exit in `beginSpawn`, the automatic
+      // stranded-slot retry, `src/tools/kill.ts`'s manual late-recovery
+      // branch) can still be called against a job in this state - a
+      // terminal record's own state gives no signal about whether it ever
+      // held a slot - so this guard, not caller discipline, is what keeps
+      // `activeSlots` honest: decrementing it here would free a DIFFERENT
+      // job's reservation. A no-op, not an error: from this job's own
+      // point of view there was never a slot to release, so this logs at
+      // `warn`, not `error` (both reach the same stderr diagnostic channel
+      // every log call in this codebase uses, since stdout is reserved for
+      // the MCP stdio protocol stream - this is the one call site in the
+      // codebase that isn't actually reporting a failure).
+      console.warn(
+        `[ghantika] releaseSlot called for job "${jobId}", which never reserved a concurrency slot - ignoring, since decrementing activeSlots here would free a different job's reservation`
+      );
+      return;
+    }
+    if (this.slotReleased.has(jobId)) {
+      console.error(
+        `[ghantika] releaseSlot called more than once for job "${jobId}" - ignoring the duplicate release, since this job's slot was already freed`
+      );
+      return;
+    }
+    const decision = reapPromise === undefined ? "confirmed" : await reapPromise;
+    if (this.slotReleased.has(jobId)) {
+      // A concurrent release for this same job already committed while
+      // this call was suspended awaiting its own decision above - see
+      // this method's own "guard is checked TWICE" docs.
+      return;
+    }
+    if (decision !== "confirmed") {
+      this.markSlotStranded(jobId);
+      return;
+    }
+    this.slotReleased.add(jobId);
+    const stranded = this.strandedSlots.get(jobId);
+    if (stranded?.retryTimer !== undefined) clearTimeout(stranded.retryTimer);
+    this.strandedSlots.delete(jobId);
+    this.activeSlots = Math.max(0, this.activeSlots - 1);
+    this.drainQueue();
+  }
+
+  /**
+   * Records that `jobId`'s concurrency slot could NOT be freed because the
+   * reap that would have justified freeing it did not confirm zero
+   * survivors, or errored outright (`releaseSlot`'s own fail-closed
+   * paragraph) - and, unless this job has already exhausted its bounded
+   * automatic-retry budget (`MAX_STRANDED_SLOT_ATTEMPTS`), schedules
+   * exactly one retry attempt after `STRANDED_SLOT_RETRY_DELAY_MS`
+   * (`retryStrandedSlot`). Never touches `activeSlots` or the queue - a
+   * stranded slot stays held (still counted active) until either a retry
+   * confirms it, a manual `kill()` late-recovery call confirms it
+   * (`src/tools/kill.ts`), or the retry budget runs out and it becomes a
+   * permanent, disclosed residual (`getStrandedSlotCount`) - the same
+   * honesty pattern `kill_confirmed: false` already establishes elsewhere
+   * in this codebase, rather than inventing a new disclosure channel for
+   * this one case.
+   *
+   * Idempotent against being called more than once for a job already
+   * tracked here: a second mark for a job with an entry already present
+   * is a no-op (does not reschedule, does not touch `attempts`) - the
+   * legitimate way this can happen is the same concurrent-caller race
+   * `releaseSlot`'s own docs describe, where two callers both reach a
+   * non-confirmed decision for the same job before either commits.
+   *
+   * DISCLOSED OPERATIONAL HAZARD: this fail-closed design trades a
+   * different failure mode for the real-cap-overrun one it closes - in an
+   * environment where the underlying process-existence oracle
+   * (`killProcessGroupPosix`'s own `pgrep`-based confirmation, see
+   * `src/process.ts`) is itself broken or permanently unavailable, EVERY
+   * job would exhaust its retry budget without ever confirming, and
+   * server capacity would monotonically strand toward zero with no
+   * automatic recovery - including the manual `kill()` late-recovery
+   * path, which relies on the SAME oracle. This is a real, accepted
+   * precondition rather than a hazard this design closes: a broken
+   * process-existence oracle is a more fundamental failure than this
+   * store can repair from underneath it, and `getStrandedSlotCount`
+   * exists precisely so this condition is observable (a monotonically
+   * growing count with no drops) rather than silent.
+   */
+  private markSlotStranded(jobId: string): void {
+    if (this.strandedSlots.has(jobId)) return;
+    const entry: { attempts: number; retryTimer: NodeJS.Timeout | undefined } = {
+      attempts: 1,
+      retryTimer: undefined,
+    };
+    this.strandedSlots.set(jobId, entry);
+    if (entry.attempts < JobStore.MAX_STRANDED_SLOT_ATTEMPTS) {
+      entry.retryTimer = setTimeout(() => {
+        entry.retryTimer = undefined;
+        void this.retryStrandedSlot(jobId);
+      }, JobStore.STRANDED_SLOT_RETRY_DELAY_MS);
+    }
+  }
+
+  /**
+   * The bounded automatic retry `markSlotStranded` schedules - runs a
+   * fresh `reapProcessGroupOnce` cycle for `jobId` (a genuine second
+   * chance: an unconfirmed first attempt leaves `hasReapBeenAttempted`
+   * `false`, so this really does re-consult the reaper rather than
+   * hitting the already-attempted short-circuit - see that method's own
+   * docs) and, if the decision this produces (via the SAME shared
+   * `reapOutcomeToReleaseDecision` every other caller uses) is now
+   * `"confirmed"`, commits the release through `releaseSlot` exactly as
+   * the original eager reap would have. A no-op if `jobId` is no longer
+   * tracked in `strandedSlots` at all (the job was deleted, or a manual
+   * `kill()` late-recovery call already won the race and committed the
+   * release first - `releaseSlot`'s own docs cover that race).
+   *
+   * Advances `attempts` before running the retry, regardless of the
+   * outcome (a real reap cycle happened either way), then schedules
+   * exactly one further retry if the budget still allows it - so no job
+   * ever gets more than `MAX_STRANDED_SLOT_ATTEMPTS` real reap cycles in
+   * total (the initial attempt plus this method's own retries). A
+   * `reapProcessGroupOnce` rejection is treated as `"errored"` (fails
+   * closed, same as `releaseSlot`'s own `reapPromise` contract) rather
+   * than propagating - this runs off a `setTimeout` with no caller to
+   * hand a rejection back to.
+   */
+  private async retryStrandedSlot(jobId: string): Promise<void> {
+    const entry = this.strandedSlots.get(jobId);
+    if (entry === undefined) return;
+    entry.attempts += 1;
+    let decision: ReapReleaseDecision;
+    try {
+      decision = reapOutcomeToReleaseDecision(await this.reapProcessGroupOnce(jobId));
+    } catch {
+      decision = "errored";
+    }
+    if (decision === "confirmed") {
+      await this.releaseSlot(jobId, Promise.resolve(decision));
+      return;
+    }
+    if (entry.attempts < JobStore.MAX_STRANDED_SLOT_ATTEMPTS) {
+      entry.retryTimer = setTimeout(() => {
+        entry.retryTimer = undefined;
+        void this.retryStrandedSlot(jobId);
+      }, JobStore.STRANDED_SLOT_RETRY_DELAY_MS);
+    }
+  }
+
+  /**
+   * How many jobs currently have a stranded (held, unreleased, unconfirmed)
+   * concurrency slot - exposed for the same observability/testing reason
+   * as `getSlotReleasedCount`. A non-zero count that does not shrink on
+   * its own (no further retry pending, no manual `kill()` late-recovery
+   * call made) is the honest, disclosed residual `markSlotStranded`'s own
+   * docs describe: a job whose retry budget ran out with its reap still
+   * unconfirmed, which this store deliberately does not pretend was
+   * safely reaped.
+   */
+  getStrandedSlotCount(): number {
+    return this.strandedSlots.size;
+  }
+
+  /**
+   * Whether `jobId` currently holds a stranded (unconfirmed, still-held)
+   * concurrency slot - the per-job predicate behind the aggregate
+   * `getStrandedSlotCount` above. Exists so a caller with a reclamation
+   * policy of its own (`src/tasksAdapter.ts`'s TTL purge is the one real
+   * caller today) can refuse to reclaim a job's record WHILE it is the
+   * only durable, attributable trace of a held slot - see `deleteJob`'s
+   * own docs for why deleting a stranded job's record would otherwise
+   * silently and permanently lose both the observability and the manual
+   * `kill()` recovery target for that held slot, with `activeSlots` itself
+   * never decremented to compensate.
+   */
+  isJobSlotStranded(jobId: string): boolean {
+    return this.strandedSlots.has(jobId);
+  }
+
+  /**
+   * How many jobs currently have an entry in `reapEntered` - exposed for
+   * the same observability/testing reason as `getSlotReleasedCount` and
+   * `getStrandedSlotCount` above. `reapEntered` only ever grows (via
+   * `reapProcessGroupOnce`'s own signal-capable branch) and is reclaimed
+   * only by `deleteJob`, so this count returning to (or staying at) its
+   * pre-purge-cycle value across repeated create/reap/delete cycles is
+   * the real oracle proving it does not grow without bound on a
+   * long-running server, exactly the same shape `getSlotReleasedCount`'s
+   * own docs describe for `slotReleased`.
+   */
+  getReapEnteredCount(): number {
+    return this.reapEntered.size;
+  }
+
+  /**
+   * Gives a just-freed slot to the NEXT queued job (FIFO - the queue
+   * array's own order IS insertion order), if any are waiting AND the
+   * CURRENTLY configured cap actually has room for one more active job.
+   * That second condition is what enforces `setConcurrencyConfig`'s own
+   * documented contract for a lowered cap: if an operator drops
+   * `maxConcurrentJobs` below the count that is presently active, a slot
+   * freeing up here must NOT be handed to the next queued job until
+   * enough OTHER jobs have also finished to bring `activeSlots` back
+   * under the new, lower cap - so this checks `activeSlots` against the
+   * cap AFTER `releaseSlot` has already decremented it for the finishing
+   * job, and, when the cap does not yet allow it, leaves the queue
+   * entirely untouched (nothing is shifted off, `activeSlots` is not
+   * incremented) rather than draining it one release at a time regardless
+   * of the new cap. When the cap does allow it: reserves the slot for the
+   * dequeued job immediately (increments the active count again right
+   * here - `releaseSlot`/`dequeueNext` are the only writers of that count,
+   * and this codebase is single-threaded, so there is no real concurrency
+   * to race between "freed" and "reserved again" regardless), clears the
+   * dequeued job's own `queue_position` (it is no longer queued - it is
+   * about to actually start), renumbers every STILL-queued job's position
+   * (each one just moved one closer to the front), then calls the
+   * dequeued job's own `onDequeued` closure, which performs the actual
+   * deferred spawn for it (see `enqueueJob`'s own docs). A no-op when the
+   * queue is empty OR the cap does not currently allow another active job.
+   *
+   * Also re-adds this job's id to `slotReserved`, right alongside the
+   * `activeSlots` increment - `enqueueJob` removed it the moment this job
+   * was queued (see that method's own docs), and THIS is the moment it
+   * becomes true again: the job now genuinely holds a slot. Skipping this
+   * would leave a promoted job permanently unmarked, so its own eventual
+   * `releaseSlot` call would be wrongly refused by the ownership guard and
+   * `activeSlots` would never come back down for it.
+   */
+  private dequeueNext(): void {
+    if (this.queue.length === 0) return;
+    if (this.activeSlots >= this.concurrencyConfig.maxConcurrentJobs) return;
+    const next = this.queue.shift()!;
+    const record = this.jobs.get(next.jobId);
+    if (record) record.queue_position = undefined;
+    this.renumberQueuePositions();
+    this.activeSlots += 1;
+    this.slotReserved.add(next.jobId);
+    next.onDequeued();
+  }
+
+  /**
+   * Repeatedly calls `dequeueNext` until a call actually leaves the queue
+   * unchanged - the caller-facing entry point for "admit every queued job
+   * the cap currently allows," not just the single next one. Needed
+   * because freeing (or raising) capacity can now make room for MORE than
+   * one queued job at once: `releaseSlot`'s fail-closed handling means a
+   * release does not happen exactly once per finishing job's first
+   * attempt, and `setConcurrencyConfig` raising the cap can jump it past
+   * several queued jobs at a time - a single `dequeueNext` call only ever
+   * admits ONE.
+   *
+   * Terminates because the queue only ever SHRINKS across this loop's own
+   * iterations (nothing inside it enqueues a new job - `dequeueNext`
+   * itself is already a safe, side-effect-free no-op once the queue is
+   * empty or the cap does not currently allow another active job) - a
+   * queue bounded to `maxQueueDepth` entries drains in at most that many
+   * iterations, and reaching a cap or empty-queue no-op leaves the length
+   * unchanged, which is exactly this loop's own stopping condition.
+   */
+  private drainQueue(): void {
+    let previousLength = this.queue.length;
+    for (;;) {
+      this.dequeueNext();
+      if (this.queue.length === previousLength) return;
+      previousLength = this.queue.length;
+    }
+  }
+
+  /** Rewrites every currently-queued job's own `queue_position` from its (1-based) index in the queue array - called after a dequeue, since removing the FRONT entry moves every remaining one a position closer to the front (an enqueue, by contrast, only ever needs to set the ONE new entry's own position - see `enqueueJob`). */
+  private renumberQueuePositions(): void {
+    this.queue.forEach((entry, index) => {
+      const record = this.jobs.get(entry.jobId);
+      if (record) record.queue_position = index + 1;
+    });
+  }
+
+  /**
+   * Called once, at server shutdown (`src/server.ts`'s `performShutdown`):
+   * kills every job still sitting in the FIFO queue (it never got a
+   * chance to actually spawn) and empties the queue, so nothing is left
+   * waiting in limbo once the process exits. Drains front-to-back (this
+   * queue's own FIFO order), one entry at a time; idempotent (a second
+   * call finds an already-empty queue and is a pure no-op).
+   *
+   * A queued job never had a real child attached (`attachChild` is only
+   * ever called once a job actually spawns - see `enqueueJob`'s own
+   * docs), so there is nothing to reap here: `markKilled` alone is the
+   * complete termination for this class of job. `"queue-drained-at-
+   * shutdown"` is a descriptive synthetic `signal` value, not a real POSIX
+   * signal - the same pattern `src/tools/kill.ts`'s own Windows path
+   * already uses (`"SIGKILL-equiv"`) for a termination that never
+   * involved sending an actual signal to a real process.
+   *
+   * Never touches `slotReserved`, and needs no such cleanup: every job
+   * still in the queue at this point had its `slotReserved` entry removed
+   * already, by `enqueueJob`, the moment it was queued (see that method's
+   * own docs) - so, like `removeFromQueue`, there is nothing here left to
+   * revoke.
+   */
+  drainQueueOnShutdown(): void {
+    while (this.queue.length > 0) {
+      const entry = this.queue.shift()!;
+      const record = this.jobs.get(entry.jobId);
+      if (record) record.queue_position = undefined;
+      this.markKilled(entry.jobId, "queue-drained-at-shutdown");
+    }
   }
 
   /**
@@ -1724,9 +2542,28 @@ export class JobStore {
    * it that this codebase treats as covering the cleanup-reap concern -
    * see `reapAttempted`'s own docs for exactly which signals qualify.
    * Idempotent: setting it again for the same job id is a harmless no-op.
+   *
+   * `reapProcessGroupOnce` marks this only AFTER awaiting its own reaper
+   * call, so an unconfirmed outcome correctly leaves it unset - see that
+   * method's own docs. The concurrent-double-signal window this
+   * previously reopened (two direct calls for the same job both passing
+   * a pre-await guard keyed off this set, or off `kill_confirmed`) is now
+   * closed by `reapEntered`, a separate marker written synchronously
+   * BEFORE that same `await` - see that field's own docs for why one
+   * marker cannot answer both "entered" and "confirmed".
    */
   markReapAttempted(jobId: string): void {
     this.reapAttempted.add(jobId);
+  }
+
+  /** See `reapEntered`'s own class-level docs. */
+  private hasReapEntered(jobId: string): boolean {
+    return this.reapEntered.has(jobId);
+  }
+
+  /** See `reapEntered`'s own class-level docs. */
+  private markReapEntered(jobId: string): void {
+    this.reapEntered.add(jobId);
   }
 
   /**
@@ -1767,23 +2604,38 @@ export class JobStore {
    * SIGKILL escalation was correctly refused), unlike the root-exits-
    * first case this function was originally written for.
    *
-   * Deliberately never runs the leader-pid identity check
-   * (`evaluatePreSignalIdentityGate`) the live `kill()` path uses, in
-   * EITHER of the two cases above: in the root-exits-first case the
-   * leader is already gone by construction, so a leader-pid comparison
-   * would always read "not-found" and abort before ever reaching a group
-   * that can still hold real, live descendants; in the combined-degraded
-   * RETRY case the leader may still be alive, but it is the SAME tracked
-   * pid this codebase has held continuously since spawn - nothing about
-   * this retry involves a fresh pid that could have been recycled out
-   * from under it, so the check that guards against a REUSED leader pid
-   * has nothing to add here either. Real protection for the retry case
-   * comes from `killProcessGroupPosix`'s own escalation identity gate,
-   * run fresh on every call (see `src/process.ts`'s
-   * `evaluateEscalationIdentityGate`). `killProcessGroupPosix` itself
-   * checks group EXISTENCE before ever signaling (see that function's own
-   * docs) - an already-empty group is a safe no-op there, never a
-   * delivered signal.
+   * RETRY SAFETY - a RETRY call (this function invoked again for a job
+   * whose first attempt left `hasReapBeenAttempted` `false`, i.e. an
+   * unconfirmed outcome) NEVER signals. Ownership continuity over
+   * `handle.pid`'s numeric value is real ONLY at the moment of the FIRST
+   * real attempt for a job: the eager root-exits-first call happens
+   * essentially synchronously with the leader's own exit, when a POSIX
+   * pgid cannot yet have been recycled, since the group (or its
+   * descendants) has held it continuously since this codebase's own spawn
+   * call. By the time a RETRY runs - `STRANDED_SLOT_RETRY_DELAY_MS` later
+   * for the automatic path, or arbitrarily later for a manual `kill()`
+   * late-recovery call - that guarantee no longer holds: if the group DID
+   * fully empty out between the first attempt and now, its numeric pgid
+   * is free for the OS to hand to an unrelated later process group, and a
+   * naive re-signal has no way to tell that recycled group from this
+   * job's own. `killProcessGroupPosix`'s own escalation identity gate
+   * (`evaluateEscalationIdentityGate`) does NOT close this: it compares an
+   * identity snapshot taken just before ITS OWN first SIGTERM against one
+   * re-read just before ITS OWN follow-up SIGKILL - both within the SAME
+   * call, moments apart - and has nothing to say about whether the group
+   * that call's FIRST SIGTERM targets is still this job's own, when that
+   * call is itself a delayed retry. So a retry here calls
+   * `existenceOnlyReaper` (the real default is `confirmProcessGroupReapedPosix`,
+   * the same pure, non-signaling `pgrep`-based oracle `killProcessGroupPosix`
+   * already uses for its own post-signal confirmation) instead of the
+   * signal-capable `reaper`: confirmed-gone is safe to trust and release
+   * on (no signal was ever sent, so there is nothing to have mis-targeted),
+   * but "still reads alive" can never be signaled again - it stays a
+   * permanently disclosed unconfirmed residual instead (`getStrandedSlotCount`).
+   * This trades away the ability to eventually force-terminate a
+   * genuinely-still-alive, SIGTERM-resistant orphaned descendant group via
+   * a delayed automatic retry - accepted, since the alternative is a real
+   * possibility of signaling an unrelated process this server never spawned.
    *
    * A no-op when no child was ever attached to this job at all (e.g. a
    * job that started already-`failed` and never reached a real spawn).
@@ -1799,13 +2651,30 @@ export class JobStore {
    * substitute a spy, following the same injectable-oracle pattern
    * `src/process.ts`'s own `waitForProcessDeath` already uses for
    * `isAlive`. This is what makes the reap-once guard's own safety
-   * claim - a job whose reap has already been attempted never signals
-   * again, however its numeric pgid may since have been reused - directly
-   * testable without needing the kernel to hand back a chosen pid: a test
-   * calls this twice for the same job with a `reaper` spy that reports a
-   * live group if it is ever invoked, and confirms the spy runs on the
-   * first call but never on the second, proving no real signal could ever
-   * reach whatever now sits at that recycled pgid on that later call.
+   * claim directly testable without needing the kernel to hand back a
+   * chosen pid: a job whose reap has already CONFIRMED empty never
+   * signals again, however its numeric pgid may since have been reused -
+   * a test calling this twice for the same job with a `reaper` spy that
+   * reports confirmed after the first call and would report a live group
+   * if it were ever invoked again confirms the spy runs on the first
+   * call but never on the second. An UNCONFIRMED first attempt is
+   * different and deliberately so: `hasReapBeenAttempted` stays `false`
+   * for it (see `reapAttempted`'s own docs), so a SECOND direct call for
+   * the same job genuinely re-consults the reaper - this is what makes a
+   * bounded automatic retry (`releaseSlot`'s stranded-slot handling) or a
+   * manual `kill()` retry a real second chance rather than a guaranteed
+   * no-op.
+   *
+   * Returns a `ReapOutcome` rather than `void` - see that type's own
+   * docs, and `reapOutcomeToReleaseDecision`, the one function every
+   * caller must use to turn this into a release decision. The
+   * `"already-attempted"` case reports the job's actual CURRENT
+   * `kill_confirmed` state rather than assuming `true`: `reapAttempted`
+   * has writers other than this function's own confirmed path (see that
+   * set's class-level docs) that mark it UNCONDITIONALLY, before any
+   * confirmation ever lands, so treating every already-attempted hit as
+   * "safe" would silently reopen the exact fail-open gap this return
+   * type exists to close.
    */
   async reapProcessGroupOnce(
     jobId: string,
@@ -1813,14 +2682,85 @@ export class JobStore {
     reaper: (pid: number, graceMs: number) => Promise<{ readonly confirmed: boolean }> = (
       pid,
       ms
-    ) => killProcessGroupPosix(pid, ms)
-  ): Promise<void> {
-    if (this.hasReapBeenAttempted(jobId)) return;
+    ) => killProcessGroupPosix(pid, ms),
+    existenceOnlyReaper: (pid: number) => Promise<boolean> = confirmProcessGroupReapedPosix
+  ): Promise<ReapOutcome> {
+    if (this.hasReapBeenAttempted(jobId)) {
+      return {
+        kind: "already-attempted",
+        confirmed: this.jobs.get(jobId)?.kill_confirmed === true,
+      };
+    }
     const handle = this.getChildHandle(jobId);
-    if (handle === undefined) return;
-    this.markReapAttempted(jobId);
-    const result = await reaper(handle.pid, graceMs);
+    if (handle === undefined) return { kind: "no-child" };
+
+    // TWO conditions, ORed, because they close two DIFFERENT gaps and
+    // neither alone covers both: `hasReapEntered` is set SYNCHRONOUSLY
+    // below, before the `await reaper(...)` a few lines down, so two
+    // calls reaching THIS method for the same job at once (two
+    // independently-dispatched public `kill` requests, per the installed
+    // MCP SDK's own dispatch - see `reapEntered`'s own class-level docs)
+    // cannot both read it as `false`: whichever call's synchronous
+    // prologue runs first marks it before yielding, so the second always
+    // takes the existence-only retry branch instead of also signaling.
+    // But this method is NOT the only signal-capable caller in this
+    // codebase - `src/tools/kill.ts`'s own default SIGTERM/escalation
+    // path and its custom-signal branch, `src/tools/run.ts`'s
+    // `deadline_ms` enforcement, and `src/server.ts`'s shutdown reap each
+    // call `killProcessGroupPosix` DIRECTLY, never through this method,
+    // and each records its own outcome via `setKillConfirmation` - so
+    // `reapEntered` alone is blind to an attempt that already happened
+    // through one of THOSE call sites before this call ever ran (the
+    // combined-degraded-retry scenario: a live job's first `kill()` call
+    // signals via kill.ts's own direct path and settles unconfirmed, the
+    // job goes terminal, and a SECOND `kill()` call reaches this method
+    // for the first time - `reapEntered` is empty for this job, but a
+    // genuine signal-capable attempt already happened). `kill_confirmed
+    // !== undefined` is what catches that: every one of those direct
+    // callers sets it, confirmed or not, the moment their own attempt
+    // resolves.
+    const isRetry =
+      this.hasReapEntered(jobId) || this.jobs.get(jobId)?.kill_confirmed !== undefined;
+    if (isRetry) {
+      const confirmed = await existenceOnlyReaper(handle.pid);
+      this.setKillConfirmation(jobId, confirmed);
+      if (confirmed) {
+        this.markReapAttempted(jobId);
+        return { kind: "confirmed" };
+      }
+      return { kind: "unconfirmed" };
+    }
+
+    // Marked HERE - synchronously, before the `await` below, in the same
+    // tick as the `hasReapEntered` read above - so a concurrent second
+    // call sees this immediately rather than only after this call's own
+    // reaper settles. This is what actually closes the double-signal
+    // window; moving `setKillConfirmation` earlier would not, since
+    // `kill_confirmed` also has to keep meaning "confirmed", not
+    // "entered" (see `reapEntered`'s own docs for why one field cannot
+    // answer both).
+    this.markReapEntered(jobId);
+
+    let result: { readonly confirmed: boolean };
+    try {
+      result = await reaper(handle.pid, graceMs);
+    } catch (err) {
+      // A thrown first signal-capable attempt already marked `reapEntered`
+      // above, so a concurrent or later call still correctly takes the
+      // retry branch. It still gets `kill_confirmed: false` here too,
+      // exactly like an ordinary `confirmed: false` return, so
+      // `getStrandedSlotCount` and everything else that reads
+      // `kill_confirmed` sees the same "attempted, unconfirmed" shape
+      // either way.
+      this.setKillConfirmation(jobId, false);
+      throw err;
+    }
     this.setKillConfirmation(jobId, result.confirmed);
+    if (result.confirmed) {
+      this.markReapAttempted(jobId);
+      return { kind: "confirmed" };
+    }
+    return { kind: "unconfirmed" };
   }
 
   /** Appends one raw data chunk from a job's stdout or stderr to that stream's independent buffer, firing any registered `onOutputArrival` listeners for `jobId` once per line materialized (see that method's own docs). */
@@ -1930,13 +2870,58 @@ export class JobStore {
    * Permanently removes EVERY piece of state this store holds for `jobId`
    * - the job record itself, its tracked child handle (if any), both
    * stream buffers, every registered output-arrival/job-terminal
-   * listener, and any recorded output-watch-stop annotation. A one-way
-   * reclamation primitive: after this call, `has`/`get`/`getStreamSnapshot`/
-   * `getOutputCounts` all behave EXACTLY as if `jobId` had never existed.
-   * Generic - this store has no opinion on WHY a caller reclaims a job (a
-   * task-layer TTL purge is the one real caller today, see
-   * `src/tasksAdapter.ts`'s `getTask`, but nothing here is Tasks-specific).
-   * Returns whether a job actually existed to remove.
+   * listener, any recorded output-watch-stop annotation, its
+   * `slotReserved`/`slotReleased` dedupe entries, its `strandedSlots`
+   * entry INCLUDING clearing any pending automatic-retry timer, and its
+   * `reapEntered` entry (if any of these was ever set for `jobId` at all - a preflight-failed job
+   * (`createFailedJob`) or one that was rejected outright never gets a
+   * `slotReserved` entry in the first place, and `Set.delete`/`Map.delete`
+   * on a missing entry is already a harmless no-op; a job admitted into
+   * the queue but cancelled before ever being dequeued does NOT carry a
+   * `slotReserved` entry by the time it reaches here either - `enqueueJob`
+   * already removed it, the moment the job was queued, for exactly this
+   * reason (see its own docs) - and it never carries a `slotReleased`,
+   * `strandedSlots`, or `reapEntered` entry, since a later `releaseSlot`
+   * call against it is refused by the now-absent `slotReserved` entry).
+   * All four matter on a long-running server: `slotReleased` is add-only
+   * everywhere but here, `slotReserved` moves between
+   * `createJob`/`enqueueJob`/`dequeueNext` (see their own docs) besides
+   * this method, `strandedSlots` likewise only grows via
+   * `markSlotStranded`, and `reapEntered` only ever grows via
+   * `reapProcessGroupOnce`'s own signal-capable branch - never cleared by
+   * anything else this store does - so
+   * this is the ONE place anything is ever removed from any of them - without it,
+   * every job that ever ran and was later purged would leave a permanent
+   * entry behind (unbounded linear growth in exactly the store whose
+   * whole purpose is bounding resource use), and an uncleared retry timer
+   * would fire later against a job no longer in the store at all
+   * (`retryStrandedSlot`'s own no-op guard makes that harmless, but
+   * leaving a live timer running past its job's own lifetime is still
+   * real, needless work this store can just as easily cancel here). A
+   * one-way reclamation primitive: after this call,
+   * `has`/`get`/`getStreamSnapshot`/`getOutputCounts`/`getSlotReleasedCount`/
+   * `getStrandedSlotCount`/`getReapEnteredCount` all behave EXACTLY as if
+   * `jobId` had never existed. Generic - this store has no opinion on WHY a caller reclaims
+   * a job (a task-layer TTL purge is the one real caller today, see
+   * `src/tasksAdapter.ts`'s `getTask`, but nothing here is Tasks-
+   * specific). Returns whether a job actually existed to remove.
+   *
+   * DELETING A STRANDED JOB IS THE CALLER'S OWN CHOICE, NEVER THIS
+   * METHOD'S: this store still holds `activeSlots` as a store-wide
+   * counter entirely separate from any one job's own record, so removing
+   * a stranded job's record here does NOT and cannot decrement it -
+   * `activeSlots` stays held, permanently, with every piece of state that
+   * could ever have recovered or even observed that held slot now gone
+   * (`isJobSlotStranded` would report `false` afterward not because the
+   * slot was freed, but because there is nothing left to ask). This
+   * method does not refuse that call - a caller with a genuine reason to
+   * force-delete even a stranded job's record (an explicit operator
+   * action, say) can still do so - but it does not happen implicitly via
+   * this generic primitive either: `src/tasksAdapter.ts`'s lazy TTL purge,
+   * the one real caller today, checks `isJobSlotStranded` itself before
+   * ever reaching this call (see that file's own `isExpiredTerminalRecord`
+   * docs) precisely so an unattended, time-based purge can never be the
+   * thing that silently strands a slot forever.
    */
   deleteJob(jobId: string): boolean {
     const existed = this.jobs.delete(jobId);
@@ -1945,6 +2930,12 @@ export class JobStore {
     this.outputArrivalListeners.delete(jobId);
     this.jobTerminalListeners.delete(jobId);
     this.outputWatchStops.delete(jobId);
+    this.slotReleased.delete(jobId);
+    this.slotReserved.delete(jobId);
+    const stranded = this.strandedSlots.get(jobId);
+    if (stranded?.retryTimer !== undefined) clearTimeout(stranded.retryTimer);
+    this.strandedSlots.delete(jobId);
+    this.reapEntered.delete(jobId);
     return existed;
   }
 

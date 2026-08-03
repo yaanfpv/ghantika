@@ -404,9 +404,22 @@ export const TASK_TTL_MS = 24 * 60 * 60 * 1000;
  * `TASK_TTL_MS`'s own docs): a non-terminal record (still `working`,
  * however old `record.started_at` is) NEVER qualifies, unconditionally,
  * before age is even considered.
+ *
+ * A job whose concurrency slot is currently STRANDED (`jobStore.
+ * isJobSlotStranded`) never qualifies either, for the same reason and at
+ * the same unconditional priority: `jobStore.deleteJob` cannot touch
+ * `activeSlots` (a store-wide counter, not part of any one job's own
+ * record - see that method's own docs), so purging a stranded job's
+ * record here would silently erase the only durable, attributable trace
+ * of a held slot - both the observability `getStrandedSlotCount` provides
+ * and the manual `kill()` late-recovery target - while the slot itself
+ * stays held forever with no path back. This check runs BEFORE the age
+ * check specifically so a record that is old enough to purge, but still
+ * stranded, is refused rather than treated as merely "not yet".
  */
 function isExpiredTerminalRecord(record: JobRecord, now: number): boolean {
   if (!isTerminalJobState(record.state)) return false;
+  if (jobStore.isJobSlotStranded(record.job_id)) return false;
   if (record.ended_at === undefined) return false; // defensive only - every real terminal record sets this
   const endedAtMs = Date.parse(record.ended_at);
   if (Number.isNaN(endedAtMs)) return false; // defensive only - ended_at is always a real toISOString() value

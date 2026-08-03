@@ -800,7 +800,7 @@ test(
 );
 
 test(
-  "kill: A STRANDED COMBINED-DEGRADED KILL IS RETRYABLE - the exact combined-degraded scenario above, then a SECOND kill() call against the same job once identity observers recover genuinely re-runs the identity gate (not short-circuited by a stale reap-attempt flag) and actually signals/reaps the still-alive group",
+  "kill: A STRANDED COMBINED-DEGRADED KILL NEVER RECEIVES A SECOND SIGNAL, even once ps/pgrep are available again - a SECOND kill() call against the same job re-checks EXISTENCE ONLY and leaves a genuinely-still-alive group unconfirmed; once the group has since genuinely emptied by an external means, a THIRD call recovers it via that same existence-only re-check, still without ever sending it a second signal",
   {
     skip:
       process.platform === "win32"

@@ -75,6 +75,7 @@ import {
   WAKE_COALESCE_WINDOW_MS,
   WAKE_MAX_RATE_PER_SEC,
   WATCH_STOP_REASON_FIREHOSE,
+  getTask,
 } from "../dist/tasksAdapter.js";
 
 // ---------------------------------------------------------------------------
@@ -401,6 +402,94 @@ test("TTL purge removes a completed record past TASK_TTL_MS while a still-workin
     }
   } finally {
     if (workingJobId !== undefined) await killAndReapRealChild(workingJobId);
+    await pair.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// TTL purge must NEVER reclaim a job whose concurrency slot is still
+// stranded: deleteJob cannot touch activeSlots (a store-wide counter, not
+// part of any one job's own record), so purging a stranded job's record
+// erases the only durable, attributable trace of a held slot while the
+// slot itself stays held forever with no path back. Driven directly
+// against the singleton jobStore (`../dist/jobStore.js`, the SAME module
+// instance getTask itself reads from) with a synthetic stranded release -
+// a real kernel-forced unconfirmed reap cannot be produced deterministically
+// from a test, exactly as this repo's own reap-once tests document, so this
+// exercises the safety property directly via releaseSlot's own public
+// contract. `getTask`'s own `now` parameter (mirroring
+// `process.checkProcessIdentity`'s pattern) makes this deterministic with
+// no real wall-clock wait and no `mock.timers` needed.
+// ---------------------------------------------------------------------------
+
+test("TTL purge REFUSES a job whose concurrency slot is still stranded, however far past TASK_TTL_MS it is - and purges it normally the moment a later reap actually confirms", async () => {
+  // Drives the singleton jobStore directly (getTask itself has no
+  // injectable-store seam - see this file's own header), so, matching
+  // every other test in this file, opens a real pair purely for
+  // createServer()'s own documented side effect of reopening the
+  // shutdown gate at construction time: an earlier test's pair.close()
+  // leaves that gate closed, and requestSlot() below would otherwise
+  // reject as "shutting-down" rather than exercising the real admission
+  // path this test needs.
+  const pair = await startPair(true);
+  const job = jobStore.createJob({
+    argv: ["true"],
+    cwd: "/tmp",
+    env: {},
+    isShell: false,
+    label: "ttl-stranded-fixture",
+  });
+  try {
+    assert.deepEqual(jobStore.requestSlot(), { kind: "admit" });
+    jobStore.markExited(job.job_id, 0, null);
+    await jobStore.releaseSlot(job.job_id, Promise.resolve("unconfirmed"));
+    assert.equal(jobStore.isJobSlotStranded(job.job_id), true, "expected the slot to be stranded");
+
+    const endedAtMs = Date.parse(jobStore.get(job.job_id)!.ended_at!);
+    const wayPastTtl = endedAtMs + TASK_TTL_MS * 10; // far past TTL, not just barely
+
+    const stillStranded = getTask(job.job_id, wayPastTtl);
+    assert.equal(
+      "error" in stillStranded,
+      false,
+      `TTL purge must refuse a still-stranded job however far past TTL it is, got ${JSON.stringify(stillStranded)}`
+    );
+    assert.equal(
+      jobStore.has(job.job_id),
+      true,
+      "the record itself must survive, not just the read"
+    );
+    assert.equal(
+      jobStore.isJobSlotStranded(job.job_id),
+      true,
+      "the stranded slot's own tracking entry must survive too - that IS the durable recovery/observability record this guard exists to protect"
+    );
+
+    // The guard is temporary, tied to stranded status - not a permanent
+    // block that would itself leak memory forever. Once a later reap
+    // actually confirms (the automatic retry's or a manual kill()'s own
+    // commit path), the SAME job becomes purgeable again on a subsequent
+    // read past TTL, exactly like any other terminal record.
+    await jobStore.releaseSlot(job.job_id, Promise.resolve("confirmed"));
+    assert.equal(
+      jobStore.isJobSlotStranded(job.job_id),
+      false,
+      "expected recovery to clear stranding"
+    );
+
+    const afterRecovery = getTask(job.job_id, wayPastTtl);
+    assert.equal(
+      "error" in afterRecovery && afterRecovery.error,
+      "task_not_found",
+      `expected a NOW-confirmed, still-past-TTL record to purge normally, got ${JSON.stringify(afterRecovery)}`
+    );
+    assert.equal(
+      jobStore.has(job.job_id),
+      false,
+      "expected deleteJob to have actually run this time"
+    );
+  } finally {
+    jobStore.deleteJob(job.job_id); // safe no-op if the recovery branch above already purged it
     await pair.close();
   }
 });

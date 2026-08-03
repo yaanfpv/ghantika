@@ -49,8 +49,8 @@ async function waitForProcessGroupGone(pid: number, timeoutMs = 3000): Promise<b
 }
 
 /**
- * The shared body of the stranded-combined-degraded-kill-is-retryable
- * scenario, factored out so the real regression test below and its own
+ * The shared body of the stranded-combined-degraded-kill scenario,
+ * factored out so the real regression test below and its own
  * failure-safety control can drive the IDENTICAL setup - proving the
  * SAME `finally`-block cleanup actually runs on both a passing and a
  * deliberately-failing path, rather than only ever being exercised by the
@@ -58,6 +58,21 @@ async function waitForProcessGroupGone(pid: number, timeoutMs = 3000): Promise<b
  * pid the moment it is spawned, BEFORE any assertion below can throw, so
  * a caller can verify real cleanup even when this function itself
  * rejects.
+ *
+ * PROVES THE RETRY-SAFETY CONTRACT (`jobStore.reapProcessGroupOnce`'s own
+ * "RETRY SAFETY" docs), end to end, through the real `kill()` handler and
+ * a real, genuinely SIGTERM-resistant OS process - never an injected
+ * spy: a SECOND `kill()` call against the same already-terminal,
+ * combined-degraded job NEVER sends a further signal, however available
+ * ps/pgrep have since become, because ownership continuity over the
+ * tracked numeric pid is no longer guaranteed by then. So a group that is
+ * STILL genuinely alive at that point stays unconfirmed (the negative
+ * control below), while a group that has since genuinely emptied - by
+ * some means entirely OUTSIDE this codebase's own retry, simulated here
+ * with a raw external `process.kill` the test itself sends - IS correctly
+ * recognized and confirmed by a THIRD call's existence-only re-check
+ * (the legitimate-recovery control), still without this codebase ever
+ * having sent that group a second signal.
  *
  * `forceFailureAfterSpawn`, when set, throws immediately after the
  * resistant process is confirmed alive and attached, before either
@@ -164,17 +179,16 @@ export async function runStrandedRetryScenario(
     );
 
     // SECOND call, same job_id, real ps/pgrep available this time (PATH
-    // is already restored). THE ACTUAL REGRESSION PROOF: with the old
-    // code, the first call's `markReapAttempted` ran unconditionally
-    // BEFORE `killProcessGroupPosix` ever ran, so `hasReapBeenAttempted`
-    // was already permanently `true` by the time this second call's
-    // terminal-job branch reaches `reapProcessGroupOnce` - which would
-    // then be a pure no-op regardless of whether the group is genuinely
-    // still alive, leaving this real process stranded forever. With the
-    // fix, the first call's UNCONFIRMED outcome left that flag unset, so
-    // this second call's `reapProcessGroupOnce` finds `hasReapBeenAttempted`
-    // still false, runs a FRESH escalation identity gate, and can
-    // genuinely signal/reap the group for real this time.
+    // is already restored). `hasReapBeenAttempted` is still false (the
+    // first call's outcome was UNCONFIRMED, never marked), so
+    // `reapProcessGroupOnce` genuinely re-consults - but ownership
+    // continuity over the tracked numeric pid is no longer guaranteed at
+    // this point, so it re-checks EXISTENCE ONLY and never signals again.
+    // The real process is STILL genuinely alive
+    // (this fixture ignores SIGTERM and neither call above ever reached
+    // it), so that existence check correctly reports "still alive" -
+    // proving this codebase never sent it a further signal, whether or
+    // not it could have.
     const secondResult = await killTool.handler({ job_id: record.job_id });
     assert.notEqual(
       secondResult.isError,
@@ -182,27 +196,47 @@ export async function runStrandedRetryScenario(
       `expected the second kill() to succeed: ${JSON.stringify(secondResult)}`
     );
     const secondStructured = secondResult.structuredContent as Record<string, unknown>;
-
-    // THE OBSERVABLE DIFFERENCE FROM THE FIRST CALL: this call's own
-    // external confirmation now reads true - a real, additional signal
-    // reached this genuinely-still-alive group and actually finished it
-    // off, rather than the flag having simply been inspected and left
-    // alone.
     assert.equal(
       secondStructured.kill_confirmed,
+      false,
+      `expected the second call to STAY unconfirmed - the retry must never signal again, so a genuinely-still-alive group correctly reads as still unconfirmed rather than being finished off by a second signal - got: ${JSON.stringify(secondStructured)}`
+    );
+    assert.equal(
+      isProcessAlive(child!.pid!),
       true,
-      `expected the second call to actually confirm the group reaped this time (a fresh identity gate genuinely ran and signaled it) - got: ${JSON.stringify(secondStructured)}`
+      "expected the real resistant process to have SURVIVED the second call too - proving no second signal ever reached it, even though ps/pgrep were genuinely available this time"
     );
 
-    // The real, resistant process must actually be dead now - polled,
-    // since SIGKILL delivery and OS-level reaping are asynchronous
-    // relative to the call that sent it (the same real gap this
-    // codebase's own SIGKILL_CONFIRMATION_TIMEOUT_MS closes elsewhere).
-    const gone = await waitForProcessGroupGone(child!.pid!);
+    // Now make the group ACTUALLY empty, by a means entirely OUTSIDE this
+    // codebase's own retry (a raw external SIGKILL the test itself
+    // sends) - simulating whatever eventually ends a real stranded
+    // group in production (an operator's own out-of-band kill, the host
+    // reclaiming the process, etc.), never this codebase's own kill()
+    // tool signaling it again.
+    process.kill(-child!.pid!, "SIGKILL");
+    const externallyGone = await waitForProcessGroupGone(child!.pid!);
     assert.equal(
-      gone,
+      externallyGone,
       true,
-      "expected the real resistant process to have actually been killed by the SECOND call - the first call left it stranded, and only a genuine retry (not merely re-checking an already-tripped flag) can end it"
+      "expected the external SIGKILL (sent by this test, not by kill()) to have actually ended the real process group"
+    );
+
+    // THIRD call, same job_id: the retry's own existence-only re-check
+    // now correctly observes the group is
+    // genuinely gone and confirms it - real recovery, through the real
+    // `kill()` handler, still without this codebase ever having sent
+    // that group a second signal of its own.
+    const thirdResult = await killTool.handler({ job_id: record.job_id });
+    assert.notEqual(
+      thirdResult.isError,
+      true,
+      `expected the third kill() to succeed: ${JSON.stringify(thirdResult)}`
+    );
+    const thirdStructured = thirdResult.structuredContent as Record<string, unknown>;
+    assert.equal(
+      thirdStructured.kill_confirmed,
+      true,
+      `expected the third call to confirm the now-genuinely-empty group via its existence-only re-check - got: ${JSON.stringify(thirdStructured)}`
     );
   } finally {
     // Every partially-created resource this scenario sets up is torn

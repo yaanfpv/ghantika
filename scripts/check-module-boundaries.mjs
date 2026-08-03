@@ -2,8 +2,8 @@
 /**
  * Guards the frozen module ownership for `src/`: exactly the modules
  * named in FROZEN_MODULES below (`server.ts`, `registry.ts`, `jobStore.ts`,
- * `process.ts`, `policy.ts`, `tasksAdapter.ts`, and the six `tools/*.ts`
- * handler files), no more, no fewer - `src/index.ts` is deliberately
+ * `process.ts`, `policy.ts`, `scheduler.ts`, `tasksAdapter.ts`, and the six
+ * `tools/*.ts` handler files), no more, no fewer - `src/index.ts` is deliberately
  * excluded, since it's the package's public entry point (`package.json`'s
  * `"main"`/`"types"`), not one of the six-tool architecture's internal
  * modules.
@@ -83,11 +83,18 @@ const SRC_DIR = path.join(REPO_ROOT, "src");
 // may never grow its own Map/Set/mutable module state either): admitting
 // it here widens WHICH FILE is allowed to exist, not what rules apply to
 // it once it does.
+//
+// `scheduler.ts` is the concurrency-cap/queue-depth admission POLICY -
+// deliberately holds no state of its own (see its own header), so it too
+// is scanned for persistent state like every other module here, not
+// excluded the way `jobStore.ts` is (the real active-slot count and queue
+// array live in `jobStore.ts`, the sole designated state owner).
 export const FROZEN_MODULES = [
   "jobStore.ts",
   "policy.ts",
   "process.ts",
   "registry.ts",
+  "scheduler.ts",
   "server.ts",
   "tasksAdapter.ts",
   "tools/kill.ts",
