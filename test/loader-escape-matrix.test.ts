@@ -340,10 +340,15 @@ function ensureBaseline(): NonNullable<typeof baseline> {
 // this one - never folded into these 19 RED executions.
 // =============================================================================
 
-test('import { createRequire } from "node:module" - the recognised path, the control that already works - must ALSO red on the unmutated tree as the guard\'s liveness control', () => {
+test('import { createRequire } from "node:module" - the recognised path, the control that already works - must ALSO red on the unmutated tree as the guard\'s liveness control', async () => {
   // First test in the file - see ensureBaseline()'s own doc comment above
   // for why the blocking nested run happens here rather than in a
-  // before() hook.
+  // before() hook. A synchronous callback that calls ensureBaseline() as
+  // its first statement never yields the event loop before that call
+  // blocks the whole process, so this test's own test:dequeue event may
+  // not finish delivering to the parent process before the freeze - an
+  // explicit yield here guarantees that delivery completes first.
+  await new Promise((resolve) => setImmediate(resolve));
   ensureBaseline();
   const dir = buildScratchSrc({
     "tools/mutant.ts": 'import { createRequire } from "node:module";\n',
