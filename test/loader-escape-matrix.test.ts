@@ -21,6 +21,11 @@ import { checkStdioPurity } from "../scripts/check-stdio-purity.mjs";
  * this guard intentionally leaves open, one hop past the closed one-hop
  * alias/computed-member forms earlier in this file.
  *
+ * PLUS four unrelated classifier self-tests, also in their own section
+ * (CLASSIFIER SELF-TESTS below): not module-loader escape-route cases at
+ * all, these cover this file's own spawnSync-termination-classification
+ * helper used by the nested-process timeout guard further below.
+ *
  * Methodology, matching test/guard-mutation-coverage.test.ts: a real
  * scratch directory on disk (`mkdtempSync`), a fixture file written into
  * it containing the EXACT code shape a case describes, then the REAL
@@ -171,12 +176,64 @@ async function loadMutatedGuardCopy(
 }
 
 /**
+ * Classifies a `spawnSync` result that ended in a signal, and throws with a
+ * message specific to the real cause - module-scoped, not exported outside
+ * this file, rather than inlined in `runPermanentGuardSuite`, so it can be
+ * driven directly with real termination shapes. Its parameter is
+ * structurally typed (`Pick<ReturnType<typeof spawnSync>, "signal" | "error">`)
+ * with no runtime provenance check, so it accepts any object of that shape;
+ * this file's own tests drive it with real child-process results only,
+ * never a synthetic one.
+ *
+ * `spawnSync`'s own `timeout` option kills the child and sets BOTH
+ * `result.signal` and `result.error.code === "ETIMEDOUT"` when it fires;
+ * `maxBuffer` overflow kills the child the same way but sets
+ * `result.error.code === "ENOBUFS"` instead; a child that receives an
+ * ordinary external signal (or sends itself one) sets `result.signal` with
+ * NO `result.error` at all. `result.signal !== null` alone cannot tell these
+ * apart - checking `result.error?.code === "ETIMEDOUT"` specifically is what
+ * distinguishes "this call's own configured timeout fired" from every other
+ * way a child can end in a signal. `ETIMEDOUT` proves only that the call did
+ * not complete inside its configured duration - it does not by itself prove
+ * the call was genuinely stuck rather than legitimately slow, so the message
+ * below states the observed fact and does not characterize the cause.
+ */
+function classifyTerminatedSpawnSync(
+  result: Pick<ReturnType<typeof spawnSync>, "signal" | "error">,
+  context: string
+): void {
+  if (result.error?.code === "ETIMEDOUT") {
+    throw new Error(`${context} did not complete within its configured timeout and was killed`);
+  }
+  if (result.signal !== null) {
+    throw new Error(
+      `${context} was terminated by signal ${result.signal}${result.error ? ` (${result.error.code})` : ""} before completing - not the configured timeout`
+    );
+  }
+}
+
+/**
  * Spawns a FRESH `node --test` process over the three permanent guard test
  * files, and parses the real, current pass/fail/tests counts off its
  * summary lines - never a hardcoded historical figure. Node's default
  * (non-TTY) test-runner summary reporter prints `ℹ tests N` / `ℹ pass N` /
  * `ℹ fail N`; the `#`-prefixed TAP form is accepted too as a defensive
  * fallback in case the reporter's exact prefix ever changes.
+ *
+ * This bounds the direct `node --test` supervisor process spawnSync itself
+ * controls. Each of the three nested test files runs as its OWN CHILD
+ * PROCESS of that supervisor (Node's default `--test-isolation=process`,
+ * not a worker thread - confirmed empirically: each nested file reports a
+ * distinct `process.pid` and `isMainThread: true`, never a shared parent
+ * PID). Sending the timeout's default `SIGTERM` to the supervisor was
+ * observed, in one manual, single-host (macOS) reproduction, to also
+ * terminate an already-hung nested child with no orphan left behind - a
+ * manual observation, not a tracked, repeatable check, and not confirmed
+ * across every platform this guard runs on. A nested child that explicitly
+ * traps and ignores `SIGTERM` would not be reaped by this path (none of
+ * the three files here do that); that is a known residual, disclosed
+ * rather than assumed, and this single observation does not establish it
+ * is the only one.
  */
 function runPermanentGuardSuite(): { tests: number; pass: number; fail: number; raw: string } {
   // NODE_TEST_CONTEXT / NODE_TEST_WORKER_ID are set by the OUTER `node
@@ -200,7 +257,17 @@ function runPermanentGuardSuite(): { tests: number; pass: number; fail: number; 
       "test/module-boundaries.test.ts",
       "test/no-tasks-import.test.ts",
     ],
-    { cwd: REPO_ROOT, encoding: "utf8", maxBuffer: 1024 * 1024 * 64, env: childEnv }
+    {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024 * 64,
+      env: childEnv,
+      timeout: 45_000,
+    }
+  );
+  classifyTerminatedSpawnSync(
+    result,
+    'the nested "node --test" run (guard-mutation-coverage/module-boundaries/no-tasks-import)'
   );
   const raw = `${result.stdout}\n${result.stderr}`;
   const testsMatch = raw.match(/[ℹ#] tests (\d+)/);
@@ -1415,6 +1482,93 @@ test("the three permanent guard test files pass at a literal, self-consistent, r
     nt.status,
     0,
     `expected "npm run guard:no-tasks-import" to exit 0, got ${nt.status}, stderr=${nt.stderr}`
+  );
+});
+
+// =============================================================================
+// CLASSIFIER SELF-TESTS (4 executions). NOT part of the 45 physical
+// mutation-test cases above, and not module-loader escape-route cases at
+// all: these test this file's OWN spawnSync-termination-classification
+// helper (`classifyTerminatedSpawnSync`), used by `runPermanentGuardSuite`'s
+// nested-process timeout handling. Three of the four deliberately throw and
+// are asserted for their thrown message, not green pass/fail behavior; the
+// fourth is the green control proving the other three are a real
+// discriminating signal rather than a function that always throws. Each is
+// driven with a real, short-lived child process and a real classifier call
+// against that child's actual result - never a synthetic result object.
+// =============================================================================
+
+test("classifyTerminatedSpawnSync throws the timeout-specific message when spawnSync's OWN timeout genuinely fires - driven with a real hung child and a short injected timeout, never a synthetic result object", () => {
+  const result = spawnSync(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"], {
+    timeout: 200,
+    encoding: "utf8",
+  });
+  assert.equal(
+    result.error?.code,
+    "ETIMEDOUT",
+    "setup check: spawnSync's own timeout must have actually fired for this test to mean anything"
+  );
+  assert.throws(
+    () => classifyTerminatedSpawnSync(result, "the test child"),
+    /did not complete within its configured timeout/,
+    "a genuine ETIMEDOUT result must throw the timeout-specific message"
+  );
+});
+
+test("classifyTerminatedSpawnSync throws a DISTINCT, non-timeout message when the child is terminated by an ordinary signal with no timeout involved - proving result.signal!==null alone is not what this function keys on, AND that the reported signal name is genuinely interpolated from result.signal rather than a hardcoded string (a different signal than every other fixture in this file uses)", () => {
+  const result = spawnSync(process.execPath, ["-e", "process.kill(process.pid, 'SIGINT')"], {
+    timeout: 60_000,
+    encoding: "utf8",
+  });
+  assert.equal(
+    result.signal,
+    "SIGINT",
+    "setup check: the child must have genuinely died by signal"
+  );
+  assert.equal(
+    result.error,
+    undefined,
+    "setup check: this signal must NOT have come from spawnSync's own timeout/maxBuffer mechanism"
+  );
+  assert.throws(
+    () => classifyTerminatedSpawnSync(result, "the test child"),
+    (err: unknown) =>
+      err instanceof Error &&
+      /terminated by signal SIGINT/.test(err.message) &&
+      !/terminated by signal SIGTERM/.test(err.message) &&
+      !/configured timeout and was killed/.test(err.message),
+    "a non-timeout signal must throw a message naming the REAL signal (SIGINT here), never the timeout-specific wording and never a different, hardcoded signal name"
+  );
+});
+
+test("classifyTerminatedSpawnSync does not throw for a clean, signal-free exit - the green control proving the two tests above are a real discriminating signal, not a function that always throws", () => {
+  const result = spawnSync(process.execPath, ["-e", "process.exit(0)"], {
+    timeout: 60_000,
+    encoding: "utf8",
+  });
+  assert.equal(result.signal, null);
+  assert.doesNotThrow(() => classifyTerminatedSpawnSync(result, "the test child"));
+});
+
+test("classifyTerminatedSpawnSync classifies a maxBuffer overflow (ENOBUFS) the same non-timeout way as an ordinary signal, never as the configured timeout - the exact misclassification the bare result.signal!==null check produced", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["-e", "process.stdout.write('x'.repeat(1024 * 1024))"],
+    { timeout: 60_000, maxBuffer: 16, encoding: "utf8" }
+  );
+  assert.equal(
+    result.error?.code,
+    "ENOBUFS",
+    "setup check: maxBuffer must have genuinely overflowed"
+  );
+  assert.throws(
+    () => classifyTerminatedSpawnSync(result, "the test child"),
+    (err: unknown) =>
+      err instanceof Error &&
+      /terminated by signal/.test(err.message) &&
+      /ENOBUFS/.test(err.message) &&
+      !/configured timeout and was killed/.test(err.message),
+    "a maxBuffer overflow must be classified as a non-timeout termination, distinctly naming ENOBUFS, never conflated with the ETIMEDOUT case"
   );
 });
 
