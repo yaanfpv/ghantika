@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { before, test } from "node:test";
+import { test } from "node:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -78,8 +78,29 @@ const ORIGINAL_NO_TASKS_GUARD_TEXT = readFileSync(
   "utf8"
 );
 
-/** Builds a scratch src/-shaped tree from a flat map of relative path -> file contents. Mirrors test/guard-mutation-coverage.test.ts's own helper of the same name. */
+/**
+ * Builds a scratch src/-shaped tree from a flat map of relative path ->
+ * file contents. Mirrors test/guard-mutation-coverage.test.ts's own helper
+ * of the same name.
+ *
+ * Also where ensureBaseline() is forced to run - not merely invoked in the
+ * first declared test, which only guarantees the baseline predates a
+ * mutation as long as declaration order is never disturbed. This is the
+ * entry point every fixture/acquisition case that mutates a scratch
+ * src/-shaped tree calls before writing its mutant, so calling it here
+ * guarantees the baseline is captured before that mutation BY
+ * CONSTRUCTION, regardless of test order - the same structural guarantee
+ * the old before() hook gave, for those cases. It does NOT cover the
+ * three guard-self-mutation cases below (loadMutatedGuardCopy()), which
+ * each write their own mutant - a scratch copy of the guard script
+ * itself - before ever calling this function. That is safe for a
+ * different reason: loadMutatedGuardCopy() writes its mutant under its
+ * own temp subdirectory, while runPermanentGuardSuite()'s spawn always
+ * runs with cwd REPO_ROOT against the real guard scripts, so the
+ * baseline it computes never reads that scratch copy at all.
+ */
 function buildScratchSrc(files: Record<string, string>): string {
+  ensureBaseline();
   const dir = mkdtempSync(path.join(tmpdir(), "ghantika-loader-escape-"));
   for (const [relPath, content] of Object.entries(files)) {
     const abs = path.join(dir, relPath);
@@ -284,12 +305,26 @@ function runPermanentGuardSuite(): { tests: number; pass: number; fail: number; 
   };
 }
 
-/** Captured once, before any test in this file runs (node:test's `before()` hook guarantee) - the pre-mutation baseline the later denominator/consistency checks compare against. */
+/**
+ * Captured once, on FIRST ACCESS rather than in a `before()` hook - the
+ * pre-mutation baseline the later denominator/consistency checks compare
+ * against. This used to run inside a `before()` hook, but node:test's own
+ * TestsStream never emits a reportable event for a hook's own execution -
+ * only for an actual test - so the entire blocking nested `node --test`
+ * call ran in a window with zero test-runner events, leaving this file's
+ * outer idle-watchdog with nothing to reset on until the call finished.
+ * `ensureBaseline()` is instead invoked as the first statement inside this
+ * file's own first test, so that test's own `test:start` event resets the
+ * idle timer before the blocking call begins - the outer and inner bounds
+ * now measure the same window instead of different ones. Memoized so
+ * every later caller (including the two tests below that depend on it)
+ * gets the identical value regardless of call order.
+ */
 let baseline: ReturnType<typeof runPermanentGuardSuite> | undefined;
-
-before(() => {
-  baseline = runPermanentGuardSuite();
-});
+function ensureBaseline(): NonNullable<typeof baseline> {
+  if (baseline === undefined) baseline = runPermanentGuardSuite();
+  return baseline;
+}
 
 // =============================================================================
 // ACQUISITION: how the loader capability is OBTAINED (19 executions). All
@@ -306,6 +341,10 @@ before(() => {
 // =============================================================================
 
 test('import { createRequire } from "node:module" - the recognised path, the control that already works - must ALSO red on the unmutated tree as the guard\'s liveness control', () => {
+  // First test in the file - see ensureBaseline()'s own doc comment above
+  // for why the blocking nested run happens here rather than in a
+  // before() hook.
+  ensureBaseline();
   const dir = buildScratchSrc({
     "tools/mutant.ts": 'import { createRequire } from "node:module";\n',
   });
@@ -1439,7 +1478,7 @@ test('exactly one fixture - import { readFile } from "node:fs/promises" - is nev
 });
 
 test("the existing permanent guard-test suite is unchanged - same denominator - after every scratch mutation case in this file has run and been restored", () => {
-  assert.ok(baseline, "the before() hook must have captured the pre-mutation baseline first");
+  ensureBaseline();
   const after = runPermanentGuardSuite();
   assert.equal(
     after.fail,
@@ -1454,7 +1493,7 @@ test("the existing permanent guard-test suite is unchanged - same denominator - 
 });
 
 test("the three permanent guard test files pass at a literal, self-consistent, runtime-derived baseline - both production guard commands also exit 0", () => {
-  assert.ok(baseline, "the before() hook must have captured the baseline first");
+  ensureBaseline();
   assert.equal(
     baseline!.fail,
     0,
