@@ -8,15 +8,24 @@
 // (180000ms default) and wall-timeout (600000ms default), or node:test's
 // own inherited --test-timeout (120000ms in CI) fires first and this
 // produces an ordinary test failure instead of the idle-watchdog path
-// under verification. Confirmed locally against this exact mechanism via
-// scripts/run-tests-fixture-harness.mjs with scaled timeouts preserving
-// the same idle-timeout > test-timeout relationship CI uses.
+// under verification.
+//
+// A bare `await new Promise(() => {})` is not enough on its own: once the
+// test function returns and nothing else is scheduled, node:test's own
+// unresolved-promise detector ("Promise resolution is still pending but
+// the event loop has already resolved") fails the test in milliseconds,
+// before the supervisor's idle watchdog ever gets a chance to fire - the
+// same shape this repo's other hung-test fixtures already avoid. The
+// no-op `setTimeout` below is the same fix reapplied: a live timer keeps
+// the event loop non-empty for long enough that the supervisor's own
+// 180s idle window elapses first.
 import { test } from "node:test";
 
 test(
   "TEMPORARY fixture: hangs past the idle watchdog on purpose",
   { timeout: 3600000 },
   async () => {
+    setTimeout(() => {}, 3600000);
     await new Promise(() => {});
   }
 );
