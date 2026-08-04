@@ -269,14 +269,15 @@ export function parseArgs(argv) {
     //
     // Disclosed limit, not solved by this change: if the underlying
     // stranding is a genuinely PERMANENT hang rather than a slow-but-
-    // completing one - consistent with the still-open upstream report
-    // that a child_process timeout's SIGTERM reaches only the immediate
-    // child, never a grandchild it spawned (nodejs/node#43704) - this
-    // raise does not fix that. It only stops killing a run that was
-    // legitimately still finishing its own already-configured recovery;
-    // a genuinely permanent hang is still caught, just 120s later than
-    // before, and that added latency is the real, honest cost of this
-    // change.
+    // completing one - consistent with an upstream report (nodejs/node#43704,
+    // closed as not_planned in 2023, cited here for the mechanism it
+    // documents, not as an open issue) that a child_process timeout's
+    // SIGTERM reaches only the immediate child, never a grandchild it
+    // spawned - this raise does not fix that. It only stops killing a
+    // run that was legitimately still finishing its own already-configured
+    // recovery; a genuinely permanent hang is still caught, just 120s
+    // later than before, and that added latency is the real, honest cost
+    // of this change.
     idleTimeoutMs: 180_000,
     // Backstop for the whole run regardless of how the time is spent -
     // catches a death by a thousand near-idle-but-not-quite-idle cuts
