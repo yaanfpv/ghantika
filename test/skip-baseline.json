@@ -1,5 +1,6 @@
 {
   "win32": [
+    "test/concurrency.test.ts::DISCLOSED RESIDUAL, pinned by a real reproduction: a queued job's cwd is not re-validated at actual spawn time - swapping the checked directory for a symlink escaping the configured root WHILE the job is queued lets the real spawn land outside every configured root",
     "test/e2e-server.test.ts::spawnServer(): a real SIGKILL to the server's own process group kills the server but never reaches its own caller",
     "test/e2e-server.test.ts::spawnServer(): the spawned server-under-test is its own process-group leader, outside the invoking test process's own group",
     "test/integration.test.ts::cross-tool: a SIGTERM-resistant job's WHOLE process group is escalated to real SIGKILL after the real ~5s grace period (confirmed genuinely leader-only mid-escalation: its own descendants, forked before the trap, are already gone from the plain SIGTERM while the leader and its keep-alive job are still alive), and status() independently reflects exactly that signal - proven over the real wire, with real status/output reads and real kill() calls on 3 ordinary jobs provably landing while the escalation is still in flight, and a real external pgrep process-group check",
@@ -7,6 +8,7 @@
     "test/integration.test.ts::orphan-proof teardown on a catchable shutdown signal under concurrent load (multiple live jobs at once, not the single-job case)",
     "test/integration.test.ts::process-group reap under concurrent load - a real external pgrep confirms zero surviving process-group members across every one of several concurrently-killed jobs, each with its own real descendant tree",
     "test/integration.test.ts::real stdio client drives JOBS=4 concurrent live jobs (DESCENDANTS-per-job=3, NOISE-bytes=64KiB each); while one stays live the SAME session reads its status/output AND starts a 5th job, non-blocking; framing stays clean under the noise",
+    "test/job-metadata-redaction.test.ts::NEGATIVE CONTROL: a genuinely EXTERNAL same-uid OS process inspection (a real `ps eww` call, not an in-process read) can observe a live child's own env - the actual hazard this non-goal names, exercised directly rather than substituted with a weaker in-process proxy",
     "test/jobStore.test.ts::OWNER 7 - kill()'s real caller (resolveBirthIdentityForKill) settles a genuinely still-pending capture by the aggregate cap, never hanging past it",
     "test/jobStore.test.ts::REGRESSION: shutdown reaping a job whose process group already exited naturally emits NO false kill error even when the signal-send deterministically reports EPERM, and a real external pgrep independently confirms zero survivors",
     "test/jobStore.test.ts::attachChild/getChildHandle: a real attached child's pid and an approximate spawnedAtMs are retrievable, never the raw ChildProcess itself",
@@ -106,6 +108,8 @@
     "test/process.test.ts::readPidStartTimesBatchPosix: a mix of one well-formed row and one malformed row keeps the well-formed one - a malformed row is discarded, never poisoning the others",
     "test/process.test.ts::readPidStartTimesBatchPosix: reads MULTIPLE real pids in ONE batched call (a fake ps counts its own invocations to prove this), returning every one's own correct row",
     "test/process.test.ts::readPidStartTimesBatchPosix: reads a real, single, freshly-spawned process's own pid+lstart correctly",
+    "test/process.test.ts::resolveCwd's root check validates the REAL, symlink-resolved target - a symlink whose own path sits inside an allowed root but that POINTS OUTSIDE every root is rejected",
+    "test/process.test.ts::resolveCwd's root check resolves a configured root that is ITSELF a symlink to its real target before comparing - a cwd matching that real target is accepted even though the configured string named the symlink",
     "test/process.test.ts::run(): a deadline-expired job's record, present right after the deadline fires, is later purged by the ordinary Tasks-extension TTL read once TASK_TTL_MS has also elapsed - the two mechanisms compose, proving the distinctness claim above rather than merely asserting it",
     "test/process.test.ts::run(): a job that finishes naturally well before its own deadline keeps its natural outcome - the deadline timer never fires and never overrides a real result",
     "test/process.test.ts::run(): deadline_ms accepts Node's own exact timer maximum (2147483647) - the supported boundary is not accidentally excluded by the overflow rejection above",

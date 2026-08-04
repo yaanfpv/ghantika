@@ -1,13 +1,25 @@
 #!/usr/bin/env node
 /**
- * Guards the OTHER half of the typescript-6.0.3 pin decision: an open,
+ * Guards the OTHER half of the typescript peer-range decision: an open,
  * unmerged Dependabot pull request proposing a later typescript version
  * (one that lands outside typescript-eslint's declared peer range) is
- * deliberately left OPEN as a visible tracking signal - it shows at a
- * glance that a newer typescript exists and that this repo is waiting on
- * typescript-eslint's peer range to widen before taking it. Silencing
- * that PR with a Dependabot "ignore" rule would hide the constraint
- * instead of tracking it, so this guard checks two things together:
+ * deliberately left OPEN as a visible tracking signal.
+ *
+ * What it signals changed the moment this repo adopted the side-by-side
+ * TypeScript 7 layout (see scripts/check-typescript-peer-range.mjs):
+ * typescript-eslint's peer range still excludes TypeScript past 6.1, and
+ * that constraint has not moved - the side-by-side aliasing ROUTES AROUND
+ * it (typecheck/build run on a real TypeScript 7, while the plain
+ * `typescript` import typescript-eslint resolves still lands on a 6.x
+ * shim), it does not satisfy it. So this PR is no longer tracking "may we
+ * take the bump" - it is tracking "has typescript-eslint's peer range
+ * widened enough that the alias can be REMOVED and `typescript` can go
+ * back to being one real package again." It fires (turns red) the day
+ * this PR closes, is superseded, or dependabot.yml gains an "ignore" rule
+ * for typescript - any of which would destroy the only signal watching
+ * for that release. Silencing this PR with a Dependabot "ignore" rule
+ * would hide the constraint instead of tracking it, so this guard checks
+ * two things together:
  *
  *   1. .github/dependabot.yml carries no "ignore" rule matching
  *      "typescript" in any update block.

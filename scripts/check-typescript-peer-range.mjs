@@ -6,7 +6,8 @@
  * that range - 6.0.3 is simply the highest version that satisfies it. This
  * script itself reads whatever range is CURRENTLY installed and checks two
  * things against it: that every checked package agrees, and that the
- * pinned `typescript` version satisfies it. It does not hardcode the range
+ * resolved, installed `typescript` version satisfies it. It does not
+ * hardcode the range
  * anywhere in its own pass/fail logic, so a legitimate `typescript-eslint`
  * upgrade that widens the range in agreement across every package stays
  * green here - that is this script's job, and it is not the mechanism that
@@ -41,6 +42,16 @@
  * `typescript-eslint` actually publishes. This is deliberately not a
  * general semver-range parser - that would be untested surface for range
  * shapes this repo never actually encounters.
+ *
+ * The version checked against that range is read from the INSTALLED
+ * `node_modules/typescript/package.json`'s own "version" field, never from
+ * package.json's raw `devDependencies.typescript` manifest spec. Under an
+ * npm alias (`"typescript": "npm:@typescript/typescript6@6.0.2"`) the raw
+ * spec string is not a bare semver at all, so parsing it directly throws
+ * before the range check ever runs. Reading the resolved package's own
+ * version is also simply more correct regardless of aliasing: it is the
+ * actual code that will execute, not a string in a manifest that a range
+ * operator (^, ~, an alias) could make diverge from what got installed.
  *
  * Run with:
  *
@@ -143,8 +154,9 @@ export function versionSatisfiesRange(version, rangeString) {
 // ---------------------------------------------------------------------------
 // The real check: reads every package in PEER_RANGE_PACKAGES_TO_CHECK's
 // actual installed peerDependencies.typescript entry, confirms they all
-// agree, and confirms this repo's own pinned typescript version satisfies
-// the agreed-upon range.
+// agree, and confirms the RESOLVED, installed typescript version (read from
+// node_modules/typescript/package.json, not the raw devDependencies spec)
+// satisfies the agreed-upon range.
 // ---------------------------------------------------------------------------
 
 /**
@@ -224,22 +236,32 @@ export function checkTypescriptPeerRange(root = REPO_ROOT) {
     return { ok: false, problems, range };
   }
 
-  let pkg;
+  const installedTypescriptPackageJsonPath = path.join(
+    root,
+    "node_modules",
+    "typescript",
+    "package.json"
+  );
+  let installedTypescriptPackageJson;
   try {
-    pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
+    installedTypescriptPackageJson = JSON.parse(
+      readFileSync(installedTypescriptPackageJsonPath, "utf8")
+    );
   } catch (err) {
-    problems.push(`could not read package.json: ${err.message}`);
+    problems.push(
+      `could not read the installed typescript package.json at ${installedTypescriptPackageJsonPath}: ${err.message}`
+    );
     return { ok: false, problems, range };
   }
 
-  const pinnedVersion = pkg.devDependencies?.typescript;
-  if (typeof pinnedVersion !== "string") {
+  const resolvedVersion = installedTypescriptPackageJson.version;
+  if (typeof resolvedVersion !== "string") {
     problems.push(
-      'package.json has no "devDependencies"."typescript" entry to check against the peer range'
+      `the installed typescript package.json at ${installedTypescriptPackageJsonPath} has no "version" field to check against the peer range`
     );
-  } else if (!versionSatisfiesRange(pinnedVersion, range)) {
+  } else if (!versionSatisfiesRange(resolvedVersion, range)) {
     problems.push(
-      `package.json pins typescript to "${pinnedVersion}", which does NOT satisfy typescript-eslint's declared peer range "${range}" (requires >= ${parsedRange.min} and < ${parsedRange.max})`
+      `the installed typescript resolves to version "${resolvedVersion}" (from ${installedTypescriptPackageJsonPath}), which does NOT satisfy typescript-eslint's declared peer range "${range}" (requires >= ${parsedRange.min} and < ${parsedRange.max})`
     );
   }
 

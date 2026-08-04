@@ -123,8 +123,9 @@ auth.json
 *.mcpb
 
 # test/lint-scope.test.js's own disposable runtime-witness canary: a real
-# file it plants inside src/ to prove `npm run lint` genuinely executes
-# against this repository's real tree, then deletes. Ignored so a test run
-# that crashes before its own cleanup can never leave something a `git add`
+# file it plants inside test/ (not src/ - see that file's own comment on
+# CANARY_RELATIVE_PATH) to prove `npm run lint` genuinely executes against
+# this repository's real tree, then deletes. Ignored so a test run that
+# crashes before its own cleanup can never leave something a `git add`
 # would pick up.
-/src/__lint_scope_runtime_canary__.ts
+/test/__lint_scope_runtime_canary__.ts

@@ -157,6 +157,21 @@ function writeFixturePackageJson(dir: string, packageName: string, peerRange: st
   writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify(body));
 }
 
+/**
+ * Writes the fixture's resolved `node_modules/typescript/package.json`,
+ * mirroring what a real install resolves to regardless of aliasing - the
+ * production guard reads this file's "version" field, never the raw
+ * devDependencies spec string in package.json.
+ */
+function writeFixtureResolvedTypescript(dir: string, resolvedVersion: string) {
+  const pkgDir = path.join(dir, "node_modules", "typescript");
+  mkdirSync(pkgDir, { recursive: true });
+  writeFileSync(
+    path.join(pkgDir, "package.json"),
+    JSON.stringify({ name: "typescript", version: resolvedVersion })
+  );
+}
+
 function makeFixtureRoot({
   pinnedVersion,
   ranges,
@@ -169,6 +184,7 @@ function makeFixtureRoot({
     path.join(dir, "package.json"),
     JSON.stringify({ devDependencies: { typescript: pinnedVersion } })
   );
+  writeFixtureResolvedTypescript(dir, pinnedVersion);
   for (const packageName of PEER_RANGE_PACKAGES_TO_CHECK) {
     writeFixturePackageJson(dir, packageName, ranges[packageName] ?? ">=4.8.4 <6.1.0");
   }
@@ -380,6 +396,7 @@ test("the real production guard (checkTypescriptPeerRange) goes red with a usefu
       path.join(dir, "package.json"),
       JSON.stringify({ devDependencies: { typescript: "6.0.3" } })
     );
+    writeFixtureResolvedTypescript(dir, "6.0.3");
     for (const packageName of PEER_RANGE_PACKAGES_TO_CHECK) {
       const pkgDir = path.join(dir, "node_modules", packageName);
       mkdirSync(pkgDir, { recursive: true });
@@ -461,6 +478,7 @@ test("the real production guard (checkTypescriptPeerRange) goes red with a usefu
       path.join(dir, "package.json"),
       JSON.stringify({ devDependencies: { typescript: "6.0.3" } })
     );
+    writeFixtureResolvedTypescript(dir, "6.0.3");
     for (const packageName of PEER_RANGE_PACKAGES_TO_CHECK) {
       const pkgDir = path.join(dir, "node_modules", packageName);
       mkdirSync(pkgDir, { recursive: true });
