@@ -37,6 +37,81 @@ export type CwdResolution =
   | { readonly ok: false; readonly message: string };
 
 /**
+ * The trusted-source environment variable naming an OPTIONAL,
+ * `path.delimiter`-separated list of absolute directory roots a job's
+ * resolved cwd must fall inside. Read only from THIS SERVER's own process
+ * environment, never from a tool call's own arguments - the same trust
+ * boundary `src/policy.ts`'s `POLICY_FILE_ENV_VAR` uses, for the same
+ * reason (an operator's own configuration, never caller-suppliable).
+ * UNSET, or the raw environment-variable value ITSELF being the empty
+ * string, is the ONLY shape meaning no restriction is applied at all: this
+ * preserves this codebase's own pre-existing default (any real, existing
+ * directory a `resolveCwd` stat/realpath could reach was always
+ * acceptable), so root validation is opt-in server configuration layered
+ * on top of that existing behavior, never a silently-imposed new
+ * default-deny. An operator who wants the restriction sets this; one who
+ * doesn't sees no change at all. Any OTHER raw value - including one that
+ * splits and filters down to zero effective entries, such as a lone
+ * `path.delimiter` on its own - is a non-empty configuration attempt and
+ * denies every cwd rather than being read as unrestricted: a non-empty
+ * value is evidence the operator intended some restriction, and silently
+ * treating a malformed or all-stale one as "no restriction" would be a
+ * wildcard, not a narrowing.
+ */
+export const CWD_ROOTS_ENV_VAR = "GHANTIKA_CWD_ROOTS";
+
+/**
+ * `undefined` ONLY when the env var is genuinely unset or its raw value is
+ * itself the empty string (see `CWD_ROOTS_ENV_VAR`'s own docs) - that is
+ * the sole shape meaning "no restriction". Any other raw value returns the
+ * split-and-filtered array AS IS, including an empty one (e.g. a raw value
+ * of just `path.delimiter`), so `resolveCwd`'s `configuredRoots !==
+ * undefined` check still treats it as configured and `isWithinConfiguredRoots`
+ * denies every cwd against zero entries - never silently reinterpreted as
+ * unrestricted.
+ */
+function loadConfiguredCwdRoots(): readonly string[] | undefined {
+  const raw = process.env[CWD_ROOTS_ENV_VAR];
+  if (raw === undefined || raw.length === 0) return undefined;
+  return raw.split(path.delimiter).filter((entry) => entry.length > 0);
+}
+
+/**
+ * `true` iff `resolvedCwd` (already realpath-resolved by the caller) is
+ * EQUAL TO, or a real descendant of, at least one entry in `roots`. Each
+ * root is ALSO realpath-resolved here before comparison - a configured
+ * root that is itself a symlink is judged by its real target, closing the
+ * same "compare a symlink's spelling, not what it actually points at"
+ * ambiguity `resolvedCwd` itself is already immune to by having been
+ * realpath-resolved before this function ever sees it. A root that cannot
+ * be resolved at all (doesn't exist, permission denied) is silently
+ * DROPPED from the effective set rather than treated as a match or a hard
+ * failure - the same "a stale entry narrows rather than crashes or
+ * wildcards" precedent `src/policy.ts`'s `resolveAllowlistEntry` already
+ * uses for a stale allowlist entry.
+ *
+ * Directory-boundary comparison, not a bare string prefix: `/srv/job-2`
+ * must never match a configured root of `/srv/job` (a real prefix of that
+ * string that is NOT actually an ancestor directory) - the trailing
+ * separator appended to `realRoot` before the `startsWith` check is what
+ * makes the comparison test path COMPONENTS, not characters.
+ */
+function isWithinConfiguredRoots(resolvedCwd: string, roots: readonly string[]): boolean {
+  for (const root of roots) {
+    let realRoot: string;
+    try {
+      realRoot = fs.realpathSync(root);
+    } catch {
+      continue;
+    }
+    if (resolvedCwd === realRoot) return true;
+    const realRootWithSep = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
+    if (resolvedCwd.startsWith(realRootWithSep)) return true;
+  }
+  return false;
+}
+
+/**
  * Resolves and validates a job's working directory. An OMITTED `rawCwd`
  * defaults to the server's own `process.cwd()` (documented default
  * behavior). A PROVIDED `rawCwd` that doesn't exist, or exists but isn't a
@@ -45,7 +120,43 @@ export type CwdResolution =
  * (`src/tools/run.ts`) turns a `{ok:false}` here into an already-failed job
  * (`diagnostic.reason: "spawn-error"`) rather than ever attempting to spawn.
  * The successful resolution is realpath-resolved, per the
- * frozen internal `JobRecord.cwd` shape.
+ * frozen internal `JobRecord.cwd` shape - and, when `CWD_ROOTS_ENV_VAR` is
+ * configured, is ALSO validated against that root set (see
+ * `isWithinConfiguredRoots`) before this function reports success; a cwd
+ * outside every configured root fails here, the same way a nonexistent one
+ * does, rather than ever reaching a real spawn.
+ *
+ * DISCLOSED TOCTOU RESIDUAL - and the gap is NOT narrow, because `run()`'s
+ * own admission queue sits between this validation and the real spawn.
+ * This function validates the REAL path a symlink resolves to AT THE
+ * MOMENT OF THIS CALL, which happens BEFORE `run()` asks for a concurrency
+ * slot. A free slot removes only the QUEUE-DURATION extension of that gap,
+ * not the gap itself: between this call and the real spawn, `run()` still
+ * builds the child's env, resolves the caller-named executable (a
+ * synchronous, unbounded-length walk of a caller-suppliable `PATH`),
+ * resolves policy, and creates the job record - none of that is a fixed or
+ * guaranteed-short interval, so an immediately admitted job's window is
+ * shorter than a queued job's but still open and still unbounded. When the
+ * job is QUEUED instead (`src/tools/run.ts`'s own "Concurrency cap + FIFO
+ * queue" docs), this exact resolved string is captured in a closure and
+ * held, unconfirmed again, for the job's ENTIRE time in that queue - which
+ * can be arbitrarily long, bounded only by how long every job ahead of it
+ * takes to finish. Nothing re-validates the string against
+ * `GHANTIKA_CWD_ROOTS` at the moment the job actually reaches the front of
+ * the queue and spawns. And "no SECOND resolution" was never true for
+ * either path: passing a pathname to `child_process.spawn` causes the OS
+ * itself to resolve it again at process-creation time - the exact same
+ * independent-second-resolution shape `src/tools/run.ts` already discloses
+ * for the executable/policy check just above this one in that file. So
+ * what is actually open here: a symlink somewhere on `resolvedCwd`'s own
+ * path being swapped, or the directory itself being replaced, at ANY point
+ * between this validation and the moment the OS actually creates the
+ * process - a real, exploitable window on either path, wider for a queued
+ * job than an immediately admitted one but never zero for either. This
+ * story does not close it; it is a known, unclosed time-of-check-to-
+ * time-of-use limitation this validation does not claim to guard against,
+ * proven by a real queued-job reproduction in
+ * `test/concurrency.test.ts`.
  */
 export function resolveCwd(rawCwd: string | undefined): CwdResolution {
   const target = rawCwd ?? process.cwd();
@@ -64,11 +175,17 @@ export function resolveCwd(rawCwd: string | undefined): CwdResolution {
   if (!stat.isDirectory()) {
     return { ok: false, message: "cwd exists but is not a directory" };
   }
+  let resolvedCwd: string;
   try {
-    return { ok: true, resolvedCwd: fs.realpathSync(target) };
+    resolvedCwd = fs.realpathSync(target);
   } catch {
     return { ok: false, message: "cwd could not be resolved" };
   }
+  const configuredRoots = loadConfiguredCwdRoots();
+  if (configuredRoots !== undefined && !isWithinConfiguredRoots(resolvedCwd, configuredRoots)) {
+    return { ok: false, message: "cwd is outside the configured allowed roots" };
+  }
+  return { ok: true, resolvedCwd };
 }
 
 // ---------------------------------------------------------------------------
