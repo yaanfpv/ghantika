@@ -975,7 +975,7 @@ test("the real supervisor exits zero when only legitimate per-platform skips are
  * to fire first. Bounded (not setInterval) so nothing about this
  * fixture's OWN timer lingers past its own 2s expiry - comfortably
  * longer than the 500ms both tests below configure, comfortably shorter
- * than run-tests.mjs's own 60s idle watchdog. This bound does not, by
+ * than run-tests.mjs's own 180s idle watchdog. This bound does not, by
  * itself, guarantee the underlying OS process exits: node:test's own
  * `--test-timeout` marks THIS TEST failed without necessarily
  * terminating the process it runs in, if something else (the
@@ -1045,6 +1045,74 @@ test("the real supervisor still fails a genuinely hung test fast, at whatever --
   // test/process.test.ts's own POSIX_PROCESS_GROUP_SKIP for the identical
   // rationale) and this repository's own production kill.ts, which
   // discloses no process-group confirmation on Windows either.
+  if (process.platform !== "win32") {
+    assert.deepEqual(
+      pgrepGroupMembers(result.pgid),
+      [],
+      `expected zero real survivors in pgid ${result.pgid} after the hung fixture's supervisor exited`
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Negative control for the `--idle-timeout` ceiling itself (production
+// value: run-tests.mjs's own idleTimeoutMs default, raised from 60_000 to
+// 180_000 - see its own doc comment for the measured basis). Raising that
+// ceiling to give a real, already-bounded operation (loader-escape-
+// matrix.test.ts's nested spawnSync) enough room is only safe if a
+// GENUINELY stuck run still gets killed and named at whatever value is
+// configured - this proves the mechanism itself, at a short timeout chosen
+// for this test's own speed, never at the production value (which would
+// make this control itself take over three minutes to run and would prove
+// nothing a short timeout doesn't already prove just as well - the same
+// reasoning the `--test-timeout` control above states for its own short
+// value).
+// ---------------------------------------------------------------------------
+
+test("the real supervisor still fails a genuinely hung run fast, at whatever --idle-timeout value is configured - proving the mechanism a raised production ceiling depends on", () => {
+  // The SAME hung-test fixture the --test-timeout control above drives -
+  // never a new shape - with the two timing flags flipped: --test-timeout
+  // set far above this test's own duration so IT never fires, and
+  // --idle-timeout set to the short value this control actually exercises.
+  // With nothing else able to intervene first, the idle watchdog is the
+  // only mechanism left standing, and it fires before node:test's own
+  // per-test `test:start` for the hung test even has a chance to report -
+  // confirmed empirically (not assumed): the diagnostic's own captured
+  // last-event names `test:dequeue`, not `test:start`. That is not an
+  // incidental detail - it is the exact shape both real hosted-CI
+  // failures this raise responds to showed in their own diagnostic
+  // output (last event test:dequeue, then total silence), because
+  // loader-escape-matrix.test.ts's own before() hook blocks synchronously
+  // on a nested spawnSync call before any of its tests can reach
+  // test:start either.
+  const result = runSupervisorAgainstFixture({
+    testFiles: buildHungTestFixtureFiles(),
+    buildBaseline: () => ({}),
+    buildCriticalTests: () => [],
+    extraArgs: ["--idle-timeout=300", "--test-timeout=60000"],
+  });
+
+  assert.notEqual(
+    result.status,
+    0,
+    `expected the hung run to fail, got exit ${result.status}. stdout: ${result.stdout}`
+  );
+  assert.ok(
+    result.stderr.includes("IDLE WATCHDOG: no test-runner event for 300ms"),
+    `expected the idle-watchdog diagnostic naming the configured 300ms value, got: ${result.stderr}`
+  );
+  assert.ok(
+    result.stderr.includes("hang.test.mjs"),
+    `expected the diagnostic to name the stuck fixture file, got: ${result.stderr}`
+  );
+
+  // Same second, independent confirmation the --test-timeout control above
+  // makes: the exit code and diagnostic only prove the SUPERVISOR reported
+  // the idle timeout, not that the hung fixture's own OS process is
+  // actually gone. collectChildResult (via reapFixtureProcessGroup) already
+  // force-killed and confirmed the whole group empty before returning; this
+  // checks that same property a second, independent way. No Windows
+  // equivalent, matching every other process-group test in this file.
   if (process.platform !== "win32") {
     assert.deepEqual(
       pgrepGroupMembers(result.pgid),
