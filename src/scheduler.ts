@@ -304,12 +304,15 @@ export interface RetainedJobSummary {
  * on why reading via `output`/`tail` never resets this clock).
  *
  * This function is a pure decision, evaluated against whatever `now` its
- * caller supplies - it does not itself run on any schedule. The actual
- * wall-clock bound a caller can rely on depends on how often it is
+ * caller supplies - it does not itself run on any schedule. How promptly
+ * a caller actually reaches this function depends on how often it is
  * invoked: `jobStore.ts`'s `sweepRetention` calls it both opportunistically
  * (on every `createJob`/`createFailedJob`, for immediacy) and from a
- * periodic timer (`startRetentionSweeper`, for a real bound that holds even
- * on an otherwise-idle server) - see that file for the composed guarantee.
+ * periodic timer (`startRetentionSweeper`, scheduled every
+ * `RETENTION_SWEEP_INTERVAL_MS` so an otherwise-idle server still gets
+ * checked) - see that file's own docs for why the timer's cadence is a
+ * schedule, not a guaranteed wall-clock ceiling on when a check actually
+ * runs.
  *
  * `jobs` must already exclude anything this predicate must never touch.
  * The real caller (`jobStore.ts`'s `sweepRetention`) applies six checks

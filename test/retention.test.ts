@@ -890,7 +890,7 @@ test("negative control: the aggressive config used above genuinely reclaims an o
 });
 
 // ---------------------------------------------------------------------------
-// startRetentionSweeper / stopRetentionSweeper - the real time bound (a1)
+// startRetentionSweeper / stopRetentionSweeper - the scheduled sweep timer (a1)
 // ---------------------------------------------------------------------------
 
 test("startRetentionSweeper is idempotent - a second call while one is already running does not create a second timer", () => {

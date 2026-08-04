@@ -314,11 +314,24 @@ function runPermanentGuardSuite(): { tests: number; pass: number; fail: number; 
  * call ran in a window with zero test-runner events, leaving this file's
  * outer idle-watchdog with nothing to reset on until the call finished.
  * `ensureBaseline()` is instead invoked as the first statement inside this
- * file's own first test, so that test's own `test:start` event resets the
- * idle timer before the blocking call begins - the outer and inner bounds
- * now measure the same window instead of different ones. Memoized so
- * every later caller (including the two tests below that depend on it)
- * gets the identical value regardless of call order.
+ * file's own first test - and that test's own callback begins with an
+ * explicit yield (`await new Promise((resolve) => setImmediate(resolve))`)
+ * BEFORE calling this, specifically so `test:dequeue` for that test can
+ * finish delivering to the parent process before the synchronous block
+ * begins. `test:dequeue`, not `test:start`, is what resets the idle
+ * watchdog here: node:test never emits `test:start` for a given test
+ * until that test's own callback has already settled, so for this
+ * particular test `test:start` necessarily arrives together with
+ * `test:complete`, after the blocking call is already done - confirmed
+ * directly against this file's own shape (parent-process TestsStream
+ * probe: `test:dequeue` at 98ms, then the block, then `test:complete`,
+ * `test:start`, and `test:pass` together at ~1116ms). The yield narrows
+ * the gap between the outer watchdog's last reset and the start of the
+ * blocking call to whatever `setImmediate` takes to fire - it does not
+ * make the two bounds begin at the same instant, and nothing here claims
+ * that it does. Memoized so every later caller (including the two tests
+ * below that depend on it) gets the identical value regardless of call
+ * order.
  */
 let baseline: ReturnType<typeof runPermanentGuardSuite> | undefined;
 function ensureBaseline(): NonNullable<typeof baseline> {

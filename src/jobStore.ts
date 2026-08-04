@@ -1655,30 +1655,32 @@ export class JobStore {
   }
 
   /**
-   * Starts the REAL periodic timer that makes retention a genuine
-   * time-based guarantee rather than one that only ever fires when a new
-   * job happens to arrive (`createJob`/`createFailedJob` already call
-   * `sweepRetention` opportunistically, but on an otherwise-idle server
-   * nothing would ever trigger it again). In PRODUCTION this is called
-   * exactly once, from `src/server.ts`'s `runServer` - the real
-   * production entrypoint - never from `createServer()` (which every
-   * test in this codebase's own suite calls directly, often many times
-   * against this one process-lifetime singleton); a test that specifically
-   * exercises the timer itself calls this method directly instead. That
-   * production split is deliberate and load-bearing: starting this timer
-   * from the `JobStore` CONSTRUCTOR, instead, would mean every
-   * test-constructed instance spins up its own background interval,
-   * accreting across a whole test run - which is exactly why the
-   * constructor never calls it and every caller that wants the timer,
-   * production or test, must ask for it explicitly. Idempotent - a
-   * second call while one is already running is a no-op, matching this
-   * file's other start/stop pairs.
+   * Starts the REAL periodic timer that makes retention check on a
+   * schedule rather than only ever firing when a new job happens to
+   * arrive (`createJob`/`createFailedJob` already call `sweepRetention`
+   * opportunistically, but on an otherwise-idle server nothing would
+   * ever trigger it again). In PRODUCTION this is called exactly once,
+   * from `src/server.ts`'s `runServer` - the real production entrypoint
+   * - never from `createServer()` (which every test in this codebase's
+   * own suite calls directly, often many times against this one
+   * process-lifetime singleton); a test that specifically exercises the
+   * timer itself calls this method directly instead. That production
+   * split is deliberate and load-bearing: starting this timer from the
+   * `JobStore` CONSTRUCTOR, instead, would mean every test-constructed
+   * instance spins up its own background interval, accreting across a
+   * whole test run - which is exactly why the constructor never calls it
+   * and every caller that wants the timer, production or test, must ask
+   * for it explicitly. Idempotent - a second call while one is already
+   * running is a no-op, matching this file's other start/stop pairs.
    *
-   * `RETENTION_SWEEP_INTERVAL_MS` bounds how stale the timer-driven check
-   * can be against a configured `retentionMs`: a job becomes eligible the
-   * instant it crosses `retentionMs`, but this timer only actually looks
-   * at most once per interval, so the worst-case delay past the
-   * documented deadline is bounded by that interval, not by activity.
+   * `RETENTION_SWEEP_INTERVAL_MS` sets how often the check is
+   * SCHEDULED, not a guaranteed maximum delay: it is an ordinary
+   * `setInterval`, and its callback only runs once the event loop is
+   * free to reach it, so a job's actual reclamation can lag this
+   * interval by however long the loop is busy with other work at that
+   * moment (a blocking synchronous call elsewhere in the process, or
+   * genuine host contention) - the schedule names the cadence the check
+   * is attempted at, not a wall-clock ceiling on when it completes.
    * `.unref()`'d so this timer is never, on its own, the reason a real
    * MCP stdio server's process stays alive - the transport connection
    * already governs that.

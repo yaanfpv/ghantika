@@ -232,15 +232,19 @@ export function parseArgs(argv) {
     //
     // Raised from 60_000 to 180_000 after the 60s ceiling started firing
     // on a legitimate, already-bounded operation rather than a genuine
-    // hang. loader-escape-matrix.test.ts's own before() hook blocks
+    // hang. loader-escape-matrix.test.ts's own first test blocks
     // synchronously on a nested `node --test` supervisor (spawnSync with
     // its own timeout: 45_000, added in the same repo's history to bound
-    // that supervisor - see runPermanentGuardSuite's doc comment) - and
-    // while that call is in flight, this file emits nothing this
-    // wrapper's stream ever sees, because before() runs before any of
-    // the file's own tests can reach test:start. Under coverage (c8
-    // forces this run() call to a single concurrent file), no OTHER file
-    // is running at the same time to paper over the silence either.
+    // that supervisor - see runPermanentGuardSuite's doc comment); it
+    // used to run inside a before() hook, which this file no longer has
+    // - the call now happens as the first statement of that test's own
+    // callback, immediately after an explicit yield lets that test's
+    // test:dequeue reach the parent first. While the blocking call is in
+    // flight, this file still emits nothing this wrapper's stream ever
+    // sees, because test:start for that same test does not arrive until
+    // the callback (block included) has already settled. Under coverage
+    // (c8 forces this run() call to a single concurrent file), no OTHER
+    // file is running at the same time to paper over the silence either.
     //
     // Measured directly, not assumed: instrumenting this file's own
     // noteEvent() to log the gap before every liveness event and running
