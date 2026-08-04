@@ -481,6 +481,47 @@ function beginSpawn(
   env: Record<string, string>,
   deadlineMs: number | undefined
 ): void {
+  // The job's own client-visible terminal transition - what
+  // `jobStore.markExited` actually does - must never become observable
+  // before this job's last output event. `exit`, `stdout end`, and
+  // `stderr end` are three independent, unsynchronized listeners on the
+  // same child (see spawnManaged's own wiring); Node gives no ordering
+  // guarantee between them, and a backgrounded grandchild that inherits
+  // this job's stdio and outlives the immediate child is a real, ordinary
+  // way for `exit` to fire before either stream's `end` does (see
+  // test/wake-integration.test.ts's "TERMINAL ORDER" test for a
+  // reproduction driven through this exact code path). So the actual
+  // `markExited` call waits for whichever of these three signals arrives
+  // LAST; the two that arrive first only record that they happened. This
+  // does not touch the reap/release-slot path below, which is OS-level
+  // process cleanup with no dependency on the job's own terminal state
+  // (see `reapProcessGroupOnce`'s own docs) and must still run the
+  // instant the real child exits.
+  let exitInfo: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+  let stdoutEnded = false;
+  let stderrEnded = false;
+  // A grandchild that has escaped this job's process group (e.g. via its
+  // own `setsid`) can hold a stream open indefinitely - `reapProcessGroupOnce`
+  // below only ever signals THIS job's own group, so it has no way to reach
+  // a descendant that removed itself from it. Waiting on `stdoutEnded &&
+  // stderrEnded` alone in that case would never fire, hanging the job's
+  // OBSERVABLE terminal state forever even though this codebase has
+  // already done everything it can to reap the real processes. `reapSettled`
+  // bounds the wait to that same reap attempt instead of an arbitrary new
+  // timeout: once it resolves - confirmed, unconfirmed, or errored are all
+  // still a SETTLEMENT - a still-open stream stops blocking the terminal
+  // mark. The residual this accepts is narrow and disclosed, not a
+  // reintroduction of the bug this fix closes: only a descendant that has
+  // both escaped process-group containment AND is still writing can produce
+  // a stray line after the client sees terminal; every ordinary case (no
+  // escaped descendant) still gets the full ordering guarantee.
+  let reapSettled = false;
+  const markExitedOnceStreamsSettled = () => {
+    if (exitInfo === undefined) return;
+    if (!(stdoutEnded && stderrEnded) && !reapSettled) return;
+    jobStore.markExited(jobId, exitInfo.code, exitInfo.signal);
+  };
+
   const child = spawnManaged(
     { argv, shellCommand, shellExecutable, cwd, env },
     {
@@ -502,7 +543,8 @@ function beginSpawn(
         });
       },
       onExit: (code, signal) => {
-        jobStore.markExited(jobId, code, signal);
+        exitInfo = { code, signal };
+        markExitedOnceStreamsSettled();
         // The PRIMARY reap path for the root-exits-first case: fired the
         // instant the leader's own exit is observed, without ever being
         // awaited here (the same fire-and-forget shape as the async
@@ -535,6 +577,16 @@ function beginSpawn(
             );
             return "errored";
           });
+        // Bounds the terminal-mark wait above to this SAME reap attempt -
+        // see `markExitedOnceStreamsSettled`'s own docs for why an
+        // unbounded wait on both streams ending is unsafe. `reapDecision`
+        // never rejects (the `.catch` above always resolves it to a real
+        // `ReapReleaseDecision`), so this always fires once the reap has
+        // genuinely settled, whatever the outcome.
+        reapDecision.then(() => {
+          reapSettled = true;
+          markExitedOnceStreamsSettled();
+        });
         // The slot releases only once THIS reap decision has been awaited
         // to completion, never merely kicked off - a slow/delayed reap
         // must not release it early, and a non-"confirmed" decision does
@@ -551,8 +603,16 @@ function beginSpawn(
       },
       onStdoutChunk: (chunk) => jobStore.appendOutput(jobId, "stdout", chunk),
       onStderrChunk: (chunk) => jobStore.appendOutput(jobId, "stderr", chunk),
-      onStdoutEnd: () => jobStore.finalizeStream(jobId, "stdout"),
-      onStderrEnd: () => jobStore.finalizeStream(jobId, "stderr"),
+      onStdoutEnd: () => {
+        jobStore.finalizeStream(jobId, "stdout");
+        stdoutEnded = true;
+        markExitedOnceStreamsSettled();
+      },
+      onStderrEnd: () => {
+        jobStore.finalizeStream(jobId, "stderr");
+        stderrEnded = true;
+        markExitedOnceStreamsSettled();
+      },
     }
   );
   if (child !== undefined) {

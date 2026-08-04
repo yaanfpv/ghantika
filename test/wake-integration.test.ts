@@ -39,7 +39,7 @@
  * meaningful against a real, separate OS process.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { mock, test } from "node:test";
@@ -1518,3 +1518,152 @@ test("STDERR WAKE PROOF (real spawned process, zero stdout): a command that writ
     await pair.close();
   }
 });
+
+test("TERMINAL ORDER (real spawned process, backgrounded grandchild): a job's terminal state never becomes observable before its last output line has arrived, even when a backgrounded grandchild inherits stdout and outlives the immediate child", async () => {
+  const pair = await startPair(false);
+  let jobId: string | undefined;
+  try {
+    // The immediate child backgrounds a subshell that inherits its stdout fd
+    // and outlives it - an ordinary shell idiom (`some_task &`). The
+    // immediate child's own `exit` fires well before the grandchild's
+    // `sleep` returns and it writes its own line, and the stdout pipe's
+    // `end` event does not fire until every process still holding that fd
+    // open - including the grandchild - has closed it.
+    //
+    // The `trap '' TERM` is load-bearing against a SEPARATE mechanism, not
+    // a workaround for anything this test is checking: `beginSpawn`'s own
+    // `onExit` handler signals the job's whole process group the instant
+    // the leader exits (`reapProcessGroupOnce`, this file's primary
+    // leader-exit reap path). Without the trap, that signal reaches the
+    // grandchild well before its 20ms sleep elapses and kills it before it
+    // ever reaches its own `echo` - the line is lost, not merely delayed,
+    // on BOTH the buggy and the fixed code, which makes the assertion
+    // below vacuous either way. Trapping the signal lets the grandchild
+    // finish its short sleep and write its line regardless of when the
+    // reap's signal arrives, then exit voluntarily right after - well
+    // inside the reap's own multi-second grace period, so this never
+    // depends on an escalation to SIGKILL.
+    const shellCommand =
+      "(trap '' TERM; sleep 0.02; echo late-from-grandchild) & echo immediate-done";
+    const minted = await runJob(pair.client, {
+      command: shellCommand,
+      shell: true,
+      label: "terminal-order-grandchild",
+    });
+    jobId = minted.job_id as string;
+    assert.equal(typeof jobId, "string");
+
+    // The property under test: the FIRST poll to observe a terminal state
+    // must already see the grandchild's delayed line in stdout. Reading
+    // `output` immediately after `pollUntilTerminal` returns - not after any
+    // further wait - is what makes this a genuine ordering assertion rather
+    // than a timing coincidence: on the pre-fix code, `markExited` fires
+    // synchronously in `onExit`, well before the grandchild's 20ms sleep has
+    // elapsed, so the poll that first observes "terminal" sees only the
+    // immediate child's own line, not the grandchild's. On the fix, the
+    // terminal marking is deferred until stdout AND stderr have both ended,
+    // which for this command only happens once the grandchild has also
+    // closed its inherited stdout fd - by which point its line is already
+    // in the buffer.
+    await pollUntilTerminal(pair.client, jobId);
+    const outputResult = (await pair.client.callTool({
+      name: "output",
+      arguments: { job_id: jobId, stream: "stdout" },
+    })) as { structuredContent?: { events?: Array<{ text: string }> } };
+    const texts = (outputResult.structuredContent?.events ?? []).map((event) => event.text);
+    assert.ok(
+      texts.includes("immediate-done"),
+      `expected the immediate child's own line to have arrived, got: ${JSON.stringify(texts)}`
+    );
+    assert.ok(
+      texts.includes("late-from-grandchild"),
+      `expected the grandchild's delayed line to have already arrived by the time the job's ` +
+        `terminal state first became observable, got: ${JSON.stringify(texts)}`
+    );
+  } finally {
+    if (jobId !== undefined) await killAndReapRealChild(jobId);
+    await pair.close();
+  }
+});
+
+test(
+  "BOUNDED TERMINAL WAIT (real spawned process, process-group-escaped grandchild): a job's terminal state becomes observable within a normal poll bound even when a descendant has escaped this job's process group and holds a stream open indefinitely",
+  { skip: process.platform === "win32" ? "POSIX process-group semantics only" : false },
+  async () => {
+    const pair = await startPair(false);
+    let jobId: string | undefined;
+    let escapedPid: number | undefined;
+    const dir = mkdtempSync(path.join(tmpdir(), "ghantika-wake-escape-"));
+    const marker = path.join(dir, "escaped-pid.txt");
+    const escapeScriptPath = path.join(dir, "escape.mjs");
+    // A descendant that detaches into its OWN process group - the same
+    // primitive the `setsid` shell command wraps, invoked here through
+    // Node's own `detached: true` rather than that command so this runs
+    // on every platform in the matrix (macOS has no `setsid` binary by
+    // default; Linux does). It holds this job's inherited stdout fd open
+    // for 30s - well past `pollUntilTerminal`'s own default poll bound
+    // (200 attempts * 20ms = 4s) below, which is what makes this test
+    // genuinely discriminating rather than a coincidental pass: without
+    // the reap-settled fallback, the terminal mark would wait on this
+    // descendant's OWN 30s bound rather than the job's reap, and the poll
+    // would time out first. 30s is still bounded, not indefinite, so a
+    // missed explicit reap in this test's cleanup below still
+    // self-terminates rather than leaking a real process.
+    writeFileSync(
+      escapeScriptPath,
+      [
+        `import { spawn } from "node:child_process";`,
+        `import { writeFileSync } from "node:fs";`,
+        `const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000);"], {`,
+        `  detached: true,`,
+        `  stdio: ["ignore", "inherit", "inherit"],`,
+        `});`,
+        `writeFileSync(${JSON.stringify(marker)}, String(child.pid));`,
+        `child.unref();`,
+      ].join("\n")
+    );
+    try {
+      const shellCommand = `${process.execPath} ${escapeScriptPath}; echo immediate-done`;
+      const minted = await runJob(pair.client, {
+        command: shellCommand,
+        shell: true,
+        label: "terminal-order-escaped-grandchild",
+      });
+      jobId = minted.job_id as string;
+      assert.equal(typeof jobId, "string");
+
+      const pidText = await waitForFile(marker, {
+        until: (content) => content.trim().length > 0,
+      });
+      escapedPid = Number(pidText.trim());
+      assert.ok(
+        Number.isInteger(escapedPid) && escapedPid > 0,
+        `expected a real numeric pid, got ${JSON.stringify(pidText)}`
+      );
+
+      // The property under test: even though the escaped descendant is
+      // still alive and still holding this job's stdout fd open, the
+      // FIRST poll to observe a terminal state arrives within the poll's
+      // own ordinary bound (4s at the default 200 attempts * 20ms) -
+      // never hangs waiting on a stream `end` this job's own process-
+      // group reap has no way to produce, since the escaped descendant is
+      // no longer a member of the group `reapProcessGroupOnce` signals.
+      const terminalStatus = await pollUntilTerminal(pair.client, jobId);
+      assert.ok(
+        terminalStatus.state === "exited" || terminalStatus.state === "killed",
+        `expected a real terminal state, got: ${JSON.stringify(terminalStatus)}`
+      );
+    } finally {
+      if (jobId !== undefined) await killAndReapRealChild(jobId);
+      if (escapedPid !== undefined) {
+        try {
+          process.kill(escapedPid, "SIGKILL");
+        } catch {
+          // Already gone - its own 30s bound elapsed, or this ran after a
+          // prior cleanup already reaped it. Either way, nothing to do.
+        }
+      }
+      await pair.close();
+    }
+  }
+);
