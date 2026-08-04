@@ -191,6 +191,196 @@ test("resolveCwd rejects a path that exists but is a file, not a directory", () 
 });
 
 // ---------------------------------------------------------------------------
+// resolveCwd - GHANTIKA_CWD_ROOTS (configured-root validation)
+// ---------------------------------------------------------------------------
+
+const CWD_ROOTS_ENV_VAR_NAME = "GHANTIKA_CWD_ROOTS";
+
+test("resolveCwd with GHANTIKA_CWD_ROOTS unset accepts any real directory, exactly as before this story - opt-in, never a new silent default-deny", () => {
+  assert.equal(process.env[CWD_ROOTS_ENV_VAR_NAME], undefined);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-unset-"));
+  const result = resolveCwd(dir);
+  assert.equal(result.ok, true);
+});
+
+test("resolveCwd accepts a cwd that resolves inside a configured root", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-root-"));
+  const inside = fs.mkdtempSync(path.join(root, "job-"));
+  const original = process.env[CWD_ROOTS_ENV_VAR_NAME];
+  try {
+    process.env[CWD_ROOTS_ENV_VAR_NAME] = root;
+    const result = resolveCwd(inside);
+    assert.equal(result.ok, true);
+    if (result.ok) assert.equal(result.resolvedCwd, fs.realpathSync(inside));
+  } finally {
+    if (original === undefined) delete process.env[CWD_ROOTS_ENV_VAR_NAME];
+    else process.env[CWD_ROOTS_ENV_VAR_NAME] = original;
+  }
+});
+
+test("resolveCwd accepts a cwd equal to the configured root itself, not only a strict descendant", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-exact-"));
+  const original = process.env[CWD_ROOTS_ENV_VAR_NAME];
+  try {
+    process.env[CWD_ROOTS_ENV_VAR_NAME] = root;
+    const result = resolveCwd(root);
+    assert.equal(result.ok, true);
+  } finally {
+    if (original === undefined) delete process.env[CWD_ROOTS_ENV_VAR_NAME];
+    else process.env[CWD_ROOTS_ENV_VAR_NAME] = original;
+  }
+});
+
+test("resolveCwd rejects a cwd outside every configured root, with a diagnostic naming the reason", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-root-"));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-outside-"));
+  const original = process.env[CWD_ROOTS_ENV_VAR_NAME];
+  try {
+    process.env[CWD_ROOTS_ENV_VAR_NAME] = root;
+    const result = resolveCwd(outside);
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.match(result.message, /outside the configured allowed roots/);
+  } finally {
+    if (original === undefined) delete process.env[CWD_ROOTS_ENV_VAR_NAME];
+    else process.env[CWD_ROOTS_ENV_VAR_NAME] = original;
+  }
+});
+
+test("resolveCwd's root check is a real directory-BOUNDARY comparison, not a bare string prefix: a sibling directory whose name happens to start with the root's name is rejected", () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-boundary-"));
+  const root = path.join(parent, "job");
+  fs.mkdirSync(root);
+  // A real, separate directory whose STRING is a prefix-match of `root`
+  // (same parent, "job" + "-sibling") but is NOT a subdirectory of it at
+  // all - a naive `resolvedCwd.startsWith(root)` (no trailing separator)
+  // would wrongly accept this.
+  const sibling = path.join(parent, "job-sibling");
+  fs.mkdirSync(sibling);
+  const original = process.env[CWD_ROOTS_ENV_VAR_NAME];
+  try {
+    process.env[CWD_ROOTS_ENV_VAR_NAME] = root;
+    const result = resolveCwd(sibling);
+    assert.equal(result.ok, false);
+  } finally {
+    if (original === undefined) delete process.env[CWD_ROOTS_ENV_VAR_NAME];
+    else process.env[CWD_ROOTS_ENV_VAR_NAME] = original;
+  }
+});
+
+test(
+  "resolveCwd's root check validates the REAL, symlink-resolved target - a symlink whose own path sits inside an allowed root but that POINTS OUTSIDE every root is rejected",
+  {
+    skip:
+      process.platform === "win32"
+        ? "symlink creation needs elevated privileges on win32 in CI"
+        : false,
+  },
+  () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-symlink-root-"));
+    const outsideTarget = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ghantika-cwdroots-symlink-target-")
+    );
+    const linkPath = path.join(root, "escape-link");
+    fs.symlinkSync(outsideTarget, linkPath, "dir");
+    const original = process.env[CWD_ROOTS_ENV_VAR_NAME];
+    try {
+      process.env[CWD_ROOTS_ENV_VAR_NAME] = root;
+      // The literal path is INSIDE root by string shape; the real target
+      // it resolves to is not. Rejecting proves the check follows the
+      // symlink before comparing, rather than judging the literal spelling.
+      const result = resolveCwd(linkPath);
+      assert.equal(result.ok, false);
+    } finally {
+      if (original === undefined) delete process.env[CWD_ROOTS_ENV_VAR_NAME];
+      else process.env[CWD_ROOTS_ENV_VAR_NAME] = original;
+    }
+  }
+);
+
+test(
+  "resolveCwd's root check resolves a configured root that is ITSELF a symlink to its real target before comparing - a cwd matching that real target is accepted even though the configured string named the symlink",
+  {
+    skip:
+      process.platform === "win32"
+        ? "symlink creation needs elevated privileges on win32 in CI"
+        : false,
+  },
+  () => {
+    const realRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-real-root-"));
+    const linkRoot = path.join(
+      os.tmpdir(),
+      `ghantika-cwdroots-link-root-${process.pid}-${Date.now()}`
+    );
+    fs.symlinkSync(realRoot, linkRoot, "dir");
+    const original = process.env[CWD_ROOTS_ENV_VAR_NAME];
+    try {
+      process.env[CWD_ROOTS_ENV_VAR_NAME] = linkRoot; // the symlink path, not the real one
+      const result = resolveCwd(realRoot); // the job's cwd is the REAL directory
+      assert.equal(result.ok, true);
+    } finally {
+      if (original === undefined) delete process.env[CWD_ROOTS_ENV_VAR_NAME];
+      else process.env[CWD_ROOTS_ENV_VAR_NAME] = original;
+      fs.unlinkSync(linkRoot);
+    }
+  }
+);
+
+test("resolveCwd's root check accepts multiple path.delimiter-separated roots, matching against any of them", () => {
+  const rootA = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-multi-a-"));
+  const rootB = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-multi-b-"));
+  const insideB = fs.mkdtempSync(path.join(rootB, "job-"));
+  const original = process.env[CWD_ROOTS_ENV_VAR_NAME];
+  try {
+    process.env[CWD_ROOTS_ENV_VAR_NAME] = `${rootA}${path.delimiter}${rootB}`;
+    const result = resolveCwd(insideB);
+    assert.equal(result.ok, true);
+  } finally {
+    if (original === undefined) delete process.env[CWD_ROOTS_ENV_VAR_NAME];
+    else process.env[CWD_ROOTS_ENV_VAR_NAME] = original;
+  }
+});
+
+test("resolveCwd's root check silently drops a configured root that cannot itself be resolved, rather than crashing or treating it as a wildcard match - a genuinely valid sibling root still works", () => {
+  const staleRoot = path.join(os.tmpdir(), `ghantika-cwdroots-stale-${process.pid}-${Date.now()}`);
+  const realRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-real-"));
+  const inside = fs.mkdtempSync(path.join(realRoot, "job-"));
+  const original = process.env[CWD_ROOTS_ENV_VAR_NAME];
+  try {
+    process.env[CWD_ROOTS_ENV_VAR_NAME] = `${staleRoot}${path.delimiter}${realRoot}`;
+    const result = resolveCwd(inside);
+    assert.equal(result.ok, true);
+  } finally {
+    if (original === undefined) delete process.env[CWD_ROOTS_ENV_VAR_NAME];
+    else process.env[CWD_ROOTS_ENV_VAR_NAME] = original;
+  }
+});
+
+test("REGRESSION: resolveCwd rejects every cwd when GHANTIKA_CWD_ROOTS is a non-empty value that splits and filters to zero effective roots - a lone path.delimiter is NOT read as unrestricted", () => {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-delimonly-"));
+  const original = process.env[CWD_ROOTS_ENV_VAR_NAME];
+  try {
+    process.env[CWD_ROOTS_ENV_VAR_NAME] = path.delimiter;
+    const result = resolveCwd(outside);
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.match(result.message, /outside the configured allowed roots/);
+  } finally {
+    if (original === undefined) delete process.env[CWD_ROOTS_ENV_VAR_NAME];
+    else process.env[CWD_ROOTS_ENV_VAR_NAME] = original;
+  }
+});
+
+// mutation control: prove the boundary check above is actually discriminating,
+// not vacuously true - a bare (no trailing separator) startsWith on the two
+// real fixture strings themselves WOULD wrongly match, showing the naive
+// version this function deliberately does not use.
+test("mutation control: a bare startsWith without a trailing separator would wrongly treat a prefix-sharing sibling as inside the root", () => {
+  const root = "/tmp/ghantika-mutant-job";
+  const sibling = "/tmp/ghantika-mutant-job-sibling";
+  assert.equal(sibling.startsWith(root), true); // the naive check a mutant would use
+  assert.equal(sibling.startsWith(root.endsWith(path.sep) ? root : root + path.sep), false); // the real one
+});
+
+// ---------------------------------------------------------------------------
 // buildChildEnv
 // ---------------------------------------------------------------------------
 
@@ -4741,6 +4931,32 @@ function runJobIdOf(result: ReturnType<typeof runTool.handler>): string {
   assert.equal(typeof jobId, "string", `expected a real job_id, got: ${JSON.stringify(result)}`);
   return jobId as string;
 }
+
+// REGRESSION for the fail-open GHANTIKA_CWD_ROOTS bug: a non-empty raw
+// value that splits and filters down to zero effective roots (a lone
+// `path.delimiter`, on its own) must NOT be read as "unrestricted" - it
+// must deny every cwd. Exercised through the REAL run() production path
+// (not resolveCwd directly), because the real defect was reachable there:
+// a job with this env var set could spawn and exit 0 in an arbitrary
+// directory outside every intended root.
+test("REGRESSION: run() rejects every cwd, never spawning, when GHANTIKA_CWD_ROOTS is set to a non-empty value that filters to zero effective roots", () => {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-run-delimonly-"));
+  const original = process.env[CWD_ROOTS_ENV_VAR_NAME];
+  try {
+    process.env[CWD_ROOTS_ENV_VAR_NAME] = path.delimiter;
+    const result = runTool.handler({ command: ["true"], cwd: outside });
+    const jobId = runJobIdOf(result);
+    const record = jobStore.get(jobId)!;
+    // createFailedJob settles the job synchronously and immediately - no
+    // real child was ever spawned, so no wait-for-terminal is needed.
+    assert.equal(record.state, "failed");
+    assert.equal(record.diagnostic?.reason, "spawn-error");
+    assert.match(record.diagnostic!.message, /outside the configured allowed roots/);
+  } finally {
+    if (original === undefined) delete process.env[CWD_ROOTS_ENV_VAR_NAME];
+    else process.env[CWD_ROOTS_ENV_VAR_NAME] = original;
+  }
+});
 
 test(
   "run(): omitting deadline_ms leaves a job's own natural lifecycle completely untouched, even across a huge mocked time jump - no deadline was ever scheduled to expire",

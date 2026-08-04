@@ -22,6 +22,9 @@
  *   observability via `list`.
  */
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/client";
@@ -29,12 +32,20 @@ import { InMemoryTransport } from "@modelcontextprotocol/server";
 
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
 // import comment for why.
-import { ALL_JOB_STATES, JobStore, type ReapReleaseDecision, jobStore } from "../dist/jobStore.js";
+import {
+  ALL_JOB_STATES,
+  JobStore,
+  type ReapReleaseDecision,
+  isTerminalJobState,
+  jobStore,
+} from "../dist/jobStore.js";
+import { CWD_ROOTS_ENV_VAR } from "../dist/process.js";
 import { loadConcurrencyConfigFromEnv, normalizeNonNegativeInteger } from "../dist/scheduler.js";
 import { createServer } from "../dist/server.js";
 import * as tasksAdapter from "../dist/tasksAdapter.js";
 import * as killTool from "../dist/tools/kill.js";
 import * as listTool from "../dist/tools/list.js";
+import * as outputTool from "../dist/tools/output.js";
 import * as runTool from "../dist/tools/run.js";
 import * as statusTool from "../dist/tools/status.js";
 
@@ -1269,3 +1280,124 @@ test("shutdown gates new admissions the instant it begins: a run() call arriving
     jobStore.drainQueueOnShutdown();
   }
 });
+
+// ---------------------------------------------------------------------------
+// GHANTIKA_CWD_ROOTS - the queue-duration TOCTOU residual, disclosed rather
+// than closed (see src/process.ts's resolveCwd doc comment): a queued
+// job's cwd is validated once, before admission, and never re-validated
+// against GHANTIKA_CWD_ROOTS when it actually reaches the front of the
+// queue and spawns. This test proves and pins the REAL shape of that gap
+// with a genuine queued-job reproduction, rather than leaving it as an
+// unverified claim in a doc comment.
+// ---------------------------------------------------------------------------
+
+test(
+  "DISCLOSED RESIDUAL, pinned by a real reproduction: a queued job's cwd is not re-validated at actual spawn time - swapping the checked directory for a symlink escaping the configured root WHILE the job is queued lets the real spawn land outside every configured root",
+  {
+    skip:
+      process.platform === "win32"
+        ? "symlink creation needs elevated privileges on win32 in CI"
+        : false,
+  },
+  async () => {
+    // A preceding test in this file may leave activeSlots/queue settling
+    // asynchronously (its own cleanup does not always wait for that, e.g.
+    // the shutdown-admission-race test just above only clears the
+    // shutdown gate) - establish a genuinely clean baseline here rather
+    // than assuming one, so this test's own cap=1/queue=1 admission
+    // decisions are never computed against leftover state from whatever
+    // ran immediately before it.
+    await waitUntil(() => jobStore.getActiveSlotCount() === 0 && jobStore.getQueueLength() === 0);
+    jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 1 });
+    const allowedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-toctou-root-"));
+    const checkedDir = path.join(allowedRoot, "job");
+    fs.mkdirSync(checkedDir);
+    const outsideTarget = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ghantika-cwdroots-toctou-outside-")
+    );
+    const originalRoots = process.env[CWD_ROOTS_ENV_VAR];
+    let blockerJobId: string | undefined;
+    let queuedJobId: string | undefined;
+    try {
+      process.env[CWD_ROOTS_ENV_VAR] = allowedRoot;
+
+      // Occupies the single slot so the job below is forced to queue. Its
+      // own cwd must ALSO pass the now-active root check (equal to the
+      // root itself is accepted) - otherwise it fails pre-flight, never
+      // reserves a slot at all, and the job below is admitted instantly
+      // instead of genuinely queuing.
+      const blocker = runTool.handler({
+        command: ["sleep", "30"],
+        cwd: allowedRoot,
+        label: "toctou-blocker",
+      });
+      assert.notEqual(blocker.isError, true);
+      const blockerStructured = structured(blocker);
+      blockerJobId = blockerStructured.job_id as string;
+      assert.ok(
+        ["starting", "running"].includes(blockerStructured.state as string),
+        `blocker must genuinely hold the concurrency slot, got: ${JSON.stringify(blockerStructured)}`
+      );
+
+      // Validated NOW, while checkedDir is a real directory genuinely
+      // inside allowedRoot - exactly the check the fail-open fix above
+      // makes correct. It passes.
+      const queued = runTool.handler({
+        command: ["node", "-e", "process.stdout.write(process.cwd())"],
+        cwd: checkedDir,
+        label: "toctou-queued",
+      });
+      assert.notEqual(queued.isError, true);
+      const queuedStructured = structured(queued);
+      queuedJobId = queuedStructured.job_id as string;
+      assert.equal(queuedStructured.state, "starting");
+      assert.equal(queuedStructured.queue_position, 1, "must genuinely be queued, not admitted");
+
+      // The swap: remove the checked directory and put a symlink of the
+      // SAME name in its place, pointing OUTSIDE every configured root.
+      // The queued job's own already-validated string never sees this -
+      // it sits closed over, unconfirmed, for the rest of this job's
+      // queue residence.
+      fs.rmdirSync(checkedDir);
+      fs.symlinkSync(outsideTarget, checkedDir, "dir");
+
+      // Release the blocker's slot so the queued job dequeues and its
+      // real spawn actually happens - now, against the swapped path.
+      await killTool.handler({ job_id: blockerJobId });
+      await waitUntil(() => isTerminalJobState(jobStore.get(queuedJobId!)!.state));
+
+      assert.equal(jobStore.get(queuedJobId)!.state, "exited");
+      const output = structured(outputTool.handler({ job_id: queuedJobId, stream: "stdout" }));
+      const events = output.events as Array<{ text: string }>;
+      const printedCwd = events.map((event) => event.text).join("");
+      // THE DISCLOSED ESCAPE ITSELF: the process that actually ran printed
+      // the OUTSIDE-root real path, not the allowed-root one it was
+      // validated against moments earlier - the swap won. This is exactly
+      // the residual src/process.ts's resolveCwd doc comment now
+      // discloses; if a future change closes this gap (e.g. revalidating
+      // at actual dequeue/spawn time), this assertion is the one that
+      // must then flip to prove the closure, not be deleted.
+      assert.equal(printedCwd, fs.realpathSync(outsideTarget));
+    } finally {
+      if (originalRoots === undefined) delete process.env[CWD_ROOTS_ENV_VAR];
+      else process.env[CWD_ROOTS_ENV_VAR] = originalRoots;
+      // Pass BOTH ids through cleanup rather than assuming the happy path
+      // already terminated them - an assertion above can throw at any
+      // point (including before the blocker is killed, or before the
+      // queued job reaches a terminal state), and in that case one or
+      // both real process groups are still alive when this block runs.
+      // killTool.handler is idempotent against an already-terminal job
+      // (a documented no-op with respect to its recorded state, though it
+      // may still attempt a real cleanup reap), so calling it on both ids
+      // unconditionally is always safe and is what actually guarantees
+      // the blocker's group - and the queued job's, if it ever spawned -
+      // is signaled and reaped rather than left running past this test.
+      // Filtered to only the ids that were actually assigned, since a
+      // throw before runTool.handler returns leaves that variable
+      // undefined.
+      await cleanUpSharedJobs(
+        [blockerJobId, queuedJobId].filter((id): id is string => id !== undefined)
+      );
+    }
+  }
+);
