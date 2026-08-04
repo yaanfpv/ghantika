@@ -273,35 +273,80 @@ test("mutation control: EXPECTED_OS being a bare string (not an array) is named 
 // unconditionally in `finally`), and assert on the ACTUAL text on stderr -
 // the named diagnostic must be present, and the crash's own TypeError
 // text must be absent - not merely that the process exited non-zero.
+//
+// The mutated copy is written under a REPO-ROOT scratch directory, never
+// under scripts/ itself - the same isolation
+// test/loader-escape-matrix.test.ts's own loadMutatedGuardCopy already
+// uses for its guard-self mutation cases (mkdtempSync at REPO_ROOT, a
+// mirrored scripts/lib/ subtree so the mutant's own relative import of
+// ./lib/is-main.mjs still resolves, node_modules/js-yaml still resolves
+// via the normal upward walk since the scratch dir sits inside the repo
+// tree). scripts/ is a real, shared, tracked directory some other
+// script (scripts/check-npm-ci-usage.mjs) also walks; no reader coupling
+// with THIS mutant's content was found there on inspection (its scan
+// surface assertions are `.some()`/named-file checks, never a closed set
+// an extra file could break), so this relocation is preventive hygiene
+// rather than a fix for an observed failure - unlike this file's own
+// counterpart change to test/lint-scope.test.js's src/-tree canary, which had a
+// demonstrated concurrent coupling with test/loader-escape-matrix.test.ts's
+// FROZEN_MODULES check and is fixed on that file's own evidence, not this
+// one's.
 import { execFileSync } from "node:child_process";
-import { readFileSync as readFileSyncForMutant, writeFileSync, rmSync } from "node:fs";
+import {
+  readFileSync as readFileSyncForMutant,
+  writeFileSync,
+  rmSync,
+  mkdtempSync,
+  mkdirSync,
+} from "node:fs";
+import path from "node:path";
 import { fileURLToPath as toPathForMutant } from "node:url";
 
+const MUTANT_REPO_ROOT = toPathForMutant(new URL("..", import.meta.url));
 const REAL_SCRIPT_PATH = toPathForMutant(
   new URL("../scripts/lint-workflow-jobs.mjs", import.meta.url)
 );
-const MUTANT_SCRIPT_PATH = toPathForMutant(
-  new URL("../scripts/.tmp-null-axis-mutant.mjs", import.meta.url)
-);
 
 function runMutatedAxis(constantName) {
-  const original = readFileSyncForMutant(REAL_SCRIPT_PATH, "utf8");
-  const pattern = new RegExp(`^export const ${constantName} = .*;$`, "m");
-  assert.match(
-    original,
-    pattern,
-    `test assumption: ${constantName}'s declaration line is findable`
-  );
-  const mutated = original.replace(pattern, `export const ${constantName} = null;`);
-  assert.notEqual(mutated, original, `the ${constantName} mutation should have changed the source`);
-  writeFileSync(MUTANT_SCRIPT_PATH, mutated);
+  const scratchDir = mkdtempSync(path.join(MUTANT_REPO_ROOT, ".ghantika-workflow-mutant-"));
   try {
-    execFileSync(process.execPath, [MUTANT_SCRIPT_PATH], { stdio: "pipe" });
-    assert.fail(`expected the mutant to exit non-zero (${constantName} = null)`);
-  } catch (error) {
-    return { status: error.status, stderr: String(error.stderr) };
+    const libDir = path.join(scratchDir, "lib");
+    mkdirSync(libDir, { recursive: true });
+    // lint-workflow-jobs.mjs imports both of these by relative specifier
+    // ("./lib/is-main.mjs", "./lib/ts-ast.mjs"); both must exist alongside
+    // the mutated copy for that copy to run standalone from the scratch
+    // dir. Neither has a further relative import of its own (verified
+    // directly against their real source).
+    for (const libFile of ["is-main.mjs", "ts-ast.mjs"]) {
+      writeFileSync(
+        path.join(libDir, libFile),
+        readFileSyncForMutant(path.join(MUTANT_REPO_ROOT, "scripts", "lib", libFile), "utf8")
+      );
+    }
+
+    const original = readFileSyncForMutant(REAL_SCRIPT_PATH, "utf8");
+    const pattern = new RegExp(`^export const ${constantName} = .*;$`, "m");
+    assert.match(
+      original,
+      pattern,
+      `test assumption: ${constantName}'s declaration line is findable`
+    );
+    const mutated = original.replace(pattern, `export const ${constantName} = null;`);
+    assert.notEqual(
+      mutated,
+      original,
+      `the ${constantName} mutation should have changed the source`
+    );
+    const mutantScriptPath = path.join(scratchDir, "lint-workflow-jobs.mjs");
+    writeFileSync(mutantScriptPath, mutated);
+    try {
+      execFileSync(process.execPath, [mutantScriptPath], { stdio: "pipe" });
+      assert.fail(`expected the mutant to exit non-zero (${constantName} = null)`);
+    } catch (error) {
+      return { status: error.status, stderr: String(error.stderr) };
+    }
   } finally {
-    rmSync(MUTANT_SCRIPT_PATH, { force: true });
+    rmSync(scratchDir, { recursive: true, force: true });
   }
 }
 

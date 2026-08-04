@@ -348,13 +348,32 @@ test(REAL_LINT_EXIT_CLEAN_TEST_TITLE, () => {
 
 /**
  * The canary's own path, inside a REAL positive lint target directory
- * (`src/`) so an invocation bound to the wrong `cwd`, or to some other
+ * (`test/`) so an invocation bound to the wrong `cwd`, or to some other
  * package's own lint script entirely, can never see it. Named distinctively
  * so it can never be confused with a real source file, and excluded from
  * version control (see .gitignore) so a run that dies before its own
  * cleanup can never leave something a `git add` would pick up.
+ *
+ * Deliberately `test/`, not `src/`: this repo's other production guards
+ * (`checkModuleBoundaries`/`checkNoTasksImport`/`checkStdioPurity` in
+ * test/loader-escape-matrix.test.ts's own "final restoration check")
+ * default to scanning `src/` for the real, live tree, and
+ * `checkModuleBoundaries` specifically enforces a CLOSED set of files
+ * there (`FROZEN_MODULES`) - any extra `.ts` file, regardless of its
+ * content, is reported as a violation on sight. Planting this canary in
+ * `src/` therefore genuinely couples with that unrelated guard the moment
+ * the two run concurrently rather than serially: a real, reproduced
+ * failure under node:test's own file-level concurrency, independent of
+ * and unrelated to whatever the canary's own content
+ * happens to be. `test/` carries the identical real ESLint violation
+ * (`@typescript-eslint/no-unused-vars` fires there exactly as it does
+ * under `src/` - verified directly against this repo's live config, the
+ * same standard this file holds its other real-rule claims to) and sits
+ * outside every one of those guards' scan roots, so the exact same proof
+ * this canary exists to make - a real command against a real, live-scoped
+ * target - survives the move with nothing weakened.
  */
-const CANARY_RELATIVE_PATH = "src/__lint_scope_runtime_canary__.ts";
+const CANARY_RELATIVE_PATH = "test/__lint_scope_runtime_canary__.ts";
 const CANARY_ABSOLUTE_PATH = path.join(REPO_ROOT, CANARY_RELATIVE_PATH);
 
 /**
