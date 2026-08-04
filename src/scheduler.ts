@@ -1,8 +1,11 @@
 /**
- * The concurrency-cap + FIFO-queue admission POLICY that sits in front of
- * `run()`'s real spawn - a bound on how many jobs can be live (spawned and
- * not yet reaped) at once, plus a bounded FIFO queue for a job that arrives
- * while the cap is full.
+ * The job-lifecycle POLICY module: admission (the concurrency-cap +
+ * FIFO-queue policy that sits in front of `run()`'s real spawn) and
+ * retention (which TERMINAL jobs a busy, long-running server reclaims,
+ * and when - see "Retention" below). Two different questions about the
+ * same jobs at two different ends of their life, sharing this file
+ * because both are pure decisions over config the caller already holds,
+ * not because they are the same policy.
  *
  * This module deliberately holds NO state of its own - not a counter, not a
  * queue array, nothing. `src/jobStore.ts` is this codebase's designated sole
@@ -11,9 +14,9 @@
  * enforces the same rule mechanically across every other root module,
  * this one included). So every function here is a PURE computation over
  * plain numbers/config the CALLER already holds: `src/jobStore.ts` owns the
- * real `activeSlots` count and the real FIFO queue array, and calls into
- * this module to DECIDE what to do with them. This module decides,
- * jobStore.ts remembers.
+ * real `activeSlots` count, the real FIFO queue array, and the real job
+ * map, and calls into this module to DECIDE what to do with them. This
+ * module decides, jobStore.ts remembers.
  */
 
 // ---------------------------------------------------------------------------
@@ -224,4 +227,153 @@ export function decideAdmission(
       `the concurrency cap (${maxConcurrentJobs}) is full and the queue ` +
       `(max ${maxQueueDepth}) has no room (currently ${queueLength} queued)`,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Retention
+// ---------------------------------------------------------------------------
+
+/**
+ * Retention config for a TERMINAL job's buffered OUTPUT, held in `jobStore`
+ * (the job's own record - state, exit code, timestamps - is never deleted
+ * by this; see `jobStore.ts`'s `sweepRetention`). Deliberately separate
+ * from the task-record TTL (`src/tasksAdapter.ts`'s `TASK_TTL_MS`, a
+ * different lifecycle gating the `tasks/*` API) and from concurrency-slot
+ * release (`ConcurrencyConfig` above). The three lifecycles stay distinct,
+ * and two guards defer their own reclamation while a job's concurrency
+ * slot is STRANDED - the task-record TTL purge
+ * (`src/tasksAdapter.ts`'s `isExpiredTerminalRecord`) and this output-
+ * retention sweep (`jobStore.ts`'s `sweepRetention`) - because purging
+ * that state would destroy the only recoverable trace of a slot still
+ * held. The two guards are NOT symmetric beyond that: this output-
+ * retention sweep ALSO defers while a reap decision is still pending
+ * (`jobStore.ts`'s `reapPending`, awaited-but-not-yet-settled - a
+ * narrower and earlier window than confirmed-stranded), while the
+ * task-record TTL purge checks confirmed-stranded only and has no
+ * equivalent reap-pending check. Any future lifecycle that reclaims
+ * job-tied state is expected to defer for a stranded slot at minimum,
+ * never exempt by default; every other cross-gate interaction remains
+ * forbidden.
+ */
+export interface RetentionConfig {
+  /** How long a terminal job's output is kept, from `ended_at`, before it becomes eligible for reclamation. */
+  readonly retentionMs: number;
+  /** How many terminal jobs' output `jobStore` retains at once. Once exceeded, the OLDEST-`ended_at` terminal jobs' output is reclaimed first, down to this count. */
+  readonly maxRetainedJobs: number;
+}
+
+/** 1 hour - job output is normally read shortly after a job ends; a much longer default just delays discovering an unbounded-growth misconfiguration. Independent of `TASK_TTL_MS` (24h) by design (see `RetentionConfig`'s own docs). */
+export const DEFAULT_RETENTION_MS = 60 * 60 * 1000;
+/** Generous, non-restrictive - matches this file's own `DEFAULT_MAX_QUEUE_DEPTH` tone. */
+export const DEFAULT_MAX_RETAINED_JOBS = 200;
+
+export function normalizeRetentionConfig(config: RetentionConfig): RetentionConfig {
+  return {
+    retentionMs: normalizeNonNegativeInteger(config.retentionMs, DEFAULT_RETENTION_MS),
+    maxRetainedJobs: normalizeNonNegativeInteger(config.maxRetainedJobs, DEFAULT_MAX_RETAINED_JOBS),
+  };
+}
+
+const RETENTION_MS_ENV_VAR = "GHANTIKA_JOB_RETENTION_MS";
+const MAX_RETAINED_JOBS_ENV_VAR = "GHANTIKA_MAX_RETAINED_JOBS";
+
+export function loadRetentionConfigFromEnv(
+  env: Readonly<Record<string, string | undefined>> = process.env
+): RetentionConfig {
+  return normalizeRetentionConfig({
+    retentionMs: normalizeNonNegativeInteger(env[RETENTION_MS_ENV_VAR], DEFAULT_RETENTION_MS),
+    maxRetainedJobs: normalizeNonNegativeInteger(
+      env[MAX_RETAINED_JOBS_ENV_VAR],
+      DEFAULT_MAX_RETAINED_JOBS
+    ),
+  });
+}
+
+/** One terminal job as this decision needs to see it - never the real `JobRecord` (that stays `jobStore.ts`'s own type, this module only ever sees plain numbers/strings). */
+export interface RetainedJobSummary {
+  readonly jobId: string;
+  readonly endedAtMs: number;
+}
+
+/**
+ * ONE retention predicate: a terminal job's output is eligible for
+ * reclamation once `retentionMs` ELAPSES since `ended_at`, OR once the
+ * `maxRetainedJobs` cap is exceeded (oldest-`ended_at` first), WHICHEVER
+ * FIRST - purely time + cap, never gated on whether/how a caller has read
+ * the job (no ack operation, no 7th tool; see `src/jobStore.ts`'s own docs
+ * on why reading via `output`/`tail` never resets this clock).
+ *
+ * This function is a pure decision, evaluated against whatever `now` its
+ * caller supplies - it does not itself run on any schedule. How promptly
+ * a caller actually reaches this function depends on how often it is
+ * invoked: `jobStore.ts`'s `sweepRetention` calls it both opportunistically
+ * (on every `createJob`/`createFailedJob`, for immediacy) and from a
+ * periodic timer (`startRetentionSweeper`, scheduled every
+ * `RETENTION_SWEEP_INTERVAL_MS` so an otherwise-idle server still gets
+ * checked) - see that file's own docs for why the timer's cadence is a
+ * schedule, not a guaranteed wall-clock ceiling on when a check actually
+ * runs.
+ *
+ * `jobs` must already exclude anything this predicate must never touch.
+ * The real caller (`jobStore.ts`'s `sweepRetention`) applies six checks
+ * before a job ever reaches this function, and this function trusts every
+ * one of them rather than re-deriving any: (1) a non-terminal
+ * (still-running) job is never terminal in the first place; (2) a job
+ * that has never received a single byte on either stream (cumulative
+ * `bytesEverReceived === 0`, checked once per stream, never
+ * decremented - see that field's own docs) has nothing to reclaim and
+ * must not occupy a `maxRetainedJobs` slot it would only ever displace
+ * real output from - this is a check on bytes EVER received, not on
+ * current content, so it says nothing about whether a job still holds
+ * anything retrievable right now; (3) a job whose concurrency slot is currently
+ * STRANDED (mirrors `src/tasksAdapter.ts`'s `isExpiredTerminalRecord`
+ * guard) keeps its output, since reclaiming it would erase the only
+ * durable trace of a held slot; (4) a job whose process-group reap
+ * decision is still being awaited (`jobStore.ts`'s `reapPending` - a
+ * narrower, earlier window than confirmed-stranded) is excluded for the
+ * identical reason; (5) a job already in `jobStore.ts`'s own
+ * `retentionEvicted` bookkeeping is skipped, INDEPENDENTLY of check 2:
+ * check 2 tests cumulative bytes-ever-received, which reclaiming a job's
+ * output never resets (see that field's own docs), so a reclaimed job
+ * keeps passing check 2 forever and this is the only check that actually
+ * excludes it; (6) two purely defensive checks (`ended_at` present,
+ * `Date.parse` succeeds) that every real terminal record satisfies by
+ * construction.
+ * This function only ever ranks and picks from the survivors of all six.
+ *
+ * Two passes: every job whose age already exceeds `retentionMs` is
+ * returned unconditionally (the time half of "whichever first"); THEN, if
+ * the remaining survivors still outnumber `maxRetainedJobs`, the
+ * oldest-`endedAtMs` surplus among them is returned too (the cap half). A
+ * job can appear only once in the result, and eviction order within each
+ * pass is oldest-`endedAtMs` first (ties broken by `jobId` for a
+ * deterministic result over an unordered input).
+ */
+export function decideRetentionEvictions(
+  jobs: readonly RetainedJobSummary[],
+  now: number,
+  config: RetentionConfig
+): string[] {
+  const byAge = [...jobs].sort(
+    (a, b) => a.endedAtMs - b.endedAtMs || a.jobId.localeCompare(b.jobId)
+  );
+
+  // No Map/Set here (`scripts/check-module-boundaries.mjs` reserves those
+  // for `jobStore.ts` alone) - plain arrays suffice, since membership is
+  // never queried, only accumulated and returned.
+  const evicted: string[] = [];
+  const survivors: RetainedJobSummary[] = [];
+  for (const job of byAge) {
+    if (now - job.endedAtMs >= config.retentionMs) {
+      evicted.push(job.jobId);
+    } else {
+      survivors.push(job);
+    }
+  }
+
+  const overflow = survivors.length - config.maxRetainedJobs;
+  if (overflow > 0) {
+    for (const job of survivors.slice(0, overflow)) evicted.push(job.jobId);
+  }
+  return evicted;
 }

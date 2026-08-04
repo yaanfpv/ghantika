@@ -28,14 +28,21 @@
  * ## Bounded drop disclosure, not exact per-seq ranges (v1)
  *
  * A response never claims WHICH specific lines a stream dropped. Instead,
- * once a selected stream has ever evicted any of its own lines (under the
- * byte/line retention cap - see `MAX_BUFFER_LINES`/`MAX_BUFFER_BYTES` in
- * `src/jobStore.ts`), the response discloses a bounded, honest pair for
- * that stream: `dropped` (how many of that stream's own lines have ever
- * been evicted - `StreamBufferSnapshot.droppedCount`) and
+ * whenever a selected stream has ever suffered a discrete loss event -
+ * a line evicted under the byte/line retention cap (see
+ * `MAX_BUFFER_LINES`/`MAX_BUFFER_BYTES` in `src/jobStore.ts`), a pending
+ * fragment discarded on job-output reclaim, or output arriving after
+ * reclaim with no line ever rematerialized - the response discloses a
+ * bounded, honest pair for that stream: `dropped` (that stream's own
+ * running count of every such event - `StreamBufferSnapshot.droppedCount`,
+ * never just a count of evicted lines) and
  * `droppedBeforeCursor` (that stream's own current retained floor - the
- * lowest `seq` still retained, or its `headSeq` if nothing survives). This
- * never names a seq value, so it can never misattribute a still-live
+ * lowest `seq` still retained, or its `headSeq` if nothing survives -
+ * itself 0 if this stream has never materialized a line, which is NOT a
+ * claim that nothing was lost: see `computeDropInfo`'s own doc below for
+ * the two loss events that leave `droppedBeforeCursor` at 0 while
+ * `dropped` is still positive). This never names a seq value, so it can
+ * never misattribute a still-live
  * SIBLING stream's own event as this stream's loss. An exact per-seq range
  * representation is unbounded because stdout and stderr share one sequence
  * counter, so a stream's own retained-line seqs can interleave with the
@@ -66,7 +73,7 @@ import {
 export const name = "output";
 
 export const description =
-  'Get a background job\'s accumulated stdout/stderr output, paginated by a monotonic cursor. Pass after_cursor (from a PRIOR CALL WITH THE SAME stream SELECTION\'s own next_cursor) to fetch only new events since your last read of that same selection - a cursor is scoped to the exact stream value that produced it, and reusing it with a DIFFERENT stream value can skip an already-retained event on the other stream (start from 0/omit after_cursor instead when switching selections). stream selects stdout, stderr, or both (merged in real line-materialization order, default). Once a selected stream has dropped its own old lines under its byte/line cap, the response discloses a bounded "dropped" count for that stream (how many of its own lines were ever dropped) plus "droppedBeforeCursor" (the boundary before which that happened) - never which specific lines were lost. For stream:"stdout"/"stderr" this is a scalar pair at the top level; for stream:"both" it is a nested object keyed by stream ({stdout?:{...}, stderr?:{...}}), since each stream\'s own loss is independent. Three distinct signals, never conflate them: "dropped" means this stream lost lines forever; "truncated" means this specific call\'s own response window (from limit, or from the same lifetime loss) does not contain everything currently available; "next_cursor" is simply where to resume paging with the SAME stream selection - it carries no information about loss on its own.';
+  'Get a background job\'s accumulated stdout/stderr output, paginated by a monotonic cursor. Pass after_cursor (from a PRIOR CALL WITH THE SAME stream SELECTION\'s own next_cursor) to fetch only new events since your last read of that same selection - a cursor is scoped to the exact stream value that produced it, and reusing it with a DIFFERENT stream value can skip an already-retained event on the other stream (start from 0/omit after_cursor instead when switching selections). stream selects stdout, stderr, or both (merged in real line-materialization order, default). Once a selected stream has lost some of its own history - either under its own byte/line cap while the job is still running, or because the job finished and its output later became eligible for job-output retention (see GHANTIKA_JOB_RETENTION_MS/GHANTIKA_MAX_RETAINED_JOBS) - the response discloses a bounded "dropped" count for that stream plus "droppedBeforeCursor" (the lowest seq still retained, or the stream\'s highest-ever-assigned seq - possibly 0 if no line was ever materialized - when nothing survives) - never which specific lines were lost, and never which of the two causes applied. "dropped" is ordinarily a count of complete lines, but it also counts two narrower events the same way: a not-yet-newline-terminated fragment discarded on reclaim, and a chunk arriving for a stream after its job is already reclaimed - neither is a materialized line, but each is real, permanent loss, so both count too rather than leaving the stream falsely indistinguishable from one that never received anything. For stream:"stdout"/"stderr" this is a scalar pair at the top level; for stream:"both" it is a nested object keyed by stream ({stdout?:{...}, stderr?:{...}}), since each stream\'s own loss is independent. Three distinct signals, never conflate them: "dropped" means this stream lost something forever; "truncated" means this specific call\'s own response window (from limit, or from that same loss) does not contain everything currently available; "next_cursor" is simply where to resume paging with the SAME stream selection - it carries no information about loss on its own.';
 
 const DEFAULT_LIMIT: number | undefined = undefined;
 
@@ -309,12 +316,19 @@ function buildEvent(
 
 /**
  * This stream's own bounded drop disclosure (see this file's header):
- * `dropped` is `StreamBufferSnapshot.droppedCount` verbatim (how many of
- * this stream's own lines have ever been evicted); `droppedBeforeCursor`
- * is this stream's own current retained floor - the lowest `seq` still in
- * `lines`, or its `headSeq` when nothing currently survives (nothing
- * retained at all, so "everything up to and including the highest seq
- * this stream ever produced" is the honest floor).
+ * `dropped` is `StreamBufferSnapshot.droppedCount` verbatim (this
+ * stream's own running count of every discrete loss event it has ever
+ * suffered, not just evicted lines - see that field's own docs);
+ * `droppedBeforeCursor` is this stream's own current retained floor - the
+ * lowest `seq` still in `lines`, or its `headSeq` when nothing currently
+ * survives. `headSeq` is 0 if this stream has never materialized a line
+ * (see its own docs) - so `droppedBeforeCursor` can be 0 even while
+ * `dropped` is positive: a pending fragment discarded on reclaim, or a
+ * chunk arriving after reclaim, is real loss that never advances
+ * `headSeq` at all, since neither one ever materializes a line. That 0 is
+ * not a claim that nothing was lost; it is the honest floor for a stream
+ * that never had a materialized-line boundary to report in the first
+ * place.
  */
 function computeDropInfo(snapshot: StreamBufferSnapshot): StreamDropInfo {
   const droppedBeforeCursor = snapshot.lines.length > 0 ? snapshot.lines[0]!.seq : snapshot.headSeq;

@@ -1082,9 +1082,12 @@ test("the real supervisor still fails a genuinely hung run fast, at whatever --i
   // incidental detail - it is the exact shape both real hosted-CI
   // failures this raise responds to showed in their own diagnostic
   // output (last event test:dequeue, then total silence), because
-  // loader-escape-matrix.test.ts's own before() hook blocks synchronously
-  // on a nested spawnSync call before any of its tests can reach
-  // test:start either.
+  // loader-escape-matrix.test.ts's own first test blocks synchronously
+  // on a nested spawnSync call, and node:test never emits that same
+  // test's own test:start until after the callback (block included)
+  // has already settled - so test:start cannot report either, whether
+  // the blocking call sits in a before() hook or, as it does now, in
+  // the test's own callback.
   const result = runSupervisorAgainstFixture({
     testFiles: buildHungTestFixtureFiles(),
     buildBaseline: () => ({}),

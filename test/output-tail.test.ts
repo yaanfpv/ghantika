@@ -10,6 +10,7 @@ import {
   jobStore,
   snapshotStreamBuffer,
 } from "../dist/jobStore.js";
+import { DEFAULT_MAX_RETAINED_JOBS, DEFAULT_RETENTION_MS } from "../dist/scheduler.js";
 import * as outputTool from "../dist/tools/output.js";
 import * as tailTool from "../dist/tools/tail.js";
 import * as runTool from "../dist/tools/run.js";
@@ -27,10 +28,14 @@ import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/sp
  * returns: real per-line `seq` (a per-JOB GLOBAL value - see jobStore.ts's
  * `JobSeqCounter` docs), `headSeq` (the highest seq ever assigned to a line
  * on THIS stream, persisting through eviction), and `droppedCount` (how
- * many of THIS stream's own lines have ever been evicted - see
- * `StreamBufferSnapshot.droppedCount`'s own docs in jobStore.ts for why v1
- * discloses a bounded COUNT and a cursor boundary, never an exact per-seq
- * range). Each line's `seq` defaults to its 1-based array position
+ * many discrete loss events THIS stream has ever suffered - an evicted
+ * line, a discarded pending fragment, or a chunk arriving after the
+ * job's output was already reclaimed, per job-output retention; see
+ * `StreamBufferSnapshot.droppedCount`'s own docs in jobStore.ts for why
+ * v1 discloses a bounded COUNT and a cursor boundary, never an exact
+ * per-seq range - this file's own fixtures below construct only the
+ * evicted-line case, since that is the shape ordinary byte/line-cap
+ * eviction produces). Each line's `seq` defaults to its 1-based array position
  * (correct for a SINGLE-stream, UNTRUNCATED fixture, where nothing has
  * ever been evicted and no sibling stream shares the counter), but can be
  * overridden per-line to simulate a REALISTIC post-eviction scenario
@@ -1072,6 +1077,239 @@ test("output()/tail() after a job's stream is finalized (post-terminal) still re
   assert.deepEqual(
     tailEvents.map((e) => e.text),
     ["line one", "trailing, no newline"]
+  );
+});
+
+// --- job-output retention: real output()/tail() handler bodies (not the
+// internal event-builder called directly, not the store-level snapshot -
+// the actual MCP-visible response, single-stream AND "both", for every
+// shape src/jobStore.ts's own retention docs enumerate) ---
+
+/**
+ * Forces the shared singleton's next `sweepRetention()` call to reclaim
+ * ANY terminal job regardless of age (retentionMs: 0), while leaving
+ * maxRetainedJobs generous (DEFAULT_MAX_RETAINED_JOBS) so a cap-driven
+ * eviction never touches an unrelated job this file's OTHER tests created
+ * earlier - only the time-based path fires. Restores the singleton's
+ * defaults immediately after the forced sweep, so no later test in this
+ * file observes an altered retention policy.
+ */
+function forceImmediateRetentionSweep(now?: number): string[] {
+  jobStore.setRetentionConfig({ retentionMs: 0, maxRetainedJobs: DEFAULT_MAX_RETAINED_JOBS });
+  const evicted = jobStore.sweepRetention(now);
+  jobStore.setRetentionConfig({
+    retentionMs: DEFAULT_RETENTION_MS,
+    maxRetainedJobs: DEFAULT_MAX_RETAINED_JOBS,
+  });
+  return evicted;
+}
+
+test("output()/tail() real handler bodies: a job reclaimed while its only content on EITHER stream is a pending fragment (no line ever formed) discloses dropped:1 per stream, never a fabricated line - single-stream and both", () => {
+  const jobId = makeJobWithRawOutput();
+  jobStore.appendOutput(jobId, "stdout", Buffer.from("abc")); // 3 bytes, no newline - pending only
+  jobStore.appendOutput(jobId, "stderr", Buffer.from("xyz")); // same, other stream
+  jobStore.markExited(jobId, 0, null);
+  assert.equal(
+    jobStore.getStreamSnapshot(jobId, "stdout")!.lines.length,
+    0,
+    "setup check: stdout never materialized a line"
+  );
+  assert.equal(
+    jobStore.getStreamSnapshot(jobId, "stderr")!.lines.length,
+    0,
+    "setup check: stderr never materialized a line"
+  );
+
+  const evicted = forceImmediateRetentionSweep(Date.now() + 1_000_000_000);
+  assert.ok(
+    evicted.includes(jobId),
+    "setup check: the real sweep must have genuinely reclaimed this job"
+  );
+
+  for (const stream of ["stdout", "stderr"] as const) {
+    const outputResult = structuredOf(outputTool.handler({ job_id: jobId, stream }));
+    assert.deepEqual(
+      outputResult.events,
+      [],
+      `output(${stream}): the pending fragment never became a line, so events must be empty`
+    );
+    assert.equal(
+      outputResult.truncated,
+      true,
+      `output(${stream}): a real byte was genuinely lost, even though it never formed a line`
+    );
+    assert.equal(
+      outputResult.dropped,
+      1,
+      `output(${stream}): exactly one loss event - the discarded pending fragment`
+    );
+    assert.equal(
+      outputResult.droppedBeforeCursor,
+      0,
+      `output(${stream}): no line was ever assigned a seq`
+    );
+
+    const tailResult = structuredOf(tailTool.handler({ job_id: jobId, stream, lines: 10 }));
+    assert.deepEqual(tailResult.events, [], `tail(${stream}): same real body, same empty events`);
+    assert.equal(
+      tailResult.truncated,
+      true,
+      `tail(${stream}): reimplements the identical drop-disclosure scheme`
+    );
+    assert.equal(tailResult.dropped, 1, `tail(${stream}): same dropped:1`);
+  }
+
+  const bothOutput = structuredOf(outputTool.handler({ job_id: jobId, stream: "both" }));
+  assert.deepEqual(
+    bothOutput.events,
+    [],
+    "output(both): still nothing to disclose - neither stream ever formed a line"
+  );
+  assert.deepEqual(
+    bothOutput.dropped,
+    {
+      stdout: { dropped: 1, droppedBeforeCursor: 0 },
+      stderr: { dropped: 1, droppedBeforeCursor: 0 },
+    },
+    "output(both): both streams disclosed, neither omitted, since both genuinely lost their one pending fragment"
+  );
+
+  const bothTail = structuredOf(tailTool.handler({ job_id: jobId, stream: "both", lines: 10 }));
+  assert.deepEqual(bothTail.events, [], "tail(both): same real body");
+  assert.deepEqual(
+    bothTail.dropped,
+    {
+      stdout: { dropped: 1, droppedBeforeCursor: 0 },
+      stderr: { dropped: 1, droppedBeforeCursor: 0 },
+    },
+    "tail(both): matches output(both) exactly"
+  );
+});
+
+test("output()/tail() real handler bodies: a stream reclaimed with BOTH a real line AND a pending fragment discloses dropped:2 (two separate loss events, not one), while its untouched sibling discloses nothing - single-stream and both", () => {
+  const jobId = makeJobWithRawOutput();
+  jobStore.appendOutput(jobId, "stdout", Buffer.from("a real line\n"));
+  jobStore.appendOutput(jobId, "stdout", Buffer.from("xyz")); // 3 bytes, no newline - stays pending
+  // stderr: appendOutput is never called at all - genuinely untouched.
+  jobStore.markExited(jobId, 0, null);
+  assert.equal(
+    jobStore.getStreamSnapshot(jobId, "stdout")!.lines.length,
+    1,
+    "setup check: exactly one materialized line before reclamation"
+  );
+
+  const evicted = forceImmediateRetentionSweep(Date.now() + 1_000_000_000);
+  assert.ok(
+    evicted.includes(jobId),
+    "setup check: the real sweep must have genuinely reclaimed this job"
+  );
+
+  const stdoutOutput = structuredOf(outputTool.handler({ job_id: jobId, stream: "stdout" }));
+  assert.deepEqual(
+    stdoutOutput.events,
+    [],
+    "output(stdout): both the line and the fragment are genuinely gone"
+  );
+  assert.equal(
+    stdoutOutput.dropped,
+    2,
+    "output(stdout): the materialized line PLUS the separately-discarded fragment"
+  );
+
+  const stdoutTail = structuredOf(tailTool.handler({ job_id: jobId, stream: "stdout", lines: 10 }));
+  assert.deepEqual(stdoutTail.events, []);
+  assert.equal(stdoutTail.dropped, 2, "tail(stdout): matches output(stdout)'s real body");
+
+  const stderrOutput = structuredOf(outputTool.handler({ job_id: jobId, stream: "stderr" }));
+  assert.equal(
+    "dropped" in stderrOutput,
+    false,
+    "output(stderr): must be entirely omitted from disclosure - it never lost anything, even though its sibling stream and the whole job were reclaimed"
+  );
+  assert.equal(
+    stderrOutput.truncated,
+    undefined,
+    "output(stderr): never touched, so truncated stays absent, not falsely true"
+  );
+
+  const bothOutput = structuredOf(outputTool.handler({ job_id: jobId, stream: "both" }));
+  assert.deepEqual(
+    bothOutput.dropped,
+    { stdout: { dropped: 2, droppedBeforeCursor: 1 } },
+    "output(both): stderr must be omitted from the nested dropped object entirely - it never lost anything"
+  );
+
+  const bothTail = structuredOf(tailTool.handler({ job_id: jobId, stream: "both", lines: 10 }));
+  assert.deepEqual(
+    bothTail.dropped,
+    { stdout: { dropped: 2, droppedBeforeCursor: 1 } },
+    "tail(both): matches output(both) exactly"
+  );
+});
+
+test("output()/tail() real handler bodies: a stream genuinely empty at reclaim time, which THEN receives late bytes via appendOutput, discloses that arrival honestly as dropped:1 - not silently indistinguishable from a stream that never received anything - single-stream and both", () => {
+  const jobId = makeJobWithRawOutput();
+  jobStore.appendOutput(jobId, "stdout", Buffer.from("the only output at reclaim time\n"));
+  // stderr: zero footprint at reclaim time - correctly truncated:false/dropped absent, nothing lost YET.
+  jobStore.markExited(jobId, 0, null);
+
+  const evicted = forceImmediateRetentionSweep(Date.now() + 1_000_000_000);
+  assert.ok(
+    evicted.includes(jobId),
+    "setup check: the real sweep must have genuinely reclaimed this job"
+  );
+
+  const beforeLateArrival = structuredOf(outputTool.handler({ job_id: jobId, stream: "stderr" }));
+  assert.equal(
+    "dropped" in beforeLateArrival,
+    false,
+    "output(stderr) before the late arrival: no drop disclosure yet, matching a stream that never received anything"
+  );
+
+  // A late chunk now arrives for stderr on this already-reclaimed job - the
+  // exact shape that must flip truncated and increment droppedCount,
+  // rather than silently vanishing into bytesEverReceived alone.
+  jobStore.appendOutput(jobId, "stderr", Buffer.from("late bytes that arrive too late"));
+
+  const afterOutput = structuredOf(outputTool.handler({ job_id: jobId, stream: "stderr" }));
+  assert.deepEqual(
+    afterOutput.events,
+    [],
+    "output(stderr): the late bytes never materialize into a visible line"
+  );
+  assert.equal(
+    afterOutput.truncated,
+    true,
+    "output(stderr): the late arrival is a real loss event now"
+  );
+  assert.equal(
+    afterOutput.dropped,
+    1,
+    "output(stderr): one loss event for the late arrival, distinct from the earlier reclaim which lost nothing on this stream"
+  );
+
+  const afterTail = structuredOf(tailTool.handler({ job_id: jobId, stream: "stderr", lines: 10 }));
+  assert.deepEqual(afterTail.events, []);
+  assert.equal(afterTail.dropped, 1, "tail(stderr): matches output(stderr)'s real body");
+
+  const bothOutput = structuredOf(outputTool.handler({ job_id: jobId, stream: "both" }));
+  assert.deepEqual(
+    bothOutput.dropped,
+    {
+      stdout: { dropped: 1, droppedBeforeCursor: 1 },
+      stderr: { dropped: 1, droppedBeforeCursor: 0 },
+    },
+    "output(both): both streams now disclosed - stdout's own real line reclaimed, stderr's late-arrival loss - neither omitted"
+  );
+
+  const bothTail = structuredOf(tailTool.handler({ job_id: jobId, stream: "both", lines: 10 }));
+  assert.deepEqual(
+    bothTail.dropped,
+    {
+      stdout: { dropped: 1, droppedBeforeCursor: 1 },
+      stderr: { dropped: 1, droppedBeforeCursor: 0 },
+    },
+    "tail(both): matches output(both) exactly"
   );
 });
 

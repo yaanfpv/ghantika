@@ -47,9 +47,13 @@ import type { ProcessBirthIdentity } from "./process.js";
 import {
   type AdmissionDecision,
   type ConcurrencyConfig,
+  type RetentionConfig,
   decideAdmission,
+  decideRetentionEvictions,
   loadConcurrencyConfigFromEnv,
+  loadRetentionConfigFromEnv,
   normalizeConcurrencyConfig,
+  normalizeRetentionConfig,
 } from "./scheduler.js";
 
 // ---------------------------------------------------------------------------
@@ -457,6 +461,9 @@ export const MAX_BUFFER_BYTES = 1_048_576; // 1 MiB
 /** The per-line forced-split threshold is the SAME 1 MiB constant, applied to a single not-yet-terminated line. */
 export const MAX_LINE_BYTES = MAX_BUFFER_BYTES;
 
+/** How often `startRetentionSweeper`'s real timer re-checks retention - see that method's own docs for what this bounds. Independent of any configured `retentionMs`: a fixed, small interval regardless of how long or short retention itself is configured to be. */
+export const RETENTION_SWEEP_INTERVAL_MS = 30_000;
+
 const NEWLINE_BYTE = 0x0a; // '\n'
 const CARRIAGE_RETURN_BYTE = 0x0d; // '\r'
 const UTF8_CONTINUATION_MASK = 0xc0;
@@ -558,11 +565,14 @@ export interface StreamBufferSnapshot {
    */
   readonly headSeq: number;
   /**
-   * How many of THIS stream's own lines have EVER been evicted, over its
+   * How many discrete loss events THIS stream has EVER suffered, over its
    * whole life - a pure per-stream COUNT, never a claim about WHICH `seq`
    * values were lost (see `JobStore`'s own file-header note on why v1
    * deliberately stops at a bounded count rather than exact per-seq
-   * disclosure). 0 if this stream has never had a line evicted.
+   * disclosure). 0 if this stream has never lost anything. Ordinarily one
+   * event equals one materialized line, but see the writer list below for
+   * the two narrower cases where a single event does not correspond to a
+   * complete line at all.
    *
    * (Architectural history: an earlier revision of this fix tracked the
    * exact SET of this stream's own evicted `seq` values, as the fewest
@@ -583,13 +593,24 @@ export interface StreamBufferSnapshot {
    * never names one at all - see `droppedBeforeCursor`'s own computation in
    * `src/tools/output.ts`/`src/tools/tail.ts` for the paired boundary.)
    *
-   * Incremented by exactly 1 in `evictOldestLine` (the ONE place either
-   * eviction loop in this file actually removes a line) every time it
-   * actually removes one of THIS stream's own lines - never reset or
-   * decremented, matching this file's other `*EverMaterialized`/
-   * `*EverReceived` per-stream counters in shape (a single unbounded
-   * NUMBER, cheap regardless of a job's lifetime, unlike the abandoned
-   * per-seq-range design's array).
+   * Incremented by THREE writers, never reset or decremented:
+   * `evictOldestLine` bumps it by exactly 1 every time it removes one of
+   * this stream's own lines (ordinary byte/line-cap eviction, one line at
+   * a time); `evictAllLines` bumps it by however many lines it drains in
+   * one bulk step, PLUS one further event when a pending fragment - never
+   * materialized into a line at all - is discarded alongside them (both
+   * job-output retention's own reclaim, see that function's own docs); and
+   * `appendOutput` bumps it by 1 for a chunk arriving after this stream's
+   * job is already reclaimed, which can never become a line either. The
+   * first writer's unit is exactly "materialized lines"; the other two
+   * widen that to "discrete loss events" specifically so this field can
+   * express sub-line loss without ever pairing `truncated:true` with
+   * `droppedCount:0` (see `evictAllLines`'s own docs for why that pairing
+   * is reserved for response pagination and never used for genuine loss).
+   * Matches this file's other `*EverMaterialized`/`*EverReceived`
+   * per-stream counters in shape (a single unbounded NUMBER, cheap
+   * regardless of a job's lifetime, unlike the abandoned per-seq-range
+   * design's array).
    */
   readonly droppedCount: number;
 }
@@ -634,15 +655,16 @@ export interface StreamBufferState {
    */
   highestSeqAssigned: number;
   /**
-   * How many of THIS stream's own lines have EVER been evicted, over its
+   * How many discrete loss events THIS stream has EVER suffered, over its
    * whole life - the source of `StreamBufferSnapshot.droppedCount` (see its
    * own docs for why a bounded count, never a per-seq range, is what v1
-   * discloses). Incremented by exactly 1 in `evictOldestLine` (the ONE
-   * place either eviction loop in this file actually removes a line) every
-   * time it actually removes one of THIS stream's own lines - never reset
-   * or decremented, matching this struct's other `*EverMaterialized`/
-   * `*EverReceived` counters in shape: a single unbounded NUMBER, cheap
-   * regardless of a job's lifetime.
+   * discloses, and for the full writer list: `evictOldestLine` and
+   * `evictAllLines`'s line-based bumps, plus `evictAllLines`'s
+   * pending-fragment case and `appendOutput`'s post-reclaim-arrival case,
+   * neither of which corresponds to a materialized line). Never reset or
+   * decremented. Matches this struct's other
+   * `*EverMaterialized`/`*EverReceived` counters in shape: a single
+   * unbounded NUMBER, cheap regardless of a job's lifetime.
    */
   droppedCount: number;
   /**
@@ -654,6 +676,14 @@ export interface StreamBufferState {
    * so it stays simple and unambiguous regardless of how a given byte ends
    * up split/merged/marked in `lines`. `JobStore.getOutputCounts`'s
    * `*_bytes` field reads this directly.
+   *
+   * A SECOND consumer as of job-output retention: `sweepRetention`'s
+   * holds-output filter tests `bytesEverReceived > 0` (see that method's
+   * own docs), so "never decremented" is also what makes a job that has
+   * ever received a byte pass that filter FOREVER, including after its
+   * own output has already been reclaimed - `retentionEvicted` is the
+   * only thing that then keeps it from re-entering candidacy (see that
+   * field's own docs).
    */
   bytesEverReceived: number;
 }
@@ -729,6 +759,74 @@ function evictOldestLine(state: StreamBufferState): StreamLineEntry | undefined 
   state.truncated = true;
   state.droppedCount += 1;
   return removed;
+}
+
+/**
+ * Drops every currently-retained line on `state`, in one bulk step, AND
+ * discards any not-yet-materialized pending fragment - the retention
+ * sweep's own reclaim primitive, deliberately separate from
+ * `evictOldestLine` above. That function removes ONE line via
+ * `Array.shift()`, which is the right shape for ordinary cap eviction
+ * (one line evicted per newly-materialized one, so the per-call cost is
+ * already bounded) but is the WRONG shape for retention, which drops an
+ * entire stream's retained set at once: calling `evictOldestLine` in a
+ * loop would `shift()` once per retained line, and repeated front-removal
+ * from an array is itself linear per call - making the whole drain
+ * quadratic in the stream's own retained-line count. This does the same
+ * per-line `droppedCount` accounting `evictOldestLine` does, but in one
+ * bulk assignment - the whole operation is a fixed number of field writes
+ * regardless of how many lines or pending bytes it drops.
+ *
+ * `state.pending` is cleared here UNCONDITIONALLY, not just `state.lines`:
+ * once retention calls this, `appendOutput`/`finalizeStream`'s own
+ * `retentionEvicted` guards (see their docs) permanently refuse to ever
+ * flush a pending fragment for this job again, so bytes left sitting in
+ * `pending` after this call would otherwise be retained forever, reachable
+ * by nothing - up to just under 1 MiB per stream, entirely outside the
+ * cap this whole mechanism exists to enforce. Dropping them here is what
+ * actually closes that window; leaving them for a `finalizeStream` that
+ * can now never run would not.
+ *
+ * `truncated` and `droppedCount` are always set TOGETHER, never one without
+ * the other - the invariant `evictOldestLine` already keeps and that a
+ * caught-up stream's public response depends on (`truncated:true` paired
+ * with `droppedCount:0` is reserved for mid-response pagination, never for
+ * genuine loss). `droppedCount` counts DISCRETE LOSS EVENTS, not materialized
+ * lines: the `count` materialized lines dropped this call contribute `count`
+ * (identical to `evictOldestLine`'s own one-at-a-time accounting), and a
+ * pending fragment cleared alongside them contributes a FURTHER, SEPARATE
+ * `+1` if one existed (`state.pending.length > 0` before the clear above) -
+ * it is REAL DATA THE CALLER CAN NEVER SEE AGAIN, exactly like a dropped
+ * line, and its own discard is never folded into the line count regardless
+ * of whether this call also dropped zero, one, or many lines. That is a
+ * deliberate widening of what `droppedCount` counts - from "materialized
+ * lines dropped" to "discrete loss events", the smallest change that lets
+ * this signal express sub-line loss at all without ever producing the
+ * forbidden `truncated:true`/`droppedCount:0` pair, and without silently
+ * absorbing a fragment's own loss into an unrelated line count on the one
+ * call where both happen together. `headSeq` (see
+ * `StreamBufferState.highestSeqAssigned`) is deliberately left untouched by
+ * the fragment's contribution: a fragment never received a `seq`, so there
+ * is no boundary value to report for it without fabricating one - the same
+ * never-name-a-value discipline `droppedBeforeCursor`'s own docs already
+ * describe. `appendOutput` registers the other new loss-event source (a
+ * chunk arriving for an already-reclaimed stream); see its own docs.
+ * Returns how many materialized LINES were actually dropped (0 if none
+ * were retained), so a caller can tell a genuine line-drain from a
+ * pending-only or no-op reclaim; the returned count is unaffected by
+ * whether a pending fragment was also discarded.
+ */
+function evictAllLines(state: StreamBufferState): number {
+  const count = state.lines.length;
+  const hadPending = state.pending.length > 0;
+  state.lines = [];
+  state.pending = Buffer.alloc(0);
+  state.totalBytes = 0;
+  if (count > 0 || hadPending) {
+    state.truncated = true;
+    state.droppedCount += count + (hadPending ? 1 : 0);
+  }
+  return count;
 }
 
 function materializeLine(
@@ -1275,6 +1373,81 @@ export class JobStore {
    * (e.g. the shared singleton) without a fresh instance.
    */
   private concurrencyConfig: ConcurrencyConfig;
+  /** The retention policy for a terminal job's BUFFERED OUTPUT - see `src/scheduler.ts`'s `RetentionConfig`/`decideRetentionEvictions` for the pure decision, and `sweepRetention` below for the only place this store acts on it. */
+  private retentionConfig: RetentionConfig;
+  /**
+   * Job ids whose buffered stdout/stderr have already been reclaimed by
+   * `sweepRetention`. Its independently load-bearing use is in
+   * `appendOutput` (see its own docs): checking this Set there is what
+   * closes the exit-before-stream-end race, where a child's `exit` and
+   * its stdout/stderr `end` fire as independent, unordered events -
+   * without that check, a chunk arriving AFTER eviction would run
+   * through the ordinary append path and materialize as plain content
+   * with no loss signal at all, silently re-populating a buffer this
+   * store has already told every caller is empty, rather than the
+   * active `truncated`/`droppedCount` disclosure `appendOutput`'s guard
+   * produces today. `finalizeStream`'s own check against this Set is
+   * DEFENSE-IN-DEPTH, not independently necessary: `evictAllLines` (see
+   * its own docs) always empties `pending` on reclaim, and it is
+   * `appendOutput`'s own guard above - not `finalizeStream`'s - that
+   * keeps `pending` from ever becoming non-empty again for a reclaimed
+   * job, so there is never anything left for a post-reclaim
+   * `finalizeStream` call to flush regardless of whether its own check
+   * runs first. `getRetentionEvictedCount()` reads this Set's size directly for
+   * observability, and `deleteJob` reclaims this entry too, the same
+   * discipline as every other per-job Set/Map in this file.
+   *
+   * ITS OWN exclusion check inside `sweepRetention`'s candidate loop is
+   * INDEPENDENTLY NECESSARY, not defense-in-depth: `sweepRetention`'s
+   * holds-output filter (see that method's own docs) tests
+   * `bytesEverReceived > 0` on each stream, a cumulative counter that
+   * only ever grows (see that field's own docs) and that `evictAllLines`
+   * never touches when it drains a stream's lines and pending bytes on
+   * reclaim. So a job that has ever received any output keeps
+   * `holdsOutput === true` forever, including after this Set has already
+   * reclaimed it - this Set's own membership check is what actually
+   * stops such a job from re-entering candidacy and being selected again
+   * by a later sweep.
+   */
+  private readonly retentionEvicted = new Set<string>();
+  /**
+   * Job ids for which `releaseSlot` has STARTED awaiting a reap decision
+   * but that decision has not yet resolved - the window `isJobSlotStranded`
+   * cannot see, since it only becomes true once a reap has ALREADY
+   * resolved unconfirmed/errored (`markSlotStranded`). A job in this set
+   * is terminal but its process-group cleanup outcome is still unknown:
+   * `sweepRetention` must treat it exactly like a confirmed-stranded job
+   * (deferring output reclamation), because the diagnostic trace it would
+   * reclaim may turn out to be the only one this store ever gets if the
+   * reap comes back unconfirmed. Added the instant `releaseSlot` is
+   * called with a real reap promise, removed the instant that promise
+   * settles (in a `finally`, so a decision that somehow throws instead of
+   * resolving still clears it rather than leaving the job wrongly
+   * protected forever).
+   *
+   * SCOPE, STATED DELIBERATELY NARROW: this protects only the window that
+   * begins when `releaseSlot` is actually called with a reap promise, and
+   * only for as long as that specific promise is unsettled. It says
+   * nothing about, and does not protect, an EARLIER window some call
+   * sites can produce - `src/tools/run.ts`'s deadline-enforcement path
+   * (and the equivalent live `kill()` path) can mark a record terminal
+   * (`markDeadlineExceeded`) from inside `killProcessGroupPosix`'s
+   * `onSignaled` callback, which fires the moment a signal is sent, well
+   * BEFORE that same call's eventual `releaseSlot(jobId, reapPromise)`
+   * ever runs. Between those two moments the job is terminal, its
+   * concurrency slot has not been released, and neither this Set nor
+   * `isJobSlotStranded` has anything to say about it - `sweepRetention`
+   * can reclaim its output in that specific window today. That gap
+   * predates this file (the deadline and kill paths have always marked a
+   * record terminal before their own cleanup could confirm it); retention
+   * is what made the gap reachable, not what created it, and widening
+   * this mechanism to also cover it is tracked separately (a change to
+   * the deadline/kill subsystem itself, not to this store's retention
+   * sweep) rather than folded in here.
+   */
+  private readonly reapPending = new Set<string>();
+  /** The real periodic timer behind `startRetentionSweeper` - `undefined` whenever no real production process has started it (every test-constructed `JobStore` instance, by design; see that method's own docs). */
+  private retentionTimer: NodeJS.Timeout | undefined;
   /** How many jobs currently hold a concurrency slot - spawned and not yet reaped. See `releaseSlot`'s own docs for exactly when a slot is freed. */
   private activeSlots = 0;
   /** The FIFO queue of jobs admitted into the queue (the cap was full when they arrived, but queue depth allowed it) - this array's own push/shift order IS insertion order, the queue's own tie-break. */
@@ -1342,8 +1515,187 @@ export class JobStore {
   /** Whether this store has begun shutting down - see `beginShutdown`'s own docs for exactly what that gates and why it is permanent on a real server. */
   private shuttingDown = false;
 
-  constructor(concurrencyConfig: ConcurrencyConfig = loadConcurrencyConfigFromEnv()) {
+  constructor(
+    concurrencyConfig: ConcurrencyConfig = loadConcurrencyConfigFromEnv(),
+    retentionConfig: RetentionConfig = loadRetentionConfigFromEnv()
+  ) {
     this.concurrencyConfig = normalizeConcurrencyConfig(concurrencyConfig);
+    this.retentionConfig = normalizeRetentionConfig(retentionConfig);
+  }
+
+  /** Reconfigures the retention policy on an already-constructed store (e.g. the shared singleton) - mirrors `setConcurrencyConfig`. Takes effect on the next `sweepRetention` call; does not retroactively re-judge anything already reclaimed. */
+  setRetentionConfig(config: RetentionConfig): void {
+    this.retentionConfig = normalizeRetentionConfig(config);
+  }
+
+  /**
+   * Reclaims a TERMINAL job's BUFFERED OUTPUT past retention - the ONE
+   * place this store acts on `decideRetentionEvictions`'s decision. Does
+   * NOT delete the job's own record: `has`/`get`/`status`/`list` still
+   * find it exactly as before. What changes is `output`/`tail`: every
+   * currently-retained line on both streams is dropped (`headSeq` is
+   * untouched since it already tracks the true highest-ever-assigned
+   * value), applied in bulk to every retained line at once via
+   * `evictAllLines` (see its own docs), which ALSO discards any
+   * not-yet-newline-terminated pending fragment on each stream - the one
+   * thing `evictOldestLine`'s ordinary per-line eviction never has to
+   * touch, since a byte/line-cap eviction only ever removes complete
+   * lines. The unit these two paths increment `droppedCount` by is
+   * therefore NOT the same: `evictOldestLine` counts materialized lines
+   * one at a time; reclamation counts DISCRETE LOSS EVENTS (a
+   * materialized line, a discarded fragment, or - via `appendOutput`'s
+   * own post-reclaim branch - a later arriving chunk, each exactly one).
+   * A caller reading a retention-evicted job's output still sees the
+   * SAME kind of honest, bounded, in-stream "this stream lost something
+   * forever" signal `output.ts`/`tail.ts` already report for ordinary
+   * byte/line-cap eviction - never a bare "job not found" that reads
+   * identically to a job that never existed at all - but the count
+   * behind that signal is a wider unit on this path than on the cap
+   * path.
+   *
+   * Synchronous and non-`await`ing throughout, like every other mutation
+   * in this file, so a concurrent read (`get`/`getStreamSnapshot`/etc.,
+   * themselves plain synchronous reads) can never observe a
+   * partially-evicted buffer: Node's single-threaded execution means a
+   * call to this method and a call to a read method can never interleave
+   * mid-operation, only run fully before or fully after each other - so a
+   * caller sees either the buffer's real final state or the fully-dropped
+   * one, never a torn read. Calling `evictAllLines` on the SAME job's
+   * streams twice is itself a harmless no-op (nothing left to drop the
+   * second time) - but the `retentionEvicted` exclusion below is what
+   * stops a reclaimed job from being re-selected as a CANDIDATE at all
+   * on a later sweep (see that field's own docs: it is independently
+   * necessary for this, not defense-in-depth), so this method's own
+   * idempotence as observed by a caller - a second sweep returning an
+   * empty list for an already-reclaimed job - rests on that exclusion,
+   * not on `evictAllLines` alone. Synchronous latency per call is
+   * proportional to the total number of terminal job RECORDS this store
+   * currently holds (one pass over `this.jobs.values()` to build
+   * candidates - that population has no cap of its own on the non-Tasks
+   * path, since retention bounds accumulated OUTPUT, never accumulated
+   * RECORD count), plus a FIXED, small amount of additional work per job
+   * this call actually evicts: `evictAllLines` (see its own docs) drains
+   * an entire stream's retained lines and pending bytes in one bulk step,
+   * never a per-line `Array.shift()`, so the number of lines or bytes
+   * being dropped does not itself add proportional cost.
+   *
+   * Four exclusions before a terminal job is even considered eligible:
+   * - Non-terminal (still-running) jobs are never terminal in the first
+   *   place, so `isTerminalJobState` alone excludes them.
+   * - A job currently holding no output at all on EITHER stream - checked
+   *   via `bytesEverReceived`, not `lines.length`, so a job whose only
+   *   content is a pending fragment that never formed a complete line is
+   *   still a real candidate - is skipped regardless of age or the cap:
+   *   there is nothing to reclaim, and letting a genuinely empty record
+   *   occupy a `maxRetainedJobs` slot would let it displace an older job
+   *   that still holds real output, which is exactly backwards from what
+   *   the cap exists to bound.
+   * - A job whose slot is currently STRANDED (`isJobSlotStranded`), or
+   *   whose reap decision is still being awaited (`reapPending` - see
+   *   that field's own docs for the timing gap this closes), is excluded
+   *   even though it IS terminal - mirrors `src/tasksAdapter.ts`'s
+   *   `isExpiredTerminalRecord` guard, which checks the identical
+   *   confirmed-stranded flag before its own (separate) full-record
+   *   reclamation, for the analogous reason: a stranded or
+   *   cleanup-pending job's output is often the only remaining
+   *   diagnostic trace of what a still-held process group was doing, and
+   *   this store has no way to know a caller isn't about to inspect it
+   *   as part of the manual `kill()` recovery path.
+   * - A job already in `retentionEvicted` is skipped - INDEPENDENTLY
+   *   NECESSARY, not covered by the holds-output filter above: that
+   *   filter tests cumulative `bytesEverReceived`, which reclaiming a
+   *   job's streams never resets (see that field's own docs), so a
+   *   reclaimed job keeps `holdsOutput === true` forever and this Set's
+   *   own membership check is what stops it re-entering candidacy here.
+   *
+   * A fresh, separate lifecycle from `src/tasksAdapter.ts`'s task-record
+   * TTL purge (which reclaims the whole record, output included, on its
+   * own much longer trigger) and from concurrency-slot release - see
+   * `RetentionConfig`'s own docs. Each acts only on its own trigger
+   * (`createJob`/`createFailedJob` call this method below, and so does
+   * `startRetentionSweeper`'s periodic timer; the task TTL purge is
+   * lazy-on-`tasks/get` read; a slot is released only on its own
+   * confirmed reap) - with two named exceptions, never a blanket "none":
+   * both this method and the task-record TTL purge independently defer
+   * their own reclamation while a job's slot is stranded, for the
+   * identical reason (protecting the only remaining trace of a held
+   * slot). Every other cross-lifecycle interaction remains forbidden.
+   */
+  sweepRetention(now: number = Date.now()): string[] {
+    const candidates: { jobId: string; endedAtMs: number }[] = [];
+    for (const record of this.jobs.values()) {
+      if (!isTerminalJobState(record.state)) continue;
+      const streams = this.buffers.get(record.job_id);
+      const holdsOutput =
+        streams !== undefined &&
+        (streams.stdout.bytesEverReceived > 0 || streams.stderr.bytesEverReceived > 0);
+      if (!holdsOutput) continue;
+      if (this.isJobSlotStranded(record.job_id) || this.reapPending.has(record.job_id)) continue;
+      if (this.retentionEvicted.has(record.job_id)) continue;
+      if (record.ended_at === undefined) continue; // defensive only - every real terminal record sets this
+      const endedAtMs = Date.parse(record.ended_at);
+      if (Number.isNaN(endedAtMs)) continue; // defensive only - ended_at is always a real toISOString() value
+      candidates.push({ jobId: record.job_id, endedAtMs });
+    }
+    const evicted = decideRetentionEvictions(candidates, now, this.retentionConfig);
+    for (const jobId of evicted) {
+      const streams = this.buffers.get(jobId);
+      if (streams !== undefined) {
+        evictAllLines(streams.stdout);
+        evictAllLines(streams.stderr);
+      }
+      this.retentionEvicted.add(jobId);
+    }
+    return evicted;
+  }
+
+  /** How many jobs currently have an entry in `retentionEvicted` - the same observability shape `getReapEnteredCount`/`getStrandedSlotCount` already establish for this file's other per-job Sets. */
+  getRetentionEvictedCount(): number {
+    return this.retentionEvicted.size;
+  }
+
+  /**
+   * Starts the REAL periodic timer that makes retention check on a
+   * schedule rather than only ever firing when a new job happens to
+   * arrive (`createJob`/`createFailedJob` already call `sweepRetention`
+   * opportunistically, but on an otherwise-idle server nothing would
+   * ever trigger it again). In PRODUCTION this is called exactly once,
+   * from `src/server.ts`'s `runServer` - the real production entrypoint
+   * - never from `createServer()` (which every test in this codebase's
+   * own suite calls directly, often many times against this one
+   * process-lifetime singleton); a test that specifically exercises the
+   * timer itself calls this method directly instead. That production
+   * split is deliberate and load-bearing: starting this timer from the
+   * `JobStore` CONSTRUCTOR, instead, would mean every test-constructed
+   * instance spins up its own background interval, accreting across a
+   * whole test run - which is exactly why the constructor never calls it
+   * and every caller that wants the timer, production or test, must ask
+   * for it explicitly. Idempotent - a second call while one is already
+   * running is a no-op, matching this file's other start/stop pairs.
+   *
+   * `RETENTION_SWEEP_INTERVAL_MS` sets how often the check is
+   * SCHEDULED, not a guaranteed maximum delay: it is an ordinary
+   * `setInterval`, and its callback only runs once the event loop is
+   * free to reach it, so a job's actual reclamation can lag this
+   * interval by however long the loop is busy with other work at that
+   * moment (a blocking synchronous call elsewhere in the process, or
+   * genuine host contention) - the schedule names the cadence the check
+   * is attempted at, not a wall-clock ceiling on when it completes.
+   * `.unref()`'d so this timer is never, on its own, the reason a real
+   * MCP stdio server's process stays alive - the transport connection
+   * already governs that.
+   */
+  startRetentionSweeper(): void {
+    if (this.retentionTimer !== undefined) return;
+    this.retentionTimer = setInterval(() => this.sweepRetention(), RETENTION_SWEEP_INTERVAL_MS);
+    this.retentionTimer.unref();
+  }
+
+  /** Stops the timer `startRetentionSweeper` started, if any - a harmless no-op for a store that never started one (every test-constructed instance, by design; see that method's own docs). Called from `src/server.ts`'s shutdown path unconditionally, for the same reason it's harmless there. */
+  stopRetentionSweeper(): void {
+    if (this.retentionTimer === undefined) return;
+    clearInterval(this.retentionTimer);
+    this.retentionTimer = undefined;
   }
 
   /** True if a job with this id has ever been registered. */
@@ -1400,6 +1752,19 @@ export class JobStore {
    * to be un-spawnable (use `createFailedJob` for that).
    */
   createJob(input: CreateJobInput): JobRecord {
+    // Opportunistic retention sweep - a new job arriving is a convenient
+    // moment to reclaim eligible output immediately, ahead of the periodic
+    // timer's next tick (`startRetentionSweeper` is what supplies the real
+    // time bound on an idle server - see `sweepRetention`'s own docs).
+    // Never changes the admission decision below - its result is
+    // discarded here, and a caller that wants the evicted ids calls
+    // `sweepRetention` directly. It does run synchronously before that
+    // decision, so it adds the sweep's own synchronous work to this call's
+    // latency; it is not free, and that work scales with the total number
+    // of terminal job RECORDS this store currently holds (see
+    // `sweepRetention`'s own docs for why that population has no cap of
+    // its own on the non-Tasks path).
+    this.sweepRetention();
     const now = new Date().toISOString();
     const record: JobRecord = {
       job_id: randomUUID(),
@@ -1443,6 +1808,7 @@ export class JobStore {
    * the same timestamp.
    */
   createFailedJob(input: CreateFailedJobInput): JobRecord {
+    this.sweepRetention(); // same forward-progress trigger as createJob - see that method's own comment
     const now = new Date().toISOString();
     const record: JobRecord = {
       job_id: randomUUID(),
@@ -1805,7 +2171,29 @@ export class JobStore {
       );
       return;
     }
-    const decision = reapPromise === undefined ? "confirmed" : await reapPromise;
+    let decision: ReapReleaseDecision;
+    if (reapPromise === undefined) {
+      decision = "confirmed";
+    } else {
+      // Marked BEFORE the await starts, cleared once it settles either
+      // way - this is the retention-exclusion window `sweepRetention`
+      // needs (see `reapPending`'s own docs): terminal but cleanup-
+      // outcome-unknown, which `isJobSlotStranded` alone cannot express
+      // since it only becomes true once a reap has ALREADY resolved
+      // unconfirmed/errored. The `finally` covers the reap promise
+      // rejecting instead of resolving (never expected in practice - a
+      // real reap failure is mapped to the explicit "errored" decision
+      // value, never left as a rejection - but this keeps a violation of
+      // that invariant from leaving a job wrongly output-protected
+      // forever instead of merely losing this one call's fail-closed
+      // stranding).
+      this.reapPending.add(jobId);
+      try {
+        decision = await reapPromise;
+      } finally {
+        this.reapPending.delete(jobId);
+      }
+    }
     if (this.slotReleased.has(jobId)) {
       // A concurrent release for this same job already committed while
       // this call was suspended awaiting its own decision above - see
@@ -2763,15 +3151,66 @@ export class JobStore {
     return { kind: "unconfirmed" };
   }
 
-  /** Appends one raw data chunk from a job's stdout or stderr to that stream's independent buffer, firing any registered `onOutputArrival` listeners for `jobId` once per line materialized (see that method's own docs). */
+  /**
+   * Appends one raw data chunk from a job's stdout or stderr to that
+   * stream's independent buffer, firing any registered `onOutputArrival`
+   * listeners for `jobId` once per line materialized (see that method's
+   * own docs). Once `jobId` is in `retentionEvicted` - see that field's
+   * own docs for why: a child's `exit` (which can make a job
+   * retention-eligible) and its stdout/stderr `end` are independent,
+   * unordered events, so a chunk can legitimately still be in flight for a
+   * stream whose job `sweepRetention` has already reclaimed - the chunk is
+   * never materialized into a line or added to `pending` (this store has
+   * told every caller the stream is empty, and honoring that is the whole
+   * point of reclaiming it), but its raw byte count is STILL added to
+   * `bytesEverReceived`: that counter's own doc promises "total raw bytes
+   * EVER received," full stop, and silently exempting post-reclamation
+   * bytes from it would make the promise false the moment retention drops
+   * anything. Counting bytes costs nothing extra a caller can observe
+   * (`bytesEverReceived` is a plain running total, decoupled from line
+   * materialization by design - see its own docs) and keeps this store's
+   * one truly unconditional counter unconditional.
+   *
+   * This arrival is ALSO its own loss event, registered the same way
+   * `evictAllLines`'s pending-fragment branch registers one (see that
+   * function's own docs): `truncated = true`, `droppedCount += 1`, every
+   * time this branch runs, so a stream that was genuinely empty at the
+   * moment its job was reclaimed - and would otherwise stay silently
+   * indistinguishable from one that never received output at all, the
+   * instant this specific arrival is the first thing to break that - gets
+   * the same honest, in-band `output`/`tail` signal a reclaimed line or a
+   * reclaimed pending fragment already gets. `headSeq` is untouched here
+   * too, for the identical reason: this chunk never receives a `seq`.
+   */
   appendOutput(jobId: string, stream: ManagedStream, chunk: Buffer): void {
     const buffers = this.buffers.get(jobId);
     if (!buffers) return;
+    if (this.retentionEvicted.has(jobId)) {
+      const buf = buffers[stream];
+      buf.bytesEverReceived += chunk.length;
+      buf.truncated = true;
+      buf.droppedCount += 1;
+      return;
+    }
     appendChunkToBuffer(buffers[stream], chunk, this.arrivalNotifier(jobId, stream));
   }
 
-  /** Call when a job's stdout or stderr stream has ended, to flush any pending partial final line - this too fires `onOutputArrival` listeners if that flush materializes a line (see `finalizeStreamBuffer`'s own docs on the `stream-end` case). */
+  /**
+   * Call when a job's stdout or stderr stream has ended, to flush any
+   * pending partial final line - this too fires `onOutputArrival`
+   * listeners if that flush materializes a line (see
+   * `finalizeStreamBuffer`'s own docs on the `stream-end` case). Skipped
+   * entirely once `jobId` is in `retentionEvicted` - DEFENSE-IN-DEPTH,
+   * not independently necessary today (measured): `evictAllLines` (see
+   * its own docs) always empties `pending` on reclaim, and `appendOutput`
+   * above's own guard is what prevents `pending` ever becoming non-empty
+   * again for a reclaimed job, so `finalizeStreamBuffer`'s own internal
+   * `pending.length > 0` check already blocks this call from
+   * materializing anything by the time it would ever run here. Kept
+   * anyway as a second, independent check against the same invariant.
+   */
   finalizeStream(jobId: string, stream: ManagedStream): void {
+    if (this.retentionEvicted.has(jobId)) return;
     const buffers = this.buffers.get(jobId);
     if (!buffers) return;
     finalizeStreamBuffer(buffers[stream], this.arrivalNotifier(jobId, stream));
@@ -2872,8 +3311,9 @@ export class JobStore {
    * stream buffers, every registered output-arrival/job-terminal
    * listener, any recorded output-watch-stop annotation, its
    * `slotReserved`/`slotReleased` dedupe entries, its `strandedSlots`
-   * entry INCLUDING clearing any pending automatic-retry timer, and its
-   * `reapEntered` entry (if any of these was ever set for `jobId` at all - a preflight-failed job
+   * entry INCLUDING clearing any pending automatic-retry timer, its
+   * `reapEntered` entry, and its `retentionEvicted` entry (if any of
+   * these was ever set for `jobId` at all - a preflight-failed job
    * (`createFailedJob`) or one that was rejected outright never gets a
    * `slotReserved` entry in the first place, and `Set.delete`/`Map.delete`
    * on a missing entry is already a harmless no-op; a job admitted into
@@ -2883,14 +3323,20 @@ export class JobStore {
    * reason (see its own docs) - and it never carries a `slotReleased`,
    * `strandedSlots`, or `reapEntered` entry, since a later `releaseSlot`
    * call against it is refused by the now-absent `slotReserved` entry).
-   * All four matter on a long-running server: `slotReleased` is add-only
+   * All five matter on a long-running server: `slotReleased` is add-only
    * everywhere but here, `slotReserved` moves between
    * `createJob`/`enqueueJob`/`dequeueNext` (see their own docs) besides
    * this method, `strandedSlots` likewise only grows via
-   * `markSlotStranded`, and `reapEntered` only ever grows via
-   * `reapProcessGroupOnce`'s own signal-capable branch - never cleared by
-   * anything else this store does - so
-   * this is the ONE place anything is ever removed from any of them - without it,
+   * `markSlotStranded`, `reapEntered` only ever grows via
+   * `reapProcessGroupOnce`'s own signal-capable branch, and
+   * `retentionEvicted` only ever grows via `sweepRetention` - none of
+   * them ever cleared by anything else this store does - so
+   * this is the ONE place anything is ever removed from any of them
+   * (`reapPending` is the one exception - `releaseSlot`'s own `finally`
+   * clears it in the ordinary case, so this call is a defensive backstop
+   * for the case where a job's record is force-deleted while a reap
+   * decision is still outstanding, not the structure's primary clear
+   * path) - without it,
    * every job that ever ran and was later purged would leave a permanent
    * entry behind (unbounded linear growth in exactly the store whose
    * whole purpose is bounding resource use), and an uncleared retry timer
@@ -2900,7 +3346,8 @@ export class JobStore {
    * real, needless work this store can just as easily cancel here). A
    * one-way reclamation primitive: after this call,
    * `has`/`get`/`getStreamSnapshot`/`getOutputCounts`/`getSlotReleasedCount`/
-   * `getStrandedSlotCount`/`getReapEnteredCount` all behave EXACTLY as if
+   * `getStrandedSlotCount`/`getReapEnteredCount`/`getRetentionEvictedCount`
+   * all behave EXACTLY as if
    * `jobId` had never existed. Generic - this store has no opinion on WHY a caller reclaims
    * a job (a task-layer TTL purge is the one real caller today, see
    * `src/tasksAdapter.ts`'s `getTask`, but nothing here is Tasks-
@@ -2936,6 +3383,8 @@ export class JobStore {
     if (stranded?.retryTimer !== undefined) clearTimeout(stranded.retryTimer);
     this.strandedSlots.delete(jobId);
     this.reapEntered.delete(jobId);
+    this.retentionEvicted.delete(jobId);
+    this.reapPending.delete(jobId);
     return existed;
   }
 
