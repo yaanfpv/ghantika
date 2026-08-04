@@ -20,6 +20,7 @@
 // the event loop non-empty for long enough that the supervisor's own
 // 180s idle window elapses first.
 import { test } from "node:test";
+import { setTimeout } from "node:timers";
 
 test(
   "TEMPORARY fixture: hangs past the idle watchdog on purpose",

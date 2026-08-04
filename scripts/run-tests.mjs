@@ -721,13 +721,11 @@ function printDiagnosticHeader(title, context) {
   // The `::error::` prefix is a GitHub Actions workflow command: a line
   // starting with it (recognized per-line, regardless of surrounding
   // output) becomes a job annotation, hoisted into the run summary instead
-  // of sitting unread inside a thousand-plus lines of ordinary stdout.
-  // Measured on a real red (Manager, 2026-08-04): 1,167 log lines, zero
-  // `::error::` annotations, this exact title line present once and
-  // effectively invisible. Only this one line gets the prefix - the
-  // active-resources/active-handles dump below stays plain stderr, since a
-  // multi-line GitHub annotation renders as one run-on block, not a
-  // structured dump, and the title alone already names what happened.
+  // of sitting unread inside a runner-level failure with no individual
+  // failing test to point at. Only this one line gets the prefix - the
+  // active-resources/active-handles dump below stays plain stderr, since
+  // it is structured detail rather than the single fact a reader needs
+  // first.
   console.error(`\n::error::${title}`);
   for (const line of context) console.error(line);
   console.error("active resources (process.getActiveResourcesInfo()):");
