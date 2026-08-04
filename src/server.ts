@@ -359,6 +359,7 @@ async function performShutdown(transport: Transport, reason: string): Promise<vo
   // than admitted or queued into a queue this function is never going to
   // drain again. See JobStore.beginShutdown's own docs.
   jobStore.beginShutdown();
+  jobStore.stopRetentionSweeper();
   console.error(`[ghantika] shutting down (${reason})`);
   try {
     // Any job still sitting in the concurrency queue never got a real
@@ -814,12 +815,17 @@ function attachParseErrorReporting(transport: Transport): void {
  * actually run as a server process - tests exercise `createServer()`
  * directly (or spawn a real child process for the end-to-end suite) so
  * that in-process unit tests never install `SIGTERM`/`SIGINT` handlers or
- * consume the test runner's own stdin.
+ * consume the test runner's own stdin. Also the ONLY place
+ * `jobStore.startRetentionSweeper()` is ever called, for the identical
+ * reason - see that method's own docs for why starting it from
+ * `createServer()` (or the `JobStore` constructor) instead would leave
+ * every test-constructed instance running its own background timer.
  */
 export async function runServer(): Promise<GhantikaServer> {
   const instance = createServer();
   await instance.server.connect(instance.transport);
   attachProcessShutdownHandlers(instance);
+  jobStore.startRetentionSweeper();
   return instance;
 }
 

@@ -472,6 +472,203 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
  * from `slotReserved` the correct signal to `releaseSlot`'s own ownership
  * guard.
  */
+export interface TerminalMarkGate {
+  readonly onExit: (code: number | null, signal: NodeJS.Signals | null) => void;
+  readonly onStdoutChunk: () => void;
+  readonly onStderrChunk: () => void;
+  readonly onStdoutEnd: () => void;
+  readonly onStderrEnd: () => void;
+  readonly onReapSettled: () => void;
+}
+
+/**
+ * The state machine deciding WHEN a job's client-visible terminal
+ * transition - what `jobStore.markExited` (here, `fire`) actually does -
+ * becomes observable. `exit`, `stdout end`, and `stderr end` are three
+ * independent, unsynchronized listeners on the same child (see
+ * spawnManaged's own wiring); Node gives no ordering guarantee between
+ * them, and a backgrounded grandchild that inherits this job's stdio and
+ * outlives the immediate child is a real, ordinary way for `exit` to fire
+ * before either stream's `end` does (see test/wake-integration.test.ts's
+ * "TERMINAL ORDER" test for a reproduction driven through this exact
+ * code path).
+ *
+ * THE PROPERTY THAT HOLDS: when this job's reap CONFIRMS its process
+ * group empty AND no descendant has left that group, the terminal mark
+ * orders after the last real output event - `fire` never runs before
+ * both `stdout` and `stderr` have genuinely ended. This is proven, not
+ * assumed: a process's file descriptors close synchronously as part of
+ * its own exit, strictly before it can stop appearing to this
+ * codebase's own process-group poll, so once every member of the group
+ * has been confirmed gone, every write end that group ever held is
+ * already closed and `end` follows promptly - verified directly
+ * against real spawned-process timing, including a dense poll trace
+ * sampled through a descendant's actual lifetime, not merely reasoned
+ * about.
+ *
+ * THE DISCLOSED RESIDUAL - two distinct ways to fall outside that
+ * property, sharing one consequence:
+ *
+ * (1) THE REAP DID NOT CONFIRM. `reapProcessGroupOnce` can settle
+ * `"unconfirmed"` (the group's emptiness was never externally
+ * established) or `"errored"` (a real signal-send failure) instead of
+ * `"confirmed"` - see `ReapOutcome`'s own docs. Either way, a
+ * same-group process may still be alive holding a stream, and can
+ * therefore emit output after the mark.
+ *
+ * (2) A DESCENDANT LEFT THE GROUP. A descendant that has detached into
+ * its OWN process group (this codebase's own `spawnManaged`,
+ * `detached: true`) stops being a member of THIS job's group the
+ * instant it does so, while continuing to hold whatever fds it already
+ * inherited - including this job's own stdout/stderr. Process-group
+ * membership and file-descriptor possession are orthogonal kernel
+ * facts, so a reap that DOES confirm this job's own group empty can
+ * still be wrong about every write end being closed: such a
+ * descendant can hold a stream open, and can therefore emit output
+ * after the terminal mark has already fired, for as long as it
+ * chooses to.
+ *
+ * BOTH cells share the same bound and the same reason for it: this
+ * job's own reap attempt, never an unbounded wait on a stream nothing
+ * here can prove will ever close (see test/wake-integration.test.ts's
+ * "BOUNDED TERMINAL WAIT" test, which constructs the escaped-descendant
+ * case and requires it to resolve within an ordinary poll bound rather
+ * than hang on the descendant's own lifetime). No finite settle-check
+ * bound closes either cell on its own terms either - a survivor quiet
+ * for N ticks and emitting on tick N+1 breaks any bound this gate
+ * could pick - so the only thing that actually closes them is the
+ * stream ending on its own, which this codebase is not willing to wait
+ * on indefinitely.
+ *
+ * WINDOWS SCOPE: the property above, and both residual cells, are a
+ * POSIX-only guarantee. `spawnManaged` never makes a Windows job's
+ * child its own process-group leader (`CONTAIN_IN_OWN_PROCESS_GROUP`
+ * is `false` on `win32` - see that constant's own docs in
+ * `src/process.ts`), so there is no real process group for
+ * `reapProcessGroupOnce`'s reap to confirm on Windows in the first
+ * place. This codebase's own test suite already treats every
+ * identity/reap test built on real, external POSIX process-group
+ * confirmation as having no Windows equivalent (see
+ * test/wake-integration.test.ts's `PGREP_ORACLE_SKIP` and its sibling
+ * win32 skips). Nothing above is a claim about Windows.
+ *
+ * `onReapSettled` is the mechanism that realizes both halves at once:
+ * once the reap has settled - confirmed, unconfirmed, or errored are
+ * all still a SETTLEMENT - a still-open stream eventually stops
+ * blocking the terminal mark, bounding the wait to that SAME reap
+ * attempt instead of an arbitrary new timeout. It schedules one
+ * settle-check tick (via `scheduleCheck`, `setImmediate` in production
+ * - the check phase, which runs strictly after the SAME iteration's
+ * poll phase, so any 'data'/'end' event already ready to deliver is
+ * delivered first) and keeps re-arming itself for as long as either
+ * still-open stream keeps producing chunks - real draining in
+ * progress, tracked via `onStdoutChunk`/`onStderrChunk`, never a bare
+ * elapsed-time guess. Only once a full tick passes with ZERO chunks on
+ * every still-open stream does it accept the residual and fire - which
+ * resolves near-instantly for a genuinely escaped, silent descendant
+ * (nothing was ever going to arrive), and, for an ordinary job whose
+ * reap simply happened to settle first, only after the real,
+ * already-buffered output it was ever going to produce has actually
+ * drained.
+ *
+ * Extracted into its own pure, injectable-scheduler unit rather than left
+ * as beginSpawn's inline closures because this exact property - reap-
+ * settles-before-stream-drains, in the ordinary case - is a JS
+ * scheduling-order accident that cannot be reliably forced through a real
+ * spawned process's own OS-level timing; `scheduleCheck` is the seam a
+ * unit test uses to drive it deterministically. This does not touch the
+ * reap/release-slot path in `beginSpawn`, which is OS-level process
+ * cleanup with no dependency on the job's own terminal state (see
+ * `reapProcessGroupOnce`'s own docs) and must still run the instant the
+ * real child exits.
+ */
+export function createTerminalMarkGate(
+  fire: (code: number | null, signal: NodeJS.Signals | null) => void,
+  scheduleCheck: (callback: () => void) => void = setImmediate
+): TerminalMarkGate {
+  let exitInfo: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+  let stdoutEnded = false;
+  let stderrEnded = false;
+  let reapSettled = false;
+  let stdoutProgressed = false;
+  let stderrProgressed = false;
+  let settleCheckScheduled = false;
+  // Guards `fire` itself, not just the paths that call it: a settle-check
+  // tick already queued via scheduleCheck stays queued even after the fast
+  // path (both streams ending) fires first through `evaluate` - there is
+  // no way to cancel a callback already handed to `scheduleCheck`. Without
+  // this flag, that stale tick runs its own check, still sees both streams
+  // ended, and calls `fire` a second time. The gate promises a single
+  // terminal mark and keeps that promise itself, rather than depending on
+  // whatever `fire` happens to be wired to (in production, `jobStore.markExited`
+  // is independently idempotent, but that is a property of the CONSUMER,
+  // not a substitute for this gate's own exactly-once guarantee).
+  let fired = false;
+
+  const fireOnce = (): void => {
+    if (fired || exitInfo === undefined) return;
+    fired = true;
+    fire(exitInfo.code, exitInfo.signal);
+  };
+
+  const scheduleSettleCheck = (): void => {
+    if (settleCheckScheduled) return;
+    settleCheckScheduled = true;
+    stdoutProgressed = false;
+    stderrProgressed = false;
+    scheduleCheck(() => {
+      settleCheckScheduled = false;
+      if (fired || exitInfo === undefined) return;
+      if (stdoutEnded && stderrEnded) {
+        fireOnce();
+        return;
+      }
+      const madeProgress = (!stdoutEnded && stdoutProgressed) || (!stderrEnded && stderrProgressed);
+      if (madeProgress) {
+        scheduleSettleCheck();
+        return;
+      }
+      // A full tick passed with no new bytes on any still-open stream
+      // while the reap has already settled - the disclosed residual.
+      fireOnce();
+    });
+  };
+
+  const evaluate = (): void => {
+    if (fired || exitInfo === undefined) return;
+    if (stdoutEnded && stderrEnded) {
+      fireOnce();
+      return;
+    }
+    if (reapSettled) scheduleSettleCheck();
+  };
+
+  return {
+    onExit: (code, signal) => {
+      exitInfo = { code, signal };
+      evaluate();
+    },
+    onStdoutChunk: () => {
+      stdoutProgressed = true;
+    },
+    onStderrChunk: () => {
+      stderrProgressed = true;
+    },
+    onStdoutEnd: () => {
+      stdoutEnded = true;
+      evaluate();
+    },
+    onStderrEnd: () => {
+      stderrEnded = true;
+      evaluate();
+    },
+    onReapSettled: () => {
+      reapSettled = true;
+      evaluate();
+    },
+  };
+}
+
 function beginSpawn(
   jobId: string,
   argv: string[],
@@ -481,6 +678,10 @@ function beginSpawn(
   env: Record<string, string>,
   deadlineMs: number | undefined
 ): void {
+  const terminalMarkGate = createTerminalMarkGate((code, signal) =>
+    jobStore.markExited(jobId, code, signal)
+  );
+
   const child = spawnManaged(
     { argv, shellCommand, shellExecutable, cwd, env },
     {
@@ -502,7 +703,7 @@ function beginSpawn(
         });
       },
       onExit: (code, signal) => {
-        jobStore.markExited(jobId, code, signal);
+        terminalMarkGate.onExit(code, signal);
         // The PRIMARY reap path for the root-exits-first case: fired the
         // instant the leader's own exit is observed, without ever being
         // awaited here (the same fire-and-forget shape as the async
@@ -535,6 +736,15 @@ function beginSpawn(
             );
             return "errored";
           });
+        // Bounds the terminal-mark wait above to this SAME reap attempt -
+        // see `createTerminalMarkGate`'s own docs for why an unbounded
+        // wait on both streams ending is unsafe. `reapDecision` never
+        // rejects (the `.catch` above always resolves it to a real
+        // `ReapReleaseDecision`), so this always fires once the reap has
+        // genuinely settled, whatever the outcome.
+        reapDecision.then(() => {
+          terminalMarkGate.onReapSettled();
+        });
         // The slot releases only once THIS reap decision has been awaited
         // to completion, never merely kicked off - a slow/delayed reap
         // must not release it early, and a non-"confirmed" decision does
@@ -549,10 +759,22 @@ function beginSpawn(
           );
         });
       },
-      onStdoutChunk: (chunk) => jobStore.appendOutput(jobId, "stdout", chunk),
-      onStderrChunk: (chunk) => jobStore.appendOutput(jobId, "stderr", chunk),
-      onStdoutEnd: () => jobStore.finalizeStream(jobId, "stdout"),
-      onStderrEnd: () => jobStore.finalizeStream(jobId, "stderr"),
+      onStdoutChunk: (chunk) => {
+        jobStore.appendOutput(jobId, "stdout", chunk);
+        terminalMarkGate.onStdoutChunk();
+      },
+      onStderrChunk: (chunk) => {
+        jobStore.appendOutput(jobId, "stderr", chunk);
+        terminalMarkGate.onStderrChunk();
+      },
+      onStdoutEnd: () => {
+        jobStore.finalizeStream(jobId, "stdout");
+        terminalMarkGate.onStdoutEnd();
+      },
+      onStderrEnd: () => {
+        jobStore.finalizeStream(jobId, "stderr");
+        terminalMarkGate.onStderrEnd();
+      },
     }
   );
   if (child !== undefined) {
