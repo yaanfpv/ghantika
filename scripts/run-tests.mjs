@@ -228,10 +228,56 @@ export function parseArgs(argv) {
     // No event of any kind (not just no test finishing - ANY event,
     // including test:start on some other still-running test) for this
     // long means something is stuck badly enough that the test runner
-    // itself has gone quiet. 60s is deliberately generous: real local
-    // suite runs land well under half of this between any two
-    // consecutive events even on the slowest file.
-    idleTimeoutMs: 60_000,
+    // itself has gone quiet.
+    //
+    // Raised from 60_000 to 180_000 after the 60s ceiling started firing
+    // on a legitimate, already-bounded operation rather than a genuine
+    // hang. loader-escape-matrix.test.ts's own before() hook blocks
+    // synchronously on a nested `node --test` supervisor (spawnSync with
+    // its own timeout: 45_000, added in the same repo's history to bound
+    // that supervisor - see runPermanentGuardSuite's doc comment) - and
+    // while that call is in flight, this file emits nothing this
+    // wrapper's stream ever sees, because before() runs before any of
+    // the file's own tests can reach test:start. Under coverage (c8
+    // forces this run() call to a single concurrent file), no OTHER file
+    // is running at the same time to paper over the silence either.
+    //
+    // Measured directly, not assumed: instrumenting this file's own
+    // noteEvent() to log the gap before every liveness event and running
+    // `npm run coverage` end to end on this machine (macOS, arm64, node
+    // 26.5.1) put the worst observed gap at 40.8s, landing immediately
+    // before loader-escape-matrix.test.ts's own test:enqueue - the same
+    // file, the same shape, as the two real hosted-CI failures this
+    // raise responds to. Both of those (ubuntu-24.04, node 22, ghantika
+    // PR #63) show the full configured 60000ms elapsing in total silence
+    // with test:dequeue for that same file as the last liveness event -
+    // a LOWER bound on the real CI-side gap, not a measured upper one:
+    // the watchdog fires and the process exits at exactly that point, so
+    // what the gap would have grown to if left alone is unmeasured. CI
+    // is the slower host here (this repo's own testTimeoutMs comment
+    // above already documents CI's node22 legs running visibly slower
+    // than a local run), so the true CI-side gap is expected to sit
+    // above the 40.8s measured locally, and reaching the old 60s ceiling
+    // twice in two independent runs is consistent with that.
+    //
+    // 180_000 is roughly 4x the measured local worst case and 3x the
+    // nested spawnSync's own already-configured 45_000ms bound - real
+    // headroom for that already-approved recovery mechanism (SIGTERM,
+    // its grace period, and whatever it takes the OS to actually reap
+    // the child) to finish under real CI scheduling latency before this
+    // wrapper's own patience runs out from underneath it.
+    //
+    // Disclosed limit, not solved by this change: if the underlying
+    // stranding is a genuinely PERMANENT hang rather than a slow-but-
+    // completing one - consistent with the still-open upstream report
+    // that a child_process timeout's SIGTERM reaches only the immediate
+    // child, never a grandchild it spawned (nodejs/node#43704) - this
+    // raise does not fix that. It only stops killing a run that was
+    // legitimately still finishing its own already-configured recovery;
+    // a genuinely permanent hang is still caught, just 120s later than
+    // before, and that added latency is the real, honest cost of this
+    // change.
+    idleTimeoutMs: 180_000,
     // Backstop for the whole run regardless of how the time is spent -
     // catches a death by a thousand near-idle-but-not-quite-idle cuts
     // that never individually trips the idle watchdog. 600s against a
