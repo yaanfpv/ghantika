@@ -260,7 +260,7 @@ export function parseArgs(argv) {
     // above the 40.8s measured locally, and reaching the old 60s ceiling
     // twice in two independent runs is consistent with that.
     //
-    // 180_000 is roughly 4x the measured local worst case and 3x the
+    // 180_000 is roughly 4x the measured local worst case and 4x the
     // nested spawnSync's own already-configured 45_000ms bound - real
     // headroom for that already-approved recovery mechanism (SIGTERM,
     // its grace period, and whatever it takes the OS to actually reap
