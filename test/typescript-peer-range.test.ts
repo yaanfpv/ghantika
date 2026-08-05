@@ -82,7 +82,7 @@ test("6.2.0 does NOT satisfy the range", () => {
   assert.equal(versionSatisfiesRange("6.2.0", REAL_PEER_RANGE), false);
 });
 
-test("7.0.2 (Dependabot's proposed bump, still open as PR #1) does NOT satisfy the range", () => {
+test("7.0.2 (the version now shipped via the @typescript/native alias) does NOT satisfy the range", () => {
   assert.equal(versionSatisfiesRange("7.0.2", REAL_PEER_RANGE), false);
 });
 

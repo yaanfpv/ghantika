@@ -305,6 +305,7 @@ jobs:
       - run: npm run guard:module-boundaries
       - run: npm run guard:no-tasks-import
       - run: npm run guard:stdio-purity
+      - run: npm run guard:typescript-tracking-signal
 
   # Confirms the checked-out commit really is the pull request's head rather
   # than the synthetic merge commit a pull_request event checks out by
