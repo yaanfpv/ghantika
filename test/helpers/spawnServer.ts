@@ -4,13 +4,18 @@
  * it over its actual stdin/stdout: a real spawned process, real stdio,
  * real protocol bytes end to end, no internal function calls standing in
  * for any of it. Not a `*.test.ts` file itself (so
- * `node --test`'s auto-discovery never tries to run it as a suite), used
- * by every spawned-real-child suite in this repo - `test/e2e-server.test.ts`,
- * `test/shutdown.test.ts`, `test/modern-handshake.test.ts`,
- * `test/jobStore.test.ts`, `test/kill.test.ts`,
- * `test/kill-slow-paths.test.ts`, `test/output-tail.test.ts`,
- * `test/wake-integration.test.ts`, `test/spawnServer.test.ts`, and
- * `test/harness.ts`.
+ * `node --test`'s auto-discovery never tries to run it as a suite).
+ *
+ * Imported directly by every spawned-real-child suite in this repo -
+ * `test/e2e-server.test.ts`, `test/shutdown.test.ts`,
+ * `test/modern-handshake.test.ts`, `test/kill.test.ts`,
+ * `test/kill-slow-paths.test.ts`, `test/output-tail.test.ts`, and
+ * `test/helpers/hostileGroupKillProbe.ts` - plus `test/harness.ts`, which
+ * re-exports `spawnServer` for its own two callers,
+ * `test/integration.test.ts` and `test/wake-integration.test.ts`.
+ * `test/spawnServer.test.ts` imports only this file's own `lineTimeoutFor`
+ * (the budget function below), never `spawnServer` itself, so it is not a
+ * spawned-real-child suite.
  *
  * `npm test` runs `npm run build` first (see package.json), so
  * `dist/index.js` is guaranteed fresh by the time any test file that
@@ -43,12 +48,12 @@ const CONTAIN_TEST_SERVER_IN_OWN_PROCESS_GROUP = process.platform !== "win32";
  * The measurements this budget rests on: a real coverage run was once
  * observed to time out waiting on a stdout line at the previous flat
  * 2000ms budget. Two direct measurements under coverage instrumentation
- * did not reproduce a wait anywhere near that: an isolated burst of 48
- * instrumented spawns (4 bursts of 12 concurrent), timing only the very
- * first stdout line, found a worst case of 705ms; a full real `npm run
- * coverage` run, instrumented to record every single `nextLine` wait in
- * the entire suite (919 real waits, not a synthetic sample), found a
- * worst case of 503ms and zero waits anywhere near 2000ms.
+ * did not reproduce a wait anywhere near that: an isolated burst of
+ * concurrent instrumented spawns, timing only the very first stdout
+ * line, found a worst case of 705ms; a full real `npm run coverage` run,
+ * instrumented to record every single `nextLine` wait in the entire
+ * suite, found a worst case of 503ms and zero waits anywhere near
+ * 2000ms.
  *
  * This budget is set well above both measured worst cases rather than
  * tied to either one directly, so it also covers occasional load this

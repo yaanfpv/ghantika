@@ -328,44 +328,208 @@ test("modern context: a malformed line arriving AFTER a successful server/discov
 // even if the real wiring were removed.
 // ---------------------------------------------------------------------------
 
-test("negative control (initialize-gate): a serveStdio server built with NO gate wiring at all lets tools/call succeed with ZERO handshake - proving the real pre-handshake-rejection assertions above are discriminating", async () => {
-  const server = tracked([NEGATIVE_CONTROL_FIXTURE, "no-gate"]);
-  server.send({
-    jsonrpc: "2.0",
-    id: 1,
-    method: "tools/call",
-    params: { name: "ping", arguments: {} },
-  });
-  const line = await server.nextLine();
-  const body = line.parsed as { error?: unknown; result?: { content?: Array<{ text?: string }> } };
-  assert.equal(
-    body.error,
-    undefined,
-    "WITHOUT the gate, a pre-handshake tools/call succeeds outright - this IS the exact bypass the real gate exists to close"
-  );
-  assert.equal(body.result?.content?.[0]?.text, "pong");
-  server.child.kill("SIGKILL");
-});
+test(
+  "negative control (initialize-gate): a serveStdio server built with NO gate wiring at all lets tools/call succeed with ZERO handshake - proving the real pre-handshake-rejection assertions above observe a real failure mode, not one that would pass regardless - and its own unrelated parse-recovery and reap guarantees stay intact",
+  {
+    skip:
+      process.platform === "win32"
+        ? "confirms reap via a real process.kill(pid, 0) existence probe; matches every other reap test's own skip"
+        : false,
+  },
+  async () => {
+    const server = tracked([NEGATIVE_CONTROL_FIXTURE, "no-gate"]);
+    server.send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "ping", arguments: {} },
+    });
+    const line = await server.nextLine();
+    const body = line.parsed as {
+      error?: unknown;
+      result?: { content?: Array<{ text?: string }> };
+    };
+    assert.equal(
+      body.error,
+      undefined,
+      "WITHOUT the gate, a pre-handshake tools/call succeeds outright - this IS the exact bypass the real gate exists to close"
+    );
+    assert.equal(body.result?.content?.[0]?.text, "pong");
 
-test("negative control (parse-error reply): a serveStdio server using the SDK's stock, UNWRAPPED StdioServerTransport produces NO reply at all to an unparseable line - proving createStdioTransport's own wrapping is what produces the real -32700 the e2e tests observe", async () => {
-  const server = tracked([NEGATIVE_CONTROL_FIXTURE, "no-parse-wrap"]);
-  server.sendRaw("this is not valid json {{{\n");
-  // The next thing written to stdout, if anything is ever written for the
-  // malformed line at all, would be that -32700 reply. Send a real,
-  // well-formed request right after and confirm the FIRST line observed
-  // is ITS response - proving no reply for the malformed line ever
-  // arrived, not merely that it arrived late.
-  server.send({ jsonrpc: "2.0", id: 501, method: "totally/unknown/method" });
-  const line = await server.nextLine();
-  const body = line.parsed as { id: unknown; error?: { code: number } };
-  assert.equal(
-    body.id,
-    501,
-    "WITHOUT createStdioTransport's own wrapping, no -32700 reply is ever produced - the first (and only) line seen is the next real request's own response"
-  );
-  assert.equal(body.error?.code, -32601);
-  server.child.kill("SIGKILL");
-});
+    // Unrelated guarantee: this variant's own parse-recovery guarantee
+    // (buildWrappedTransport) must stay intact even with the gate
+    // removed, so the removal is attributable to the gate alone and not
+    // to a side effect that also silences parse recovery.
+    server.sendRaw("this is not valid json {{{\n");
+    const parseErrorLine = await server.nextLine();
+    const parseErrorBody = parseErrorLine.parsed as {
+      id: unknown;
+      error?: { code: number };
+    };
+    assert.equal(parseErrorBody.id, null);
+    assert.equal(parseErrorBody.error?.code, -32700);
+
+    server.send({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "ping", arguments: {} },
+    });
+    const afterParseErrorLine = await server.nextLine();
+    const afterParseErrorBody = afterParseErrorLine.parsed as {
+      id: number;
+      error?: unknown;
+      result?: { content?: Array<{ text?: string }> };
+    };
+    assert.equal(
+      afterParseErrorBody.id,
+      3,
+      "the connection must still serve a real request after the malformed line"
+    );
+    assert.equal(afterParseErrorBody.error, undefined);
+    assert.equal(afterParseErrorBody.result?.content?.[0]?.text, "pong");
+
+    // Unrelated guarantee: this variant's own reap wiring must stay
+    // intact even with the gate removed, so the removal is attributable
+    // to the gate alone and not to a side effect that also silences reap.
+    server.send({
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: { name: "spawn-orphan", arguments: {} },
+    });
+    const spawnLine = await server.nextLine();
+    const spawnBody = spawnLine.parsed as {
+      result?: { structuredContent?: { pid?: number } };
+    };
+    const pid = spawnBody.result?.structuredContent?.pid;
+    assert.equal(
+      typeof pid,
+      "number",
+      `expected a real spawned child pid, got: ${JSON.stringify(spawnBody)}`
+    );
+    assert.equal(
+      isProcessAlive(pid!),
+      true,
+      "the spawned child must be genuinely alive before shutdown"
+    );
+
+    server.child.kill("SIGTERM");
+    await server.waitForExit();
+    assert.equal(
+      isProcessAlive(pid!),
+      false,
+      "this variant's own reap guarantee must still hold with the gate removed"
+    );
+  }
+);
+
+test(
+  "negative control (parse-error reply): a serveStdio server using the SDK's stock, UNWRAPPED StdioServerTransport produces NO reply at all to an unparseable line - proving createStdioTransport's own wrapping is what produces the real -32700 the e2e tests observe - and its own unrelated initialize-gate and reap guarantees stay intact",
+  {
+    skip:
+      process.platform === "win32"
+        ? "confirms reap via a real process.kill(pid, 0) existence probe; matches every other reap test's own skip"
+        : false,
+  },
+  async () => {
+    const server = tracked([NEGATIVE_CONTROL_FIXTURE, "no-parse-wrap"]);
+
+    // Unrelated guarantee, exercised first: this variant keeps the real
+    // initialize gate, so a pre-handshake tools/call is still rejected,
+    // and a real completed handshake still lets one through. The shipped
+    // control's own parse-error assertion below proves nothing about the
+    // gate on its own - this is what actually exercises it.
+    server.send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "ping", arguments: {} },
+    });
+    const preHandshakeLine = await server.nextLine();
+    const preHandshakeBody = preHandshakeLine.parsed as {
+      error?: { code: number };
+      result?: unknown;
+    };
+    assert.ok(
+      preHandshakeBody.error,
+      "this variant's own gate must still reject a pre-handshake tools/call"
+    );
+    assert.equal(preHandshakeBody.error?.code, -32600);
+
+    await completeHandshake(server);
+    server.send({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "ping", arguments: {} },
+    });
+    const postHandshakeLine = await server.nextLine();
+    const postHandshakeBody = postHandshakeLine.parsed as {
+      error?: unknown;
+      result?: { content?: Array<{ text?: string }> };
+    };
+    assert.equal(
+      postHandshakeBody.error,
+      undefined,
+      "this variant's own gate must still open normally after a real completed handshake"
+    );
+    assert.equal(postHandshakeBody.result?.content?.[0]?.text, "pong");
+
+    // The variant's OWN named removal: no createStdioTransport-style
+    // wrapping, so an unparseable line gets no -32700 reply at all. Send
+    // a real, well-formed request right after and confirm the FIRST line
+    // observed is ITS response - proving no reply for the malformed line
+    // ever arrived, not merely that it arrived late.
+    server.sendRaw("this is not valid json {{{\n");
+    server.send({
+      jsonrpc: "2.0",
+      id: 501,
+      method: "totally/unknown/method",
+      params: {},
+    });
+    const parseLine = await server.nextLine();
+    const parseBody = parseLine.parsed as { id: unknown; error?: { code: number } };
+    assert.equal(
+      parseBody.id,
+      501,
+      "WITHOUT createStdioTransport's own wrapping, no -32700 reply is ever produced - the first (and only) line seen is the next real request's own response"
+    );
+    assert.equal(parseBody.error?.code, -32601);
+
+    // Unrelated guarantee, exercised last (it terminates the process):
+    // this variant's own reap wiring stays intact even with the
+    // parse-wrap removed.
+    server.send({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "spawn-orphan", arguments: {} },
+    });
+    const spawnLine = await server.nextLine();
+    const spawnBody = spawnLine.parsed as {
+      result?: { structuredContent?: { pid?: number } };
+    };
+    const pid = spawnBody.result?.structuredContent?.pid;
+    assert.equal(
+      typeof pid,
+      "number",
+      `expected a real spawned child pid, got: ${JSON.stringify(spawnBody)}`
+    );
+    assert.equal(
+      isProcessAlive(pid!),
+      true,
+      "the spawned child must be genuinely alive before shutdown"
+    );
+    server.child.kill("SIGTERM");
+    await server.waitForExit();
+    assert.equal(
+      isProcessAlive(pid!),
+      false,
+      "this variant's own reap guarantee must still hold with the parse-wrap removed"
+    );
+  }
+);
 
 test(
   "negative control (shutdown job-reap): a serveStdio server with NO reap wiring at all leaves a real spawned child ALIVE after SIGTERM - proving ghantika's real reap logic (test/shutdown.test.ts) is what prevents that orphan",
@@ -377,14 +541,105 @@ test(
   },
   async () => {
     const server = tracked([NEGATIVE_CONTROL_FIXTURE, "no-reap"]);
-    // This variant keeps the initialize gate (see
-    // test/fixtures/negative-control-server.ts's own doc comment) - a
-    // real handshake first, as a real client would, so the ONLY thing
-    // this test observes the absence of is the reap wiring.
-    await completeHandshake(server);
+
+    // Unrelated guarantee: this variant's own gate must still reject a
+    // pre-handshake tools/call.
+    server.send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "ping", arguments: {} },
+    });
+    const preHandshakeLine = await server.nextLine();
+    const preHandshakeBody = preHandshakeLine.parsed as {
+      error?: { code: number };
+      result?: unknown;
+    };
+    assert.ok(
+      preHandshakeBody.error,
+      "this variant's own gate must still reject a pre-handshake tools/call"
+    );
+    assert.equal(preHandshakeBody.error?.code, -32600);
+
+    // Unrelated guarantee: a bare notifications/initialized with no
+    // preceding genuine initialize request/response - the exact bypass
+    // the gate exists to close - must still be rejected on this variant.
+    server.send(initializedNotification());
     server.send({
       jsonrpc: "2.0",
       id: 2,
+      method: "tools/call",
+      params: { name: "ping", arguments: {} },
+    });
+    const bareNotificationLine = await server.nextLine();
+    const bareNotificationBody = bareNotificationLine.parsed as {
+      error?: { code: number };
+      result?: unknown;
+    };
+    assert.ok(
+      bareNotificationBody.error,
+      "a bare notifications/initialized with no preceding real initialize exchange must still be rejected"
+    );
+    assert.equal(bareNotificationBody.error?.code, -32600);
+
+    // This variant keeps the initialize gate (see
+    // test/fixtures/negative-control-server.ts's own doc comment) - a
+    // real handshake now, as a real client would, so the ONLY thing
+    // this test observes the absence of is the reap wiring.
+    await completeHandshake(server, 3);
+    server.send({
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: { name: "ping", arguments: {} },
+    });
+    const postHandshakeLine = await server.nextLine();
+    const postHandshakeBody = postHandshakeLine.parsed as {
+      error?: unknown;
+      result?: { content?: Array<{ text?: string }> };
+    };
+    assert.equal(
+      postHandshakeBody.error,
+      undefined,
+      "this variant's own gate must still open normally after a real completed handshake"
+    );
+    assert.equal(postHandshakeBody.result?.content?.[0]?.text, "pong");
+
+    // Unrelated guarantee: this variant's own parse-recovery guarantee
+    // (buildWrappedTransport) must stay intact even with the reap
+    // wiring removed.
+    server.sendRaw("this is not valid json {{{\n");
+    const parseErrorLine = await server.nextLine();
+    const parseErrorBody = parseErrorLine.parsed as {
+      id: unknown;
+      error?: { code: number };
+    };
+    assert.equal(parseErrorBody.id, null);
+    assert.equal(parseErrorBody.error?.code, -32700);
+
+    server.send({
+      jsonrpc: "2.0",
+      id: 5,
+      method: "tools/call",
+      params: { name: "ping", arguments: {} },
+    });
+    const afterParseErrorLine = await server.nextLine();
+    const afterParseErrorBody = afterParseErrorLine.parsed as {
+      id: number;
+      error?: unknown;
+      result?: { content?: Array<{ text?: string }> };
+    };
+    assert.equal(
+      afterParseErrorBody.id,
+      5,
+      "the connection must still serve a real request after the malformed line"
+    );
+    assert.equal(afterParseErrorBody.error, undefined);
+    assert.equal(afterParseErrorBody.result?.content?.[0]?.text, "pong");
+
+    server.send({
+      jsonrpc: "2.0",
+      id: 6,
       method: "tools/call",
       params: { name: "spawn-orphan", arguments: {} },
     });
