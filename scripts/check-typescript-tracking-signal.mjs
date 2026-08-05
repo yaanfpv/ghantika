@@ -2,8 +2,10 @@
 /**
  * Guards one narrow invariant left over from this repo's `typescript`
  * peer-range pin decision: `.github/dependabot.yml` carries no "ignore"
- * rule that would silence Dependabot's ability to propose a newer
- * `typescript` version.
+ * rule for `typescript`. An ignore entry would suppress any
+ * Dependabot-proposed bump for that manifest key outright and silently -
+ * whatever Dependabot's own ordinary parser would otherwise do with this
+ * aliased entry (see below, which this file does not claim to know).
  *
  * This file used to also track a specific pull request's open/closed
  * state on the live forge (Dependabot's own PR #1, proposing a bump past
@@ -121,7 +123,7 @@ export function checkDependabotHasNoTypescriptIgnore(dependabotYamlText) {
       if (typeof pattern !== "string") continue;
       if (dependabotNamePatternMatches(pattern, TRACKED_DEPENDENCY_NAME)) {
         problems.push(
-          `.github/dependabot.yml has an "ignore" rule ("dependency-name": "${pattern}") in its "${update["package-ecosystem"] ?? "?"}" update block that matches "${TRACKED_DEPENDENCY_NAME}" - this would silence Dependabot's ability to ever propose a newer typescript at all`
+          `.github/dependabot.yml has an "ignore" rule ("dependency-name": "${pattern}") in its "${update["package-ecosystem"] ?? "?"}" update block that matches "${TRACKED_DEPENDENCY_NAME}" - this would suppress any Dependabot-proposed typescript bump permanently and silently, whatever the odds of one otherwise arriving`
         );
       }
     }
