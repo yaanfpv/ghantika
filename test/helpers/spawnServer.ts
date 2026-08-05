@@ -94,12 +94,16 @@ export interface SpawnedServer {
 }
 
 /**
- * Spawns `dist/index.js` as a real child process and wires up line-based
- * stdout collection exactly the way a real MCP client would (newline-
- * delimited JSON-RPC messages).
+ * Spawns `dist/index.js` (or, when `entry` is given, a different real
+ * entry point - e.g. a standalone comparison fixture under
+ * `test/fixtures/`, run directly via Node's own native TypeScript support
+ * exactly like `dist/index.js` itself, since both are real files on disk
+ * rather than something requiring a build step) as a real child process
+ * and wires up line-based stdout collection exactly the way a real MCP
+ * client would (newline-delimited JSON-RPC messages).
  */
-export function spawnServer(): SpawnedServer {
-  const child = spawn(process.execPath, [SERVER_ENTRY], {
+export function spawnServer(entry: readonly string[] = [SERVER_ENTRY]): SpawnedServer {
+  const child = spawn(process.execPath, [...entry], {
     stdio: ["pipe", "pipe", "pipe"],
     detached: CONTAIN_TEST_SERVER_IN_OWN_PROCESS_GROUP,
     windowsHide: true,
@@ -224,6 +228,42 @@ export function initializeRequest(id: number | string = 1) {
 /** The `notifications/initialized` notification that completes the handshake. */
 export function initializedNotification() {
   return { jsonrpc: "2.0", method: "notifications/initialized" };
+}
+
+/**
+ * The modern (2026-07-28) revision's per-request `_meta` envelope reserved
+ * keys, hand-rolled here rather than imported from the installed SDK's
+ * internal-only constants: `io.modelcontextprotocol/protocolVersion` and
+ * `io.modelcontextprotocol/clientCapabilities` are the two the installed
+ * `@modelcontextprotocol/server` package's own `checkInboundEnvelope`
+ * REQUIRES on every modern-era request (confirmed by reading its own
+ * `REQUIRED_ENVELOPE_KEYS` source, not assumed) - `clientCapabilities` may
+ * be an empty object, but its KEY must be present, or the message
+ * classifies as a claim-less (legacy) request instead of a modern one.
+ */
+export const MODERN_PROTOCOL_VERSION = "2026-07-28";
+
+function modernMetaEnvelope(extra: Record<string, unknown> = {}) {
+  return {
+    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+    "io.modelcontextprotocol/clientCapabilities": {},
+    ...extra,
+  };
+}
+
+/** A minimal, valid `server/discover` request (the modern revision's opening exchange, in place of `initialize`). */
+export function discoverRequest(id: number | string = 1) {
+  return {
+    jsonrpc: "2.0",
+    id,
+    method: "server/discover",
+    params: { _meta: modernMetaEnvelope() },
+  };
+}
+
+/** Wraps `params` (already containing whatever the request itself needs) with the modern revision's required `_meta` envelope - for any request sent AFTER a `server/discover` has already pinned/probed a modern connection (e.g. a modern-era `tools/call`). */
+export function withModernEnvelope(params: Record<string, unknown> = {}) {
+  return { ...params, _meta: modernMetaEnvelope() };
 }
 
 /**
