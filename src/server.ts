@@ -1,10 +1,10 @@
 /**
- * The stdio transport and protocol wiring: creates the
- * SDK's `Server`, registers the `tools/list`/`tools/call` handlers,
- * connects the stdio transport, and attaches shutdown handling. This is
- * the only file that touches the SDK's `Server`/`StdioServerTransport`
- * classes directly - `src/registry.ts` owns what the six tools ARE,
- * this file owns wiring them onto the wire.
+ * The stdio transport and protocol wiring: creates the SDK's `Server`,
+ * registers the `tools/list`/`tools/call` handlers, connects it to a
+ * stdio transport, and attaches shutdown handling. This is the only file
+ * that touches the SDK's `Server`/`StdioServerTransport`/`serveStdio`
+ * classes directly - `src/registry.ts` owns what the six tools ARE, this
+ * file owns wiring them onto the wire.
  *
  * This file also wires in the `io.modelcontextprotocol/tasks` capability
  * (advertisement at construction, the three registered `tasks/*` methods,
@@ -15,6 +15,90 @@
  * hand-rolled definition (enforced by `scripts/check-no-tasks-import.mjs`);
  * this file stays exactly as unaware of the extension's real shape as
  * `registry.ts` and every `tools/*.ts` handler already are.
+ *
+ * ## Two eras, one factory, one shared construction path
+ *
+ * The installed `@modelcontextprotocol/server@2.0.0` SDK speaks two wire
+ * eras: the 2025 handshake (`initialize` / `notifications/initialized`,
+ * negotiated per-connection) this codebase always spoke, and the
+ * 2026-07-28 revision's `server/discover` opening exchange (a per-request
+ * `_meta` envelope, no `initialize` at all). `serveStdio` (from
+ * `@modelcontextprotocol/server/stdio`) owns the era decision for a real
+ * stdio connection: it classifies the FIRST message, pins ONE instance
+ * from a caller-supplied FACTORY for the connection's lifetime, and - for
+ * a client that opens with `server/discover` and then falls back to
+ * `initialize` - discards a first, optimistic "probe" instance and builds
+ * a second one from the SAME factory. `runServer()` below is what wires
+ * ghantika onto `serveStdio`; `createServer()` stays a lower-level,
+ * transport-agnostic entry point (a direct in-process test - most of
+ * `test/jobStore.test.ts`, `test/concurrency.test.ts`, part of
+ * `test/shutdown.test.ts`, and others - connects a `createServer()`
+ * instance directly to an `InMemoryTransport`, with no `serveStdio`
+ * involved at all; a spawned real-child test - `test/e2e-server.test.ts`,
+ * the rest of `test/shutdown.test.ts`, and `test/modern-handshake.test.ts`
+ * - spawns the real `dist/index.js` binary, which runs through
+ * `serveStdio` exactly as a production connection does - see its own
+ * doc comment). Both share ONE construction function,
+ * `buildGhantikaServerCore()`, so a real production connection and every
+ * in-process test build the exact same `Server` the exact same way.
+ *
+ * ## The initialize-gate is a SECURITY CONTROL, and it moves to connect()
+ *
+ * The gate below (`isInitializedForToolCalls`) exists so `tools/call`
+ * never runs before a client has completed a REAL, SUCCESSFUL handshake -
+ * see `buildGhantikaServerCore()`'s own doc comment for the full
+ * three-condition rationale (unchanged from before this file grew
+ * `serveStdio` support). What DID change: the old code attached its two
+ * observers (`attachInitializeRequestObserver`/
+ * `attachInitializeResponseObserver`) directly onto a known `transport`
+ * object BEFORE calling `server.connect(transport)` externally, relying
+ * on `Protocol.connect()`'s own behavior of reading whatever
+ * `transport.onmessage`/`.send` was already set at connect-time and
+ * chaining it ahead of its own dispatch. Under `serveStdio`, a pinned
+ * instance is never connected to the real wire transport at all - it is
+ * connected to a `StdioConnectionChannel` proxy that `serveStdio`
+ * constructs and connects INTERNALLY, inside its own `connectInstance()`,
+ * entirely after this file's factory function has already returned. There
+ * is no external hook that hands this file a reference to that channel
+ * before `.connect()` runs on it.
+ *
+ * The fix: override `.connect` on the `Server` instance ITSELF, so
+ * whatever object `.connect(x)` is eventually called with - the real
+ * `Transport` this file's own `createServer()` callers pass directly, or
+ * the channel `serveStdio` passes internally - gets the SAME two
+ * observers wired onto it FIRST, before delegating to the real
+ * `Protocol.prototype.connect`. This preserves the exact chaining
+ * mechanism the old code relied on (confirmed directly against the
+ * installed SDK's own `Protocol.connect()` source, not assumed - it
+ * still reads `transport.onmessage`/`.onclose`/`.onerror` at the moment
+ * `connect()` runs and chains them), just triggered from inside this
+ * file's own OWN `.connect` rather than from an external caller - so both
+ * calling conventions (direct `.connect(transport)`, and `serveStdio`'s
+ * own `product.connect(channel)`) share one wiring mechanism instead of
+ * two. Proven against the real `StdioConnectionChannel` proxy by real
+ * execution in `test/modern-handshake.test.ts`'s serveStdio gate-observer
+ * tests, not assumed from reading the SDK's source alone.
+ *
+ * ## Modern era's own trust anchor: `serveStdio`'s construction sequence
+ *
+ * The 2026-07-28 revision has no `initialize`/`notifications/initialized`
+ * exchange for the gate to observe at all. Confirmed directly against the
+ * installed SDK's own `serveStdio` source: for a modern-era instance,
+ * `connectInstance()` calls `setNegotiatedProtocolVersion(server,
+ * revision)` BEFORE `product.connect(channel)` - so by the time this
+ * file's own `.connect` override runs, `server.getNegotiatedProtocolVersion()`
+ * already reports the negotiated modern revision, for every modern
+ * instance and ONLY for a modern instance (a legacy instance's negotiated
+ * version stays `undefined` until its own real `initialize` request is
+ * processed, which happens strictly after `.connect()` resolves). That
+ * ordering is itself a stronger guarantee than the legacy gate's own
+ * three-flag proof: nothing can reach this instance's `channel.deliver()`
+ * - not even the `server/discover` request that opened the connection -
+ * until `connectInstance()`'s full sequence, including this file's own
+ * `.connect` override, has already resolved. So a modern instance treats
+ * that ordering itself as proof of a completed handshake, rather than
+ * hand-rolling an equivalent for a handshake shape that does not exist on
+ * this era.
  *
  * ## Why stdout purity matters
  *
@@ -37,20 +121,17 @@
  *   base `Protocol` class replies `MethodNotFound` for any method with no
  *   registered handler, so registering handlers only for the methods this
  *   server actually supports is sufficient - nothing extra to write here.
- * - A genuinely unparseable line (fails `JSON.parse` itself) gets -32700:
- *   the stock transport now silently skips a line like this rather than
- *   reporting it at all (confirmed against the installed
- *   @modelcontextprotocol/server package's own source), so
- *   `createStdioTransport` intercepts ahead of the transport to restore
- *   the reply - see its own doc comment for the full picture (why this
- *   codebase intercepts ahead of the transport, why its own `ReadBuffer`
- *   can't be reused here, and how single-reader/single-writer safety is
- *   proven, not assumed).
- * - A line that parses as JSON but isn't a valid JSON-RPC envelope still
- *   gets -32600 automatically via the transport's own `onerror` callback,
- *   unchanged; `attachParseErrorReporting` below closes THAT gap (the
- *   stock transport still doesn't reply on its own, it only fires the
- *   callback).
+ * - A genuinely unparseable line (fails `JSON.parse` itself) gets -32700,
+ *   and a line that parses as JSON but fails the base JSON-RPC envelope
+ *   schema gets -32600: `createStdioTransport` below classifies every raw
+ *   line BEFORE it ever reaches the real transport (see its own doc
+ *   comment for the full rationale, including why this moved off the
+ *   transport's own `onerror` callback - `serveStdio` owns that callback
+ *   now and never writes a reply through it).
+ * - A line that parses as valid JSON-RPC but carries a malformed
+ *   2026-07-28 `_meta` envelope (a present-but-invalid modern claim) is a
+ *   SEPARATE, higher-level concern `serveStdio` itself owns (-32602
+ *   `Invalid _meta envelope: ...`), not this file's classification above.
  * - An unknown TOOL NAME (`tools/call` naming something other than one of
  *   the six registered tools) is -32602, thrown by `registry.dispatchToolCall`
  *   - a valid method (`tools/call`) with an invalid parameter (the tool
@@ -66,7 +147,8 @@ import {
   Server,
   deserializeMessage,
 } from "@modelcontextprotocol/server";
-import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
+import { StdioServerTransport, serveStdio } from "@modelcontextprotocol/server/stdio";
+import type { StdioServerHandle } from "@modelcontextprotocol/server/stdio";
 import type { JSONRPCMessage, Transport } from "@modelcontextprotocol/server";
 import { Readable } from "node:stream";
 
@@ -91,19 +173,10 @@ export interface GhantikaServer {
   readonly server: Server;
   readonly transport: Transport;
   /**
-   * True once the client has completed a REAL, SUCCESSFUL initialize/
-   * initialized handshake: a genuine `initialize` REQUEST (never a
-   * same-named notification - see `createServer()`'s doc comment) was
-   * observed on the wire, the SDK's own negotiation for that exact request
-   * actually SUCCEEDED (the outgoing response carried a `result`, not an
-   * `error`), and the `notifications/initialized` notification arrived
-   * afterward. All three conditions are independent and every one is
-   * required: a same-named notification (no `id`) is not a request at all;
-   * an `initialize` request the SDK's own validation rejects never
-   * produces a successful negotiation even though a message named
-   * "initialize" was seen; and the notification alone, with no preceding
-   * request, is exactly the bypass a malicious/buggy client can exploit by
-   * skipping `initialize` entirely.
+   * True once this connection has completed a real handshake for its own
+   * era - see `buildGhantikaServerCore()`'s doc comment for exactly what
+   * that means on each era (the legacy three-condition proof, or the
+   * modern pre-connect trust anchor).
    */
   isInitialized(): boolean;
   /**
@@ -125,35 +198,23 @@ export interface GhantikaServer {
 }
 
 /**
- * Builds a `GhantikaServer` and registers its request handlers, but does
- * NOT connect it to a transport or touch any process-level signal
- * handler. Kept separate from `runServer` so tests can construct and
- * exercise a server instance in-process without it taking over the test
- * runner's own stdin/stdout or `SIGTERM`/`SIGINT`.
- *
- * @param transport - defaults to a real stdio transport, wrapped to restore
- *   a `-32700` reply for genuinely unparseable input (see
- *   `createStdioTransport`'s own doc comment for why the stock transport
- *   needs that wrapper now). A test may inject any other `Transport`
- *   implementation instead - e.g. the SDK's own `InMemoryTransport`, to
- *   drive a real `Client`/`Server` round trip in-process (see the
- *   jobStore-singleton-sharing regression coverage in
- *   `test/jobStore.test.ts`, which needs the running server and the test's
- *   own directly-imported `jobStore` to share one Node module registry -
- *   only possible in-process, never across the real spawned-child-process
- *   boundary `test/helpers/spawnServer.ts` otherwise uses).
+ * Builds a fresh `Server` (a brand-new instance, with brand-new
+ * initialize-gate closure state - never anything module-level or shared)
+ * and registers every request handler this codebase's own protocol
+ * surface needs, but does NOT connect it to anything. Shared by
+ * `createServer()` (this file's transport-agnostic, test-facing entry
+ * point) and `ghantikaServerFactory()` (the `McpServerFactory`
+ * `runServer()` hands to `serveStdio`) - a real production connection and
+ * every in-process test build the Server the exact same way, and a
+ * probe-then-fallback connection (see this file's header doc) gets a
+ * genuinely FRESH instance, with fresh closure state, on every call: two
+ * separate `buildGhantikaServerCore()` invocations never share so much as
+ * a variable binding, which is what keeps a discarded probe's gate state
+ * from ever leaking into the fallback instance that replaces it (proven
+ * by real execution in `test/modern-handshake.test.ts`'s probe-then-
+ * fallback test).
  */
-export function createServer(transport: Transport = createStdioTransport()): GhantikaServer {
-  // A freshly constructed server is not itself shutting down - reopens
-  // whatever an earlier server built against this same shared `jobStore`
-  // singleton already closed. Harmless, and a genuine no-op, in real
-  // production use (a real process calls createServer() exactly once,
-  // before its own single shutdown); it only does real work once more
-  // than one createServer() call shares this one process-lifetime
-  // singleton, which is exactly what this codebase's own test suite does.
-  // See JobStore.clearShutdownGate's own docs.
-  jobStore.clearShutdownGate();
-
+function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean } {
   const server = new Server(
     { name: SERVER_NAME, version: SERVER_VERSION },
     {
@@ -204,59 +265,22 @@ export function createServer(transport: Transport = createStdioTransport()): Gha
   // AND a real `id`, which rules out a same-named notification), and
   // `initializeNegotiationSucceeded` is set only when the SDK's own
   // outgoing response for that exact id carries a `result`. The gate
-  // requires both that success flag AND the `initialized` notification.
-  //
-  // There's no public hook to observe the `initialize` REQUEST (or its
-  // response) directly: the base `Server` constructor already claims the
-  // `initialize` method's request handler internally to do real protocol-
-  // version/capability negotiation, and `setRequestHandler` silently
-  // REPLACES any existing handler for a method, so re-registering it here
-  // would silently break the SDK's own initialize handling instead of
-  // adding a check alongside it.
-  //
-  // Instead: intercept at the transport message layer, one level below the
-  // `Server`/`Protocol` dispatch, on BOTH directions of traffic. Verified
-  // directly against the real installed @modelcontextprotocol/server
-  // package (a live Server/Transport pair, not just reading source): a
-  // handler set on `transport.onmessage` BEFORE `server.connect(transport)`
-  // is chained ahead of the SDK's own dispatch and observes every raw
-  // JSON-RPC message, including the `initialize` request itself; and
-  // `transport.send` wrapped BEFORE `server.connect(transport)` is what the
-  // SDK genuinely invokes to deliver the real initialize response, since
-  // `connect()` never reassigns `.send` on its own. Both directions are
-  // therefore a transparent pass-through-plus-observation, mirroring each
-  // other and the same chaining pattern `attachParseErrorReporting` below
-  // already relies on for `transport.onerror`.
+  // requires both that success flag AND the `initialized` notification -
+  // on a LEGACY connection. On a MODERN connection there is no
+  // `initialize`/`initialized` exchange to observe at all, so this
+  // file's own `.connect` override below (see its own doc comment) marks
+  // both flags true directly, from a strictly stronger trust anchor:
+  // `serveStdio`'s own pre-connect construction sequence.
   let pendingInitializeRequestId: string | number | undefined;
   let initializeNegotiationSucceeded = false;
   let receivedInitializedNotification = false;
 
-  attachInitializeRequestObserver(transport, (id) => {
-    pendingInitializeRequestId = id;
-  });
-  attachInitializeResponseObserver(
-    transport,
-    (id) => pendingInitializeRequestId !== undefined && id === pendingInitializeRequestId,
-    {
-      onSucceeded: () => {
-        initializeNegotiationSucceeded = true;
-      },
-      onFailed: () => {
-        // A client is unlikely to retry a failed initialize with the same
-        // id, but clearing the pending id means a later, unrelated
-        // response can never be mismatched against a stale one either.
-        pendingInitializeRequestId = undefined;
-      },
-    }
-  );
-  attachParseErrorReporting(transport);
+  const isInitializedForToolCalls = (): boolean =>
+    initializeNegotiationSucceeded && receivedInitializedNotification;
 
   server.oninitialized = () => {
     receivedInitializedNotification = true;
   };
-
-  const isInitializedForToolCalls = (): boolean =>
-    initializeNegotiationSucceeded && receivedInitializedNotification;
 
   // The one thing tasksAdapter.ts's output-driven wake needs from THIS
   // connection's real `Server` instance - see maybeAugmentRunResult's own
@@ -335,6 +359,90 @@ export function createServer(transport: Transport = createStdioTransport()): Gha
     async (params) => tasksAdapter.cancelTask(params.taskId)
   );
 
+  // See this file's header doc ("The initialize-gate is a SECURITY
+  // CONTROL, and it moves to connect()") for the full rationale. This
+  // override is what lets ONE wiring mechanism serve both calling
+  // conventions: a direct in-process test calling `.connect(transport)`
+  // itself against a known `Transport`, and `serveStdio` (used by
+  // `runServer()` and by every spawned-real-child test) calling
+  // `product.connect(channel)` internally against a
+  // `StdioConnectionChannel` proxy this file never otherwise sees.
+  const realConnect = server.connect.bind(server);
+  server.connect = async (transport: Transport): Promise<void> => {
+    if (server.getNegotiatedProtocolVersion() !== undefined) {
+      // A pre-negotiated MODERN connection - see this file's header doc
+      // ("Modern era's own trust anchor") for why `serveStdio` setting
+      // this BEFORE calling `.connect()` is itself the proof a legacy
+      // connection has no equivalent for and does not need one.
+      initializeNegotiationSucceeded = true;
+      receivedInitializedNotification = true;
+      return realConnect(transport);
+    }
+    attachInitializeRequestObserver(transport, (id) => {
+      pendingInitializeRequestId = id;
+    });
+    attachInitializeResponseObserver(
+      transport,
+      (id) => pendingInitializeRequestId !== undefined && id === pendingInitializeRequestId,
+      {
+        onSucceeded: () => {
+          initializeNegotiationSucceeded = true;
+        },
+        onFailed: () => {
+          // A client is unlikely to retry a failed initialize with the same
+          // id, but clearing the pending id means a later, unrelated
+          // response can never be mismatched against a stale one either.
+          pendingInitializeRequestId = undefined;
+        },
+      }
+    );
+    return realConnect(transport);
+  };
+
+  return { server, isInitialized: isInitializedForToolCalls };
+}
+
+/**
+ * Builds a `GhantikaServer` and registers its request handlers, but does
+ * NOT connect it to a transport or touch any process-level signal
+ * handler. Kept separate from `runServer` so tests can construct and
+ * exercise a server instance in-process without it taking over the test
+ * runner's own stdin/stdout or `SIGTERM`/`SIGINT` - and entirely without
+ * `serveStdio`'s own era-selection machinery, which a direct in-process
+ * test using this function has no need for (it drives exactly one known
+ * era over one known transport, decided by what IT sends, never by a real
+ * client's own opening choice). Era-selection itself - a probe that opens
+ * with `server/discover` and then falls back to `initialize` - IS
+ * exercised, but only by a spawned real-child test going through
+ * `serveStdio` (`test/modern-handshake.test.ts`'s own probe-then-fallback
+ * test), never by a test built on this function.
+ *
+ * @param transport - defaults to a real stdio transport, wrapped to restore
+ *   `-32700`/`-32600` replies for input the stock transport no longer
+ *   reports on its own (see `createStdioTransport`'s own doc comment). A
+ *   test may inject any other `Transport` implementation instead - e.g.
+ *   the SDK's own `InMemoryTransport`, to drive a real `Client`/`Server`
+ *   round trip in-process (see the jobStore-singleton-sharing regression
+ *   coverage in `test/jobStore.test.ts`, which needs the running server
+ *   and the test's own directly-imported `jobStore` to share one Node
+ *   module registry - only possible in-process, never across the real
+ *   spawned-child-process boundary `test/helpers/spawnServer.ts`
+ *   otherwise uses).
+ */
+export function createServer(transport: Transport = createStdioTransport()): GhantikaServer {
+  // A freshly constructed server is not itself shutting down - reopens
+  // whatever an earlier server built against this same shared `jobStore`
+  // singleton already closed. Harmless, and a genuine no-op, in real
+  // production use (a real process serves at most two Server instances
+  // over its own single connection's lifetime - see this file's header
+  // doc on probe-then-fallback - before its own single shutdown); it only
+  // does real work once more than one construction shares this one
+  // process-lifetime singleton, which is exactly what this codebase's own
+  // test suite does. See JobStore.clearShutdownGate's own docs.
+  jobStore.clearShutdownGate();
+
+  const { server, isInitialized } = buildGhantikaServerCore();
+
   let shuttingDown: Promise<void> | undefined;
   const shutdown = (reason: string): Promise<void> => {
     if (!shuttingDown) {
@@ -346,28 +454,57 @@ export function createServer(transport: Transport = createStdioTransport()): Gha
   return {
     server,
     transport,
-    isInitialized: isInitializedForToolCalls,
+    isInitialized,
     shutdown,
   };
 }
 
-async function performShutdown(transport: Transport, reason: string): Promise<void> {
-  // Closes admission before anything else below - including the queue
-  // drain two lines down - so a run() call arriving anywhere in this
-  // function's own async tail (particularly the awaited live-job reap,
-  // which can take a while against many jobs) is rejected outright rather
-  // than admitted or queued into a queue this function is never going to
-  // drain again. See JobStore.beginShutdown's own docs.
+/**
+ * The `McpServerFactory` `runServer()` hands to `serveStdio`: builds a
+ * fresh, unconnected `Server` for one era-connection attempt.
+ * `serveStdio` calls this once per real connection, and once more for a
+ * `server/discover` probe instance that gets discarded again if the
+ * client falls back to `initialize` (see this file's header doc) - every
+ * call gets its own fresh `Server` and fresh initialize-gate closure
+ * state via `buildGhantikaServerCore()`, never anything shared across
+ * calls. Deliberately a ZERO-ARGUMENT factory, never declaring the
+ * `McpRequestContext` (`{ era }`) parameter `McpServerFactory` offers -
+ * the SDK's own docs state a zero-argument factory stays assignable
+ * unchanged, and this file's tools/tasks capabilities never vary by era:
+ * only what `serveStdio` does AROUND the connection (which handshake
+ * shape it accepts, whether it advertises `server/discover` at all)
+ * varies, and that lives entirely in `serveStdio`'s own options below,
+ * never in this factory.
+ */
+function ghantikaServerFactory(): Server {
+  jobStore.clearShutdownGate();
+  return buildGhantikaServerCore().server;
+}
+
+/**
+ * The shutdown SEQUENCE both entry points below share: close admission
+ * before anything else - including the queue drain right after - so a
+ * run() call arriving anywhere in this function's own async tail
+ * (particularly the awaited live-job reap, which can take a while against
+ * many jobs) is rejected outright rather than admitted or queued into a
+ * queue nothing is ever going to drain again (see
+ * `JobStore.beginShutdown`'s own docs); stop the retention sweeper; drain
+ * anything still queued (never spawned a real child at all - see
+ * `JobStore.drainQueueOnShutdown`'s own docs); then reap every tracked
+ * job's real process group (see `reapLiveJobsOnShutdown`'s own docs).
+ * Deliberately the ONLY place this sequence is written: `createServer()`'s
+ * direct-transport `shutdown()` and `runServer()`'s real serveStdio-served
+ * process both call this, then close whatever wire they each actually
+ * own - a real `Transport` for the former, the `StdioServerHandle`
+ * `serveStdio` returned for the latter (see `performShutdown`/
+ * `performProcessShutdown` below) - so the two entry points can never
+ * drift into reaping jobs differently.
+ */
+async function reapJobsForShutdown(reason: string): Promise<void> {
   jobStore.beginShutdown();
   jobStore.stopRetentionSweeper();
   console.error(`[ghantika] shutting down (${reason})`);
   try {
-    // Any job still sitting in the concurrency queue never got a real
-    // child attached at all (see `JobStore.drainQueueOnShutdown`'s own
-    // docs), so it is killed and cleared here, BEFORE the live-job reap
-    // below - which only ever has real process-group work to do for a job
-    // that actually spawned. Deterministic: this always fully empties the
-    // queue before shutdown proceeds.
     jobStore.drainQueueOnShutdown();
   } catch (error) {
     console.error("[ghantika] error while draining the concurrency queue during shutdown:", error);
@@ -377,6 +514,11 @@ async function performShutdown(transport: Transport, reason: string): Promise<vo
   } catch (error) {
     console.error("[ghantika] error while reaping live jobs during shutdown:", error);
   }
+}
+
+/** `createServer()`'s own shutdown path: reaps jobs, then closes the exact `Transport` it was built against. */
+async function performShutdown(transport: Transport, reason: string): Promise<void> {
+  await reapJobsForShutdown(reason);
   try {
     await transport.close();
   } catch (error) {
@@ -385,10 +527,32 @@ async function performShutdown(transport: Transport, reason: string): Promise<vo
 }
 
 /**
+ * `runServer()`'s own shutdown path: reaps jobs, then closes via
+ * `serveStdio`'s own returned `StdioServerHandle.close()` rather than a
+ * transport directly - `serveStdio` owns the wire AND whichever instance
+ * (if any) is currently pinned or being probed, and its own `close()`
+ * tears down both (see this file's header doc for why this file never
+ * gets a direct handle to whatever instance is live at shutdown time).
+ * Reaping jobs BEFORE calling this is what keeps the ordering identical
+ * to `performShutdown` above: every live job is signaled while the
+ * connection (and thus this process's stdout) is still usable, in case a
+ * job's own diagnostics needed it, before the connection itself goes
+ * away.
+ */
+async function performProcessShutdown(handle: StdioServerHandle, reason: string): Promise<void> {
+  await reapJobsForShutdown(reason);
+  try {
+    await handle.close();
+  } catch (error) {
+    console.error("[ghantika] error while closing the stdio connection during shutdown:", error);
+  }
+}
+
+/**
  * Reaps every currently tracked job's own process GROUP, on every
- * shutdown path - stdin EOF, SIGTERM, SIGINT all funnel through the single
- * `shutdown()` function above (see `attachProcessShutdownHandlers` below),
- * so this runs identically for all three. Deliberately REUSES the real
+ * shutdown path - stdin EOF, SIGTERM, SIGINT all funnel through
+ * `reapJobsForShutdown` above (see `attachProcessShutdownHandlers`
+ * below), so this runs identically for all three. Deliberately REUSES the real
  * containment machinery (`process.ts`'s `evaluatePreSignalIdentityGate`/
  * `killProcessGroupPosix`/`killProcessTreeWindows`, the exact functions
  * `src/tools/kill.ts` itself calls) rather than inventing a second kill
@@ -574,18 +738,21 @@ async function reapOneJobOnShutdown(jobId: string, state: JobState): Promise<voi
  * genuine `initialize` REQUEST (never a same-named notification) was
  * received, and to hand back its `id` - independent of the SDK's own
  * routing/dispatch, and without touching `InitializeRequestSchema`. See
- * `createServer()`'s own doc comment above for the full rationale (why
- * `oninitialized` alone is bypassable, why a bare method-name match is
- * bypassable too, and why re-registering `InitializeRequestSchema` isn't a
- * safe option).
+ * `buildGhantikaServerCore()`'s own doc comment above for the full
+ * rationale (why `oninitialized` alone is bypassable, why a bare
+ * method-name match is bypassable too, and why re-registering
+ * `InitializeRequestSchema` isn't a safe option).
  *
  * `Protocol.connect()` reads whatever `transport.onmessage` was already
- * set at connect-time and chains it ahead of its own dispatch (see this
- * file's docs on `attachParseErrorReporting`, which relies on the exact
- * same chaining behavior for `transport.onerror`) - so this handler sees
- * every message the SDK sees, including ones that never end up dispatched
- * anywhere (e.g. a `notifications/initialized` sent with no prior
- * `initialize` - exactly the bypass this closes).
+ * set at connect-time and chains it ahead of its own dispatch - so this
+ * handler sees every message the SDK sees, including ones that never end
+ * up dispatched anywhere (e.g. a `notifications/initialized` sent with no
+ * prior `initialize` - exactly the bypass this closes). `transport` here
+ * is whatever this file's own `.connect` override (see
+ * `buildGhantikaServerCore()`) was called with - a real `Transport` under
+ * `createServer()`'s direct-connect callers, or `serveStdio`'s own
+ * `StdioConnectionChannel` proxy under `runServer()`; this function
+ * itself stays agnostic to which.
  *
  * A JSON-RPC message is a discriminated union (request / notification /
  * response / error) with no shared `method` field on every branch, so the
@@ -624,11 +791,15 @@ function initializeRequestId(message: JSONRPCMessage): string | number | undefin
  * is ever called, purely to detect whether the SDK's own negotiation for a
  * specific pending initialize request `id` actually SUCCEEDED - a
  * transparent pass-through-plus-observation wrapper, never altering what's
- * actually sent or introducing any delay. See `createServer()`'s own doc
- * comment above for the full rationale (why observing only the incoming
- * request is insufficient, and the verified load-bearing claim that
- * `Protocol._onrequest`'s `capturedTransport.send(...)` genuinely invokes
- * this wrapper for the real initialize response).
+ * actually sent or introducing any delay. See `buildGhantikaServerCore()`'s
+ * own doc comment above for the full rationale (why observing only the
+ * incoming request is insufficient, and the verified load-bearing claim
+ * that `Protocol._onrequest`'s `capturedTransport.send(...)` genuinely
+ * invokes this wrapper for the real initialize response - re-verified
+ * against `StdioConnectionChannel.send()` specifically for the
+ * `serveStdio` calling convention: it forwards every non-intercepted
+ * outbound message straight to the real wire's own `send`, so a wrapper
+ * installed here still observes it).
  *
  * `isPendingId` is a callback rather than a captured value so the caller
  * can always compare against its OWN current `pendingInitializeRequestId`
@@ -671,25 +842,38 @@ function initializeResponseOutcome(
 }
 
 /**
- * Wraps a real stdio transport so a genuinely unparseable line still gets a
- * `-32700` Parse error reply, restoring the behavior the stock SDK
- * transport no longer provides.
+ * Wraps a real stdio transport so a line that fails to reach a valid
+ * JSON-RPC message still gets a JSON-RPC error reply, restoring behavior
+ * the stock SDK transport no longer provides on its own.
  *
  * Confirmed directly against the installed @modelcontextprotocol/server
  * package's own source (not inferred from types): `StdioServerTransport`'s
  * internal `ReadBuffer.readMessage()` catches a `SyntaxError` from
  * `JSON.parse` and silently moves on to the next line -
  * `if (error instanceof SyntaxError) continue;` - so `transport.onerror`
- * never fires for that case at all; only a `ZodError` (valid JSON that
- * isn't a valid JSON-RPC envelope, still handled by
- * `attachParseErrorReporting` below) propagates out. The MCP 2026-07-28
- * draft's stdio transport page obligates the CLIENT not to send anything
- * that isn't a valid MCP message, but says nothing about what a server
- * does when a client violates that - genuinely silent, not permissive. So
- * restoring
- * the conventional JSON-RPC reply is the safer default for an unknown
- * population of client authors, not a requirement the spec forces either
- * way.
+ * never fires for that case at all; a `ZodError` (valid JSON that isn't a
+ * valid JSON-RPC envelope) DOES still propagate out of `readMessage()` and
+ * reach `transport.onerror` on its own. So far this is unchanged from
+ * before this file grew `serveStdio` support.
+ *
+ * What DID change, and why this now classifies BOTH failure classes at
+ * this one raw-stdin layer instead of splitting them across two
+ * mechanisms (`-32700` handled here, `-32600` handled by a separate
+ * `transport.onerror` hook installed at connect-time): under `serveStdio`,
+ * the WIRE transport's `onerror` callback is owned by `serveStdio` itself
+ * (installed once, at `serveStdio(...)` call time, unconditionally
+ * overwriting whatever was there before) and is reporting-only - it never
+ * writes a reply to the wire. A `-32600` reply that depended on
+ * `transport.onerror` would therefore silently stop arriving the moment
+ * this file's production entry point (`runServer()`) started routing
+ * through `serveStdio`, even though nothing about the actual malformed
+ * input changed. Classifying both failure classes HERE instead - strictly
+ * before any line ever reaches the real transport at all, whether that
+ * transport is later connected directly or wrapped by `serveStdio` -
+ * removes the dependency on a callback slot `serveStdio` owns, and is a
+ * genuine simplification over the split this file used to have (both
+ * codes now share one code path and one, not two, real
+ * `deserializeMessage` call per line).
  *
  * The SDK's own exported `ReadBuffer` cannot be reused for this
  * specifically - confirmed empirically, not assumed: calling its
@@ -709,20 +893,23 @@ function initializeResponseOutcome(
  * stream, never from the real one directly.
  *
  * Single-writer-of-stdout by construction too, the mirror-image hazard:
- * the `-32700` reply goes out through `transport.send(...)` itself -
- * exactly the same call `attachParseErrorReporting` below already uses for
- * its own `-32600` reply, and the same one the SDK's own request handling
- * uses for every ordinary response - never a second, independent write to
- * `process.stdout`. That keeps this codebase's real invariant intact: the
- * ONLY code that ever touches `process.stdout` directly is the transport's
- * own `send()`, exactly what `scripts/check-stdio-purity.mjs` enforces
- * structurally (see this file's header). Verified empirically under real
- * backpressure, not reasoned: an 8MB transport response and a small direct
- * write fired back-to-back on the transport's own underlying stream object
- * landed as two complete, uncorrected lines, never interleaved - Node's
- * `Writable` implementation serializes writes to one stream instance
- * internally, so routing both replies through the one transport is what
- * makes that guarantee apply here at all.
+ * both replies go out through `transport.send(...)` itself - the same
+ * call the SDK's own request handling uses for every ordinary response -
+ * never a second, independent write to `process.stdout`. That keeps this
+ * codebase's real invariant intact: the ONLY code that ever touches
+ * `process.stdout` directly is the transport's own `send()`, exactly what
+ * `scripts/check-stdio-purity.mjs` enforces structurally (see this file's
+ * header). Verified empirically under real backpressure, not reasoned: an
+ * 8MB transport response and a small direct write fired back-to-back on
+ * the transport's own underlying stream object landed as two complete,
+ * uncorrected lines, never interleaved - Node's `Writable` implementation
+ * serializes writes to one stream instance internally, so routing both
+ * replies through the one transport is what makes that guarantee apply
+ * here at all. This holds regardless of whether `serveStdio` later wraps
+ * this same transport as its `wire`: `StdioConnectionChannel.send()`
+ * forwards every non-intercepted outbound message straight to
+ * `wire.send()` too - the exact same underlying call - so there is still
+ * only ever one writer.
  */
 function createStdioTransport(): StdioServerTransport {
   let buffered = Buffer.alloc(0);
@@ -735,9 +922,14 @@ function createStdioTransport(): StdioServerTransport {
     while ((newlineIndex = buffered.indexOf("\n")) !== -1) {
       const rawLine = buffered.subarray(0, newlineIndex);
       buffered = buffered.subarray(newlineIndex + 1);
-      if (isUnparseableJsonLine(rawLine.toString("utf8"))) {
-        sendParseErrorResponse(transport);
+      const classification = classifyStdinLine(rawLine.toString("utf8"));
+      if (classification === "parse-error") {
+        sendProtocolErrorResponse(transport, ProtocolErrorCode.ParseError, "Parse error");
         continue; // never forwarded - the transport must never see this line at all
+      }
+      if (classification === "invalid-envelope") {
+        sendProtocolErrorResponse(transport, ProtocolErrorCode.InvalidRequest, "Invalid Request");
+        continue; // same - a schema-invalid-but-parseable line is never forwarded either
       }
       virtualStdin.push(rawLine);
       virtualStdin.push("\n");
@@ -749,68 +941,48 @@ function createStdioTransport(): StdioServerTransport {
   return transport;
 }
 
-/** True only for a line that fails `JSON.parse` itself - a line that parses but fails the JSON-RPC envelope schema is deliberately passed through, so `attachParseErrorReporting`'s existing `-32600` path (via the transport's own `onerror`) keeps handling that case unchanged. */
-function isUnparseableJsonLine(line: string): boolean {
+/**
+ * Classifies one raw stdin line, before it's ever handed to the real
+ * transport: `"ok"` for a line that deserializes as a genuine JSON-RPC
+ * message; `"parse-error"` for a line that fails `JSON.parse` itself
+ * (gets `-32700`); `"invalid-envelope"` for a line that IS valid JSON but
+ * fails the base JSON-RPC envelope schema (gets `-32600`) - deliberately
+ * the base envelope only (`jsonrpc`/`method`/`id` shape), never the
+ * 2026-07-28 per-request `_meta` envelope, which `serveStdio` itself
+ * validates at a higher layer once a line reaches it (a malformed modern
+ * claim is `serveStdio`'s own `-32602`, a different code for a different,
+ * later check - see this file's header doc's "Error-class behavior").
+ */
+type StdinLineClassification = "ok" | "parse-error" | "invalid-envelope";
+
+function classifyStdinLine(line: string): StdinLineClassification {
   try {
     deserializeMessage(line.replace(/\r$/, ""));
-    return false;
+    return "ok";
   } catch (error) {
-    return error instanceof SyntaxError;
+    return error instanceof SyntaxError ? "parse-error" : "invalid-envelope";
   }
 }
 
-/** Sends a `-32700` Parse error reply through the transport's own `send(...)` - see `createStdioTransport`'s own doc comment for why this must go through the transport rather than a second direct write. */
-function sendParseErrorResponse(transport: Transport): void {
+/** Sends a JSON-RPC error reply (`id: null`) through the transport's own `send(...)` - see `createStdioTransport`'s own doc comment for why this must go through the transport rather than a second direct write. */
+function sendProtocolErrorResponse(
+  transport: Transport,
+  code: ProtocolErrorCode,
+  message: string
+): void {
   const response = {
     jsonrpc: "2.0" as const,
     id: null,
-    error: { code: ProtocolErrorCode.ParseError, message: "Parse error" },
+    error: { code, message },
   } as unknown as JSONRPCMessage;
   transport.send(response).catch((sendError: unknown) => {
-    console.error("[ghantika] failed to send parse-error response:", sendError);
+    console.error("[ghantika] failed to send protocol-error response:", sendError);
   });
 }
 
 /**
- * Wires a JSON-RPC `-32600` Invalid Request reply into the transport's own
- * `onerror` callback, for a line that parses as JSON but fails the SDK's
- * own JSON-RPC envelope validation (a `ZodError`) - the one parse-adjacent
- * failure the stock transport still reports via `onerror` on its own (see
- * `createStdioTransport`'s doc comment for the other, `-32700`, case that
- * no longer reaches `onerror` at all and needs the wrapper above instead).
- * Must be called BEFORE `server.connect` - `Protocol.connect` reads the
- * transport's pre-existing `onerror` and chains it ahead of its own, so
- * setting this first means our reply goes out, then the SDK's own
- * (harmless, no-op-by-default) error bookkeeping still runs too.
- */
-function attachParseErrorReporting(transport: Transport): void {
-  transport.onerror = (error: Error) => {
-    console.error("[ghantika] stdio transport error while reading a message:", error);
-    const isUnparseableJson = error?.name === "SyntaxError";
-    const code = isUnparseableJson
-      ? ProtocolErrorCode.ParseError
-      : ProtocolErrorCode.InvalidRequest;
-    const message = isUnparseableJson ? "Parse error" : "Invalid Request";
-    // JSON-RPC 2.0 requires `id: null` here (the id of the offending
-    // request can't be determined from unparseable input), which the
-    // SDK's own outgoing-message type doesn't model (it only allows
-    // string | number | undefined, since every OTHER response the SDK
-    // sends is replying to a request whose id it already parsed
-    // successfully) - hence the explicit cast for this one legitimate
-    // exception to that type.
-    const response = {
-      jsonrpc: "2.0" as const,
-      id: null,
-      error: { code, message, data: String(error?.message ?? error) },
-    } as unknown as JSONRPCMessage;
-    transport.send(response).catch((sendError: unknown) => {
-      console.error("[ghantika] failed to send protocol-error response:", sendError);
-    });
-  };
-}
-
-/**
- * Builds a server, connects it to a real stdio transport, and attaches
+ * Builds ghantika's real production entry point: serves both wire eras
+ * over a real stdio connection via `serveStdio`, and attaches
  * process-level shutdown handling. This is what `src/index.ts` calls when
  * actually run as a server process - tests exercise `createServer()`
  * directly (or spawn a real child process for the end-to-end suite) so
@@ -818,29 +990,50 @@ function attachParseErrorReporting(transport: Transport): void {
  * consume the test runner's own stdin. Also the ONLY place
  * `jobStore.startRetentionSweeper()` is ever called, for the identical
  * reason - see that method's own docs for why starting it from
- * `createServer()` (or the `JobStore` constructor) instead would leave
- * every test-constructed instance running its own background timer.
+ * `createServer()`/`ghantikaServerFactory()` (or the `JobStore`
+ * constructor) instead would leave every test-constructed instance
+ * running its own background timer.
+ *
+ * `serveStdio`'s own `legacy: 'serve'` (the default, passed explicitly
+ * below so a future SDK bump changing that default can never silently
+ * change this file's behavior) is what keeps a 2025-era `initialize`
+ * opening served exactly as `createServer()`'s own direct-connect path
+ * already serves it - see this file's header doc's "Two eras, one
+ * factory" section for the full picture, and
+ * `test/e2e-server.test.ts`'s legacy-handshake suite (unchanged by this
+ * file's `serveStdio` migration) for the real-execution proof that stays
+ * true.
  */
-export async function runServer(): Promise<GhantikaServer> {
-  const instance = createServer();
-  await instance.server.connect(instance.transport);
-  attachProcessShutdownHandlers(instance);
+export async function runServer(): Promise<StdioServerHandle> {
+  const wire = createStdioTransport();
+  const handle = serveStdio(ghantikaServerFactory, {
+    transport: wire,
+    legacy: "serve",
+    onerror: (error) => console.error("[ghantika] serveStdio connection error:", error),
+  });
+
+  let shuttingDown: Promise<void> | undefined;
+  const shutdown = (reason: string): Promise<void> => {
+    if (!shuttingDown) {
+      shuttingDown = performProcessShutdown(handle, reason);
+    }
+    return shuttingDown;
+  };
+  attachProcessShutdownHandlers(shutdown);
   jobStore.startRetentionSweeper();
-  return instance;
+  return handle;
 }
 
-function attachProcessShutdownHandlers(instance: GhantikaServer): void {
+function attachProcessShutdownHandlers(shutdown: (reason: string) => Promise<void>): void {
   const onSignal = (signal: NodeJS.Signals): void => {
-    instance
-      .shutdown(signal)
+    shutdown(signal)
       .catch((error: unknown) => console.error("[ghantika] error during shutdown:", error))
       .finally(() => process.exit(0));
   };
   process.once("SIGTERM", () => onSignal("SIGTERM"));
   process.once("SIGINT", () => onSignal("SIGINT"));
   process.stdin.once("end", () => {
-    instance
-      .shutdown("stdin EOF")
+    shutdown("stdin EOF")
       .catch((error: unknown) => console.error("[ghantika] error during shutdown:", error))
       .finally(() => process.exit(0));
   });

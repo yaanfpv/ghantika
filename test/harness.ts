@@ -2,7 +2,7 @@
  * test/harness.ts - a reusable real-stdio-client integration
  * harness. Builds directly on `test/helpers/spawnServer.ts`'s established
  * pattern (a real spawned `dist/index.js` process, real JSON-RPC over its
- * real stdin/stdout - the single most important verification tier) and adds
+ * real stdin/stdout) and adds
  * a `tools/call` convenience wrapper (mirrors `test/output-tail.test.ts`'s
  * own `callTool` helper, generalized for reuse), real external-process-
  * observer helpers (the identical `pgrep -g <pgid>` pattern `test/kill.test.ts`
