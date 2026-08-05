@@ -14,16 +14,21 @@
  * `typescript-eslint`'s declared peer range still excludes TypeScript
  * past 6.1 - moving this project onto TypeScript 7 (via the side-by-side
  * `@typescript/native` alias; see scripts/check-typescript-peer-range.mjs)
- * ROUTES AROUND that constraint, it does not satisfy it. The moment that
- * alias landed, Dependabot recognized - correctly, on its own - that the
- * `typescript` bump PR #1 had been proposing was no longer something it
- * needed to keep open, and closed it. Nothing here was silenced or
- * mishandled: an open PR tied to one specific number is simply a fragile
- * way to track an ongoing constraint, because the PR can legitimately
- * close for a reason that has nothing to do with the constraint itself
- * resolving - which is exactly what happened. Reopening a correctly-closed
- * PR to make a check pass again would hide that gap instead of fixing it,
- * so this file no longer tries.
+ * ROUTES AROUND that constraint, it does not satisfy it. PR #1 - Dependabot's
+ * own proposal to bump `typescript` past that range - closed shortly after
+ * this alias layout landed. The forge's event history does not record why,
+ * and Dependabot's own ordinary version-update parser does not resolve an
+ * `npm:`-prefixed alias specifier by default (that resolution is opt-in,
+ * enabled only for its separate dependency-graph/security-scanning path),
+ * so nothing here establishes that Dependabot recognized this alias as its
+ * own proposal or closed the PR for that reason - only that it closed.
+ * Nothing here was silenced or mishandled either way: an open PR tied to
+ * one specific number is simply a fragile way to track an ongoing
+ * constraint, because the PR can close for a reason unrelated to the
+ * constraint itself resolving, and this file no longer depends on it
+ * staying open to notice a real widening. Reopening a closed PR to make a
+ * check pass again would manufacture a false signal rather than fix
+ * anything, so this file no longer tries.
  *
  * The genuinely open question - has `typescript-eslint` widened its
  * declared peer range enough that the `typescript` alias can be dropped -
@@ -41,12 +46,15 @@
  *
  * What is still worth guarding on its own, independent of any of that, is
  * that nobody quietly tells Dependabot to stop proposing `typescript`
- * bumps at all. Dependabot remains the mechanism that will eventually
- * open a PR proposing a real (non-aliased) newer `typescript` once the
- * peer-range constraint actually lifts, and an "ignore" rule for it in
- * `.github/dependabot.yml` would suppress that proposal permanently and
- * silently - the file would look identical to a clean one, and nothing
- * would ever again prompt a look at whether the pin can be revisited.
+ * bumps at all. Whether Dependabot would ever actually open a PR proposing
+ * a real (non-aliased) newer `typescript` once the peer-range constraint
+ * lifts is not something this file claims to know - its ordinary parser's
+ * handling of this aliased dependency is not established here either way.
+ * What is certain is the other direction: an "ignore" rule for it in
+ * `.github/dependabot.yml` would suppress ANY such proposal permanently
+ * and silently, whatever the odds of one otherwise arriving - the file
+ * would look identical to a clean one, and nothing would ever again
+ * prompt a look at whether the pin can be revisited.
  *
  *   - checkDependabotHasNoTypescriptIgnore(text) - a pure parse of
  *     already-read YAML text. No filesystem, no network.
@@ -113,7 +121,7 @@ export function checkDependabotHasNoTypescriptIgnore(dependabotYamlText) {
       if (typeof pattern !== "string") continue;
       if (dependabotNamePatternMatches(pattern, TRACKED_DEPENDENCY_NAME)) {
         problems.push(
-          `.github/dependabot.yml has an "ignore" rule ("dependency-name": "${pattern}") in its "${update["package-ecosystem"] ?? "?"}" update block that matches "${TRACKED_DEPENDENCY_NAME}" - this would silence Dependabot's ability to ever propose a newer typescript once typescript-eslint's peer range widens enough to allow one`
+          `.github/dependabot.yml has an "ignore" rule ("dependency-name": "${pattern}") in its "${update["package-ecosystem"] ?? "?"}" update block that matches "${TRACKED_DEPENDENCY_NAME}" - this would silence Dependabot's ability to ever propose a newer typescript at all`
         );
       }
     }

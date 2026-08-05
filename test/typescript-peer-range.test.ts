@@ -63,14 +63,16 @@ test("parseMinInclusiveMaxExclusiveRange throws on a shape it does not understan
 
 // =============================================================================
 // versionSatisfiesRange - the exact boundary this pin decision rests on.
-// The peer range is ">=4.8.4 <6.1.0": 6.0.3 is the highest version that
-// satisfies it, so the boundary at 6.1.0 (excluded) and at 4.8.4
+// The peer range is ">=4.8.4 <6.1.0". These values are synthetic boundary
+// probes, not a claim about what this repo pins (that's checked separately
+// below, against the real installed version): 6.0.3 sits just below the
+// exclusive upper bound, so the boundary at 6.1.0 (excluded) and at 4.8.4
 // (included) are both proven directly, not just the interior case.
 // =============================================================================
 
 const REAL_PEER_RANGE = ">=4.8.4 <6.1.0";
 
-test("6.0.3 (this repo's pinned version) satisfies the real typescript-eslint peer range", () => {
+test("6.0.3 - just below the exclusive upper bound - satisfies the real typescript-eslint peer range", () => {
   assert.equal(versionSatisfiesRange("6.0.3", REAL_PEER_RANGE), true);
 });
 
@@ -116,7 +118,7 @@ test('the real, installed typescript-eslint peer range is exactly ">=4.8.4 <6.1.
   assert.equal(
     result.range,
     ">=4.8.4 <6.1.0",
-    "if this fails, typescript-eslint's declared peer range has changed since this test was written - re-read the acceptance criteria before assuming 6.0.3 is still the right pin"
+    "if this fails, typescript-eslint's declared peer range has changed since this test was written - re-read the acceptance criteria before assuming the current pin (npm:@typescript/typescript6@6.0.2) is still right"
   );
 });
 

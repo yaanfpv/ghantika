@@ -150,7 +150,7 @@ test('the real, tracked .github/dependabot.yml carries no ignore rule matching "
   assert.deepEqual(
     result,
     { ok: true, problems: [] },
-    "a Dependabot ignore rule for typescript would silence Dependabot's own ability to ever propose a newer typescript once typescript-eslint's peer range widens"
+    "a Dependabot ignore rule for typescript would silence Dependabot's ability to ever propose a newer typescript at all"
   );
 });
 
