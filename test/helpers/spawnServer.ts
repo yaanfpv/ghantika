@@ -1,12 +1,16 @@
 /**
  * Shared test-only helper for spawning the REAL built ghantika server
  * (`dist/index.js`) as a real child process and speaking real JSON-RPC to
- * it over its actual stdin/stdout - the single most important
- * verification this project has: a real spawned process, real stdio,
+ * it over its actual stdin/stdout: a real spawned process, real stdio,
  * real protocol bytes end to end, no internal function calls standing in
  * for any of it. Not a `*.test.ts` file itself (so
  * `node --test`'s auto-discovery never tries to run it as a suite), used
- * by `test/e2e-server.test.ts` and `test/shutdown.test.ts`.
+ * by every spawned-real-child suite in this repo - `test/e2e-server.test.ts`,
+ * `test/shutdown.test.ts`, `test/modern-handshake.test.ts`,
+ * `test/jobStore.test.ts`, `test/kill.test.ts`,
+ * `test/kill-slow-paths.test.ts`, `test/output-tail.test.ts`,
+ * `test/wake-integration.test.ts`, `test/spawnServer.test.ts`, and
+ * `test/harness.ts`.
  *
  * `npm test` runs `npm run build` first (see package.json), so
  * `dist/index.js` is guaranteed fresh by the time any test file that
@@ -36,34 +40,25 @@ const CONTAIN_TEST_SERVER_IN_OWN_PROCESS_GROUP = process.platform !== "win32";
  * a future inversion of the two branches reds mechanically instead of
  * surviving as contradictory prose.
  *
- * WHAT IS ACTUALLY KNOWN, stated plainly because the number below is not
- * fully explained: a real coverage run was observed to time out waiting
- * on a stdout line at the previous flat 2000ms budget - that is the
- * failure this function exists to fix. Two direct measurement attempts
- * could not reproduce anything close to that: an isolated burst of 48
+ * The measurements this budget rests on: a real coverage run was once
+ * observed to time out waiting on a stdout line at the previous flat
+ * 2000ms budget. Two direct measurements under coverage instrumentation
+ * did not reproduce a wait anywhere near that: an isolated burst of 48
  * instrumented spawns (4 bursts of 12 concurrent), timing only the very
  * first stdout line, found a worst case of 705ms; a full real `npm run
  * coverage` run, instrumented to record every single `nextLine` wait in
  * the entire suite (919 real waits, not a synthetic sample), found a
- * worst case of 503ms and zero waits anywhere near 2000ms. Neither
- * measurement supports 2000ms being tight under coverage instrumentation
- * on its own. The most likely remaining explanation is transient host
- * contention at the moment of the original failure (this machine
- * regularly runs many concurrent, unrelated processes) rather than a
- * reproducible property of instrumentation - consistent with the
- * general concurrent-load flakiness already observed elsewhere in this
- * suite, but not confirmed, because it could not be reproduced on demand
- * to check.
+ * worst case of 503ms and zero waits anywhere near 2000ms.
  *
- * Given that, this budget is set well above every reproducible
- * measurement specifically to tolerate an occasional contention spike
- * neither measurement could capture, not because instrumentation itself
- * is known to be this slow: 6000ms is roughly 12x the full-suite measured
- * worst case (503ms) and comfortably exceeds the uninstrumented 2000ms,
- * satisfying the one hard requirement here (the instrumented budget must
- * never be tighter than the uninstrumented one). A server that never
- * emits a line still rejects, on either budget - this only changes how
- * long a genuine failure takes to report under coverage.
+ * This budget is set well above both measured worst cases rather than
+ * tied to either one directly, so it also covers occasional load this
+ * repo's own suite is not otherwise controlled for: 6000ms is roughly
+ * 12x the full-suite measured worst case (503ms) and comfortably exceeds
+ * the uninstrumented 2000ms, satisfying the one hard requirement here
+ * (the instrumented budget must never be tighter than the uninstrumented
+ * one). A server that never emits a line still rejects, on either budget
+ * - this only changes how long a genuine failure takes to report under
+ * coverage.
  */
 export function lineTimeoutFor(env: Pick<NodeJS.ProcessEnv, "NODE_V8_COVERAGE">): number {
   return env.NODE_V8_COVERAGE ? 6000 : 2000;

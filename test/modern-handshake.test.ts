@@ -14,12 +14,13 @@
  * This file covers what those two files structurally cannot: the modern
  * opening exchange itself (`server/discover` succeeding, the
  * probe-then-fallback per-instance-state proof), and three negative
- * controls - a genuinely independent, minimal comparison server
- * (`test/fixtures/negative-control-server.ts`) that OMITS exactly one of
- * the three guarantees `src/server.ts` preserves under `serveStdio`, so
- * this file can observe by real execution what the ABSENCE of each
- * guarantee looks like on the wire, proving the real assertions
- * elsewhere in this suite are discriminating rather than vacuous.
+ * controls - a comparison server (`test/fixtures/negative-control-server.ts`)
+ * built in three variants, each of which removes exactly one of the
+ * three guarantees `src/server.ts` preserves under `serveStdio` while
+ * keeping the other two intact (see that file's own doc comment for how),
+ * so this file can observe by real execution what the ABSENCE of each
+ * guarantee looks like on the wire, with each red result attributable to
+ * the one removed guarantee and not to some other missing piece.
  */
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
@@ -318,13 +319,13 @@ test("modern context: a malformed line arriving AFTER a successful server/discov
 });
 
 // ---------------------------------------------------------------------------
-// Three negative controls, each spawning a genuinely independent,
-// minimal serveStdio-based comparison server
-// (test/fixtures/negative-control-server.ts) that OMITS exactly one
-// guarantee, proving by real execution that the real assertions above
-// (and in test/e2e-server.test.ts / test/shutdown.test.ts) are
-// discriminating - not vacuous passes that would stay green even if the
-// real wiring were removed.
+// Three negative controls, each spawning a serveStdio-based comparison
+// server (test/fixtures/negative-control-server.ts) built to remove
+// exactly one guarantee while keeping the other two intact (see that
+// file's own doc comment) - proving by real execution that the real
+// assertions above (and in test/e2e-server.test.ts / test/shutdown.test.ts)
+// each observe a real failure mode, not a check that would stay green
+// even if the real wiring were removed.
 // ---------------------------------------------------------------------------
 
 test("negative control (initialize-gate): a serveStdio server built with NO gate wiring at all lets tools/call succeed with ZERO handshake - proving the real pre-handshake-rejection assertions above are discriminating", async () => {
@@ -376,9 +377,14 @@ test(
   },
   async () => {
     const server = tracked([NEGATIVE_CONTROL_FIXTURE, "no-reap"]);
+    // This variant keeps the initialize gate (see
+    // test/fixtures/negative-control-server.ts's own doc comment) - a
+    // real handshake first, as a real client would, so the ONLY thing
+    // this test observes the absence of is the reap wiring.
+    await completeHandshake(server);
     server.send({
       jsonrpc: "2.0",
-      id: 1,
+      id: 2,
       method: "tools/call",
       params: { name: "spawn-orphan", arguments: {} },
     });

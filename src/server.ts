@@ -30,9 +30,14 @@
  * `initialize` - discards a first, optimistic "probe" instance and builds
  * a second one from the SAME factory. `runServer()` below is what wires
  * ghantika onto `serveStdio`; `createServer()` stays a lower-level,
- * transport-agnostic entry point (every test in this codebase's own
- * suite connects a `createServer()` instance directly to an
- * `InMemoryTransport`, never through `serveStdio` at all - see its own
+ * transport-agnostic entry point (a direct in-process test - most of
+ * `test/jobStore.test.ts`, `test/concurrency.test.ts`, part of
+ * `test/shutdown.test.ts`, and others - connects a `createServer()`
+ * instance directly to an `InMemoryTransport`, with no `serveStdio`
+ * involved at all; a spawned real-child test - `test/e2e-server.test.ts`,
+ * the rest of `test/shutdown.test.ts`, and `test/modern-handshake.test.ts`
+ * - spawns the real `dist/index.js` binary, which runs through
+ * `serveStdio` exactly as a production connection does - see its own
  * doc comment). Both share ONE construction function,
  * `buildGhantikaServerCore()`, so a real production connection and every
  * in-process test build the exact same `Server` the exact same way.
@@ -357,9 +362,10 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
   // See this file's header doc ("The initialize-gate is a SECURITY
   // CONTROL, and it moves to connect()") for the full rationale. This
   // override is what lets ONE wiring mechanism serve both calling
-  // conventions: a caller (every test in this codebase) calling
-  // `.connect(transport)` directly against a known `Transport`, and
-  // `serveStdio` calling `product.connect(channel)` internally against a
+  // conventions: a direct in-process test calling `.connect(transport)`
+  // itself against a known `Transport`, and `serveStdio` (used by
+  // `runServer()` and by every spawned-real-child test) calling
+  // `product.connect(channel)` internally against a
   // `StdioConnectionChannel` proxy this file never otherwise sees.
   const realConnect = server.connect.bind(server);
   server.connect = async (transport: Transport): Promise<void> => {
@@ -402,10 +408,14 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
  * handler. Kept separate from `runServer` so tests can construct and
  * exercise a server instance in-process without it taking over the test
  * runner's own stdin/stdout or `SIGTERM`/`SIGINT` - and entirely without
- * `serveStdio`'s own era-selection machinery, which every test in this
- * codebase's own suite has no need for (each test drives exactly one
- * known era over one known transport, decided by what IT sends, never by
- * a real client's own opening choice).
+ * `serveStdio`'s own era-selection machinery, which a direct in-process
+ * test using this function has no need for (it drives exactly one known
+ * era over one known transport, decided by what IT sends, never by a real
+ * client's own opening choice). Era-selection itself - a probe that opens
+ * with `server/discover` and then falls back to `initialize` - IS
+ * exercised, but only by a spawned real-child test going through
+ * `serveStdio` (`test/modern-handshake.test.ts`'s own probe-then-fallback
+ * test), never by a test built on this function.
  *
  * @param transport - defaults to a real stdio transport, wrapped to restore
  *   `-32700`/`-32600` replies for input the stock transport no longer
