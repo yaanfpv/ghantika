@@ -405,7 +405,9 @@ test("modern handshake: six-tool mint rule on the real wire - run() mints while 
     `setup: run() must genuinely mint on this connection, or the rest of this test proves nothing - got: ${JSON.stringify(runStructured)}`
   );
   // The minted TaskResult carries the handle under `taskId`, never a
-  // separate `job_id` field - see this file's own AC1 discover test and
+  // separate `job_id` field - see this file's own server/discover test,
+  // which already proves the returned capabilities descriptor is minted
+  // by tasksAdapter itself rather than a local stand-in, and
   // src/tasksAdapter.ts's "taskId == job_id, one handle namespace" doc:
   // `taskId` IS the jobStore job_id, exposed under the Task-shape's own
   // field name.
