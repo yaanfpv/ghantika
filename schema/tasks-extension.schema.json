@@ -219,7 +219,14 @@
       ]
     },
     "ackResult": {
-      "description": "UpdateTaskResult / CancelTaskResult per the spec: an empty acknowledgement carrying only resultType:'complete', nothing else. Both are eventually-consistent per the spec - the ack may arrive before the task's observable status reflects the requested change. NOTE: the real spec's own UpdateTaskResult/CancelTaskResult leave additionalProperties permissive (measured: `{}`, not `false`); this schema pins `false` here, STRICTER than the released contract rather than looser - flagged, not changed without sign-off, since a stricter pin can only reject a shape the real spec would accept, never accept one the spec rejects (the opposite direction from the defect this schema's other additionalProperties locks exist to close).",
+      "description": "UpdateTaskResult / CancelTaskResult per the spec: an empty acknowledgement carrying resultType:'complete'. Both are eventually-consistent per the spec - the ack may arrive before the task's observable status reflects the requested change. `additionalProperties` is PERMISSIVE (`{}`), matching the real spec's own UpdateTaskResult/CancelTaskResult exactly (measured) - this def pins the CONTRACT, which tolerates extra properties an ack response might legally carry. See emittedAckResult below for what ghantika's own adapter actually produces, the same two-level split taskStatus/emittedTaskStatus already uses: a node stricter than the contract it claims to pin would misdescribe that contract, even though the stricter shape is itself safe.",
+      "type": "object",
+      "properties": { "resultType": { "$ref": "#/$defs/resultTypeComplete" } },
+      "required": ["resultType"],
+      "additionalProperties": {}
+    },
+    "emittedAckResult": {
+      "description": "The EMISSION-level fact: ghantika's tasks/update and tasks/cancel handlers produce exactly this shape and nothing wider - resultType:'complete', no other properties, ever. `additionalProperties: false` here is not a pin on the spec (see ackResult above for that); it is an honest, narrower assertion about what this adapter's own ack responses actually look like, mirroring emittedTaskStatus's role beside taskStatus.",
       "type": "object",
       "properties": { "resultType": { "$ref": "#/$defs/resultTypeComplete" } },
       "required": ["resultType"],
