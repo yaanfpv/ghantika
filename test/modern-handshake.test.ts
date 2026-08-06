@@ -205,7 +205,7 @@ test("modern handshake: tools/call immediately after a successful server/discove
 // the identical connection does not.
 // ---------------------------------------------------------------------------
 
-test("modern handshake: a tools/call whose OWN request envelope declares io.modelcontextprotocol/tasks mints a real Task result, matching the released spec's advertised shape", async () => {
+test("modern handshake: a tools/call whose OWN request envelope declares io.modelcontextprotocol/tasks mints a real Task result whose extension descriptor matches this connection's own server/discover advertisement", async () => {
   const server = tracked();
   server.send(discoverRequest(1));
   const discoverLine = await server.nextLine();
@@ -240,11 +240,15 @@ test("modern handshake: a tools/call whose OWN request envelope declares io.mode
   );
   assert.equal(typeof structured?.taskId, "string", "a minted Task result must carry a taskId");
   assert.equal(typeof structured?.status, "string", "a minted Task result must carry a status");
-  // "matching the released spec's advertised shape" - checked against what
-  // THIS connection's own server/discover actually returned above, not a
-  // locally-imported constant's truthiness: the descriptor this mint is
+  // Identity against what THIS connection's own server/discover actually
+  // returned above, not mere truthiness - the descriptor this mint is
   // negotiated under must be the identical descriptor server/discover
-  // advertised for this connection.
+  // advertised for this connection. Both sides trace back to this adapter's
+  // own TASKS_CAPABILITY_DESCRIPTOR constant (src/tasksAdapter.ts), so this
+  // proves internal self-consistency between the discover and mint paths on
+  // one connection - it does not independently verify conformance to
+  // io.modelcontextprotocol/tasks's actual released shape, which
+  // src/tasksAdapter.ts's own header discloses as not yet reconciled.
   assert.deepStrictEqual(
     discoverBody.result?.capabilities?.extensions?.[TASKS_EXTENSION_URI],
     TASKS_CAPABILITY_DESCRIPTOR,

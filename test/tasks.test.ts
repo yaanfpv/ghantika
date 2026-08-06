@@ -2000,7 +2000,8 @@ const COMPLETENESS_AREAS: readonly CompletenessArea[] = [
   {
     area: "a modern-era (2026-07-28) tools/call whose OWN per-request envelope declares io.modelcontextprotocol/tasks mints a real Task result",
     file: "test/modern-handshake.test.ts",
-    titleContains: "mints a real Task result, matching the released spec's advertised shape",
+    titleContains:
+      "mints a real Task result whose extension descriptor matches this connection's own server/discover advertisement",
   },
   {
     area: "the modern era's per-request declaration is genuinely per-request, not cached at the connection level - an immediately-following incapable request on the SAME connection never mints",
