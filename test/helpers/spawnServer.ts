@@ -261,9 +261,33 @@ export function discoverRequest(id: number | string = 1) {
   };
 }
 
-/** Wraps `params` (already containing whatever the request itself needs) with the modern revision's required `_meta` envelope - for any request sent AFTER a `server/discover` has already pinned/probed a modern connection (e.g. a modern-era `tools/call`). */
-export function withModernEnvelope(params: Record<string, unknown> = {}) {
-  return { ...params, _meta: modernMetaEnvelope() };
+/**
+ * Wraps `params` (already containing whatever the request itself needs)
+ * with the modern revision's required `_meta` envelope - for any request
+ * sent AFTER a `server/discover` has already pinned/probed a modern
+ * connection (e.g. a modern-era `tools/call`).
+ *
+ * `clientCapabilities` overrides the envelope's required
+ * `io.modelcontextprotocol/clientCapabilities` key, defaulting to `{}` (a
+ * present-but-empty declaration - a valid, non-capable-of-anything
+ * declaration, never the same thing as omitting the key entirely, which
+ * the modern era does not allow at all). This is what lets a caller
+ * declare - or deliberately omit - Tasks support on a PER-REQUEST basis,
+ * exactly as the 2026-07-28 revision's own capability model requires (see
+ * `src/server.ts`'s own header doc, "Reading a request's own declared
+ * client capabilities," for why this era has no connection-level
+ * declaration at all).
+ */
+export function withModernEnvelope(
+  params: Record<string, unknown> = {},
+  clientCapabilities: Record<string, unknown> = {}
+): Record<string, unknown> {
+  return {
+    ...params,
+    _meta: modernMetaEnvelope({
+      "io.modelcontextprotocol/clientCapabilities": clientCapabilities,
+    }),
+  };
 }
 
 /**

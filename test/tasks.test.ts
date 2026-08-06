@@ -508,6 +508,88 @@ test("the server advertises io.modelcontextprotocol/tasks in its initialize-nego
 });
 
 // ---------------------------------------------------------------------------
+// A client that declares ONLY the SDK-deprecated
+// `capabilities.tasks` shape (never `extensions`/`experimental`) must still
+// not reach the extension - `isConnectionTasksCapable` has never read that
+// field, so this is unchanged behavior; asserted directly here so it cannot
+// regress.
+// ---------------------------------------------------------------------------
+
+test("a client declaring ONLY the SDK-deprecated capabilities.tasks shape (no extensions/experimental bag at all) still gets the plain poll floor, not the extension", async () => {
+  pairCounter += 1;
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const instance = createServer(serverTransport);
+  await instance.server.connect(instance.transport);
+
+  const client = new Client(
+    { name: `ghantika-tasks-test-client-${pairCounter}`, version: "0.0.0" },
+    // The SDK-deprecated shape: a bare `tasks` key, never `extensions` or
+    // `experimental` - the two bags `isConnectionTasksCapable` actually
+    // reads (see src/tasksAdapter.ts's own `hasTasksExtensionKey`).
+    { capabilities: { tasks: {} } as Record<string, unknown> }
+  );
+  await client.connect(clientTransport);
+
+  try {
+    const structured = await runJob(client, { label: "deprecated-tasks-shape" });
+    assert.equal(
+      structured.extension,
+      undefined,
+      `a capabilities.tasks-only declaration must never mint a Task result, got: ${JSON.stringify(structured)}`
+    );
+    assert.equal(
+      typeof structured.job_id,
+      "string",
+      "the plain poll floor (a bare job_id) must still be returned"
+    );
+  } finally {
+    await instance.shutdown("tasks.test.ts deprecated-capabilities-shape regression complete");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Capability negotiation matches the finalized extension contract exactly,
+// which designates `extensions` as the sole bag - a client declaring Tasks
+// support only under the older, free-form `experimental` bag must not be
+// recognized as capable. `extensions` and `capabilities.tasks` are already
+// proven not to leak into each other above; `experimental` is the third bag
+// capability negotiation deliberately never reads.
+// ---------------------------------------------------------------------------
+
+test("a client declaring Tasks support ONLY under the older experimental bag (never extensions) still gets the plain poll floor, not the extension", async () => {
+  pairCounter += 1;
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const instance = createServer(serverTransport);
+  await instance.server.connect(instance.transport);
+
+  const client = new Client(
+    { name: `ghantika-tasks-test-client-${pairCounter}`, version: "0.0.0" },
+    {
+      capabilities: {
+        experimental: { [TASKS_EXTENSION_URI]: {} },
+      } as Record<string, unknown>,
+    }
+  );
+  await client.connect(clientTransport);
+
+  try {
+    const structured = await runJob(client, { label: "experimental-bag-only" });
+    assert.equal(
+      structured.extension,
+      undefined,
+      `an experimental-bag-only declaration must never mint a Task result, got: ${JSON.stringify(structured)}`
+    );
+    assert.equal(
+      typeof structured.job_id,
+      "string",
+      "the plain poll floor (a bare job_id) must still be returned"
+    );
+  } finally {
+    await instance.shutdown("tasks.test.ts experimental-bag-only regression complete");
+  }
+});
+
+// ---------------------------------------------------------------------------
 // The six-tool mint rule: run() mints unsolicited on a capable connection,
 // with no per-request opt-in field involved at all
 // ---------------------------------------------------------------------------
@@ -1896,6 +1978,42 @@ const COMPLETENESS_AREAS: readonly CompletenessArea[] = [
     area: "an empty-string taskId is rejected at the request-validation boundary, never silently echoed through",
     file: "test/tasks.test.ts",
     titleContains: "REJECTED at the request-validation boundary on all three task methods",
+  },
+  {
+    area: "a client declaring ONLY the SDK-deprecated capabilities.tasks shape (never extensions/experimental) never reaches the extension",
+    file: "test/tasks.test.ts",
+    titleContains:
+      "declaring ONLY the SDK-deprecated capabilities.tasks shape (no extensions/experimental bag at all)",
+  },
+  {
+    area: "the SAME SDK-deprecated capabilities.tasks-only proof, on the MODERN era's own per-request envelope read - a distinct code path from the legacy connection-level getClientCapabilities() the row above exercises, so one proof does not stand in for the other",
+    file: "test/modern-handshake.test.ts",
+    titleContains:
+      "the modern era's own per-request envelope read, not the legacy connection-level one",
+  },
+  {
+    area: "server/discover's real wire response advertises the exact Tasks extension descriptor tasksAdapter constructs, not merely a truthy or locally-imported stand-in - the baseline discover test",
+    file: "test/modern-handshake.test.ts",
+    titleContains:
+      "returns a successful result advertising the 2026-07-28 revision and the tools capability",
+  },
+  {
+    area: "a modern-era (2026-07-28) tools/call whose OWN per-request envelope declares io.modelcontextprotocol/tasks mints a real Task result",
+    file: "test/modern-handshake.test.ts",
+    titleContains:
+      "mints a real Task result whose extension descriptor matches this connection's own server/discover advertisement",
+  },
+  {
+    area: "the modern era's per-request declaration is genuinely per-request, not cached at the connection level - an immediately-following incapable request on the SAME connection never mints",
+    file: "test/modern-handshake.test.ts",
+    titleContains:
+      "proving the negotiation above is genuinely per-request, not cached at the connection level",
+  },
+  {
+    area: "the six-tool mint rule, on the MODERN wire: status/output/tail/kill/list all stay plain even with Tasks capability declared on their own request, on the SAME connection where run() just minted - the real-wire counterpart to the legacy six-tool mint rule test above, since the modern era reads its capability from a genuinely different source (this file's per-request envelope, not getClientCapabilities())",
+    file: "test/modern-handshake.test.ts",
+    titleContains:
+      "run() mints while status/output/tail/kill/list each stay plain, even with Tasks capability declared on their OWN request too",
   },
 ];
 
