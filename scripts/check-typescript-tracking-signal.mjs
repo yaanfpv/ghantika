@@ -2,10 +2,9 @@
 /**
  * Guards one narrow invariant left over from this repo's `typescript`
  * peer-range pin decision: `.github/dependabot.yml` carries no "ignore"
- * rule for `typescript`. An ignore entry would suppress any
- * Dependabot-proposed bump for that manifest key outright and silently -
- * whatever Dependabot's own ordinary parser would otherwise do with this
- * aliased entry (see below, which this file does not claim to know).
+ * rule for `typescript`. A matching ignore entry can suppress proposals
+ * within that entry's declared `versions`/`update-types` scope, and this
+ * repository deliberately carries no matching TypeScript ignore entry.
  *
  * This file used to also track a specific pull request's open/closed
  * state on the live forge (Dependabot's own PR #1, proposing a bump past
@@ -47,16 +46,11 @@
  * maintain here.
  *
  * What is still worth guarding on its own, independent of any of that, is
- * that nobody quietly tells Dependabot to stop proposing `typescript`
- * bumps at all. Whether Dependabot would ever actually open a PR proposing
- * a real (non-aliased) newer `typescript` once the peer-range constraint
- * lifts is not something this file claims to know - its ordinary parser's
- * handling of this aliased dependency is not established here either way.
- * What is certain is the other direction: an "ignore" rule for it in
- * `.github/dependabot.yml` would suppress ANY such proposal permanently
- * and silently, whatever the odds of one otherwise arriving - the file
- * would look identical to a clean one, and nothing would ever again
- * prompt a look at whether the pin can be revisited.
+ * whether a matching "ignore" rule for `typescript` appears in
+ * `.github/dependabot.yml`. A matching ignore entry can suppress
+ * proposals within that entry's declared `versions`/`update-types`
+ * scope, and this repository deliberately carries no matching
+ * TypeScript ignore entry.
  *
  *   - checkDependabotHasNoTypescriptIgnore(text) - a pure parse of
  *     already-read YAML text. No filesystem, no network.
@@ -123,7 +117,7 @@ export function checkDependabotHasNoTypescriptIgnore(dependabotYamlText) {
       if (typeof pattern !== "string") continue;
       if (dependabotNamePatternMatches(pattern, TRACKED_DEPENDENCY_NAME)) {
         problems.push(
-          `.github/dependabot.yml has an "ignore" rule ("dependency-name": "${pattern}") in its "${update["package-ecosystem"] ?? "?"}" update block that matches "${TRACKED_DEPENDENCY_NAME}" - this would suppress any Dependabot-proposed typescript bump permanently and silently, whatever the odds of one otherwise arriving`
+          `.github/dependabot.yml has an "ignore" rule ("dependency-name": "${pattern}") in its "${update["package-ecosystem"] ?? "?"}" update block that matches "${TRACKED_DEPENDENCY_NAME}" - a matching ignore entry can suppress proposals within that entry's declared versions/update-types scope, and this repository deliberately carries no matching TypeScript ignore entry`
         );
       }
     }

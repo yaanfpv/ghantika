@@ -150,7 +150,7 @@ test('the real, tracked .github/dependabot.yml carries no ignore rule matching "
   assert.deepEqual(
     result,
     { ok: true, problems: [] },
-    "a Dependabot ignore rule for typescript would suppress any Dependabot-proposed typescript bump permanently and silently, whatever the odds of one otherwise arriving"
+    "a matching ignore entry can suppress proposals within that entry's declared versions/update-types scope, and this repository deliberately carries no matching TypeScript ignore entry"
   );
 });
 
