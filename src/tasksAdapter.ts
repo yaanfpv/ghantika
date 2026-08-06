@@ -75,14 +75,12 @@
  * (rather than the deprecated `tasks` field, whose shape this adapter does
  * not implement at all) keeps this adapter honestly forward-compatible
  * instead of borrowing a field name whose real shape means something else.
- * `isConnectionTasksCapable` reads BOTH `extensions` and the older
- * `experimental` bag when checking what a CLIENT declared. The finalized
- * extension designates `extensions` as the correct bag, and this server's
- * own advertisement follows that: it always advertises under `extensions`
- * only, never `experimental`. Detection stays lenient on the CLIENT side
- * regardless, since a real client built before finalization (or against
- * an SDK that predates it) may still declare under the older free-form
- * `experimental` bag - advertising is narrow, detection is lenient.
+ * `isConnectionTasksCapable` reads `extensions` ONLY, on both the
+ * advertisement side and the CLIENT-declaration side it checks - matching
+ * the finalized extension's own contract exactly, which designates
+ * `extensions` as the sole correct bag. A client that declares Tasks
+ * support only under the older, free-form `experimental` bag is not
+ * recognized as capable.
  *
  * ## The six-tool mint rule and the universal poll floor
  *
@@ -197,30 +195,50 @@ export function tasksServerCapabilitiesFragment(): { extensions: Record<string, 
 }
 
 // ---------------------------------------------------------------------------
-// Connection-level capability negotiation
+// Capability negotiation - the SOURCE this file is handed varies by era
+// (see below), but the CHECK itself does not
 // ---------------------------------------------------------------------------
 
 /**
- * True when `clientCapabilities` (the CONNECTION's initialize-declared
- * capabilities, read from `Server.getClientCapabilities()` - populated
- * once, at initialize time, never per-request) advertised Tasks support,
- * under either bag it might legitimately appear in (see this file's header
- * on why detection is lenient across `extensions`/`experimental` while
- * advertisement stays narrow). This is the ONLY signal
- * `maybeAugmentRunResult` consults - no request-level field is ever read,
- * which is what keeps the six-tool mint rule connection-level, not
- * per-request: a bare tool call with no opt-in field of any kind still
- * mints on a capable connection, and nothing about an individual request
- * can turn minting on or off.
+ * True when `clientCapabilities` advertised Tasks support under
+ * `extensions`, the sole bag the finalized extension recognizes (see this
+ * file's header on why `experimental` is not read). This is the ONLY
+ * signal `maybeAugmentRunResult` consults - never
+ * anything in `run()`'s own tool arguments, which is what keeps the
+ * six-tool mint rule free of a per-call opt-in field: a bare tool call with
+ * no such field of any kind still mints on a capable connection/request,
+ * and nothing about `run()`'s own arguments can turn minting on or off.
+ *
+ * WHERE `clientCapabilities` itself comes from is `src/server.ts`'s job,
+ * not this function's - and it genuinely differs by era, matching each
+ * era's own capability model, rather than being read the same way
+ * regardless. On the legacy (pre-2026-07-28) era a client declares
+ * capabilities ONCE, at `initialize` time, and `Server.getClientCapabilities()`
+ * returns that SAME value for every request on the connection - honestly
+ * connection-level, matching the legacy handshake itself. The 2026-07-28
+ * revision has no `initialize` exchange to declare anything in at all - it
+ * REQUIRES every request to carry its own
+ * `io.modelcontextprotocol/clientCapabilities` `_meta` envelope key (see
+ * the installed SDK's own `REQUIRED_ENVELOPE_KEYS`), so on that era
+ * `clientCapabilities` here is THIS request's own declaration, read fresh
+ * by `server.ts` off `ctx.mcpReq.envelope` - never the deprecated,
+ * connection-scoped `getClientCapabilities()` accessor, which a
+ * `serveStdio`-pinned modern instance never gets backfilled on at all
+ * (confirmed by reading the installed SDK's own `serveStdio`/
+ * `createMcpHandler` sources: only the HTTP entry point calls the SDK's
+ * internal per-request backfill, and only because it builds a brand-new
+ * `Server` instance per HTTP request to seed - stdio pins ONE instance for
+ * a connection's whole lifetime and has no equivalent step). So
+ * "per-request" on the modern era is that era's OWN correct capability
+ * model, not a weaker guarantee than the legacy connection-level one - see
+ * `src/server.ts`'s own header doc ("Reading a request's own declared
+ * client capabilities") for the full mechanics of the split.
  */
 export function isConnectionTasksCapable(
   clientCapabilities: ClientCapabilities | undefined
 ): boolean {
   if (clientCapabilities === undefined) return false;
-  return (
-    hasTasksExtensionKey(clientCapabilities.extensions) ||
-    hasTasksExtensionKey(clientCapabilities.experimental)
-  );
+  return hasTasksExtensionKey(clientCapabilities.extensions);
 }
 
 function hasTasksExtensionKey(bag: Record<string, unknown> | undefined): boolean {
