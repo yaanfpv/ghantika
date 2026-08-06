@@ -1442,6 +1442,15 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
       "state",
     ].sort();
 
+    // status's own response carries two ADDITIVE fields no other tool's
+    // response does - `pid`/`birth_identity` (see
+    // `src/tools/status.ts`'s `StatusProjection`) - so it gets its own key
+    // set, layered on top of the shared PublicJobProjection one, rather
+    // than widening PUBLIC_JOB_PROJECTION_KEYS itself: kill's own
+    // assertion below still checks against the UNCHANGED shared set,
+    // which is what actually proves status gained fields kill did not.
+    const STATUS_PROJECTION_KEYS = [...PUBLIC_JOB_PROJECTION_KEYS, "pid", "birth_identity"].sort();
+
     const statusResult = runResultStructured(
       await pair.client.callTool({ name: "status", arguments: { job_id: taskId } })
     );
@@ -1453,8 +1462,8 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
     assert.equal(statusResult.job_id, taskId);
     assert.deepEqual(
       Object.keys(statusResult).sort(),
-      PUBLIC_JOB_PROJECTION_KEYS,
-      `expected status's response to deep-equal the real PublicJobProjection key set exactly (no minted field, no dropped field), got: ${JSON.stringify(Object.keys(statusResult).sort())}`
+      STATUS_PROJECTION_KEYS,
+      `expected status's response to deep-equal STATUS_PROJECTION_KEYS exactly (no minted field, no dropped field, and including status's own additive pid/birth_identity fields), got: ${JSON.stringify(Object.keys(statusResult).sort())}`
     );
 
     // Key-set equality alone (the check above) does not prove any field's
@@ -1508,8 +1517,53 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
       ["pending", "captured", "unavailable"].includes(statusResult.identity_capture as string),
       `expected status's identity_capture to be one of pending/captured/unavailable, got: ${JSON.stringify(statusResult.identity_capture)}`
     );
+
+    // pid/birth_identity (see src/tools/status.ts's StatusProjection) are
+    // status-only additive fields, sourced from the same real tracked
+    // child jobStore.getChildHandle exposes - this job DID get a live
+    // child (a real `node` process), so both must be present. pid is
+    // checked as a real positive OS pid; birth_identity's exact settled
+    // shape races the same async capture identity_capture already names
+    // above (still "pending", or already "captured" with a real
+    // platform-tagged identity payload, or "unavailable" if the capture
+    // genuinely failed) - checked for STRUCTURAL validity here (never a
+    // stray/malformed shape, and never a "captured" state missing its
+    // identity payload or a non-captured state carrying one), then both
+    // are excluded from the exact-literal comparison below for the same
+    // reason identity_capture is: genuinely outside this test's control.
+    assert.equal(
+      typeof statusResult.pid,
+      "number",
+      `expected status's pid to be a real number, got: ${JSON.stringify(statusResult.pid)}`
+    );
+    assert.ok(
+      (statusResult.pid as number) > 0,
+      `expected status's pid to be a positive OS pid, got: ${JSON.stringify(statusResult.pid)}`
+    );
+    const birthIdentity = statusResult.birth_identity as { state?: string; identity?: unknown };
+    assert.ok(
+      typeof birthIdentity === "object" &&
+        birthIdentity !== null &&
+        ["pending", "captured", "unavailable"].includes(birthIdentity.state as string),
+      `expected status's birth_identity.state to be one of pending/captured/unavailable, got: ${JSON.stringify(statusResult.birth_identity)}`
+    );
+    assert.equal(
+      "identity" in birthIdentity,
+      birthIdentity.state === "captured",
+      `expected birth_identity to carry an "identity" payload if and only if its state is "captured" - never a "pending"/"unavailable" state carrying one, and never a "captured" state missing one - got: ${JSON.stringify(statusResult.birth_identity)}`
+    );
+    if (birthIdentity.state === "captured") {
+      const identity = birthIdentity.identity as { platform?: string };
+      assert.ok(
+        identity.platform === "linux-starttime-ticks" || identity.platform === "posix-elapsed",
+        `expected a captured birth_identity's platform to be linux-starttime-ticks or posix-elapsed, got: ${JSON.stringify(identity)}`
+      );
+    }
+
     const statusWithoutIdentityCapture = { ...statusResult };
     delete statusWithoutIdentityCapture.identity_capture;
+    delete statusWithoutIdentityCapture.pid;
+    delete statusWithoutIdentityCapture.birth_identity;
     assert.deepEqual(
       withTimestampFieldsChecked(statusWithoutIdentityCapture, ["started_at", "ended_at"]),
       {
