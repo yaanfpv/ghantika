@@ -72,9 +72,11 @@ import {
 // path uses (see src/process.ts's own `evaluatePreSignalIdentityGate`
 // docs) - reused here so this file's teardown never signals a pid this
 // test didn't positively capture and identity-confirm, rather than
-// re-implementing a parallel identity check in test code. See Story 0022
-// round-six Finding 7 on why the prior owner-blind broad-pattern kill was
-// unsafe.
+// re-implementing a parallel identity check in test code. A broad,
+// argv-pattern-matched pid list is not safe destructive authority: a
+// coincidental collision on this test's own scratch path would let a
+// naive teardown kill a process it never positively identified as its
+// own, however unlikely that collision is in practice.
 import {
   captureBirthIdentityPosix,
   evaluatePreSignalIdentityGate,
@@ -386,17 +388,17 @@ after(async () => {
   }
 
   // 4. Report-only: the broad "anything whose command line references this
-  //    path" oracle is a DIAGNOSTIC surface here, never a kill target set
-  //    (Story 0022 round-six Finding 7 - an owner-blind pid list is not
-  //    safe destructive authority, however unlikely the random scratch
-  //    path makes an accidental collision). Anything still showing up here
-  //    after steps 1-3 is something this test never positively identified
-  //    as its own, so it is surfaced, not silently destroyed.
+  //    path" oracle is a DIAGNOSTIC surface here, never a kill target set.
+  //    An owner-blind pid list is not safe destructive authority, however
+  //    unlikely the random scratch path makes an accidental collision.
+  //    Anything still showing up here after steps 1-3 is something this
+  //    test never positively identified as its own, so it is surfaced,
+  //    not silently destroyed.
   for (const record of scratchRecords) {
     const stragglers = anyPidsReferencingPath(record.dir);
     if (stragglers.length > 0) {
       console.error(
-        `[dogfood teardown] ${stragglers.length} unidentified process(es) still reference ${record.dir} after positive-identity cleanup: ${JSON.stringify(stragglers)} - left alone, not killed (see Story 0022 round-six Finding 7)`
+        `[dogfood teardown] ${stragglers.length} unidentified process(es) still reference ${record.dir} after positive-identity cleanup: ${JSON.stringify(stragglers)} - left alone, not killed: never positively identified as this test's own child`
       );
     }
     try {
