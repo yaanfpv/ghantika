@@ -36,14 +36,19 @@
  * (below) `tasks/cancel`'s REAL kill-and-reap behavior: a real,
  * grandchild-deep process tree bound to the job's original POSIX process
  * group is genuinely signalled and reaped through `tasks/cancel` itself
- * (never the raw `kill` tool), the cancel acknowledgement and a later
- * `tasks/get`'s terminal observation are asserted as two DISTINCT steps
- * (the acknowledgement's own status independently checked, not inferred
- * from the later read), and the real terminal-status mapping is proven for
- * every case tasks/cancel can actually reach - a job that exited
- * non-zero, a job that never spawned at all, and a genuinely malformed
- * request. The disclosed setsid()-escape boundary this containment
- * inherits from `src/tools/kill.ts` is proven there, not duplicated here.
+ * (never the raw `kill` tool). Under the released contract
+ * `tasks/cancel` returns a FIXED, empty acknowledgement regardless of
+ * outcome (eventually consistent by design - it carries no status of its
+ * own at all), so the cancel ack and the job's real terminal observation
+ * are asserted as two DISTINCT steps for a different reason than before:
+ * the ack is verified (via this file's own wire tap) to be exactly the
+ * fixed shape every time, and ONLY a later, separate `tasks/get` proves
+ * the kill actually took effect - never inferred from the ack. The real
+ * terminal-status mapping is proven for every case tasks/cancel can
+ * actually reach - a job that exited non-zero, a job that never spawned at
+ * all, and a genuinely malformed request. The disclosed setsid()-escape
+ * boundary this containment inherits from `src/tools/kill.ts` is proven
+ * there, not duplicated here.
  * `test/tasks.test.ts`'s own "interim contract" tests keep covering
  * `tasks/update`'s read-only behavior and `tasks/cancel`'s unchanged
  * idempotent no-op on an already-terminal or unknown taskId - this file is
@@ -58,7 +63,7 @@ import { mock, test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/client";
 import { InMemoryTransport } from "@modelcontextprotocol/server";
-import type { StandardSchemaV1 } from "@modelcontextprotocol/server";
+import type { StandardSchemaV1, Transport } from "@modelcontextprotocol/server";
 
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
 // import comment for why.
@@ -79,13 +84,63 @@ import {
 } from "../dist/tasksAdapter.js";
 
 // ---------------------------------------------------------------------------
-// Harness - mirrors test/tasks.test.ts's own startPair/tasksRequest/runJob
+// Harness - mirrors test/tasks.test.ts's own startPair/tasksRequest/mintJob
 // shape (never re-invented differently), so both files exercise the
 // identical real client/server contract.
 // ---------------------------------------------------------------------------
 
+/**
+ * See test/tasks.test.ts's own header ("why the harness itself grew a wire
+ * tap") for the full grounding: the SDK Client's own decode pipeline
+ * strips the wire-level `resultType` discriminator before any caller ever
+ * sees the parsed result, on EVERY method, not just `tools/call` - so
+ * `tasks/cancel`'s real emitted ack (`{resultType: "complete"}`, per
+ * the released contract) decodes to a genuinely EMPTY object
+ * through `tasksCancel`'s own `client.request(..., passthroughSchema())`
+ * call below. This file's own "real kill-and-reap through tasks/cancel"
+ * tests need to observe the ack's real wire shape directly, which only the
+ * tap can do.
+ */
+interface WireTap {
+  readonly latestResultFor: (method: string) => Record<string, unknown> | undefined;
+}
+
+function attachWireTap(clientTransport: Transport, serverTransport: Transport): WireTap {
+  const methodById = new Map<unknown, string>();
+  const resultByMethod = new Map<string, Record<string, unknown>>();
+
+  const originalClientSend = clientTransport.send.bind(clientTransport);
+  clientTransport.send = (message, options) => {
+    const candidate = message as { id?: unknown; method?: unknown };
+    if (
+      candidate &&
+      typeof candidate === "object" &&
+      typeof candidate.method === "string" &&
+      "id" in candidate
+    ) {
+      methodById.set(candidate.id, candidate.method);
+    }
+    return originalClientSend(message, options);
+  };
+
+  const originalServerSend = serverTransport.send.bind(serverTransport);
+  serverTransport.send = (message, options) => {
+    const candidate = message as { id?: unknown; result?: unknown };
+    if (candidate && typeof candidate === "object" && "result" in candidate) {
+      const method = methodById.get(candidate.id);
+      if (method !== undefined) {
+        resultByMethod.set(method, candidate.result as Record<string, unknown>);
+      }
+    }
+    return originalServerSend(message, options);
+  };
+
+  return { latestResultFor: (method) => resultByMethod.get(method) };
+}
+
 interface Pair {
   readonly client: Client;
+  readonly wireTap: WireTap;
   readonly close: () => Promise<void>;
 }
 
@@ -94,6 +149,7 @@ let pairCounter = 0;
 async function startPair(capable = true): Promise<Pair> {
   pairCounter += 1;
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const wireTap = attachWireTap(clientTransport, serverTransport);
   const instance = createServer(serverTransport);
   await instance.server.connect(instance.transport);
 
@@ -105,6 +161,7 @@ async function startPair(capable = true): Promise<Pair> {
 
   return {
     client,
+    wireTap,
     close: () => instance.shutdown("tasks-lifecycle.test.ts complete"),
   };
 }
@@ -142,7 +199,23 @@ function runResultStructured(result: unknown): Record<string, unknown> {
   return structured as Record<string, unknown>;
 }
 
-async function runJob(
+/**
+ * Calls `run()` on a CAPABLE connection and returns the CLIENT-DECODED
+ * minted result directly - never via `runResultStructured` above, because
+ * a minted result on the released-contract adapter has no
+ * `structuredContent` at all (the whole `CallToolResult` object IS the
+ * flat `CreateTaskResult`, cast - see `src/tasksAdapter.ts`'s own
+ * `maybeAugmentRunResult` docs, and `test/tasks.test.ts`'s own header for
+ * the full grounding). Every real `run()` call in this file runs on a
+ * `startPair(true)` (or the file's own default-capable `startPair()`)
+ * connection and expects a mint, so this is used everywhere - the ONE
+ * genuinely plain (`startPair(false)`) call in this file reads
+ * `structuredContent` directly inline instead (see that test's own
+ * comment), never through a shared plain-run helper (there being only the
+ * one call site made a dedicated `runJob` unnecessary here, unlike
+ * test/tasks.test.ts and test/wake-integration.test.ts, which need both).
+ */
+async function mintJob(
   client: Client,
   overrides: Record<string, unknown> = {}
 ): Promise<Record<string, unknown>> {
@@ -151,7 +224,7 @@ async function runJob(
     arguments: { command: ["true"], ...overrides },
   });
   assert.notEqual((result as { isError?: boolean }).isError, true);
-  return runResultStructured(result);
+  return result as unknown as Record<string, unknown>;
 }
 
 /** An idle, real, backing command that produces NOTHING on its own - the fixture every synthetic-output test uses so it has a genuine process to mint a task around, kill, and reap, while the test itself drives all observable stdout/stderr through direct jobStore calls. */
@@ -315,7 +388,7 @@ test("a real never-completing job keeps tasks/get status EXACTLY 'working' acros
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, { command: IDLE_COMMAND, label: "keepalive" });
+    const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "keepalive" });
     jobId = minted.taskId as string;
     assert.equal(typeof jobId, "string");
 
@@ -352,7 +425,7 @@ test("TTL purge removes a completed record past TASK_TTL_MS while a still-workin
   let workingJobId: string | undefined;
   try {
     // A quick, real command that completes almost immediately.
-    const completedMinted = await runJob(pair.client, {
+    const completedMinted = await mintJob(pair.client, {
       command: ["true"],
       label: "ttl-completed-fixture",
     });
@@ -362,7 +435,7 @@ test("TTL purge removes a completed record past TASK_TTL_MS while a still-workin
     assert.equal(completedBefore.status, "completed");
 
     // A real, still-working job started at the SAME rough age.
-    const workingMinted = await runJob(pair.client, {
+    const workingMinted = await mintJob(pair.client, {
       command: IDLE_COMMAND,
       label: "ttl-working-fixture",
     });
@@ -379,16 +452,19 @@ test("TTL purge removes a completed record past TASK_TTL_MS while a still-workin
       assert.equal((await tasksGet(pair.client, workingJobId)).status, "working");
 
       // Past TTL now - the SAME sweep of reads must disagree: the
-      // completed one is purged (task_not_found), the still-working one
-      // is untouched (still 'working', never an 'expired' status of any
-      // kind - the closed four-value TASK_STATUSES set has no such
-      // member).
+      // completed one is purged (throws task_not_found - the released
+      // contract's own -32602 error, never a tagged success value), the
+      // still-working one is untouched (still 'working', never an
+      // 'expired' status of any kind - the closed four-value TASK_STATUSES
+      // set has no such member).
       mock.timers.tick(2000); // TASK_TTL_MS - 1000 + 2000 > TASK_TTL_MS
-      const completedAfter = await tasksGet(pair.client, completedJobId);
-      assert.equal(
-        completedAfter.error,
-        "task_not_found",
-        `expected the completed record to be purged past TTL, got ${JSON.stringify(completedAfter)}`
+      await assert.rejects(
+        () => tasksGet(pair.client, completedJobId),
+        (error: unknown) => {
+          const message = String((error as { message?: unknown })?.message ?? error);
+          return /-32602|not found|task_not_found/i.test(message);
+        },
+        "expected the completed record to be purged past TTL, throwing task_not_found"
       );
       const workingAfter = await tasksGet(pair.client, workingJobId);
       assert.equal(
@@ -396,7 +472,6 @@ test("TTL purge removes a completed record past TASK_TTL_MS while a still-workin
         "working",
         "a still-working task of the SAME age must NEVER be purged, regardless of age - the terminal-only guard"
       );
-      assert.equal(workingAfter.error, undefined);
     } finally {
       mock.timers.reset();
     }
@@ -448,11 +523,18 @@ test("TTL purge REFUSES a job whose concurrency slot is still stranded, however 
     const endedAtMs = Date.parse(jobStore.get(job.job_id)!.ended_at!);
     const wayPastTtl = endedAtMs + TASK_TTL_MS * 10; // far past TTL, not just barely
 
+    // A refusal to purge is now the ABSENCE of a throw (getTask() returns
+    // the real snapshot normally) - the released contract's own
+    // throw-on-purge design (see src/tasksAdapter.ts's taskNotFoundError
+    // docs) means there is no longer a tagged "found but refused" value to
+    // distinguish structurally; simply reaching the assertions below
+    // without an exception already proves the refusal, and the status
+    // check confirms it is a genuine, untouched snapshot.
     const stillStranded = getTask(job.job_id, wayPastTtl);
     assert.equal(
-      "error" in stillStranded,
-      false,
-      `TTL purge must refuse a still-stranded job however far past TTL it is, got ${JSON.stringify(stillStranded)}`
+      stillStranded.status,
+      "completed",
+      `TTL purge must refuse a still-stranded job however far past TTL it is (returning its real, untouched snapshot), got ${JSON.stringify(stillStranded)}`
     );
     assert.equal(
       jobStore.has(job.job_id),
@@ -477,11 +559,16 @@ test("TTL purge REFUSES a job whose concurrency slot is still stranded, however 
       "expected recovery to clear stranding"
     );
 
-    const afterRecovery = getTask(job.job_id, wayPastTtl);
-    assert.equal(
-      "error" in afterRecovery && afterRecovery.error,
-      "task_not_found",
-      `expected a NOW-confirmed, still-past-TTL record to purge normally, got ${JSON.stringify(afterRecovery)}`
+    // getTask THROWS (task_not_found, -32602) rather than returning a
+    // tagged success value once genuinely purged - see
+    // src/tasksAdapter.ts's own taskNotFoundError docs.
+    assert.throws(
+      () => getTask(job.job_id, wayPastTtl),
+      (error: unknown) => {
+        const message = String((error as { message?: unknown })?.message ?? error);
+        return /-32602|not found|task_not_found/i.test(message);
+      },
+      "expected a NOW-confirmed, still-past-TTL record to purge normally, throwing task_not_found"
     );
     assert.equal(
       jobStore.has(job.job_id),
@@ -506,7 +593,7 @@ test("the wake's notification method is the EXACT string 'notifications/tasks/st
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, { command: IDLE_COMMAND, label: "exact-method" });
+    const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "exact-method" });
     jobId = minted.taskId as string;
     const received = registerWakeSpy(pair.client);
 
@@ -532,7 +619,7 @@ test("the wake's notification method is the EXACT string 'notifications/tasks/st
     // observable via tasks/get and output regardless.
     const quiet = await startPair(true);
     try {
-      const quietMinted = await runJob(quiet.client, {
+      const quietMinted = await mintJob(quiet.client, {
         command: [process.execPath, "-e", "process.stdout.write('suppressed-poll-floor\\n');"],
         label: "suppressed-notifications",
       });
@@ -562,7 +649,7 @@ test("one stdout batch fires one wake carrying EXACTLY that batch's new stdout d
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, { command: IDLE_COMMAND, label: "batch-delta" });
+    const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "batch-delta" });
     jobId = minted.taskId as string;
     const received = registerWakeSpy(pair.client);
 
@@ -620,7 +707,7 @@ test("with the wake handler entirely unregistered on a capable connection, tasks
   const pair = await startPair(true); // capable connection, but no wake handler ever registered
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, {
+    const minted = await mintJob(pair.client, {
       command: [process.execPath, "-e", "process.stdout.write('phase1-a\\nphase1-b\\n');"],
       label: "poll-floor-parity",
     });
@@ -646,7 +733,7 @@ test("a stderr-only batch wakes on its own carrying ONLY the stderr key; a batch
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, { command: IDLE_COMMAND, label: "stderr-wakes" });
+    const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "stderr-wakes" });
     jobId = minted.taskId as string;
     const received = registerWakeSpy(pair.client);
 
@@ -712,7 +799,7 @@ test("lines within one WAKE_COALESCE_WINDOW_MS window collapse into ONE wake; tw
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, { command: IDLE_COMMAND, label: "coalesce-window" });
+    const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "coalesce-window" });
     jobId = minted.taskId as string;
     const received = registerWakeSpy(pair.client);
 
@@ -775,7 +862,7 @@ test("a sustained firehose rate rate-limits wakes and auto-stops ONLY the notifi
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, { command: IDLE_COMMAND, label: "firehose-trigger" });
+    const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "firehose-trigger" });
     jobId = minted.taskId as string;
     const received = registerWakeSpy(pair.client);
 
@@ -810,21 +897,32 @@ test("a sustained firehose rate rate-limits wakes and auto-stops ONLY the notifi
         "working",
         "the JOB must still be 'working' - only the watch stopped"
       );
-      const watchStopped = taskGet.watchStopped as
-        { reason?: string; stoppedAt?: string } | undefined;
+      // A still-WORKING task carries the watch-stop fact rendered as TEXT
+      // into statusMessage, per the released contract - see
+      // src/tasksAdapter.ts's own renderWatchStoppedStatusMessage docs (a
+      // working task has no result/error container the way a terminal task
+      // does, so there is no structured watchStopped field to read here at
+      // all anymore).
+      const statusMessage = taskGet.statusMessage as string | undefined;
       assert.ok(
-        watchStopped,
-        `expected watchStopped to be present, got ${JSON.stringify(taskGet)}`
+        statusMessage,
+        `expected statusMessage to be present, got ${JSON.stringify(taskGet)}`
       );
-      assert.equal(watchStopped!.reason, WATCH_STOP_REASON_FIREHOSE);
-      assert.match(watchStopped!.stoppedAt!, ISO_TIMESTAMP_PATTERN);
+      const rendered = statusMessage!.match(/^output watch auto-stopped \(([^)]+)\) at (.+)$/);
+      assert.ok(
+        rendered,
+        `expected statusMessage to match the rendered watch-stop format, got ${JSON.stringify(statusMessage)}`
+      );
+      const [, renderedReason, renderedStoppedAt] = rendered!;
+      assert.equal(renderedReason, WATCH_STOP_REASON_FIREHOSE);
+      assert.match(renderedStoppedAt!, ISO_TIMESTAMP_PATTERN);
       const expectedStoppedAt = new Date(realStart + TICKS_NEEDED * TICK_MS).toISOString();
       assert.equal(
-        watchStopped!.stoppedAt,
+        renderedStoppedAt,
         expectedStoppedAt,
-        "stoppedAt must equal the EXACT injected-clock stop instant"
+        "the rendered stoppedAt must equal the EXACT injected-clock stop instant"
       );
-      stoppedAtBeforeReset = watchStopped!.stoppedAt;
+      stoppedAtBeforeReset = renderedStoppedAt;
 
       const wakeCountAtStop = received.length;
       const totalSpanSec = (TICKS_NEEDED * TICK_MS) / 1000;
@@ -893,7 +991,7 @@ test("green control: a bounded stream UNDER FIREHOSE_LINES_PER_SEC runs to its n
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, {
+    const minted = await mintJob(pair.client, {
       command: IDLE_COMMAND,
       label: "firehose-green-control",
     });
@@ -920,18 +1018,23 @@ test("green control: a bounded stream UNDER FIREHOSE_LINES_PER_SEC runs to its n
     const taskGet = await tasksGet(pair.client, jobId);
     assert.equal(taskGet.status, "working");
     assert.equal(
-      taskGet.watchStopped,
+      taskGet.statusMessage,
       undefined,
-      "a bounded, under-threshold stream must NEVER trigger the firehose auto-stop"
+      "a bounded, under-threshold stream must NEVER trigger the firehose auto-stop (no statusMessage rendered)"
     );
     assert.ok(received.length > 0, "the watch must still have delivered normal wakes throughout");
 
     // Runs to its normal (here: killed) terminal, untouched by any
-    // firehose guard.
+    // firehose guard. A CancelledTaskResult carries no result/error
+    // container at all on the released contract, so there is no
+    // watchStopped field of any shape to check here anymore - the
+    // never-auto-stopped claim is already fully proven by the
+    // still-working check above.
     await killAndReapRealChild(jobId);
     const finalGet = await tasksGet(pair.client, jobId);
     assert.equal(finalGet.status, "cancelled");
-    assert.equal(finalGet.watchStopped, undefined);
+    assert.equal(finalGet.result, undefined);
+    assert.equal(finalGet.error, undefined);
   } finally {
     if (jobId !== undefined && jobStore.getChildHandle(jobId) !== undefined) {
       await killAndReapRealChild(jobId);
@@ -947,7 +1050,7 @@ test("green control: a bounded stream UNDER FIREHOSE_LINES_PER_SEC runs to its n
 
 test("a REAL exit-0 job reports exitCode 0 and is genuinely reaped, and further synthetic output after exit fires ZERO wakes (the watch really stopped)", async () => {
   const pair = await startPair(true);
-  const minted = await runJob(pair.client, {
+  const minted = await mintJob(pair.client, {
     command: [process.execPath, "-e", "process.exit(0);"],
     label: "exit-zero",
   });
@@ -962,7 +1065,7 @@ test("a REAL exit-0 job reports exitCode 0 and is genuinely reaped, and further 
 
     const taskGet = await tasksGet(pair.client, jobId);
     assert.equal(taskGet.status, "completed");
-    assert.equal(taskGet.exitCode, 0);
+    assert.equal((taskGet.result as Record<string, unknown> | undefined)?.exitCode, 0);
 
     const beforeCount = received.length;
     jobStore.appendOutput(jobId, "stdout", line("after-exit-should-not-wake"));
@@ -979,7 +1082,7 @@ test("a REAL exit-0 job reports exitCode 0 and is genuinely reaped, and further 
 
 test("a REAL non-zero exit job reports its exact exit code and is genuinely reaped", async () => {
   const pair = await startPair(true);
-  const minted = await runJob(pair.client, {
+  const minted = await mintJob(pair.client, {
     command: [process.execPath, "-e", "process.exit(7);"],
     label: "exit-nonzero",
   });
@@ -993,7 +1096,7 @@ test("a REAL non-zero exit job reports its exact exit code and is genuinely reap
 
     const taskGet = await tasksGet(pair.client, jobId);
     assert.equal(taskGet.status, "completed");
-    assert.equal(taskGet.exitCode, 7);
+    assert.equal((taskGet.result as Record<string, unknown> | undefined)?.exitCode, 7);
   } finally {
     await pair.close();
   }
@@ -1014,7 +1117,7 @@ test("lines emitted inside an open coalescing window, then terminal forced befor
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, { command: IDLE_COMMAND, label: "flush-ordering" });
+    const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "flush-ordering" });
     jobId = minted.taskId as string;
     const received = registerWakeSpy(pair.client);
 
@@ -1099,7 +1202,7 @@ test("the wake path is proven here via a SIMULATED/mock capable client and the p
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, {
+    const minted = await mintJob(pair.client, {
       command: IDLE_COMMAND,
       label: "wake-path-label-only",
     });
@@ -1152,14 +1255,23 @@ test("a registered listener receives each REAL stdout line, in order, as the REA
     // real process race, closed deterministically rather than papered over
     // with an `if (received.length > 0)` guard that would pass vacuously on
     // zero observed lines.
-    const minted = await runJob(pair.client, {
-      command: [
-        process.execPath,
-        "-e",
-        `const fs=require('fs');const m=${JSON.stringify(goMarker)};while(!fs.existsSync(m)){}process.stdout.write('seam-1\\nseam-2\\nseam-3\\n');`,
-      ],
-      label: "seam-real-path",
+    // Inlined rather than routed through the shared runJob/mintJob helpers
+    // below: this is the ONE genuinely PLAIN (non-minting) run() call in
+    // this whole file (startPair(false) above), so it reads the ordinary
+    // structuredContent-nested job_id directly.
+    const runResult = await pair.client.callTool({
+      name: "run",
+      arguments: {
+        command: [
+          process.execPath,
+          "-e",
+          `const fs=require('fs');const m=${JSON.stringify(goMarker)};while(!fs.existsSync(m)){}process.stdout.write('seam-1\\nseam-2\\nseam-3\\n');`,
+        ],
+        label: "seam-real-path",
+      },
     });
+    assert.notEqual((runResult as { isError?: boolean }).isError, true);
+    const minted = runResultStructured(runResult);
     const jobId = minted.job_id as string;
 
     const received: OutputArrivalEvent[] = [];
@@ -1347,7 +1459,7 @@ test("tasks/cancel kills and reaps a real grandchild-deep process tree bound to 
       `echo $! > '${childMarker}'; ` +
       `wait`;
 
-    const minted = await runJob(pair.client, {
+    const minted = await mintJob(pair.client, {
       command: shellCommand,
       shell: true,
       label: "cancel-grandchild-tree",
@@ -1394,34 +1506,30 @@ test("tasks/cancel kills and reaps a real grandchild-deep process tree bound to 
     assert.ok(isProcessAlive(grandchildPid), "expected the grandchild to be alive before cancel");
 
     // -------------------------------------------------------------------
-    // CANCEL ACK: tasks/cancel returns an acknowledgement of the request -
-    // asserted on its OWN return value here, independently of the LATER
-    // tasks/get read below (never inferred from it). Message shape alone
-    // (extension/taskId/no-error) is not enough: a mutant that kills
-    // nothing and returns a stale "working" projection would still pass a
-    // shape-only check. The status must genuinely reflect the kill this
-    // call just performed.
+    // CANCEL ACK: tasks/cancel returns the released spec's own fixed,
+    // empty acknowledgement (`{resultType: "complete"}`) - eventually
+    // consistent by design, so it deliberately carries NO status/taskId/
+    // extension field of any kind (see src/tasksAdapter.ts's own
+    // cancelTask docs; previously the ack WAS a fresh snapshot and this
+    // section asserted its status already
+    // reflected the kill). The client-decoded value is genuinely EMPTY
+    // (the SDK strips the wire-level resultType before this test ever sees
+    // it - see this file's own WireTap docs), so the real ack shape is
+    // read via the wire tap instead. Confirmation that the kill actually
+    // took effect is now what the LATER, separate tasks/get read below
+    // proves - never inferred from this ack.
     // -------------------------------------------------------------------
     const cancelAck = await tasksCancel(pair.client, jobId);
-    assert.equal(
-      cancelAck.extension,
-      TASKS_EXTENSION_URI,
-      `expected tasks/cancel's own return value to be a well-formed Tasks-shaped acknowledgement, got ${JSON.stringify(cancelAck)}`
+    assert.deepEqual(
+      cancelAck,
+      {},
+      `expected tasks/cancel's client-decoded ack to be genuinely empty (only resultType, which the SDK strips), got ${JSON.stringify(cancelAck)}`
     );
-    assert.equal(
-      cancelAck.taskId,
-      jobId,
-      "expected the cancel acknowledgement to name this exact task"
-    );
-    assert.equal(
-      cancelAck.error,
-      undefined,
-      `expected a real acknowledgement, never a not-found response, got ${JSON.stringify(cancelAck)}`
-    );
-    assert.equal(
-      cancelAck.status,
-      "cancelled",
-      `expected the cancel acknowledgement's own status to already reflect the kill just performed, got ${JSON.stringify(cancelAck)}`
+    const rawCancelAck = pair.wireTap.latestResultFor("tasks/cancel");
+    assert.deepEqual(
+      rawCancelAck,
+      { resultType: "complete" },
+      `expected tasks/cancel's real wire ack to be exactly the fixed emittedAckResult shape, got ${JSON.stringify(rawCancelAck)}`
     );
 
     // -------------------------------------------------------------------
@@ -1476,40 +1584,63 @@ test("tasks/cancel kills and reaps a real grandchild-deep process tree bound to 
 });
 
 // ---------------------------------------------------------------------------
-// TERMINAL SHAPES vs PROTOCOL ERROR, read through tasks/cancel: a job that
-// ran and exited non-zero reads as a normal "completed" taskResult, with
-// the real exit code carried separately from status; a job that never
-// spawned at all (a genuine spawn error) reads as a normal "failed"
-// taskResult, a materially different case from a completed job whose
-// command happened to fail. Neither of those is ever a JSON-RPC protocol
-// error - only a genuinely malformed request (an empty taskId) is.
+// TERMINAL SHAPES vs PROTOCOL ERROR: tasks/cancel on an already-terminal
+// job never errors and never varies its ack by the job's own outcome - the
+// released contract's cancelTask (src/tasksAdapter.ts) always returns the
+// same fixed, empty acknowledgement (see the CANCEL ACK section above),
+// whether the job exited non-zero or never spawned at all. What DOES still
+// vary by outcome is the job's own real terminal shape, which this test
+// reads through a SEPARATE tasks/get call made after the cancel (never
+// through cancel's own return value, which the released contract emptied
+// out). A job that ran and exited non-zero reads as a normal "completed"
+// taskResult, with the real exit code carried separately from status; a
+// job that never spawned at all (a genuine spawn error) reads as a normal
+// "failed" taskResult, a materially different case from a completed job
+// whose command happened to fail. Neither of those is ever a JSON-RPC
+// protocol error - only a genuinely malformed request (an empty taskId) is.
 // ---------------------------------------------------------------------------
 
-test("through tasks/cancel: a job that ran and exited non-zero reads as a normal completed taskResult (exit code carried separately from status), a job that never spawned at all reads as a normal failed taskResult, neither is ever a JSON-RPC protocol error, and only a genuinely malformed request (an empty taskId) is", async () => {
+test("through tasks/cancel: the ack never varies by outcome, and a subsequent tasks/get shows a job that ran and exited non-zero as a normal completed taskResult (exit code carried separately from status), a job that never spawned at all as a normal failed taskResult, neither is ever a JSON-RPC protocol error, and only a genuinely malformed request (an empty taskId) is", async () => {
   const pair = await startPair(true);
   try {
     // Case 1: a job that RAN and exited non-zero. mapJobStateToTaskStatus
     // (src/tasksAdapter.ts) folds an "exited" job state to task status
     // "completed" REGARDLESS of its real exit code - the exit code travels
-    // separately in the result, never folded into the status itself. Read
-    // through tasks/cancel (not tasks/get): cancelTask's own before/after
-    // read of an already-terminal job behaves exactly like a fresh getTask
-    // read, so this proves the SAME normal-result shape when reached via
-    // cancel specifically, which is what the criterion requires.
-    const exitedJob = await runJob(pair.client, {
+    // separately in the result, never folded into the status itself.
+    const exitedJob = await mintJob(pair.client, {
       command: [process.execPath, "-e", "process.exitCode = 3;"],
       label: "cancel-completed-mapping",
     });
     const exitedJobId = exitedJob.taskId as string;
     await pollUntilTerminal(pair.client, exitedJobId);
-    const exitedResult = await tasksCancel(pair.client, exitedJobId);
+
+    // tasks/cancel on this already-terminal job still succeeds (kills
+    // nothing - see cancelTask's own docs on ignoring killTool's isError
+    // outcomes) and returns the SAME fixed, empty ack as every other
+    // cancel call, never a snapshot of the job it was just asked to kill.
+    const exitedAck = await tasksCancel(pair.client, exitedJobId);
+    assert.deepEqual(
+      exitedAck,
+      {},
+      `expected tasks/cancel's client-decoded ack to be genuinely empty regardless of the job's own outcome, got ${JSON.stringify(exitedAck)}`
+    );
+    assert.deepEqual(
+      pair.wireTap.latestResultFor("tasks/cancel"),
+      { resultType: "complete" },
+      "expected the real wire ack for an already-completed job's cancel to still be exactly the fixed emittedAckResult shape"
+    );
+
+    // The job's real terminal shape is read through a fresh, separate
+    // tasks/get call - never inferred from the cancel ack above, which the
+    // released contract emptied out.
+    const exitedResult = await tasksGet(pair.client, exitedJobId);
     assert.equal(
       exitedResult.status,
       "completed",
-      `expected a job that exited non-zero to read as task status 'completed' through tasks/cancel, got ${JSON.stringify(exitedResult)}`
+      `expected a job that exited non-zero to read as task status 'completed' through a post-cancel tasks/get, got ${JSON.stringify(exitedResult)}`
     );
     assert.equal(
-      exitedResult.exitCode,
+      (exitedResult.result as Record<string, unknown> | undefined)?.exitCode,
       3,
       "the real non-zero exit code must be reflected separately from status, not folded into it"
     );
@@ -1524,21 +1655,37 @@ test("through tasks/cancel: a job that ran and exited non-zero reads as a normal
     // job-store "failed" state to task status "failed" - a DIFFERENT
     // status from case 1's "completed", since this task itself never ran,
     // distinct from a completed task whose command happened to exit
-    // non-zero. Read through tasks/cancel for the same reason as case 1.
-    const neverRanJob = await runJob(pair.client, {
+    // non-zero.
+    const neverRanJob = await mintJob(pair.client, {
       command: ["this-command-definitely-does-not-exist-ghantika-cancel-test"],
       label: "cancel-failed-mapping",
     });
     const neverRanJobId = neverRanJob.taskId as string;
     await pollUntilTerminal(pair.client, neverRanJobId);
-    const neverRanResult = await tasksCancel(pair.client, neverRanJobId);
+
+    // Same fixed ack again, this time for a job that never spawned at all
+    // - proving the ack's shape truly does not vary by outcome.
+    const neverRanAck = await tasksCancel(pair.client, neverRanJobId);
+    assert.deepEqual(
+      neverRanAck,
+      {},
+      `expected tasks/cancel's client-decoded ack to be genuinely empty for a never-spawned job too, got ${JSON.stringify(neverRanAck)}`
+    );
+    assert.deepEqual(
+      pair.wireTap.latestResultFor("tasks/cancel"),
+      { resultType: "complete" },
+      "expected the real wire ack for a never-spawned job's cancel to still be exactly the fixed emittedAckResult shape"
+    );
+
+    const neverRanResult = await tasksGet(pair.client, neverRanJobId);
     assert.equal(
       neverRanResult.status,
       "failed",
-      `expected a job that never spawned to read as task status 'failed' through tasks/cancel, got ${JSON.stringify(neverRanResult)}`
+      `expected a job that never spawned to read as task status 'failed' through a post-cancel tasks/get, got ${JSON.stringify(neverRanResult)}`
     );
 
-    // Neither case above ever threw - both calls resolved as normal,
+    // Neither cancel call above ever threw, and neither of the two
+    // tasks/get reads above did either - all resolved as normal,
     // successful RPC results (a JSON-RPC protocol error would have made
     // the `await` itself reject). That IS the "never a JSON-RPC error"
     // half of this criterion, asserted by the calls above having already

@@ -150,6 +150,31 @@ async function runJob(
   return runResultStructured(result);
 }
 
+/**
+ * Calls `run()` on a CAPABLE connection and returns the CLIENT-DECODED
+ * minted result directly - NOT via `runJob`/`runResultStructured` above,
+ * because a minted result on the released-contract adapter has no
+ * `structuredContent` at all (the whole `CallToolResult` object IS the
+ * flat `CreateTaskResult`, cast - see `src/tasksAdapter.ts`'s own
+ * `maybeAugmentRunResult` docs, and `test/tasks.test.ts`'s own header for
+ * the full grounding, including why `resultType` itself is unobservable
+ * through this path). Every call site in this file that runs on a
+ * `startPair(true)` connection and expects a mint uses this; call sites on
+ * a `startPair(false)` connection (the byte-identical-golden tests) keep
+ * using the plain `runJob` above, since those never mint at all.
+ */
+async function mintJob(
+  client: Client,
+  overrides: Record<string, unknown> = {}
+): Promise<Record<string, unknown>> {
+  const result = await client.callTool({
+    name: "run",
+    arguments: { command: ["true"], ...overrides },
+  });
+  assert.notEqual((result as { isError?: boolean }).isError, true);
+  return result as unknown as Record<string, unknown>;
+}
+
 /** An idle, real, backing command that produces NOTHING on its own - the SAME fixture pattern test/tasks-lifecycle.test.ts already establishes for a genuine process to mint a task around, kill, and reap, while a test drives observable stdout/stderr independently. */
 const IDLE_COMMAND = [process.execPath, "-e", "setTimeout(() => {}, 600000);"];
 
@@ -304,7 +329,10 @@ test("run()'s CreateTaskResult response is observed before any wake (a genuine r
     });
     const runResponseOrder = recordOrder("run-response");
     assert.notEqual((runResult as { isError?: boolean }).isError, true);
-    const minted = runResultStructured(runResult);
+    // A minted result carries no structuredContent at all - see mintJob's
+    // own docs - so this reads the top-level taskId directly off the raw
+    // CallToolResult (which IS the flat CreateTaskResult, cast).
+    const minted = runResult as unknown as Record<string, unknown>;
     orderJobId = minted.taskId as string;
     assert.equal(typeof orderJobId, "string");
 
@@ -331,22 +359,27 @@ test("run()'s CreateTaskResult response is observed before any wake (a genuine r
     );
 
     // Poll tasks/get for real until it becomes genuinely OUTPUT-BEARING
-    // (terminal - buildTaskResult only includes `output` once terminal).
-    // The very first attempt, sent immediately with nothing interposed,
-    // must NOT yet be output-bearing - see the comment above for why that
-    // is provable rather than assumed, and why its failure would mean this
+    // (terminal - buildDetailedTaskResult only nests `output` under
+    // `result` once terminal - see src/tasksAdapter.ts's own docs; a
+    // still-working task never carries a `result` container at all, so
+    // its presence is the discriminator, replacing the pre-story
+    // top-level `output` field this check used to read directly). The
+    // very first attempt, sent immediately with nothing interposed, must
+    // NOT yet be output-bearing - see the comment above for why that is
+    // provable rather than assumed, and why its failure would mean this
     // test no longer proves anything about ordering at all.
     let firstOutputBearingOrder: number | undefined;
     for (let attempt = 0; attempt < 200; attempt += 1) {
       const taskGet = await tasksGet(pair.client, orderJobId);
+      const result = taskGet.result as Record<string, unknown> | undefined;
       if (attempt === 0) {
         assert.equal(
-          taskGet.output,
+          result?.output,
           undefined,
           "expected the job to still be genuinely incomplete on the very first tasks/get read, sent immediately after learning the id - otherwise this test no longer proves anything about ordering, it just observes an outcome that was already decided before the check ran"
         );
       }
-      if (taskGet.output !== undefined) {
+      if (result?.output !== undefined) {
         firstOutputBearingOrder = recordOrder("output-bearing");
         break;
       }
@@ -409,7 +442,7 @@ test("run()'s CreateTaskResult response is observed before any wake (a genuine r
     // PART B - non-blocking: spawn a never-self-completing keepalive FIRST,
     // then confirm a SECOND same-session run() request completes normally
     // while that first task is observably still in a non-terminal status.
-    const mintedKeepalive = await runJob(pair.client, {
+    const mintedKeepalive = await mintJob(pair.client, {
       command: IDLE_COMMAND,
       label: "keepalive-first",
     });
@@ -422,7 +455,7 @@ test("run()'s CreateTaskResult response is observed before any wake (a genuine r
     // past the bound instead of merely being slow.
     const startSecond = Date.now();
     const mintedSecond = (await Promise.race([
-      runJob(pair.client, { command: IDLE_COMMAND, label: "second-request" }),
+      mintJob(pair.client, { command: IDLE_COMMAND, label: "second-request" }),
       new Promise((_resolve, reject) =>
         setTimeout(
           () =>
@@ -461,12 +494,12 @@ test("two run() calls spawn CONCURRENTLY - both real backing processes are obser
   let jobAId: string | undefined;
   let jobBId: string | undefined;
   try {
-    const mintedA = await runJob(pair.client, {
+    const mintedA = await mintJob(pair.client, {
       command: IDLE_COMMAND,
       label: "concurrent-a",
     });
     jobAId = mintedA.taskId as string;
-    const mintedB = await runJob(pair.client, {
+    const mintedB = await mintJob(pair.client, {
       command: IDLE_COMMAND,
       label: "concurrent-b",
     });
@@ -513,7 +546,7 @@ test("a burst of stdout within one WAKE_COALESCE_WINDOW_MS window collapses into
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, { command: IDLE_COMMAND, label: "burst-window" });
+    const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "burst-window" });
     jobId = minted.taskId as string;
     const received = registerWakeSpy(pair.client);
 
@@ -561,7 +594,7 @@ test("a line arriving after WAKE_COALESCE_WINDOW_MS has closed opens a NEW, sepa
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, {
+    const minted = await mintJob(pair.client, {
       command: IDLE_COMMAND,
       label: "post-window",
     });
@@ -602,7 +635,7 @@ test("a sustained stream above FIREHOSE_LINES_PER_SEC for FIREHOSE_SUSTAINED_MS 
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, {
+    const minted = await mintJob(pair.client, {
       command: IDLE_COMMAND,
       label: "firehose-trigger",
     });
@@ -636,12 +669,21 @@ test("a sustained stream above FIREHOSE_LINES_PER_SEC for FIREHOSE_SUSTAINED_MS 
         "working",
         "the job must still be working - only the watch stopped"
       );
-      const watchStopped = taskGet.watchStopped as { reason?: string } | undefined;
+      // A still-WORKING task carries the watch-stop fact rendered as TEXT
+      // into statusMessage, per the released contract - see
+      // src/tasksAdapter.ts's own renderWatchStoppedStatusMessage docs and
+      // buildDetailedTaskResult (a working task has no result/error
+      // container to carry a structured watchStopped field the way a
+      // terminal task does).
+      const statusMessage = taskGet.statusMessage as string | undefined;
       assert.ok(
-        watchStopped,
-        `expected watchStopped to be present, got ${JSON.stringify(taskGet)}`
+        statusMessage,
+        `expected statusMessage to be present, got ${JSON.stringify(taskGet)}`
       );
-      assert.equal(watchStopped!.reason, WATCH_STOP_REASON_FIREHOSE);
+      assert.ok(
+        statusMessage!.includes(WATCH_STOP_REASON_FIREHOSE),
+        `expected statusMessage to name the firehose reason, got ${JSON.stringify(statusMessage)}`
+      );
 
       const wakeCountAtStop = received.length;
       jobStore.appendOutput(jobId, "stdout", line("after-firehose-stop"));
@@ -673,7 +715,7 @@ test("green control: a bounded stream UNDER FIREHOSE_LINES_PER_SEC runs to its o
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, {
+    const minted = await mintJob(pair.client, {
       command: SHORT_LIVED_COMMAND,
       label: "firehose-green-control",
     });
@@ -704,9 +746,9 @@ test("green control: a bounded stream UNDER FIREHOSE_LINES_PER_SEC runs to its o
     const taskGet = await tasksGet(pair.client, jobId);
     assert.equal(taskGet.status, "working");
     assert.equal(
-      taskGet.watchStopped,
+      taskGet.statusMessage,
       undefined,
-      "a bounded, under-threshold stream must NEVER trigger the firehose auto-stop"
+      "a bounded, under-threshold stream must NEVER trigger the firehose auto-stop (no statusMessage rendered)"
     );
     assert.ok(received.length > 0, "the watch must still have delivered normal wakes throughout");
 
@@ -720,7 +762,11 @@ test("green control: a bounded stream UNDER FIREHOSE_LINES_PER_SEC runs to its o
       "completed",
       `expected the job to reach its own natural terminal, got ${JSON.stringify(finalGet)}`
     );
-    assert.equal(finalGet.watchStopped, undefined);
+    // Once terminal, the SAME fact would render structurally under
+    // result.watchStopped instead - see this file's own firehose test
+    // above - so absence here is checked on that container's own field.
+    const finalResult = finalGet.result as Record<string, unknown> | undefined;
+    assert.equal(finalResult?.watchStopped, undefined);
   } finally {
     if (jobId !== undefined && jobStore.getChildHandle(jobId) !== undefined) {
       await killAndReapRealChild(jobId);
@@ -1037,7 +1083,7 @@ test("run/status/output/tail/kill stay byte-identical (canonical projection) to 
   const plainPair = await startPair(false);
   let capableJobId: string | undefined;
   try {
-    const mintedCapable = await runJob(capablePair.client, {
+    const mintedCapable = await mintJob(capablePair.client, {
       command: IDLE_COMMAND,
       label: "adapter-present-capable-keepalive",
     });
@@ -1071,21 +1117,29 @@ test("a terminal task's tasks/get response has an EXACT key set (no missing fiel
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, {
+    const minted = await mintJob(pair.client, {
       command: ["true"],
       label: "frozen-terminal-shape",
     });
     jobId = minted.taskId as string;
     const taskGet = await pollTaskUntilTerminal(pair.client, jobId);
 
+    // The released contract's real terminal shape (client-decoded, so
+    // `resultType` is stripped by the SDK before this test ever sees it -
+    // see test/tasks.test.ts's own header for the full grounding). No more
+    // top-level `extension`/`exitCode`/`output` (the pre-story shape this
+    // test used to check) - `extension` is gone from the vocabulary
+    // entirely, and `exitCode`/`output` now nest under `result` (or
+    // `error`), per the vendored schema's own completedTask/failedTask
+    // $defs.
     const expectedKeys = [
       "createdAt",
-      "exitCode",
-      "extension",
-      "output",
+      "lastUpdatedAt",
       "pollIntervalMs",
+      "result",
       "status",
       "taskId",
+      "ttlMs",
     ];
     assert.deepEqual(
       Object.keys(taskGet).sort(),
@@ -1093,9 +1147,7 @@ test("a terminal task's tasks/get response has an EXACT key set (no missing fiel
       `expected the EXACT terminal key set ${JSON.stringify(expectedKeys)}, got ${JSON.stringify(Object.keys(taskGet).sort())}`
     );
 
-    assert.equal(taskGet.extension, TASKS_EXTENSION_URI);
     assert.equal(taskGet.taskId, jobId);
-    assert.equal(taskGet.exitCode, 0);
     assert.ok(
       ["completed", "failed", "cancelled"].includes(taskGet.status as string),
       `expected a genuinely terminal status, got ${JSON.stringify(taskGet.status)}`
@@ -1105,8 +1157,19 @@ test("a terminal task's tasks/get response has an EXACT key set (no missing fiel
       "working",
       "a terminal task must never report the non-terminal 'working' status"
     );
+    // ttlMs is now a real, exposed, non-null number once terminal - the
+    // purge clock genuinely running from this job's own ended_at.
+    assert.equal(typeof taskGet.ttlMs, "number");
+    assert.ok((taskGet.ttlMs as number) > 0);
 
-    const output = taskGet.output as Record<string, unknown>;
+    const result = taskGet.result as Record<string, unknown>;
+    assert.equal(result.exitCode, 0);
+    assert.deepEqual(
+      Object.keys(result).sort(),
+      ["exitCode", "output"],
+      `expected the frozen result key set (no watchStopped - no firehose here), got ${JSON.stringify(Object.keys(result).sort())}`
+    );
+    const output = result.output as Record<string, unknown>;
     assert.deepEqual(
       Object.keys(output).sort(),
       ["stderr_bytes", "stderr_lines", "stdout_bytes", "stdout_lines"],
@@ -1131,7 +1194,7 @@ test("a task handle resolves PURELY from the passed argument - a totally separat
   const pairB = await startPair(false);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pairA.client, {
+    const minted = await mintJob(pairA.client, {
       command: ["true"],
       label: "stateless-handle",
     });
@@ -1144,18 +1207,22 @@ test("a task handle resolves PURELY from the passed argument - a totally separat
       "completed",
       `expected pairB to resolve the SAME task purely via the taskId argument, got ${JSON.stringify(viaB)}`
     );
-    assert.equal(viaB.exitCode, 0);
+    assert.equal((viaB.result as Record<string, unknown> | undefined)?.exitCode, 0);
 
     // Negative control: a wrong/unknown taskId on that same separate
     // connection must genuinely fail closed, never fall back to some
-    // hidden per-connection "last minted task" shortcut.
+    // hidden per-connection "last minted task" shortcut. The released
+    // contract THROWS (-32602) rather than returning a tagged success
+    // value - see src/tasksAdapter.ts's own taskNotFoundError docs.
     const wrongId = "00000000-0000-4000-8000-000000000000";
     assert.notEqual(wrongId, jobId);
-    const viaBWrong = await tasksGet(pairB.client, wrongId);
-    assert.equal(
-      viaBWrong.error,
-      "task_not_found",
-      `expected a genuinely wrong taskId to fail closed, got ${JSON.stringify(viaBWrong)}`
+    await assert.rejects(
+      () => tasksGet(pairB.client, wrongId),
+      (error: unknown) => {
+        const message = String((error as { message?: unknown })?.message ?? error);
+        return /-32602|not found|task_not_found/i.test(message);
+      },
+      "expected a genuinely wrong taskId to fail closed via a thrown task_not_found error"
     );
   } finally {
     if (jobId !== undefined) await killAndReapRealChild(jobId);
@@ -1185,7 +1252,16 @@ async function completeCapableHandshake(
 
 interface RunResponseBody {
   readonly error?: unknown;
-  readonly result?: { isError?: boolean; structuredContent?: Record<string, unknown> };
+  readonly result?: {
+    isError?: boolean;
+    structuredContent?: Record<string, unknown>;
+    // A minted result carries no structuredContent at all on the released
+    // contract - taskId is a TOP-LEVEL field of the flat CreateTaskResult
+    // (this raw stdio harness reads bytes directly, with no SDK Client
+    // decode involved - see test/tasks.test.ts's own header for the full
+    // grounding).
+    taskId?: unknown;
+  };
 }
 
 interface TasksGetResponseBody {
@@ -1224,7 +1300,7 @@ test(
       true,
       `run() must succeed: ${JSON.stringify(liveRunBody)}`
     );
-    const liveTaskId = liveRunBody.result?.structuredContent?.taskId as string;
+    const liveTaskId = liveRunBody.result?.taskId as string;
     assert.equal(typeof liveTaskId, "string");
 
     const pgidText = await waitForFile(marker, { until: parsesAsPgid });
@@ -1265,7 +1341,7 @@ test(
     });
     const terminalRunLine = await server.nextLine();
     const terminalRunBody = terminalRunLine.parsed as RunResponseBody;
-    const terminalTaskId = terminalRunBody.result?.structuredContent?.taskId as string;
+    const terminalTaskId = terminalRunBody.result?.taskId as string;
     assert.equal(typeof terminalTaskId, "string");
 
     let terminalRecordBeforeShutdown: Record<string, unknown> | undefined;
@@ -1416,7 +1492,7 @@ test("WAKE PROOF (SIMULATED/mock client only - never a real installed host): a d
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
-    const minted = await runJob(pair.client, {
+    const minted = await mintJob(pair.client, {
       command: IDLE_COMMAND,
       label: "wake-proof-simulated",
     });
@@ -1462,7 +1538,7 @@ test("STDERR WAKE PROOF (real spawned process, zero stdout): a command that writ
   let jobId: string | undefined;
   try {
     const received = registerWakeSpy(pair.client);
-    const minted = await runJob(pair.client, {
+    const minted = await mintJob(pair.client, {
       command: [process.execPath, "-e", "process.stderr.write('real-stderr-only-line\\n');"],
       label: "stderr-wake-proof",
     });

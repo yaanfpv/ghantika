@@ -414,12 +414,21 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
   });
 
   // The three registered task methods - see tasksAdapter.ts's header for
-  // why tasks/get and tasks/update share getTask's one read-only snapshot
-  // as their complete behavior, why tasks/cancel is the one place that
-  // adapter has a real side effect (it delegates to tools/kill.ts's own
-  // process-group kill/reap containment via tasksAdapter.cancelTask), and
-  // why no tasks/list or tasks/result method is registered at all (the
-  // legacy result/list surface is deliberately not implemented).
+  // why tasks/get is the one pure-read snapshot, why tasks/update is a
+  // pure existence/TTL check plus a fixed ack (its own params schema
+  // additionally accepts, but never reads, inputResponses - the released
+  // spec's own request shape, see taskUpdateParamsSchema's docs), why
+  // tasks/cancel is the one place that adapter has a real side effect (it
+  // delegates to tools/kill.ts's own process-group kill/reap containment
+  // via tasksAdapter.cancelTask) while ALSO returning the same fixed ack
+  // tasks/update does, and why no tasks/list or tasks/result method is
+  // registered at all (the legacy result/list surface is deliberately not
+  // implemented). A thrown tasksAdapter.getTask (task_not_found, -32602)
+  // propagates unchanged out of tasks/get, and out of tasks/update and
+  // tasks/cancel too (both call it internally to validate the taskId
+  // before doing anything else) - the SDK's own request dispatch turns
+  // that thrown ProtocolError into a real JSON-RPC error response, the
+  // same mechanism the tools/call gate above already relies on.
   server.setRequestHandler(
     "tasks/get",
     { params: tasksAdapter.taskIdParamsSchema() },
@@ -427,8 +436,8 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
   );
   server.setRequestHandler(
     "tasks/update",
-    { params: tasksAdapter.taskIdParamsSchema() },
-    async (params) => tasksAdapter.getTask(params.taskId)
+    { params: tasksAdapter.taskUpdateParamsSchema() },
+    async (params) => tasksAdapter.updateTask(params.taskId)
   );
   server.setRequestHandler(
     "tasks/cancel",

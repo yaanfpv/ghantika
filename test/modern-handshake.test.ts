@@ -205,7 +205,7 @@ test("modern handshake: tools/call immediately after a successful server/discove
 // the identical connection does not.
 // ---------------------------------------------------------------------------
 
-test("modern handshake: a tools/call whose OWN request envelope declares io.modelcontextprotocol/tasks mints a real Task result whose extension descriptor matches this connection's own server/discover advertisement", async () => {
+test("modern handshake: a tools/call whose OWN request envelope declares io.modelcontextprotocol/tasks mints a real Task result whose taskId is a real, present string, on the RAW wire shape - no structuredContent at all, resultType:'task' genuinely present (this raw stdio harness reads bytes directly, with no @modelcontextprotocol/client decode/strip involved, unlike test/tasks.test.ts's own InMemoryTransport-based proof, which has to build its own wire tap precisely because the SDK Client strips resultType before a caller ever sees it)", async () => {
   const server = tracked();
   server.send(discoverRequest(1));
   const discoverLine = await server.nextLine();
@@ -224,7 +224,17 @@ test("modern handshake: a tools/call whose OWN request envelope declares io.mode
   const line = await server.nextLine();
   const body = line.parsed as {
     error?: unknown;
-    result?: { isError?: boolean; structuredContent?: Record<string, unknown> };
+    result?: {
+      isError?: boolean;
+      structuredContent?: Record<string, unknown>;
+      taskId?: unknown;
+      status?: unknown;
+      createdAt?: unknown;
+      lastUpdatedAt?: unknown;
+      ttlMs?: unknown;
+      resultType?: unknown;
+      content?: unknown;
+    };
   };
   assert.equal(
     body.error,
@@ -232,23 +242,36 @@ test("modern handshake: a tools/call whose OWN request envelope declares io.mode
     `a modern tools/call declaring Tasks support must succeed, got: ${JSON.stringify(body)}`
   );
   assert.notEqual(body.result?.isError, true);
-  const structured = body.result?.structuredContent;
+  // The released contract's own flat CreateTaskResult shape (Result & Task,
+  // per SEP-2663) REPLACES the CallToolResult entirely rather than nesting
+  // under structuredContent - see src/tasksAdapter.ts's own
+  // maybeAugmentRunResult docs for the full grounding.
   assert.equal(
-    structured?.extension,
-    TASKS_EXTENSION_URI,
-    `expected a minted Task result carrying "extension": "${TASKS_EXTENSION_URI}", got: ${JSON.stringify(structured)}`
+    body.result?.structuredContent,
+    undefined,
+    `a minted result must never carry structuredContent, got: ${JSON.stringify(body.result)}`
   );
-  assert.equal(typeof structured?.taskId, "string", "a minted Task result must carry a taskId");
-  assert.equal(typeof structured?.status, "string", "a minted Task result must carry a status");
-  // Identity against what THIS connection's own server/discover actually
-  // returned above, not mere truthiness - the descriptor this mint is
-  // negotiated under must be the identical descriptor server/discover
-  // advertised for this connection. Both sides trace back to this adapter's
-  // own TASKS_CAPABILITY_DESCRIPTOR constant (src/tasksAdapter.ts), so this
-  // proves internal self-consistency between the discover and mint paths on
-  // one connection - it does not independently verify conformance to
-  // io.modelcontextprotocol/tasks's actual released shape, which
-  // src/tasksAdapter.ts's own header discloses as not yet reconciled.
+  assert.equal(typeof body.result?.taskId, "string", "a minted Task result must carry a taskId");
+  assert.equal(typeof body.result?.status, "string", "a minted Task result must carry a status");
+  assert.equal(typeof body.result?.createdAt, "string");
+  assert.equal(typeof body.result?.lastUpdatedAt, "string");
+  assert.equal(
+    body.result?.resultType,
+    "task",
+    `expected the wire-level resultType discriminator to be "task" (genuinely observable on this raw-bytes harness), got: ${JSON.stringify(body.result)}`
+  );
+  // The ONE disclosed SDK wire artifact this installed
+  // @modelcontextprotocol/server@2.0.0 version injects onto any
+  // content-less tools/call result (see src/tasksAdapter.ts's own docs) -
+  // bounded exactly, never silently tolerated as "content might be there."
+  assert.deepEqual(
+    body.result?.content,
+    [],
+    `expected the disclosed content:[] SDK artifact and nothing else beyond it, got: ${JSON.stringify(body.result?.content)}`
+  );
+  // Capability negotiation is still confirmed self-consistent: the same
+  // TASKS_CAPABILITY_DESCRIPTOR constant this adapter advertised at
+  // server/discover is what governs this connection's own mint decision.
   assert.deepStrictEqual(
     discoverBody.result?.capabilities?.extensions?.[TASKS_EXTENSION_URI],
     TASKS_CAPABILITY_DESCRIPTOR,
@@ -278,12 +301,20 @@ test("modern handshake: on the SAME connection, a tools/call whose OWN request e
   });
   const capableLine = await server.nextLine();
   const capableBody = capableLine.parsed as {
-    result?: { structuredContent?: Record<string, unknown> };
+    result?: { taskId?: unknown; resultType?: unknown; structuredContent?: unknown };
   };
+  // A mint carries no structuredContent at all on the released contract -
+  // see this file's own "mints a real Task result" test above for the full
+  // grounding - so the setup proof reads the TOP-LEVEL taskId/resultType.
   assert.equal(
-    capableBody.result?.structuredContent?.extension,
-    TASKS_EXTENSION_URI,
-    "setup: the first request must genuinely mint, or this test proves nothing about the second"
+    typeof capableBody.result?.taskId,
+    "string",
+    "setup: the first request must genuinely mint a real taskId, or this test proves nothing about the second"
+  );
+  assert.equal(
+    capableBody.result?.resultType,
+    "task",
+    "setup: the first request's raw wire result must carry resultType:'task'"
   );
 
   // Second request, same connection, no capability declared at all
@@ -301,9 +332,21 @@ test("modern handshake: on the SAME connection, a tools/call whose OWN request e
   };
   assert.equal(incapableBody.error, undefined);
   assert.notEqual(incapableBody.result?.isError, true);
+  // A NON-minted response still nests under structuredContent (unchanged -
+  // only a genuine mint replaces the CallToolResult shape entirely). Every
+  // tools/call result, minted or not, carries SOME resultType on the raw
+  // wire (the SDK's own encode contract stamps "complete" when a handler
+  // supplies none - see src/tasksAdapter.ts's own maybeAugmentRunResult
+  // docs) - so the discriminating fact is that it is never "task", not
+  // that the field is absent.
+  assert.notEqual(
+    (incapableBody.result as { resultType?: unknown } | undefined)?.resultType,
+    "task",
+    "a plain (non-minted) result must never carry the wire-level resultType:'task' discriminator"
+  );
   const structured = incapableBody.result?.structuredContent;
   assert.equal(
-    structured?.extension,
+    structured?.taskId,
     undefined,
     `a request declaring no capabilities must never mint, even on a connection where an EARLIER request just did, got: ${JSON.stringify(structured)}`
   );
@@ -355,7 +398,7 @@ test("modern handshake: a tools/call whose own request envelope declares ONLY th
   assert.notEqual(body.result?.isError, true);
   const structured = body.result?.structuredContent;
   assert.equal(
-    structured?.extension,
+    structured?.taskId,
     undefined,
     `a capabilities.tasks-only declaration must never mint a Task result on the modern era either, got: ${JSON.stringify(structured)}`
   );
@@ -408,7 +451,7 @@ test("modern handshake: a tools/call whose own request envelope declares Tasks s
   assert.notEqual(body.result?.isError, true);
   const structured = body.result?.structuredContent;
   assert.equal(
-    structured?.extension,
+    structured?.taskId,
     undefined,
     `an experimental-bag-only declaration must never mint a Task result on the real modern wire, got: ${JSON.stringify(structured)}`
   );
@@ -453,13 +496,15 @@ test("modern handshake: six-tool mint rule on the real wire - run() mints while 
   });
   const runLine = await server.nextLine();
   const runBody = runLine.parsed as {
-    result?: { structuredContent?: Record<string, unknown> };
+    result?: { taskId?: unknown; resultType?: unknown; structuredContent?: unknown };
   };
-  const runStructured = runBody.result?.structuredContent;
+  // A mint carries no structuredContent at all on the released contract -
+  // see this file's own "mints a real Task result" test for the full
+  // grounding - so the setup proof reads the TOP-LEVEL taskId/resultType.
   assert.equal(
-    runStructured?.extension,
-    TASKS_EXTENSION_URI,
-    `setup: run() must genuinely mint on this connection, or the rest of this test proves nothing - got: ${JSON.stringify(runStructured)}`
+    runBody.result?.resultType,
+    "task",
+    `setup: run() must genuinely mint on this connection, or the rest of this test proves nothing - got: ${JSON.stringify(runBody.result)}`
   );
   // The minted TaskResult carries the handle under `taskId`, never a
   // separate `job_id` field - see this file's own server/discover test,
@@ -468,7 +513,7 @@ test("modern handshake: six-tool mint rule on the real wire - run() mints while 
   // src/tasksAdapter.ts's "taskId == job_id, one handle namespace" doc:
   // `taskId` IS the jobStore job_id, exposed under the Task-shape's own
   // field name.
-  const jobId = runStructured?.taskId;
+  const jobId = runBody.result?.taskId;
   assert.equal(typeof jobId, "string", "setup: run() must return a real taskId to target below");
 
   const otherToolCalls: ReadonlyArray<{ name: string; arguments: Record<string, unknown> }> = [
@@ -499,7 +544,11 @@ test("modern handshake: six-tool mint rule on the real wire - run() mints while 
     const body = line.parsed as {
       id: number;
       error?: unknown;
-      result?: { isError?: boolean; structuredContent?: Record<string, unknown> };
+      result?: {
+        isError?: boolean;
+        resultType?: unknown;
+        structuredContent?: Record<string, unknown>;
+      };
     };
     assert.equal(body.id, id, `response id must match the request for "${call.name}"`);
     assert.equal(
@@ -512,12 +561,12 @@ test("modern handshake: six-tool mint rule on the real wire - run() mints while 
       true,
       `"${call.name}" must not report a tool-level error`
     );
-    const structured = body.result?.structuredContent;
-    assert.equal(
-      structured?.extension,
-      undefined,
-      `"${call.name}" must NEVER mint a Task result on the modern era, even with capability declared on its own request, got: ${JSON.stringify(structured)}`
+    assert.notEqual(
+      body.result?.resultType,
+      "task",
+      `"${call.name}" must NEVER carry the wire-level resultType:'task' discriminator, even with capability declared on its own request, got: ${JSON.stringify(body.result)}`
     );
+    const structured = body.result?.structuredContent;
     assert.equal(
       structured?.taskId,
       undefined,

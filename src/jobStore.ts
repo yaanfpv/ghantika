@@ -158,6 +158,30 @@ export interface JobRecord {
   readonly env: Readonly<Record<string, string>>;
   state: JobState;
   readonly started_at: string;
+  /**
+   * The last time this record genuinely changed in a way an outside reader
+   * could observe - never merely a mirror of `started_at`. Starts equal to
+   * `started_at` at creation (see `createJob`/`createFailedJob`), then
+   * advances on every real state change this store already tracks: a
+   * materialized output line on either stream (see `appendOutput`/
+   * `finalizeStream`'s shared `touchLastUpdatedAt` call, run regardless of
+   * whether any `onOutputArrival` listener is actually subscribed - a task
+   * poller with no active watch must still see an accurate value), and
+   * every terminal transition (`markSpawnFailed`/`markDeadlineExceeded`/
+   * `markExited`/`markKilled`, stamped with the SAME timestamp as
+   * `ended_at` there, never a separately-captured `Date.now()`). Added for
+   * `src/tasksAdapter.ts`'s `lastUpdatedAt` field, which the released
+   * `io.modelcontextprotocol/tasks` contract requires on every task-shaped
+   * response - but this field is deliberately generic, jobStore-owned state
+   * like every other field here, not something the adapter computes or
+   * caches itself (this store is the sole owner of job/output state - see
+   * this file's own header). A job that completes with zero output still
+   * genuinely changes state at its terminal transition, so this is never
+   * left frozen at creation time for such a job - the terminal-transition
+   * write is what keeps that true even when no output-arrival write ever
+   * ran.
+   */
+  last_updated_at: string;
   ended_at?: string;
   exit_code?: number;
   signal?: string;
@@ -1773,6 +1797,10 @@ export class JobStore {
       env: input.env,
       state: "starting",
       started_at: now,
+      // Starts equal to started_at - a fresh record's own creation IS its
+      // most recent real change so far. See JobRecord.last_updated_at's
+      // own docs for every later writer.
+      last_updated_at: now,
       label: input.label,
       seq: this.nextSeq(),
       is_shell: input.isShell,
@@ -1817,6 +1845,10 @@ export class JobStore {
       env: input.env,
       state: "failed",
       started_at: now,
+      // Starts equal to started_at/ended_at - a failed-to-spawn job's
+      // creation and its (immediate) terminal transition are the same
+      // instant. See JobRecord.last_updated_at's own docs.
+      last_updated_at: now,
       ended_at: now,
       diagnostic: {
         reason: input.diagnosticReason ?? "spawn-error",
@@ -2702,7 +2734,11 @@ export class JobStore {
     if (!record || isTerminalJobState(record.state)) return;
     record.state = "failed";
     record.diagnostic = { reason: "spawn-error", message };
-    record.ended_at = new Date().toISOString();
+    const now = new Date().toISOString();
+    record.ended_at = now;
+    // Same instant as ended_at - a terminal transition IS a real,
+    // observable state change. See JobRecord.last_updated_at's own docs.
+    record.last_updated_at = now;
     this.clearDeadlineTimer(jobId);
     this.fireJobTerminal(jobId);
   }
@@ -2735,7 +2771,10 @@ export class JobStore {
     if (!record || isTerminalJobState(record.state)) return;
     record.state = "failed";
     record.diagnostic = { reason: "watcher/runtime-error", message };
-    record.ended_at = new Date().toISOString();
+    const now = new Date().toISOString();
+    record.ended_at = now;
+    // Same instant as ended_at - see JobRecord.last_updated_at's own docs.
+    record.last_updated_at = now;
     this.clearDeadlineTimer(jobId);
     this.fireJobTerminal(jobId);
   }
@@ -2787,7 +2826,10 @@ export class JobStore {
       record.state = "exited";
       record.exit_code = exitCode ?? undefined;
     }
-    record.ended_at = new Date().toISOString();
+    const now = new Date().toISOString();
+    record.ended_at = now;
+    // Same instant as ended_at - see JobRecord.last_updated_at's own docs.
+    record.last_updated_at = now;
     this.clearDeadlineTimer(jobId);
     this.fireJobTerminal(jobId);
   }
@@ -2811,7 +2853,10 @@ export class JobStore {
     if (!record || isTerminalJobState(record.state)) return;
     record.state = "killed";
     record.signal = signal;
-    record.ended_at = new Date().toISOString();
+    const now = new Date().toISOString();
+    record.ended_at = now;
+    // Same instant as ended_at - see JobRecord.last_updated_at's own docs.
+    record.last_updated_at = now;
     this.clearDeadlineTimer(jobId);
     this.fireJobTerminal(jobId);
   }
@@ -3192,7 +3237,7 @@ export class JobStore {
       buf.droppedCount += 1;
       return;
     }
-    appendChunkToBuffer(buffers[stream], chunk, this.arrivalNotifier(jobId, stream));
+    appendChunkToBuffer(buffers[stream], chunk, this.lineMaterializedNotifier(jobId, stream));
   }
 
   /**
@@ -3213,10 +3258,10 @@ export class JobStore {
     if (this.retentionEvicted.has(jobId)) return;
     const buffers = this.buffers.get(jobId);
     if (!buffers) return;
-    finalizeStreamBuffer(buffers[stream], this.arrivalNotifier(jobId, stream));
+    finalizeStreamBuffer(buffers[stream], this.lineMaterializedNotifier(jobId, stream));
   }
 
-  /** Built fresh per call rather than cached - cheap (a closure over two primitives plus one live Map read), and it always reflects whoever is subscribed AT THE MOMENT a line actually materializes, never a stale membership snapshot taken earlier. `undefined` when nobody is subscribed, so `appendChunkToBuffer`/`finalizeStreamBuffer` skip the per-line callback entirely for the (overwhelmingly common) case of no subscriber. */
+  /** Built fresh per call rather than cached - cheap (a closure over two primitives plus one live Map read), and it always reflects whoever is subscribed AT THE MOMENT a line actually materializes, never a stale membership snapshot taken earlier. `undefined` when nobody is subscribed, so `appendChunkToBuffer`/`finalizeStreamBuffer` skip the per-line `onOutputArrival` FORWARDING entirely for the (overwhelmingly common) case of no subscriber - but see `lineMaterializedNotifier` below, which is what `appendOutput`/`finalizeStream` actually pass in: the `last_updated_at` touch is NOT gated on this, since it must happen regardless of whether anyone is watching (a `tasks/get` on a job nobody ever subscribed a watch to must still report an accurate value). */
   private arrivalNotifier(
     jobId: string,
     stream: ManagedStream
@@ -3226,6 +3271,39 @@ export class JobStore {
     return (line: StreamLineEntry) => {
       for (const listener of listeners) listener({ stream, line });
     };
+  }
+
+  /**
+   * The real callback `appendOutput`/`finalizeStream` pass into
+   * `appendChunkToBuffer`/`finalizeStreamBuffer` for every materialized
+   * line - UNCONDITIONALLY (never `undefined`, unlike `arrivalNotifier`
+   * alone), because it has two jobs, only one of which is optional:
+   * touching `JobRecord.last_updated_at` (see that field's own docs) runs
+   * on EVERY materialized line regardless of whether any `onOutputArrival`
+   * consumer is subscribed - a task record's `lastUpdatedAt` must be
+   * accurate for a plain poll (`tasks/get`) even on a connection that never
+   * started a watch at all (see `src/tasksAdapter.ts`'s own docs on why
+   * `tasks/get` needs no capability check) - while forwarding to real
+   * `onOutputArrival` listeners stays exactly as optional as before, via
+   * `arrivalNotifier`'s own `undefined`-when-nobody's-subscribed shape.
+   * `arrivalNotifier` is looked up ONCE per call (not once per line), the
+   * same cost shape it always had.
+   */
+  private lineMaterializedNotifier(
+    jobId: string,
+    stream: ManagedStream
+  ): (line: StreamLineEntry) => void {
+    const forwardToListeners = this.arrivalNotifier(jobId, stream);
+    return (line: StreamLineEntry) => {
+      this.touchLastUpdatedAt(jobId);
+      forwardToListeners?.(line);
+    };
+  }
+
+  /** Stamps `JobRecord.last_updated_at` to the current instant - see that field's own docs for every real writer. A safe no-op for an unknown job id (the same "unknown ids are safely ignored" convention `appendOutput`/`finalizeStream`/`getStreamSnapshot` already use), which is reachable here only defensively (a line can only ever materialize for a job whose buffers - and therefore whose record - already exist). */
+  private touchLastUpdatedAt(jobId: string): void {
+    const record = this.jobs.get(jobId);
+    if (record) record.last_updated_at = new Date().toISOString();
   }
 
   /**

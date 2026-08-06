@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/yaanfpv/ghantika/schema/tasks-extension.schema.json",
   "title": "io.modelcontextprotocol/tasks extension (SEP-2663, released 2026-07-28) - the pin ghantika's Tasks-extension adapter is checked against",
-  "description": "Vendored, in-repo pin (never an npm dependency - no io.modelcontextprotocol/tasks package exists to depend on) of the RELEASED SEP-2663 contract itself, not our own emitted shape. Before story-0137 this file documented what src/tasksAdapter.ts happened to return; tasksAdapter.ts's own header discloses it was designed before finalization and never reconciled, so that earlier version pinned our own pre-finalization guess, not the spec. This version pins the spec's actual field names, discriminated status variants, and request/response shapes, measured directly against the spec's own generated schema.json (modelcontextprotocol/ext-tasks) rather than summarized text; scripts/check-sdk-exact-pin.mjs's schema-vs-implementation check is what now verifies our adapter conforms TO this pin, rather than this pin describing the adapter. config/tasks-schema-digest.json records this file's SHA-256 so drift between the two is caught, not silently trusted. Every variant below restates its own fields in full rather than composing a shared base via `allOf` or `$ref`-plus-siblings: test/tasks.test.ts's hand-rolled validator implements only the keyword set this schema actually needs, `allOf` deliberately not among them (extending it is test-infrastructure work this repo has been directed to stop), and that same validator resolves a `$ref` by replacing the node it appears on, so a `$ref` next to sibling properties would silently validate nothing. The duplication below is the honest cost of staying inside that validator's real behavior. Every task-shaped variant locks `additionalProperties: false` to match the real spec exactly (measured: every DetailedTask variant, and the base Task type, locks it) - a pin that stayed looser than its own contract could never red on a shape the spec itself rejects. The spec's own DetailedTask union uses `anyOf`; this schema uses `oneOf` instead, deliberately - the four status consts are mutually exclusive by construction so the two are behaviorally identical here, and `oneOf` (unlike `anyOf`) is a keyword the validator above actually implements.",
+  "description": "Vendored, in-repo pin (never an npm dependency - no io.modelcontextprotocol/tasks package exists to depend on) of the RELEASED SEP-2663 contract itself, not our own emitted shape. This file used to document what src/tasksAdapter.ts happened to return; tasksAdapter.ts's own header discloses it was designed before finalization and never reconciled, so that earlier version pinned our own pre-finalization guess, not the spec. This version pins the spec's actual field names, discriminated status variants, and request/response shapes, measured directly against the spec's own generated schema.json (modelcontextprotocol/ext-tasks) rather than summarized text; scripts/check-sdk-exact-pin.mjs's schema-vs-implementation check is what now verifies our adapter conforms TO this pin, rather than this pin describing the adapter. config/tasks-schema-digest.json records this file's SHA-256 so drift between the two is caught, not silently trusted. Every variant below restates its own fields in full rather than composing a shared base via `allOf` or `$ref`-plus-siblings: test/tasks.test.ts's hand-rolled validator implements only the keyword set this schema actually needs, `allOf` deliberately not among them (extending it is test-infrastructure work this repo has been directed to stop), and that same validator resolves a `$ref` by replacing the node it appears on, so a `$ref` next to sibling properties would silently validate nothing. The duplication below is the honest cost of staying inside that validator's real behavior. Every task-shaped variant locks `additionalProperties: false` to match the real spec exactly (measured: every DetailedTask variant, and the base Task type, locks it) - a pin that stayed looser than its own contract could never red on a shape the spec itself rejects. The spec's own DetailedTask union uses `anyOf`; this schema uses `oneOf` instead, deliberately - the four status consts are mutually exclusive by construction so the two are behaviorally identical here, and `oneOf` (unlike `anyOf`) is a keyword the validator above actually implements.",
   "$defs": {
     "extensionUri": {
       "const": "io.modelcontextprotocol/tasks"
@@ -173,7 +173,15 @@
         "result": { "$ref": "#/$defs/ghantikaResultExtras" },
         "resultType": { "$ref": "#/$defs/resultTypeComplete" }
       },
-      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "result", "resultType"],
+      "required": [
+        "taskId",
+        "status",
+        "createdAt",
+        "lastUpdatedAt",
+        "ttlMs",
+        "result",
+        "resultType"
+      ],
       "additionalProperties": false
     },
     "getTaskResultFailed": {
@@ -190,7 +198,15 @@
         "error": { "$ref": "#/$defs/ghantikaResultExtras" },
         "resultType": { "$ref": "#/$defs/resultTypeComplete" }
       },
-      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "error", "resultType"],
+      "required": [
+        "taskId",
+        "status",
+        "createdAt",
+        "lastUpdatedAt",
+        "ttlMs",
+        "error",
+        "resultType"
+      ],
       "additionalProperties": false
     },
     "getTaskResultCancelled": {
