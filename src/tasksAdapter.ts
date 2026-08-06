@@ -80,8 +80,7 @@
  * the finalized extension's own contract exactly, which designates
  * `extensions` as the sole correct bag. A client that declares Tasks
  * support only under the older, free-form `experimental` bag is not
- * recognized as capable; that affordance is a scope decision for planning,
- * not something this adapter widens on its own.
+ * recognized as capable.
  *
  * ## The six-tool mint rule and the universal poll floor
  *

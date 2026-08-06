@@ -548,13 +548,12 @@ test("a client declaring ONLY the SDK-deprecated capabilities.tasks shape (no ex
 });
 
 // ---------------------------------------------------------------------------
-// AC a1: capability negotiation matches the released 2026-07-28 extension
-// contract exactly, which designates `extensions` as the sole bag - a
-// client declaring Tasks support only under the older, free-form
-// `experimental` bag must not be recognized as capable. `extensions` and
-// `capabilities.tasks` are already proven not to leak into each other
-// above; this is the third bag `isConnectionTasksCapable` used to also
-// read before that reading was narrowed to `extensions` only.
+// Capability negotiation matches the finalized extension contract exactly,
+// which designates `extensions` as the sole bag - a client declaring Tasks
+// support only under the older, free-form `experimental` bag must not be
+// recognized as capable. `extensions` and `capabilities.tasks` are already
+// proven not to leak into each other above; `experimental` is the third bag
+// capability negotiation deliberately never reads.
 // ---------------------------------------------------------------------------
 
 test("a client declaring Tasks support ONLY under the older experimental bag (never extensions) still gets the plain poll floor, not the extension", async () => {

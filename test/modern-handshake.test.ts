@@ -364,16 +364,13 @@ test("modern handshake: a tools/call whose own request envelope declares ONLY th
 });
 
 // ---------------------------------------------------------------------------
-// AC a1: capability negotiation matches the released 2026-07-28 extension
-// contract exactly, which designates `extensions` as the sole bag - on
-// the REAL modern wire, not just the legacy InMemoryTransport/SDK Client
-// path test/tasks.test.ts exercises (a shared boolean function proves
-// nothing about a source it was never fed from - see this file's own
-// header note on the deprecated-tasks-shape test above, same reasoning).
-// This is the exact reproduction QA's local_draft_reject cited: a real
-// modern stdio request declaring Tasks support only under `experimental`
-// used to mint a Task result before isConnectionTasksCapable was narrowed
-// to read `extensions` only.
+// Capability negotiation matches the finalized extension contract exactly,
+// which designates `extensions` as the sole bag - on the REAL modern wire,
+// not just the legacy InMemoryTransport/SDK Client path test/tasks.test.ts
+// exercises (a shared boolean function proves nothing about a source it was
+// never fed from - see this file's own header note on the deprecated-tasks-
+// shape test above, same reasoning). A real modern stdio request declaring
+// Tasks support only under `experimental` never mints a Task result.
 // ---------------------------------------------------------------------------
 
 test("modern handshake: a tools/call whose own request envelope declares Tasks support ONLY under the older experimental bag (never extensions) still gets the plain poll floor, not the extension", async () => {
