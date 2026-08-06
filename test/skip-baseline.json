@@ -135,7 +135,11 @@
     "test/shutdown.test.ts::stdin EOF reaps a REAL live job's WHOLE process group - zero survivors confirmed by a real external pgrep",
     "test/wake-integration.test.ts::BOUNDED TERMINAL WAIT (real spawned process, process-group-escaped grandchild): a job's terminal state becomes observable within a normal poll bound even when a descendant has escaped this job's process group and holds a stream open indefinitely",
     "test/wake-integration.test.ts::TERMINAL ORDER (real spawned process, backgrounded grandchild): a job's terminal state never becomes observable before its last output line has arrived, even when a backgrounded grandchild inherits stdout and outlives the immediate child",
-    "test/wake-integration.test.ts::shutdown finitely reaps a genuinely-live task's real backing job within a bounded deadline on POSIX (a hang is a distinct failure from a skip) - the real process is confirmed dead via the reused pgrep oracle, and an already-terminal task alongside it is read AGAIN mid-shutdown and found byte-for-byte unchanged"
+    "test/wake-integration.test.ts::shutdown finitely reaps a genuinely-live task's real backing job within a bounded deadline on POSIX (a hang is a distinct failure from a skip) - the real process is confirmed dead via the reused pgrep oracle, and an already-terminal task alongside it is read AGAIN mid-shutdown and found byte-for-byte unchanged",
+    "test/status-process-identity.test.ts::a1/a2/a7: status() called synchronously right after run() (no await between them) observes birth_identity still pending, with a real pid already present alongside it - never the pid alone",
+    "test/status-process-identity.test.ts::a2/a7/a8: once settled, a live job's birth_identity is captured (or, rarely, honestly unavailable) - never fabricated - and a captured identity is platform-tagged matching this host",
+    "test/status-process-identity.test.ts::a3: a TERMINAL job retains the pid it HAD and reports whatever birth_identity capture state actually holds, including pending - never omits either just because the process is gone",
+    "test/status-process-identity.test.ts::a4/a6: kill()'s own response never carries pid or birth_identity, even though it shares toPublicProjection with status"
   ],
   "darwin": [
     "test/process-slow-paths.test.ts::captureBirthIdentityPosixAsync (Linux): a hung /proc observer (GHANTIKA_TEST_DEGRADE_PROC_READ=hang) still settles within this codebase's own bound and does not block the event loop while doing so",
