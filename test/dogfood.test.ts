@@ -68,6 +68,18 @@ import {
   TASKS_EXTENSION_URI,
   TASKS_STATUS_NOTIFICATION_METHOD,
 } from "../dist/tasksAdapter.js";
+// The SAME identity-gated pre-signal primitives `kill()`'s own production
+// path uses (see src/process.ts's own `evaluatePreSignalIdentityGate`
+// docs) - reused here so this file's teardown never signals a pid this
+// test didn't positively capture and identity-confirm, rather than
+// re-implementing a parallel identity check in test code. See Story 0022
+// round-six Finding 7 on why the prior owner-blind broad-pattern kill was
+// unsafe.
+import {
+  captureBirthIdentityPosix,
+  evaluatePreSignalIdentityGate,
+  type ProcessBirthIdentity,
+} from "../dist/process.js";
 
 // Explicit ".ts" extension - see test/e2e-server.test.ts's own import
 // comment for why spawnServer.ts (no relative imports of its own) is
@@ -307,34 +319,88 @@ async function pollStatusUntilTerminal(
 
 // ---------------------------------------------------------------------------
 // Teardown bookkeeping
+//
+// A scratch record tracks ONLY what this run itself positively launched
+// and identified - never a broad "anything referencing this path" set.
+// `jobId`/`pid`/`birthIdentity` start undefined and are filled in as the
+// test body actually learns them; teardown never signals a pid it has no
+// positive record of, and never trusts a bare pid number without an
+// identity gate (a pid can be reused by an unrelated process between
+// capture and teardown - see src/process.ts's own
+// `evaluatePreSignalIdentityGate` docs for why that gate exists at all).
 // ---------------------------------------------------------------------------
 
-const spawnedServers: SpawnedServer[] = [];
-const scratchDirsToReap: string[] = [];
+interface ScratchRecord {
+  readonly dir: string;
+  jobId?: string;
+  pid?: number;
+  birthIdentity?: ProcessBirthIdentity;
+}
 
-after(() => {
-  // Belt-and-braces, matching every other e2e suite in this repo
-  // (test/integration.test.ts, test/e2e-server.test.ts): never leave a
-  // spawned server process behind after this file's tests finish, even if
-  // an assertion failed before reaching this test's own kill/close path.
+const spawnedServers: SpawnedServer[] = [];
+const scratchRecords: ScratchRecord[] = [];
+
+after(async () => {
+  // 1. Best-effort, in-band reap via ghantika's own `kill` tool while the
+  //    server can still respond - this exercises the exact identity-gated
+  //    production kill path the test itself is proving, rather than
+  //    re-deriving a parallel one here.
+  for (const record of scratchRecords) {
+    if (record.jobId === undefined) continue;
+    const server = spawnedServers.find((candidate) => !candidate.child.killed);
+    if (server === undefined) continue;
+    try {
+      await callTool(server, "kill", { job_id: record.jobId, signal: "SIGKILL" });
+    } catch {
+      // Server already unresponsive/torn down, or the job was already
+      // terminal - fall through to the direct-pid fallback below.
+    }
+  }
+
+  // 2. Belt-and-braces, matching every other e2e suite in this repo
+  //    (test/integration.test.ts, test/e2e-server.test.ts): never leave a
+  //    spawned server process behind, even if an assertion failed before
+  //    reaching this test's own kill/close path.
   for (const server of spawnedServers) {
     if (!server.child.killed) server.child.kill("SIGKILL");
   }
-  // Best-effort: reap any surviving fswatch process still pointed at a
-  // scratch path this run created, THEN remove that scratch directory -
-  // in that order, so a failed assertion earlier in the test body can
-  // never leave a real process whose command line references a directory
-  // this hook is about to delete out from under it.
-  for (const dir of scratchDirsToReap) {
-    for (const pid of anyPidsReferencingPath(dir)) {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        // Already gone - nothing to do.
-      }
+
+  // 3. Direct-pid fallback, gated through the SAME pre-signal identity
+  //    check every production kill/shutdown caller uses (see
+  //    src/process.ts's own `evaluatePreSignalIdentityGate` docs): only
+  //    the pid THIS run positively captured is ever a candidate, and even
+  //    that pid is signalled only when its captured birth identity still
+  //    matches (or was never capturable at all - the same honestly-
+  //    disclosed degraded path production callers take). A pid whose
+  //    identity has since diverged (reused by an unrelated process) is
+  //    left alone rather than blindly signalled.
+  for (const record of scratchRecords) {
+    if (record.pid === undefined) continue;
+    const gate = await evaluatePreSignalIdentityGate(record.pid, record.birthIdentity);
+    if (gate.action !== "proceed") continue; // "skip": confidently gone; "refuse": identity mismatch
+    try {
+      process.kill(record.pid, "SIGKILL");
+    } catch {
+      // Already gone - nothing to do.
+    }
+  }
+
+  // 4. Report-only: the broad "anything whose command line references this
+  //    path" oracle is a DIAGNOSTIC surface here, never a kill target set
+  //    (Story 0022 round-six Finding 7 - an owner-blind pid list is not
+  //    safe destructive authority, however unlikely the random scratch
+  //    path makes an accidental collision). Anything still showing up here
+  //    after steps 1-3 is something this test never positively identified
+  //    as its own, so it is surfaced, not silently destroyed.
+  for (const record of scratchRecords) {
+    const stragglers = anyPidsReferencingPath(record.dir);
+    if (stragglers.length > 0) {
+      console.error(
+        `[dogfood teardown] ${stragglers.length} unidentified process(es) still reference ${record.dir} after positive-identity cleanup: ${JSON.stringify(stragglers)} - left alone, not killed (see Story 0022 round-six Finding 7)`
+      );
     }
     try {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(record.dir, { recursive: true, force: true });
     } catch {
       // Best-effort cleanup only.
     }
@@ -351,7 +417,8 @@ test(
   async () => {
     fs.mkdirSync(TEST_MAILBOX_ROOT, { recursive: true });
     const scratchDir = fs.mkdtempSync(path.join(TEST_MAILBOX_ROOT, `${randomUUID()}-`));
-    scratchDirsToReap.push(scratchDir);
+    const scratchRecord: ScratchRecord = { dir: scratchDir };
+    scratchRecords.push(scratchRecord);
     const triggerPath = path.join(scratchDir, ".trigger");
     // Pre-create a stable, empty inode before watching starts - the same
     // precondition a real external watcher should establish before
@@ -401,11 +468,21 @@ test(
     );
     assert.equal(typeof minted.taskId, "string");
     const jobId = minted.taskId as string;
+    // Recorded the instant it is known, so a teardown triggered by an
+    // assertion throwing anywhere below this line still has a real job_id
+    // to attempt an in-band kill against - never left to the LAST line of
+    // a passing run to populate it.
+    scratchRecord.jobId = jobId;
     assert.equal(minted.status, "working");
     assert.equal(minted.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS);
 
     // --- the exact-argv backing-process barrier: the real process genuinely exists ---
     const ghantikaFswatchPid = await waitForExactlyOneFswatchPid(triggerPath);
+    // Same reasoning as jobId above: captured as soon as the real pid is
+    // known, with its birth identity, so the after() hook's direct-pid
+    // fallback is never signalling a pid it never positively identified.
+    scratchRecord.pid = ghantikaFswatchPid;
+    scratchRecord.birthIdentity = await captureBirthIdentityPosix(ghantikaFswatchPid);
     assert.deepEqual(
       anyPidsReferencingPath(triggerPath).sort((a, b) => a - b),
       [ghantikaFswatchPid],
