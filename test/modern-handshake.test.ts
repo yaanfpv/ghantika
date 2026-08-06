@@ -364,6 +364,62 @@ test("modern handshake: a tools/call whose own request envelope declares ONLY th
 });
 
 // ---------------------------------------------------------------------------
+// AC a1: capability negotiation matches the released 2026-07-28 extension
+// contract exactly, which designates `extensions` as the sole bag - on
+// the REAL modern wire, not just the legacy InMemoryTransport/SDK Client
+// path test/tasks.test.ts exercises (a shared boolean function proves
+// nothing about a source it was never fed from - see this file's own
+// header note on the deprecated-tasks-shape test above, same reasoning).
+// This is the exact reproduction QA's local_draft_reject cited: a real
+// modern stdio request declaring Tasks support only under `experimental`
+// used to mint a Task result before isConnectionTasksCapable was narrowed
+// to read `extensions` only.
+// ---------------------------------------------------------------------------
+
+test("modern handshake: a tools/call whose own request envelope declares Tasks support ONLY under the older experimental bag (never extensions) still gets the plain poll floor, not the extension", async () => {
+  const server = tracked();
+  server.send(discoverRequest(1));
+  const discoverLine = await server.nextLine();
+  assert.ok(
+    (discoverLine.parsed as DiscoverResultBody).result,
+    "server/discover must succeed first"
+  );
+
+  server.send({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: withModernEnvelope(
+      { name: "run", arguments: { command: ["true"] } },
+      { experimental: { [TASKS_EXTENSION_URI]: {} } }
+    ),
+  });
+  const line = await server.nextLine();
+  const body = line.parsed as {
+    error?: unknown;
+    result?: { isError?: boolean; structuredContent?: Record<string, unknown> };
+  };
+  assert.equal(
+    body.error,
+    undefined,
+    `a modern tools/call declaring Tasks support only under experimental must still succeed, got: ${JSON.stringify(body)}`
+  );
+  assert.notEqual(body.result?.isError, true);
+  const structured = body.result?.structuredContent;
+  assert.equal(
+    structured?.extension,
+    undefined,
+    `an experimental-bag-only declaration must never mint a Task result on the real modern wire, got: ${JSON.stringify(structured)}`
+  );
+  assert.equal(
+    typeof structured?.job_id,
+    "string",
+    "the plain poll floor (a bare job_id) must still be returned"
+  );
+  server.child.kill("SIGKILL");
+});
+
+// ---------------------------------------------------------------------------
 // The six-tool mint rule, on the MODERN wire: run() mints, and
 // status/output/tail/kill/list each stay plain - regardless of Tasks
 // capability being declared on THEIR OWN request too. src/server.ts's

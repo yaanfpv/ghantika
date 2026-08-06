@@ -548,6 +548,49 @@ test("a client declaring ONLY the SDK-deprecated capabilities.tasks shape (no ex
 });
 
 // ---------------------------------------------------------------------------
+// AC a1: capability negotiation matches the released 2026-07-28 extension
+// contract exactly, which designates `extensions` as the sole bag - a
+// client declaring Tasks support only under the older, free-form
+// `experimental` bag must not be recognized as capable. `extensions` and
+// `capabilities.tasks` are already proven not to leak into each other
+// above; this is the third bag `isConnectionTasksCapable` used to also
+// read before that reading was narrowed to `extensions` only.
+// ---------------------------------------------------------------------------
+
+test("a client declaring Tasks support ONLY under the older experimental bag (never extensions) still gets the plain poll floor, not the extension", async () => {
+  pairCounter += 1;
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const instance = createServer(serverTransport);
+  await instance.server.connect(instance.transport);
+
+  const client = new Client(
+    { name: `ghantika-tasks-test-client-${pairCounter}`, version: "0.0.0" },
+    {
+      capabilities: {
+        experimental: { [TASKS_EXTENSION_URI]: {} },
+      } as Record<string, unknown>,
+    }
+  );
+  await client.connect(clientTransport);
+
+  try {
+    const structured = await runJob(client, { label: "experimental-bag-only" });
+    assert.equal(
+      structured.extension,
+      undefined,
+      `an experimental-bag-only declaration must never mint a Task result, got: ${JSON.stringify(structured)}`
+    );
+    assert.equal(
+      typeof structured.job_id,
+      "string",
+      "the plain poll floor (a bare job_id) must still be returned"
+    );
+  } finally {
+    await instance.shutdown("tasks.test.ts experimental-bag-only regression complete");
+  }
+});
+
+// ---------------------------------------------------------------------------
 // The six-tool mint rule: run() mints unsolicited on a capable connection,
 // with no per-request opt-in field involved at all
 // ---------------------------------------------------------------------------

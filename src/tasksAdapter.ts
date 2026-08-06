@@ -75,14 +75,13 @@
  * (rather than the deprecated `tasks` field, whose shape this adapter does
  * not implement at all) keeps this adapter honestly forward-compatible
  * instead of borrowing a field name whose real shape means something else.
- * `isConnectionTasksCapable` reads BOTH `extensions` and the older
- * `experimental` bag when checking what a CLIENT declared. The finalized
- * extension designates `extensions` as the correct bag, and this server's
- * own advertisement follows that: it always advertises under `extensions`
- * only, never `experimental`. Detection stays lenient on the CLIENT side
- * regardless, since a real client built before finalization (or against
- * an SDK that predates it) may still declare under the older free-form
- * `experimental` bag - advertising is narrow, detection is lenient.
+ * `isConnectionTasksCapable` reads `extensions` ONLY, on both the
+ * advertisement side and the CLIENT-declaration side it checks - matching
+ * the finalized extension's own contract exactly, which designates
+ * `extensions` as the sole correct bag. A client that declares Tasks
+ * support only under the older, free-form `experimental` bag is not
+ * recognized as capable; that affordance is a scope decision for planning,
+ * not something this adapter widens on its own.
  *
  * ## The six-tool mint rule and the universal poll floor
  *
@@ -202,10 +201,10 @@ export function tasksServerCapabilitiesFragment(): { extensions: Record<string, 
 // ---------------------------------------------------------------------------
 
 /**
- * True when `clientCapabilities` advertised Tasks support, under either bag
- * it might legitimately appear in (see this file's header on why detection
- * is lenient across `extensions`/`experimental` while advertisement stays
- * narrow). This is the ONLY signal `maybeAugmentRunResult` consults - never
+ * True when `clientCapabilities` advertised Tasks support under
+ * `extensions`, the sole bag the finalized extension recognizes (see this
+ * file's header on why `experimental` is not read). This is the ONLY
+ * signal `maybeAugmentRunResult` consults - never
  * anything in `run()`'s own tool arguments, which is what keeps the
  * six-tool mint rule free of a per-call opt-in field: a bare tool call with
  * no such field of any kind still mints on a capable connection/request,
@@ -240,10 +239,7 @@ export function isConnectionTasksCapable(
   clientCapabilities: ClientCapabilities | undefined
 ): boolean {
   if (clientCapabilities === undefined) return false;
-  return (
-    hasTasksExtensionKey(clientCapabilities.extensions) ||
-    hasTasksExtensionKey(clientCapabilities.experimental)
-  );
+  return hasTasksExtensionKey(clientCapabilities.extensions);
 }
 
 function hasTasksExtensionKey(bag: Record<string, unknown> | undefined): boolean {
