@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/yaanfpv/ghantika/schema/tasks-extension.schema.json",
   "title": "io.modelcontextprotocol/tasks extension (SEP-2663, released 2026-07-28) - the pin ghantika's Tasks-extension adapter is checked against",
-  "description": "Vendored, in-repo pin (never an npm dependency - no io.modelcontextprotocol/tasks package exists to depend on) of the RELEASED SEP-2663 contract itself, not our own emitted shape. Before story-0137 this file documented what src/tasksAdapter.ts happened to return; tasksAdapter.ts's own header discloses it was designed before finalization and never reconciled, so that earlier version pinned our own pre-finalization guess, not the spec. This version pins the spec's actual field names, discriminated status variants, and request/response shapes; scripts/check-sdk-exact-pin.mjs's schema-vs-implementation check is what now verifies our adapter conforms TO this pin, rather than this pin describing the adapter. config/tasks-schema-digest.json records this file's SHA-256 so drift between the two is caught, not silently trusted. Every variant below restates its own fields in full rather than composing a shared base via `allOf` or `$ref`-plus-siblings: test/tasks.test.ts's hand-rolled validator implements only the keyword set this schema actually needs, `allOf` deliberately not among them (extending it is test-infrastructure work this repo has been directed to stop), and that same validator resolves a `$ref` by replacing the node it appears on, so a `$ref` next to sibling properties would silently validate nothing. The duplication below is the honest cost of staying inside that validator's real behavior.",
+  "description": "Vendored, in-repo pin (never an npm dependency - no io.modelcontextprotocol/tasks package exists to depend on) of the RELEASED SEP-2663 contract itself, not our own emitted shape. Before story-0137 this file documented what src/tasksAdapter.ts happened to return; tasksAdapter.ts's own header discloses it was designed before finalization and never reconciled, so that earlier version pinned our own pre-finalization guess, not the spec. This version pins the spec's actual field names, discriminated status variants, and request/response shapes, measured directly against the spec's own generated schema.json (modelcontextprotocol/ext-tasks) rather than summarized text; scripts/check-sdk-exact-pin.mjs's schema-vs-implementation check is what now verifies our adapter conforms TO this pin, rather than this pin describing the adapter. config/tasks-schema-digest.json records this file's SHA-256 so drift between the two is caught, not silently trusted. Every variant below restates its own fields in full rather than composing a shared base via `allOf` or `$ref`-plus-siblings: test/tasks.test.ts's hand-rolled validator implements only the keyword set this schema actually needs, `allOf` deliberately not among them (extending it is test-infrastructure work this repo has been directed to stop), and that same validator resolves a `$ref` by replacing the node it appears on, so a `$ref` next to sibling properties would silently validate nothing. The duplication below is the honest cost of staying inside that validator's real behavior. Every task-shaped variant locks `additionalProperties: false` to match the real spec exactly (measured: every DetailedTask variant, and the base Task type, locks it) - a pin that stayed looser than its own contract could never red on a shape the spec itself rejects. The spec's own DetailedTask union uses `anyOf`; this schema uses `oneOf` instead, deliberately - the four status consts are mutually exclusive by construction so the two are behaviorally identical here, and `oneOf` (unlike `anyOf`) is a keyword the validator above actually implements.",
   "$defs": {
     "extensionUri": {
       "const": "io.modelcontextprotocol/tasks"
@@ -35,7 +35,7 @@
     },
     "watchStoppedInfo": {
       "type": "object",
-      "description": "Present once this adapter's own output-driven notification WATCH (the wake accelerator - see notifications/tasks/status) has auto-stopped early - currently only ever for a sustained firehose rate. Never means the backing job stopped. ghantika's own extension of the spec's free-form result/error JSONObject on a TERMINAL task; see this schema's header note on the still-open pre-terminal placement question for a still-'working' task whose watch stopped early - flagged to the Manager rather than silently resolved here.",
+      "description": "Present once this adapter's own output-driven notification WATCH (the wake accelerator - see notifications/tasks/status) has auto-stopped early - currently only ever for a sustained firehose rate. Never means the backing job stopped. ghantika's own extension of the spec's free-form result/error JSONObject on a TERMINAL task. On a still-'working' task, the SAME fact (reason plus timestamp) is rendered as text into that variant's spec-legal, otherwise-unused `statusMessage` field instead - see workingTask below - since WorkingTask locks `additionalProperties: false` and has no free-form container of its own to carry this structured shape.",
       "properties": {
         "reason": { "const": "firehose" },
         "stoppedAt": { "type": "string", "minLength": 1 }
@@ -54,21 +54,25 @@
       "additionalProperties": false
     },
     "workingTask": {
-      "description": "The spec's WorkingTask: Task's base fields, status pinned to 'working', no result/error - restated in full rather than composed, see this schema's header.",
+      "description": "The spec's WorkingTask: Task's base fields, status pinned to 'working', no result/error - restated in full rather than composed, see this schema's header. `additionalProperties: false`, matching the real spec exactly (measured against modelcontextprotocol/ext-tasks's generated schema.json).",
       "type": "object",
       "properties": {
         "taskId": { "type": "string", "minLength": 1 },
         "status": { "const": "working" },
-        "statusMessage": { "type": "string" },
+        "statusMessage": {
+          "type": "string",
+          "description": "Free text per the spec - optional, no format constraint. ghantika's ONE use of it: when this adapter's own output-driven notification watch has auto-stopped early (see watchStoppedInfo) while the task is still 'working', the same fact (the fixed 'firehose' reason plus a stoppedAt timestamp - a constant and a timestamp, nothing else) is rendered into this field as text, since a still-working task has no free-form container the way a terminal task's result/error does. This field is otherwise unused by ghantika today."
+        },
         "createdAt": { "type": "string", "minLength": 1 },
         "lastUpdatedAt": { "type": "string", "minLength": 1 },
         "ttlMs": { "type": ["integer", "null"], "minimum": 0 },
         "pollIntervalMs": { "type": "integer", "exclusiveMinimum": 0 }
       },
-      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"]
+      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"],
+      "additionalProperties": false
     },
     "completedTask": {
-      "description": "The spec's CompletedTask: Task's base fields, status pinned to 'completed', plus the spec's free-form result JSONObject (ghantika's own exitCode/output/watchStopped live inside it, see ghantikaResultExtras) - restated in full rather than composed, see this schema's header.",
+      "description": "The spec's CompletedTask: Task's base fields, status pinned to 'completed', plus the spec's free-form result JSONObject (ghantika's own exitCode/output/watchStopped live inside it, see ghantikaResultExtras) - restated in full rather than composed, see this schema's header. `additionalProperties: false`, matching the real spec exactly.",
       "type": "object",
       "properties": {
         "taskId": { "type": "string", "minLength": 1 },
@@ -80,10 +84,11 @@
         "pollIntervalMs": { "type": "integer", "exclusiveMinimum": 0 },
         "result": { "$ref": "#/$defs/ghantikaResultExtras" }
       },
-      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "result"]
+      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "result"],
+      "additionalProperties": false
     },
     "failedTask": {
-      "description": "The spec's FailedTask: Task's base fields, status pinned to 'failed', plus the spec's free-form error JSONObject (ghantika's own exitCode/output/watchStopped live inside it, see ghantikaResultExtras) - restated in full rather than composed, see this schema's header.",
+      "description": "The spec's FailedTask: Task's base fields, status pinned to 'failed', plus the spec's free-form error JSONObject (ghantika's own exitCode/output/watchStopped live inside it, see ghantikaResultExtras) - restated in full rather than composed, see this schema's header. `additionalProperties: false`, matching the real spec exactly.",
       "type": "object",
       "properties": {
         "taskId": { "type": "string", "minLength": 1 },
@@ -95,10 +100,11 @@
         "pollIntervalMs": { "type": "integer", "exclusiveMinimum": 0 },
         "error": { "$ref": "#/$defs/ghantikaResultExtras" }
       },
-      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "error"]
+      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "error"],
+      "additionalProperties": false
     },
     "cancelledTask": {
-      "description": "The spec's CancelledTask: Task's base fields, status pinned to 'cancelled', no result/error - restated in full rather than composed, see this schema's header.",
+      "description": "The spec's CancelledTask: Task's base fields, status pinned to 'cancelled', no result/error - restated in full rather than composed, see this schema's header. `additionalProperties: false`, matching the real spec exactly.",
       "type": "object",
       "properties": {
         "taskId": { "type": "string", "minLength": 1 },
@@ -109,10 +115,11 @@
         "ttlMs": { "type": ["integer", "null"], "minimum": 0 },
         "pollIntervalMs": { "type": "integer", "exclusiveMinimum": 0 }
       },
-      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"]
+      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs"],
+      "additionalProperties": false
     },
     "detailedTask": {
-      "description": "The spec's DetailedTask discriminated union, narrowed to the four variants ghantika's job model can ever actually produce (working / completed / failed / cancelled - never input_required). A pure oneOf of bare $refs - no siblings alongside either $ref, which is the one form this repo's hand-rolled validator resolves correctly.",
+      "description": "The spec's DetailedTask discriminated union, narrowed to the four variants ghantika's job model can ever actually produce (working / completed / failed / cancelled - never input_required). A pure oneOf of bare $refs - no siblings alongside either $ref, which is the one form this repo's hand-rolled validator resolves correctly. The spec's own union uses anyOf; oneOf is used here deliberately, see this schema's top-level header.",
       "oneOf": [
         { "$ref": "#/$defs/workingTask" },
         { "$ref": "#/$defs/completedTask" },
@@ -121,7 +128,7 @@
       ]
     },
     "createTaskResult": {
-      "description": "CreateTaskResult = Result & Task per the spec: the flat base-Task shape (never a DetailedTask variant - a freshly minted task carries no result/error yet even if the backing job happened to already be terminal at mint time), with resultType:'task' replacing the normal CallToolResult content/structuredContent shape. Returned by run() on a Tasks-capable connection - see this schema's header note on the still-unconfirmed wire mechanics of this replacement. Restated in full rather than composed, see this schema's top-level header.",
+      "description": "CreateTaskResult = Result & Task per the spec: the flat base-Task shape (never a DetailedTask variant - a freshly minted task carries no result/error yet even if the backing job happened to already be terminal at mint time), with resultType:'task' replacing the normal CallToolResult content/structuredContent shape. Returned by run() on a Tasks-capable connection - see this schema's header note on the still-unconfirmed wire mechanics of this replacement (resultType itself is SEP-2322/core-protocol vocabulary, not redefined in the tasks extension's own generated schema - the exact envelope needs pinning against the installed SDK's own types as a first build step, not this fetch). Restated in full rather than composed, see this schema's top-level header. `additionalProperties: false`, matching the real spec's own Task-shaped branch of CreateTaskResult exactly.",
       "type": "object",
       "properties": {
         "taskId": { "type": "string", "minLength": 1 },
@@ -133,10 +140,11 @@
         "pollIntervalMs": { "type": "integer", "exclusiveMinimum": 0 },
         "resultType": { "$ref": "#/$defs/resultTypeTask" }
       },
-      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "resultType"]
+      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "resultType"],
+      "additionalProperties": false
     },
     "getTaskResultWorking": {
-      "description": "GetTaskResult's 'working' branch: WorkingTask's fields plus resultType:'complete', restated in full - see getTaskResult below.",
+      "description": "GetTaskResult's 'working' branch: WorkingTask's fields plus resultType:'complete', restated in full - see getTaskResult below. `additionalProperties: false`, matching the real spec exactly.",
       "type": "object",
       "properties": {
         "taskId": { "type": "string", "minLength": 1 },
@@ -148,10 +156,11 @@
         "pollIntervalMs": { "type": "integer", "exclusiveMinimum": 0 },
         "resultType": { "$ref": "#/$defs/resultTypeComplete" }
       },
-      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "resultType"]
+      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "resultType"],
+      "additionalProperties": false
     },
     "getTaskResultCompleted": {
-      "description": "GetTaskResult's 'completed' branch: CompletedTask's fields plus resultType:'complete', restated in full - see getTaskResult below.",
+      "description": "GetTaskResult's 'completed' branch: CompletedTask's fields plus resultType:'complete', restated in full - see getTaskResult below. `additionalProperties: false`, matching the real spec exactly.",
       "type": "object",
       "properties": {
         "taskId": { "type": "string", "minLength": 1 },
@@ -164,10 +173,11 @@
         "result": { "$ref": "#/$defs/ghantikaResultExtras" },
         "resultType": { "$ref": "#/$defs/resultTypeComplete" }
       },
-      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "result", "resultType"]
+      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "result", "resultType"],
+      "additionalProperties": false
     },
     "getTaskResultFailed": {
-      "description": "GetTaskResult's 'failed' branch: FailedTask's fields plus resultType:'complete', restated in full - see getTaskResult below.",
+      "description": "GetTaskResult's 'failed' branch: FailedTask's fields plus resultType:'complete', restated in full - see getTaskResult below. `additionalProperties: false`, matching the real spec exactly.",
       "type": "object",
       "properties": {
         "taskId": { "type": "string", "minLength": 1 },
@@ -180,10 +190,11 @@
         "error": { "$ref": "#/$defs/ghantikaResultExtras" },
         "resultType": { "$ref": "#/$defs/resultTypeComplete" }
       },
-      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "error", "resultType"]
+      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "error", "resultType"],
+      "additionalProperties": false
     },
     "getTaskResultCancelled": {
-      "description": "GetTaskResult's 'cancelled' branch: CancelledTask's fields plus resultType:'complete', restated in full - see getTaskResult below.",
+      "description": "GetTaskResult's 'cancelled' branch: CancelledTask's fields plus resultType:'complete', restated in full - see getTaskResult below. `additionalProperties: false`, matching the real spec exactly.",
       "type": "object",
       "properties": {
         "taskId": { "type": "string", "minLength": 1 },
@@ -195,10 +206,11 @@
         "pollIntervalMs": { "type": "integer", "exclusiveMinimum": 0 },
         "resultType": { "$ref": "#/$defs/resultTypeComplete" }
       },
-      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "resultType"]
+      "required": ["taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "resultType"],
+      "additionalProperties": false
     },
     "getTaskResult": {
-      "description": "GetTaskResult = Result & DetailedTask per the spec: resultType:'complete' flattened alongside whichever DetailedTask variant matches the task's current status. Returned by tasks/get (and, in ghantika's own design, also by tasks/update - see ackResult for the spec-defined tasks/update shape this schema does NOT use). A pure oneOf of bare $refs to the four resultType-carrying variants above, each already self-contained - never composed via allOf or $ref-plus-siblings, see this schema's top-level header.",
+      "description": "GetTaskResult = Result & DetailedTask per the spec: resultType:'complete' flattened alongside whichever DetailedTask variant matches the task's current status. Returned by tasks/get (and, in ghantika's own design, also by tasks/update - see ackResult for the spec-defined tasks/update shape this schema does NOT use). A pure oneOf of bare $refs to the four resultType-carrying variants above, each already self-contained - never composed via allOf or $ref-plus-siblings, see this schema's top-level header. The spec's own composition uses anyOf; oneOf is used here deliberately, see this schema's top-level header.",
       "oneOf": [
         { "$ref": "#/$defs/getTaskResultWorking" },
         { "$ref": "#/$defs/getTaskResultCompleted" },
@@ -207,7 +219,7 @@
       ]
     },
     "ackResult": {
-      "description": "UpdateTaskResult / CancelTaskResult per the spec: an empty acknowledgement carrying only resultType:'complete', nothing else. Both are eventually-consistent per the spec - the ack may arrive before the task's observable status reflects the requested change.",
+      "description": "UpdateTaskResult / CancelTaskResult per the spec: an empty acknowledgement carrying only resultType:'complete', nothing else. Both are eventually-consistent per the spec - the ack may arrive before the task's observable status reflects the requested change. NOTE: the real spec's own UpdateTaskResult/CancelTaskResult leave additionalProperties permissive (measured: `{}`, not `false`); this schema pins `false` here, STRICTER than the released contract rather than looser - flagged, not changed without sign-off, since a stricter pin can only reject a shape the real spec would accept, never accept one the spec rejects (the opposite direction from the defect this schema's other additionalProperties locks exist to close).",
       "type": "object",
       "properties": { "resultType": { "$ref": "#/$defs/resultTypeComplete" } },
       "required": ["resultType"],
