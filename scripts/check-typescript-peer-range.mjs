@@ -3,8 +3,14 @@
  * Guards the reason this repo pins `typescript` to an exact version below
  * 6.1.0 in the first place: `typescript-eslint` declares a peer dependency
  * on `typescript` of `>=4.8.4 <6.1.0`, and the pin exists ONLY because of
- * that range - 6.0.3 is simply the highest version that satisfies it. This
- * script itself reads whatever range is CURRENTLY installed and checks two
+ * that range - 6.0.3 was originally chosen as the newest TypeScript release
+ * published at the time that stayed under it. The pin now resolves through
+ * a compatibility alias (`npm:@typescript/typescript6@6.0.2`, adopted
+ * alongside the move to TypeScript 7 - see CHANGELOG.md) instead of that
+ * direct pin. 6.0.2 - one patch behind - is the highest version the alias
+ * package itself publishes, a fact about that package, not a claim about
+ * the peer range's own ceiling; it satisfies the range exactly as 6.0.3 did.
+ * This script itself reads whatever range is CURRENTLY installed and checks two
  * things against it: that every checked package agrees, and that the
  * resolved, installed `typescript` version satisfies it. It does not
  * hardcode the range

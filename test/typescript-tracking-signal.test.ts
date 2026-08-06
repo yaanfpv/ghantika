@@ -6,23 +6,18 @@ import { fileURLToPath } from "node:url";
 
 import {
   TRACKED_DEPENDENCY_NAME,
-  TRACKED_PR_NUMBER,
-  TRACKED_PR_REPO_SLUG,
   checkDependabotHasNoTypescriptIgnore,
-  checkTrackingSignal,
   dependabotNamePatternMatches,
-  fetchLivePrState,
 } from "../scripts/check-typescript-tracking-signal.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
-// This suite proves the PURE logic (parsing, glob matching, combining
-// already-resolved facts) and fetchLivePrState's own parsing/error-
-// handling against an INJECTED fake command runner. It never calls the
-// real `gh` binary or touches the network - see
-// scripts/check-typescript-tracking-signal.mjs's own header comment, and
-// test/actionlint-pin.test.js's identical "a fake curl, so nothing ever
-// touches the network" convention this suite follows.
+// This suite proves the guard's pure logic: parsing already-read YAML text
+// and matching Dependabot's own "*"-wildcard glob syntax. No filesystem
+// access beyond one real read of this repo's own tracked
+// .github/dependabot.yml below, and no network access at all - see
+// scripts/check-typescript-tracking-signal.mjs's own header comment for
+// why this guard no longer needs a live forge read.
 
 // =============================================================================
 // dependabotNamePatternMatches - Dependabot's own "*"-wildcard glob syntax
@@ -155,139 +150,7 @@ test('the real, tracked .github/dependabot.yml carries no ignore rule matching "
   assert.deepEqual(
     result,
     { ok: true, problems: [] },
-    "a Dependabot ignore rule for typescript would silence the open PR #1 tracking signal the pin decision requires"
-  );
-});
-
-// =============================================================================
-// checkTrackingSignal - the pure combination of both facts.
-// =============================================================================
-
-const CLEAN_DEPENDABOT_CHECK = { ok: true, problems: [] as string[] };
-const DIRTY_DEPENDABOT_CHECK = {
-  ok: false,
-  problems: ['.github/dependabot.yml has an "ignore" rule matching "typescript"'],
-};
-
-test("checkTrackingSignal: PR open + clean dependabot config is green", () => {
-  const result = checkTrackingSignal({ prState: "OPEN", dependabotCheck: CLEAN_DEPENDABOT_CHECK });
-  assert.deepEqual(result, { ok: true, problems: [] });
-});
-
-test('checkTrackingSignal: is case-insensitive on the PR state, matching both the GraphQL-flavoured ("OPEN") and plain REST ("open") casings', () => {
-  assert.equal(
-    checkTrackingSignal({ prState: "open", dependabotCheck: CLEAN_DEPENDABOT_CHECK }).ok,
-    true
-  );
-});
-
-test("checkTrackingSignal: PR closed reds, naming the repo/PR and the live state - even with a clean dependabot config, absence of an ignore rule alone is not sufficient", () => {
-  const result = checkTrackingSignal({
-    prState: "CLOSED",
-    dependabotCheck: CLEAN_DEPENDABOT_CHECK,
-  });
-  assert.equal(result.ok, false);
-  assert.equal(result.problems.length, 1);
-  assert.ok(result.problems[0]!.includes(`${TRACKED_PR_REPO_SLUG}#${TRACKED_PR_NUMBER}`));
-  assert.ok(result.problems[0]!.includes("CLOSED"));
-});
-
-test("checkTrackingSignal: a dirty dependabot config reds even with the PR open, and both problem sets are combined, never short-circuited", () => {
-  const result = checkTrackingSignal({
-    prState: "CLOSED",
-    dependabotCheck: DIRTY_DEPENDABOT_CHECK,
-  });
-  assert.equal(result.ok, false);
-  assert.equal(
-    result.problems.length,
-    2,
-    "both the dependabot problem and the PR-state problem must be reported together"
-  );
-});
-
-test("mutation control: clean+open is green; flipping the PR to closed alone reds; flipping the dependabot check alone (with PR open) also reds; restoring both is green again", () => {
-  const clean = { prState: "OPEN", dependabotCheck: CLEAN_DEPENDABOT_CHECK };
-  assert.equal(checkTrackingSignal(clean).ok, true);
-
-  assert.equal(checkTrackingSignal({ ...clean, prState: "CLOSED" }).ok, false);
-  assert.equal(
-    checkTrackingSignal({ ...clean, dependabotCheck: DIRTY_DEPENDABOT_CHECK }).ok,
-    false
-  );
-
-  assert.equal(checkTrackingSignal(clean).ok, true);
-});
-
-// =============================================================================
-// fetchLivePrState - proven against an INJECTED fake command runner. The
-// real `run = runGh` default (which shells out to the real `gh` binary)
-// is NEVER exercised here - every call below supplies its own synthetic
-// `run` function, so this suite makes zero network calls.
-// =============================================================================
-
-test("fetchLivePrState: a successful run returns the parsed state, and calls the injected runner with the expected gh arguments", () => {
-  const calls: string[][] = [];
-  const result = fetchLivePrState({
-    repoSlug: "yaanfpv/ghantika",
-    prNumber: 1,
-    run: (args) => {
-      calls.push(args);
-      return JSON.stringify({ state: "OPEN" });
-    },
-  });
-  assert.deepEqual(result, { state: "OPEN" });
-  assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0], ["pr", "view", "1", "--repo", "yaanfpv/ghantika", "--json", "state"]);
-});
-
-test("fetchLivePrState: defaults to the tracked repo slug and PR number when not overridden", () => {
-  const calls: string[][] = [];
-  fetchLivePrState({
-    run: (args) => {
-      calls.push(args);
-      return JSON.stringify({ state: "OPEN" });
-    },
-  });
-  assert.deepEqual(calls[0], [
-    "pr",
-    "view",
-    String(TRACKED_PR_NUMBER),
-    "--repo",
-    TRACKED_PR_REPO_SLUG,
-    "--json",
-    "state",
-  ]);
-});
-
-test("fetchLivePrState: a throwing runner (simulating no network, no gh binary, or no auth) is reported as a clear, labelled 'could not reach the forge' error - never a raw, unlabelled exception", () => {
-  assert.throws(
-    () =>
-      fetchLivePrState({
-        run: () => {
-          throw new Error("spawnSync gh ENOENT");
-        },
-      }),
-    /could not reach the forge/
-  );
-});
-
-test("fetchLivePrState: a runner returning unparseable output is reported as a clear, labelled error naming what was returned", () => {
-  assert.throws(
-    () =>
-      fetchLivePrState({
-        run: () => "not json at all",
-      }),
-    /did not return parseable JSON/
-  );
-});
-
-test('fetchLivePrState: a runner returning valid JSON with no usable "state" field is reported as a clear, labelled error - never silently treated as any particular state', () => {
-  assert.throws(
-    () =>
-      fetchLivePrState({
-        run: () => JSON.stringify({ number: 1 }),
-      }),
-    /no usable "state"/
+    "a matching ignore entry can suppress proposals within that entry's declared versions/update-types scope, and this repository deliberately carries no matching TypeScript ignore entry"
   );
 });
 
