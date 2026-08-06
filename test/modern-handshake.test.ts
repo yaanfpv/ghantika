@@ -37,6 +37,7 @@ import {
   withModernEnvelope,
 } from "./helpers/spawnServer.ts";
 import { isProcessAlive } from "../dist/process.js";
+import { TASKS_CAPABILITY_DESCRIPTOR, TASKS_EXTENSION_URI } from "../dist/tasksAdapter.js";
 
 const NEGATIVE_CONTROL_FIXTURE = fileURLToPath(
   new URL("./fixtures/negative-control-server.ts", import.meta.url)
@@ -64,7 +65,7 @@ interface DiscoverResultBody {
   readonly id: number;
   readonly result?: {
     supportedVersions?: string[];
-    capabilities?: { tools?: unknown };
+    capabilities?: { tools?: unknown; extensions?: Record<string, unknown> };
     resultType?: string;
   };
   readonly error?: { code: number; message: string };
@@ -94,6 +95,11 @@ test("server/discover over the real wire returns a successful result advertising
   assert.ok(
     body.result?.capabilities?.tools,
     "server/discover must advertise the tools capability"
+  );
+  assert.deepStrictEqual(
+    body.result?.capabilities?.extensions?.[TASKS_EXTENSION_URI],
+    TASKS_CAPABILITY_DESCRIPTOR,
+    `server/discover's real wire response must advertise the Tasks extension descriptor exactly as tasksAdapter constructs it, not merely a truthy or locally-imported stand-in - got: ${JSON.stringify(body.result?.capabilities?.extensions)}`
   );
   server.child.kill("SIGKILL");
 });
@@ -182,6 +188,342 @@ test("modern handshake: tools/call immediately after a successful server/discove
   );
   assert.notEqual(body.result?.isError, true);
   assert.equal(typeof body.result?.structuredContent?.job_id, "string");
+  server.child.kill("SIGKILL");
+});
+
+// ---------------------------------------------------------------------------
+// The 2026-07-28 revision's OWN capability
+// model - a client declares `io.modelcontextprotocol/tasks` in THIS
+// request's own `_meta` envelope (never at a connection-level `initialize`,
+// which this era has none of), and that declaration governs ONLY the
+// request that carried it - see src/server.ts's own header doc ("Reading a
+// request's own declared client capabilities") for why this is the correct
+// per-era model, not a weaker guarantee than the legacy connection-level
+// one. Both halves are proven on the SAME live connection, back to back,
+// so neither result could be explained by connection-level caching: a
+// capable request mints, and an immediately-following incapable request on
+// the identical connection does not.
+// ---------------------------------------------------------------------------
+
+test("modern handshake: a tools/call whose OWN request envelope declares io.modelcontextprotocol/tasks mints a real Task result whose extension descriptor matches this connection's own server/discover advertisement", async () => {
+  const server = tracked();
+  server.send(discoverRequest(1));
+  const discoverLine = await server.nextLine();
+  const discoverBody = discoverLine.parsed as DiscoverResultBody;
+  assert.ok(discoverBody.result, "server/discover must succeed first");
+
+  server.send({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: withModernEnvelope(
+      { name: "run", arguments: { command: ["true"] } },
+      { extensions: { [TASKS_EXTENSION_URI]: {} } }
+    ),
+  });
+  const line = await server.nextLine();
+  const body = line.parsed as {
+    error?: unknown;
+    result?: { isError?: boolean; structuredContent?: Record<string, unknown> };
+  };
+  assert.equal(
+    body.error,
+    undefined,
+    `a modern tools/call declaring Tasks support must succeed, got: ${JSON.stringify(body)}`
+  );
+  assert.notEqual(body.result?.isError, true);
+  const structured = body.result?.structuredContent;
+  assert.equal(
+    structured?.extension,
+    TASKS_EXTENSION_URI,
+    `expected a minted Task result carrying "extension": "${TASKS_EXTENSION_URI}", got: ${JSON.stringify(structured)}`
+  );
+  assert.equal(typeof structured?.taskId, "string", "a minted Task result must carry a taskId");
+  assert.equal(typeof structured?.status, "string", "a minted Task result must carry a status");
+  // Identity against what THIS connection's own server/discover actually
+  // returned above, not mere truthiness - the descriptor this mint is
+  // negotiated under must be the identical descriptor server/discover
+  // advertised for this connection. Both sides trace back to this adapter's
+  // own TASKS_CAPABILITY_DESCRIPTOR constant (src/tasksAdapter.ts), so this
+  // proves internal self-consistency between the discover and mint paths on
+  // one connection - it does not independently verify conformance to
+  // io.modelcontextprotocol/tasks's actual released shape, which
+  // src/tasksAdapter.ts's own header discloses as not yet reconciled.
+  assert.deepStrictEqual(
+    discoverBody.result?.capabilities?.extensions?.[TASKS_EXTENSION_URI],
+    TASKS_CAPABILITY_DESCRIPTOR,
+    `the descriptor server/discover advertised on this connection must match the one this mint is negotiated under - got: ${JSON.stringify(discoverBody.result?.capabilities?.extensions)}`
+  );
+  server.child.kill("SIGKILL");
+});
+
+test("modern handshake: on the SAME connection, a tools/call whose OWN request envelope declares NO capabilities gets the plain poll floor, never a minted Task - proving the negotiation above is genuinely per-request, not cached at the connection level", async () => {
+  const server = tracked();
+  server.send(discoverRequest(1));
+  const discoverLine = await server.nextLine();
+  assert.ok(
+    (discoverLine.parsed as DiscoverResultBody).result,
+    "server/discover must succeed first"
+  );
+
+  // First request on this connection: capable.
+  server.send({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: withModernEnvelope(
+      { name: "run", arguments: { command: ["true"] } },
+      { extensions: { [TASKS_EXTENSION_URI]: {} } }
+    ),
+  });
+  const capableLine = await server.nextLine();
+  const capableBody = capableLine.parsed as {
+    result?: { structuredContent?: Record<string, unknown> };
+  };
+  assert.equal(
+    capableBody.result?.structuredContent?.extension,
+    TASKS_EXTENSION_URI,
+    "setup: the first request must genuinely mint, or this test proves nothing about the second"
+  );
+
+  // Second request, same connection, no capability declared at all
+  // (withModernEnvelope's own default: a present-but-empty declaration).
+  server.send({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "tools/call",
+    params: withModernEnvelope({ name: "run", arguments: { command: ["true"] } }),
+  });
+  const incapableLine = await server.nextLine();
+  const incapableBody = incapableLine.parsed as {
+    error?: unknown;
+    result?: { isError?: boolean; structuredContent?: Record<string, unknown> };
+  };
+  assert.equal(incapableBody.error, undefined);
+  assert.notEqual(incapableBody.result?.isError, true);
+  const structured = incapableBody.result?.structuredContent;
+  assert.equal(
+    structured?.extension,
+    undefined,
+    `a request declaring no capabilities must never mint, even on a connection where an EARLIER request just did, got: ${JSON.stringify(structured)}`
+  );
+  assert.equal(typeof structured?.job_id, "string", "the plain poll floor must still be returned");
+  server.child.kill("SIGKILL");
+});
+
+// ---------------------------------------------------------------------------
+// The SDK-deprecated `capabilities.tasks` shape, on the MODERN era's OWN
+// per-request envelope - `isConnectionTasksCapable` has never read that
+// field on EITHER era, but the legacy proof (test/tasks.test.ts) only
+// exercises the connection-level `getClientCapabilities()` read path;
+// the modern era reads its capabilities from a different source entirely
+// (this request's own `_meta` envelope, off the real wire, over
+// `serveStdio` - see src/server.ts's own header doc on why the two eras
+// use genuinely different accessors). A real-wire modern proof is needed
+// because a shared boolean function proves nothing about a source it was
+// never fed from.
+// ---------------------------------------------------------------------------
+
+test("modern handshake: a tools/call whose own request envelope declares ONLY the SDK-deprecated capabilities.tasks shape (never extensions/experimental) still gets the plain poll floor, not the extension - the modern era's own per-request envelope read, not the legacy connection-level one", async () => {
+  const server = tracked();
+  server.send(discoverRequest(1));
+  const discoverLine = await server.nextLine();
+  assert.ok(
+    (discoverLine.parsed as DiscoverResultBody).result,
+    "server/discover must succeed first"
+  );
+
+  server.send({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    // The SDK-deprecated shape, declared in THIS request's own modern
+    // envelope: a bare `tasks` key, never `extensions` or `experimental`
+    // - the two bags `isConnectionTasksCapable` actually reads.
+    params: withModernEnvelope({ name: "run", arguments: { command: ["true"] } }, { tasks: {} }),
+  });
+  const line = await server.nextLine();
+  const body = line.parsed as {
+    error?: unknown;
+    result?: { isError?: boolean; structuredContent?: Record<string, unknown> };
+  };
+  assert.equal(
+    body.error,
+    undefined,
+    `a modern tools/call declaring only the deprecated tasks shape must still succeed, got: ${JSON.stringify(body)}`
+  );
+  assert.notEqual(body.result?.isError, true);
+  const structured = body.result?.structuredContent;
+  assert.equal(
+    structured?.extension,
+    undefined,
+    `a capabilities.tasks-only declaration must never mint a Task result on the modern era either, got: ${JSON.stringify(structured)}`
+  );
+  assert.equal(
+    typeof structured?.job_id,
+    "string",
+    "the plain poll floor (a bare job_id) must still be returned"
+  );
+  server.child.kill("SIGKILL");
+});
+
+// ---------------------------------------------------------------------------
+// Capability negotiation matches the finalized extension contract exactly,
+// which designates `extensions` as the sole bag - on the REAL modern wire,
+// not just the legacy InMemoryTransport/SDK Client path test/tasks.test.ts
+// exercises (a shared boolean function proves nothing about a source it was
+// never fed from - see this file's own header note on the deprecated-tasks-
+// shape test above, same reasoning). A real modern stdio request declaring
+// Tasks support only under `experimental` never mints a Task result.
+// ---------------------------------------------------------------------------
+
+test("modern handshake: a tools/call whose own request envelope declares Tasks support ONLY under the older experimental bag (never extensions) still gets the plain poll floor, not the extension", async () => {
+  const server = tracked();
+  server.send(discoverRequest(1));
+  const discoverLine = await server.nextLine();
+  assert.ok(
+    (discoverLine.parsed as DiscoverResultBody).result,
+    "server/discover must succeed first"
+  );
+
+  server.send({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: withModernEnvelope(
+      { name: "run", arguments: { command: ["true"] } },
+      { experimental: { [TASKS_EXTENSION_URI]: {} } }
+    ),
+  });
+  const line = await server.nextLine();
+  const body = line.parsed as {
+    error?: unknown;
+    result?: { isError?: boolean; structuredContent?: Record<string, unknown> };
+  };
+  assert.equal(
+    body.error,
+    undefined,
+    `a modern tools/call declaring Tasks support only under experimental must still succeed, got: ${JSON.stringify(body)}`
+  );
+  assert.notEqual(body.result?.isError, true);
+  const structured = body.result?.structuredContent;
+  assert.equal(
+    structured?.extension,
+    undefined,
+    `an experimental-bag-only declaration must never mint a Task result on the real modern wire, got: ${JSON.stringify(structured)}`
+  );
+  assert.equal(
+    typeof structured?.job_id,
+    "string",
+    "the plain poll floor (a bare job_id) must still be returned"
+  );
+  server.child.kill("SIGKILL");
+});
+
+// ---------------------------------------------------------------------------
+// The six-tool mint rule, on the MODERN wire: run() mints, and
+// status/output/tail/kill/list each stay plain - regardless of Tasks
+// capability being declared on THEIR OWN request too. src/server.ts's
+// own tools/call handler branches on `request.params.name === "run"`
+// before any capability read even happens, so this is a structural
+// guarantee independent of era - but test/tasks.test.ts's own six-tool
+// mint rule proof exercises only the legacy (InMemoryTransport/SDK
+// Client) wire. This is the real-stdio modern-wire counterpart, on the
+// SAME connection where run() has just genuinely minted, so a capable
+// connection is not itself sufficient to make any OTHER tool mint.
+// ---------------------------------------------------------------------------
+
+test("modern handshake: six-tool mint rule on the real wire - run() mints while status/output/tail/kill/list each stay plain, even with Tasks capability declared on their OWN request too, on the SAME connection where run() just minted", async () => {
+  const server = tracked();
+  server.send(discoverRequest(1));
+  const discoverLine = await server.nextLine();
+  assert.ok(
+    (discoverLine.parsed as DiscoverResultBody).result,
+    "server/discover must succeed first"
+  );
+
+  server.send({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: withModernEnvelope(
+      { name: "run", arguments: { command: ["true"] } },
+      { extensions: { [TASKS_EXTENSION_URI]: {} } }
+    ),
+  });
+  const runLine = await server.nextLine();
+  const runBody = runLine.parsed as {
+    result?: { structuredContent?: Record<string, unknown> };
+  };
+  const runStructured = runBody.result?.structuredContent;
+  assert.equal(
+    runStructured?.extension,
+    TASKS_EXTENSION_URI,
+    `setup: run() must genuinely mint on this connection, or the rest of this test proves nothing - got: ${JSON.stringify(runStructured)}`
+  );
+  // The minted TaskResult carries the handle under `taskId`, never a
+  // separate `job_id` field - see this file's own server/discover test,
+  // which already proves the returned capabilities descriptor is minted
+  // by tasksAdapter itself rather than a local stand-in, and
+  // src/tasksAdapter.ts's "taskId == job_id, one handle namespace" doc:
+  // `taskId` IS the jobStore job_id, exposed under the Task-shape's own
+  // field name.
+  const jobId = runStructured?.taskId;
+  assert.equal(typeof jobId, "string", "setup: run() must return a real taskId to target below");
+
+  const otherToolCalls: ReadonlyArray<{ name: string; arguments: Record<string, unknown> }> = [
+    { name: "status", arguments: { job_id: jobId } },
+    { name: "output", arguments: { job_id: jobId } },
+    { name: "tail", arguments: { job_id: jobId } },
+    { name: "kill", arguments: { job_id: jobId } },
+    { name: "list", arguments: {} },
+  ];
+
+  let nextId = 3;
+  for (const call of otherToolCalls) {
+    const id = nextId;
+    nextId += 1;
+    server.send({
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: withModernEnvelope(
+        { name: call.name, arguments: call.arguments },
+        // Tasks capability declared on THIS request too - proving the
+        // six-tool mint rule is a per-tool-name guarantee, not merely
+        // "the earlier request in this test happened not to declare it."
+        { extensions: { [TASKS_EXTENSION_URI]: {} } }
+      ),
+    });
+    const line = await server.nextLine();
+    const body = line.parsed as {
+      id: number;
+      error?: unknown;
+      result?: { isError?: boolean; structuredContent?: Record<string, unknown> };
+    };
+    assert.equal(body.id, id, `response id must match the request for "${call.name}"`);
+    assert.equal(
+      body.error,
+      undefined,
+      `"${call.name}" must succeed even declaring Tasks capability, got: ${JSON.stringify(body)}`
+    );
+    assert.notEqual(
+      body.result?.isError,
+      true,
+      `"${call.name}" must not report a tool-level error`
+    );
+    const structured = body.result?.structuredContent;
+    assert.equal(
+      structured?.extension,
+      undefined,
+      `"${call.name}" must NEVER mint a Task result on the modern era, even with capability declared on its own request, got: ${JSON.stringify(structured)}`
+    );
+    assert.equal(
+      structured?.taskId,
+      undefined,
+      `"${call.name}" must never carry a taskId field either, got: ${JSON.stringify(structured)}`
+    );
+  }
   server.child.kill("SIGKILL");
 });
 

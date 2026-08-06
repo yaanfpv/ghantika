@@ -100,6 +100,62 @@
  * hand-rolling an equivalent for a handshake shape that does not exist on
  * this era.
  *
+ * ## Reading a request's own declared client capabilities: two genuinely
+ * different sources, one per era, never the same accessor for both
+ *
+ * `tools/call`'s `run` branch (below) needs to know whether the CALLER
+ * declared `io.modelcontextprotocol/tasks` support before deciding whether
+ * to hand the result to `tasksAdapter.maybeAugmentRunResult`. On the legacy
+ * era this is exactly what it always was: `server.getClientCapabilities()`
+ * reads a value the SDK's `_oninitialize` sets ONCE, from the client's own
+ * `initialize` request, and that same value answers for every request on
+ * the connection - genuinely connection-level, matching the legacy
+ * handshake's own one-time-negotiation model.
+ *
+ * The 2026-07-28 revision has no `initialize` exchange to populate anything
+ * from at all - it requires every request to carry its OWN
+ * `io.modelcontextprotocol/clientCapabilities` `_meta` envelope key
+ * (confirmed against the installed SDK's own wire codec:
+ * `REQUIRED_ENVELOPE_KEYS` names it alongside the protocol-version key, and
+ * `checkInboundEnvelope` rejects any modern-era request missing it, before
+ * this file's own handler ever runs). So on the modern era,
+ * `getClientCapabilities()` is the WRONG accessor - and, under this
+ * codebase's real stdio wiring, silently returns `undefined` forever, not
+ * merely "the wrong value for this one request." Confirmed by reading the
+ * installed SDK's own source rather than assumed: the SDK's per-request
+ * backfill for that deprecated accessor (`seedClientIdentityFromEnvelope`,
+ * which copies each request's envelope-declared capabilities onto the
+ * `Server` instance so the deprecated accessor keeps answering) is called
+ * from exactly one place - the SDK's HTTP `createMcpHandler` entry point,
+ * which builds a brand-new `Server` instance PER HTTP REQUEST and seeds
+ * each one individually. `serveStdio` (what this file actually uses) pins
+ * ONE `Server` instance for a connection's entire lifetime and never calls
+ * that backfill function at all (grepped the installed
+ * `@modelcontextprotocol/server/dist/stdio.mjs` for every name it could
+ * plausibly be imported or referenced under - zero matches). So a
+ * `serveStdio`-served modern connection's `getClientCapabilities()` never
+ * gets populated by ANY code path, for the connection's entire life -
+ * meaning a client that declares Tasks support exactly the way the
+ * released spec requires (its own request's per-request envelope) could
+ * never be recognized, and the Tasks-extension mint path could never fire
+ * on the modern era, regardless of what any client actually declared. This
+ * is precisely the gap the installed SDK's own doc comment on
+ * `getClientCapabilities()` steers callers away from: "Read client
+ * identity from the per-request handler context instead."
+ *
+ * `resolveRunClientCapabilities` (below) is that per-era split, made
+ * explicit rather than left to an accessor whose correctness silently
+ * depends on which entry point happens to be serving the connection: the
+ * legacy era keeps using `getClientCapabilities()` (unchanged, still
+ * correct there), and the modern era reads
+ * `ctx.mcpReq.envelope[CLIENT_CAPABILITIES_META_KEY]` directly - the SAME
+ * per-request value the SDK's own internal capability checks use, publicly
+ * exposed on the request handler's own `ctx` for exactly this purpose. The
+ * distinction between the two eras is captured once, in the `servedModernEra`
+ * flag set inside this file's own `.connect` override (the same place that
+ * already knows, from `server.getNegotiatedProtocolVersion()`, which era a
+ * given instance serves - see "Modern era's own trust anchor" above).
+ *
  * ## Why stdout purity matters
  *
  * MCP over stdio uses the server's own stdout as the ENTIRE protocol
@@ -142,6 +198,7 @@
  *   own `toolError` helper.
  */
 import {
+  CLIENT_CAPABILITIES_META_KEY,
   ProtocolError,
   ProtocolErrorCode,
   Server,
@@ -149,7 +206,12 @@ import {
 } from "@modelcontextprotocol/server";
 import { StdioServerTransport, serveStdio } from "@modelcontextprotocol/server/stdio";
 import type { StdioServerHandle } from "@modelcontextprotocol/server/stdio";
-import type { JSONRPCMessage, Transport } from "@modelcontextprotocol/server";
+import type {
+  ClientCapabilities,
+  JSONRPCMessage,
+  ServerContext,
+  Transport,
+} from "@modelcontextprotocol/server";
 import { Readable } from "node:stream";
 
 import type { JobState } from "./jobStore.js";
@@ -274,6 +336,15 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
   let pendingInitializeRequestId: string | number | undefined;
   let initializeNegotiationSucceeded = false;
   let receivedInitializedNotification = false;
+  // Set exactly once, inside `.connect` below, from the SAME
+  // `getNegotiatedProtocolVersion()` pre-connect check the legacy-vs-modern
+  // gate logic already uses - never re-derived elsewhere, so there is only
+  // one place that decides which era this instance serves. Read by
+  // `resolveRunClientCapabilities` (module scope, below) to pick the right
+  // capability source for the `run` branch of `tools/call` - see this
+  // file's header doc ("Reading a request's own declared client
+  // capabilities") for why the two eras need genuinely different sources.
+  let servedModernEra = false;
 
   const isInitializedForToolCalls = (): boolean =>
     initializeNegotiationSucceeded && receivedInitializedNotification;
@@ -306,7 +377,7 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
     tools: listToolDefinitions(),
   }));
 
-  server.setRequestHandler("tools/call", async (request) => {
+  server.setRequestHandler("tools/call", async (request, ctx) => {
     // The server must advertise its tools via
     // initialize/tools/list BEFORE accepting any tools/call - a call sent
     // before the client has completed the initialize/initialized
@@ -325,12 +396,18 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
     // ONLY run() is ever handed to the adapter - status/output/tail/kill/
     // list pass straight through unchanged, so the plain poll floor stays
     // reachable on every connection regardless of Tasks capability.
-    // Capability is read fresh off the CONNECTION
-    // (server.getClientCapabilities(), populated once at initialize) -
-    // never off anything in `request` itself, which is what keeps minting
-    // connection-level rather than per-request.
+    // Capability comes from resolveRunClientCapabilities (below) - the
+    // connection's initialize-declared value on the legacy era, or THIS
+    // request's own per-request `_meta` envelope declaration on the
+    // 2026-07-28 era (see that function's own docs, and this file's header
+    // doc "Reading a request's own declared client capabilities," for why
+    // the two eras need genuinely different sources) - never off anything
+    // in `run()`'s own tool arguments, which is what keeps minting free of
+    // a per-call opt-in field on either era.
     if (request.params.name === "run") {
-      const capable = tasksAdapter.isConnectionTasksCapable(server.getClientCapabilities());
+      const capable = tasksAdapter.isConnectionTasksCapable(
+        resolveRunClientCapabilities(server, ctx, servedModernEra)
+      );
       return tasksAdapter.maybeAugmentRunResult(result, capable, sendTaskWakeNotification);
     }
     return result;
@@ -374,6 +451,7 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
       // ("Modern era's own trust anchor") for why `serveStdio` setting
       // this BEFORE calling `.connect()` is itself the proof a legacy
       // connection has no equivalent for and does not need one.
+      servedModernEra = true;
       initializeNegotiationSucceeded = true;
       receivedInitializedNotification = true;
       return realConnect(transport);
@@ -400,6 +478,46 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
   };
 
   return { server, isInitialized: isInitializedForToolCalls };
+}
+
+/**
+ * Resolves the client capabilities that govern ONE `tools/call` request's
+ * own Tasks-capability check - see this file's header doc ("Reading a
+ * request's own declared client capabilities") for the full rationale on
+ * why the two eras need genuinely different sources rather than one
+ * accessor that happens to work for both.
+ *
+ * Legacy era (`servedModernEra` false): `server.getClientCapabilities()`,
+ * unchanged - the connection's own `initialize`-declared value, correct
+ * and connection-level exactly as it always was.
+ *
+ * Modern era (`servedModernEra` true): `ctx.mcpReq.envelope`'s own
+ * reserved `CLIENT_CAPABILITIES_META_KEY` entry - THIS request's own
+ * per-request declaration, required and schema-validated by the SDK's own
+ * `checkInboundEnvelope` before this handler ever runs (confirmed against
+ * the installed SDK's `REQUIRED_ENVELOPE_KEYS`/`RequestMetaEnvelopeSchema`
+ * source), so a present-but-empty object (a client that legitimately
+ * declares no capabilities at all) is the only falsy-looking value ever
+ * reachable here - never `undefined` the way an absent legacy declaration
+ * would read. The cast below mirrors this same file's own
+ * `extractJobId`-style narrowing already established in
+ * `tasksAdapter.ts` - `RequestMetaEnvelope` is deliberately an opaque `{}`
+ * shape in the installed SDK's own public types (its own doc comment: "a
+ * neutral hand-written shape keyed by the public meta-key constants"), so
+ * reading a member off it by the exported key constant is the SDK's own
+ * intended usage, not a workaround.
+ */
+function resolveRunClientCapabilities(
+  server: Server,
+  ctx: ServerContext,
+  servedModernEra: boolean
+): ClientCapabilities | undefined {
+  if (!servedModernEra) return server.getClientCapabilities();
+  const envelope = ctx.mcpReq.envelope as Record<string, unknown> | undefined;
+  const declared = envelope?.[CLIENT_CAPABILITIES_META_KEY];
+  return typeof declared === "object" && declared !== null
+    ? (declared as ClientCapabilities)
+    : undefined;
 }
 
 /**
