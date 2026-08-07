@@ -550,8 +550,17 @@ test(
         ? "real shell-forked process tree tracked via `pgrep -g`, POSIX-only"
         : false,
   },
-  async () => {
+  async (t) => {
     const server = tracked();
+    // Guaranteed cleanup for any path that never reaches this test's own
+    // explicit server.child.kill() below - see test/modern-handshake.test.ts's
+    // the guaranteed-cleanup fix in test/modern-handshake.test.ts for the
+    // full rationale. A backstop only:
+    // server.child.killed is already true by the time this runs on every
+    // normal green pass.
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    });
     await completeHandshake(server);
 
     const dir = makeTempDir();
@@ -687,8 +696,17 @@ test(
         ? "real shell-forked process tree tracked via `pgrep -g`, POSIX-only - no equivalent root-exits-first fix on Windows today (no pgid concept to reap against post-hoc)"
         : false,
   },
-  async () => {
+  async (t) => {
     const server = tracked();
+    // Guaranteed cleanup for any path that never reaches this test's own
+    // explicit server.child.kill() below - see test/modern-handshake.test.ts's
+    // the guaranteed-cleanup fix in test/modern-handshake.test.ts for the
+    // full rationale. A backstop only:
+    // server.child.killed is already true by the time this runs on every
+    // normal green pass.
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    });
     await completeHandshake(server);
 
     const dir = makeTempDir();
@@ -909,8 +927,17 @@ test(
         ? "sends a real non-default signal and reads real pgrep output, POSIX-only"
         : false,
   },
-  async () => {
+  async (t) => {
     const server = tracked();
+    // Guaranteed cleanup for any path that never reaches this test's own
+    // explicit server.child.kill() below - see test/modern-handshake.test.ts's
+    // the guaranteed-cleanup fix in test/modern-handshake.test.ts for the
+    // full rationale. A backstop only:
+    // server.child.killed is already true by the time this runs on every
+    // normal green pass.
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    });
     await completeHandshake(server);
 
     const dir = makeTempDir();
@@ -1041,8 +1068,17 @@ test(
         ? "real shell-forked process tree tracked via pgrep -g, POSIX-only - no equivalent root-exits-first fix on Windows today"
         : false,
   },
-  async () => {
+  async (t) => {
     const server = tracked();
+    // Guaranteed cleanup for any path that never reaches this test's own
+    // explicit server.child.kill() below - see test/modern-handshake.test.ts's
+    // the guaranteed-cleanup fix in test/modern-handshake.test.ts for the
+    // full rationale. A backstop only:
+    // server.child.killed is already true by the time this runs on every
+    // normal green pass.
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    });
     await completeHandshake(server);
 
     const dir = makeTempDir();
@@ -1224,8 +1260,17 @@ test(
         ? "real process tracked via pgrep -g, POSIX-only - no equivalent root-exits-first fix on Windows today"
         : false,
   },
-  async () => {
+  async (t) => {
     const server = tracked();
+    // Guaranteed cleanup for any path that never reaches this test's own
+    // explicit server.child.kill() below - see test/modern-handshake.test.ts's
+    // the guaranteed-cleanup fix in test/modern-handshake.test.ts for the
+    // full rationale. A backstop only:
+    // server.child.killed is already true by the time this runs on every
+    // normal green pass.
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    });
     await completeHandshake(server);
 
     const dir = makeTempDir();
@@ -1489,8 +1534,17 @@ test(
         ? "spawns a real detached process and reads real pgrep output, POSIX-only"
         : false,
   },
-  async () => {
+  async (t) => {
     const server = tracked();
+    // Guaranteed cleanup for any path that never reaches this test's own
+    // explicit server.child.kill() below - see test/modern-handshake.test.ts's
+    // the guaranteed-cleanup fix in test/modern-handshake.test.ts for the
+    // full rationale. A backstop only:
+    // server.child.killed is already true by the time this runs on every
+    // normal green pass.
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    });
     await completeHandshake(server);
 
     const dir = makeTempDir();
@@ -1566,8 +1620,15 @@ test(
   }
 );
 
-test("kill() over the real wire: unknown job_id is a real tool-execution error, never a JSON-RPC protocol error", async () => {
+test("kill() over the real wire: unknown job_id is a real tool-execution error, never a JSON-RPC protocol error", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for any path that never reaches this test's own
+  // explicit server.child.kill() below - see test/modern-handshake.test.ts's
+  // the guaranteed-cleanup fix in test/modern-handshake.test.ts for the
+  // full rationale.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   await completeHandshake(server);
   server.send({
     jsonrpc: "2.0",
@@ -1582,8 +1643,15 @@ test("kill() over the real wire: unknown job_id is a real tool-execution error, 
   server.child.kill("SIGKILL");
 });
 
-test("kill() over the real wire: output AND tail can both actually read a killed job's buffered lines afterward - the literal assertion, not just a marker-file proxy", async () => {
+test("kill() over the real wire: output AND tail can both actually read a killed job's buffered lines afterward - the literal assertion, not just a marker-file proxy", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for any path that never reaches this test's own
+  // explicit server.child.kill() below - see test/modern-handshake.test.ts's
+  // the guaranteed-cleanup fix in test/modern-handshake.test.ts for the
+  // full rationale.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   await completeHandshake(server);
   server.send({
     jsonrpc: "2.0",
@@ -1715,8 +1783,17 @@ test(
         ? "spawns a real detached escapee and reads real pgrep output, POSIX-only"
         : false,
   },
-  async () => {
+  async (t) => {
     const server = tracked();
+    // Guaranteed cleanup for any path that never reaches this test's own
+    // explicit server.child.kill() below - see test/modern-handshake.test.ts's
+    // the guaranteed-cleanup fix in test/modern-handshake.test.ts for the
+    // full rationale. A backstop only:
+    // server.child.killed is already true by the time this runs on every
+    // normal green pass.
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    });
     await completeHandshake(server);
 
     const dir = makeTempDir();

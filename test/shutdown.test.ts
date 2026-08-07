@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import type { TestContext } from "node:test";
 
 // See test/e2e-server.test.ts's import comment for why this is ".ts", not ".js".
 import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/spawnServer.ts";
@@ -62,8 +63,15 @@ const PGREP_ORACLE_SKIP =
 // regardless of system load, and is also more representative of a real
 // client's lifecycle (connect, then eventually disconnect).
 
-test("SIGTERM reaches the real cleanup path: stderr shows the shutdown diagnostic, process exits 0", async () => {
+test("SIGTERM reaches the real cleanup path: stderr shows the shutdown diagnostic, process exits 0", async (t) => {
   const server = spawnServer();
+  // Guaranteed backstop - see the guaranteed-cleanup fix in
+  // test/modern-handshake.test.ts for the full rationale. This test's own kill+waitForExit below
+  // already runs before any assertion, so this never fires on a normal
+  // pass; it only protects a future edit that adds an earlier assertion.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   await completeHandshake(server);
   server.child.kill("SIGTERM");
   const { code, signal } = await server.waitForExit();
@@ -76,8 +84,11 @@ test("SIGTERM reaches the real cleanup path: stderr shows the shutdown diagnosti
   assert.match(server.stderrText(), /\[ghantika\] shutting down \(SIGTERM\)/);
 });
 
-test("SIGINT reaches the real cleanup path too", async () => {
+test("SIGINT reaches the real cleanup path too", async (t) => {
   const server = spawnServer();
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   await completeHandshake(server);
   server.child.kill("SIGINT");
   const { code, signal } = await server.waitForExit();
@@ -86,8 +97,11 @@ test("SIGINT reaches the real cleanup path too", async () => {
   assert.match(server.stderrText(), /\[ghantika\] shutting down \(SIGINT\)/);
 });
 
-test("stdin EOF (the client closing its side of the pipe) reaches the real cleanup path", async () => {
+test("stdin EOF (the client closing its side of the pipe) reaches the real cleanup path", async (t) => {
   const server = spawnServer();
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   await completeHandshake(server);
   server.child.stdin.end(); // closes stdin -> the child process observes EOF
   const { code, signal } = await server.waitForExit();
@@ -188,9 +202,22 @@ interface RunResponseBody {
  * group is genuinely alive via a real external `pgrep` BEFORE ever
  * triggering shutdown, then hands back the server and the group's pgid
  * for the caller to trigger its own shutdown path against and verify.
+ *
+ * Takes the caller test's own TestContext to register a guaranteed
+ * `t.after` cleanup immediately after spawning - this function's own setup
+ * (the run() call, waiting for the pgid marker, the pre-shutdown pgrep
+ * check) runs several assertions BEFORE the caller ever gets `server`
+ * back, so a thrown setup assertion here would otherwise leave both the
+ * server and its live process tree behind. See the guaranteed-cleanup
+ * fix in test/modern-handshake.test.ts for the full rationale.
  */
-async function spawnServerWithLiveTree(): Promise<{ server: SpawnedServer; pgid: number }> {
+async function spawnServerWithLiveTree(
+  t: TestContext
+): Promise<{ server: SpawnedServer; pgid: number }> {
   const server = spawnServer();
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   await completeHandshake(server);
 
   const dir = makeTempDir();
@@ -241,8 +268,8 @@ async function spawnServerWithLiveTree(): Promise<{ server: SpawnedServer; pgid:
 test(
   "stdin EOF reaps a REAL live job's WHOLE process group - zero survivors confirmed by a real external pgrep",
   { skip: PGREP_ORACLE_SKIP },
-  async () => {
-    const { server, pgid } = await spawnServerWithLiveTree();
+  async (t) => {
+    const { server, pgid } = await spawnServerWithLiveTree(t);
 
     server.child.stdin.end(); // closes stdin -> the server observes EOF and runs its real shutdown path
     const { code, signal } = await server.waitForExit();
@@ -269,8 +296,8 @@ test(
 test(
   "SIGTERM reaps a REAL live job's WHOLE process group - zero survivors confirmed by a real external pgrep",
   { skip: PGREP_ORACLE_SKIP },
-  async () => {
-    const { server, pgid } = await spawnServerWithLiveTree();
+  async (t) => {
+    const { server, pgid } = await spawnServerWithLiveTree(t);
 
     server.child.kill("SIGTERM");
     const { code, signal } = await server.waitForExit();
@@ -293,8 +320,8 @@ test(
 test(
   "SIGINT reaps a REAL live job's WHOLE process group - zero survivors confirmed by a real external pgrep",
   { skip: PGREP_ORACLE_SKIP },
-  async () => {
-    const { server, pgid } = await spawnServerWithLiveTree();
+  async (t) => {
+    const { server, pgid } = await spawnServerWithLiveTree(t);
 
     server.child.kill("SIGINT");
     const { code, signal } = await server.waitForExit();
@@ -314,8 +341,11 @@ test(
   }
 );
 
-test("green control: a job that has already exited BEFORE shutdown is simply left alone - shutdown never errors or hangs on an already-terminal job", async () => {
+test("green control: a job that has already exited BEFORE shutdown is simply left alone - shutdown never errors or hangs on an already-terminal job", async (t) => {
   const server = spawnServer();
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   await completeHandshake(server);
   server.send({
     jsonrpc: "2.0",
@@ -341,8 +371,17 @@ test("green control: a job that has already exited BEFORE shutdown is simply lef
 test(
   "root-exits-first, shutdown side: the eager reap already collects a job's real, live descendants automatically at leader-exit - well before shutdown ever runs - and shutdown still exits cleanly against that already-reaped, terminal record",
   { skip: PGREP_ORACLE_SKIP },
-  async () => {
+  async (t) => {
     const server = spawnServer();
+    // Guaranteed cleanup for any path that never reaches this test's own
+    // explicit server.child.stdin.end() far below - this test's own setup
+    // (spawning the job, witnessing the two live descendants via a real
+    // pgrep, releasing the barrier) runs many assertions first. See the
+    // guaranteed-cleanup fix in test/modern-handshake.test.ts for the
+    // full rationale.
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    });
     await completeHandshake(server);
 
     const dir = makeTempDir();

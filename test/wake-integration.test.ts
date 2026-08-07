@@ -1534,8 +1534,18 @@ async function nextResponse(
 test(
   "shutdown finitely reaps a genuinely-live task's real backing job within a bounded deadline on POSIX (a hang is a distinct failure from a skip) - the real process is confirmed dead via the reused pgrep oracle, and an already-terminal task alongside it is read AGAIN mid-shutdown and found byte-for-byte unchanged",
   { skip: PGREP_ORACLE_SKIP },
-  async () => {
+  async (t) => {
     const server = spawnServer();
+    // Guaranteed cleanup for any path that never reaches this test's own
+    // explicit server.child.kill("SIGTERM") below - a real live "sleep 60"
+    // backing job is spawned well before that signal, so a thrown setup
+    // assertion here would otherwise leave both the server AND that live
+    // process group behind. See test/modern-handshake.test.ts's
+    // the guaranteed-cleanup fix in test/modern-handshake.test.ts for the
+    // full rationale.
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    });
     await completeCapableHandshake(server);
 
     const dir = mkdtempSync(path.join(tmpdir(), "ghantika-wake-shutdown-reap-"));
