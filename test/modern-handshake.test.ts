@@ -80,7 +80,7 @@ process.on("exit", () => {
  * JSON-RPC 2.0 - skipping over any NOTIFICATION (a `method` with no `id`
  * at all) seen along the way.
  *
- * Needed because this story adds `notifications/tasks` (see
+ * Needed because this change adds `notifications/tasks` (see
  * `src/tasksAdapter.ts`'s own `startTaskStatusNotifier` docs): a
  * genuinely UNCONDITIONAL per-transition notification that now fires on
  * every Tasks-capable-minted task's own terminal transition, regardless

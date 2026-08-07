@@ -964,7 +964,7 @@ test("a sustained firehose rate rate-limits wakes and auto-stops ONLY the notifi
       // without ever removing it from jobStore. The count this asserts is
       // now 1, not 0 (this test previously asserted 0, back when the
       // watch's own terminal listener was the ONLY onJobTerminal subscriber
-      // this codebase ever registered for a job): this story adds a
+      // this codebase ever registered for a job): this change adds a
       // genuinely SEPARATE `notifications/tasks` per-transition status
       // notifier (startTaskStatusNotifier, see its own docs) that
       // subscribes onJobTerminal for this SAME still-working job

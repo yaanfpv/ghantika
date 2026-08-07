@@ -57,7 +57,7 @@
  * `taskStatus` values (never `input_required` - see that constant's own
  * docs for why), and `tasks/list`/`tasks/result` stay unregistered (the
  * spec eliminates the former and replaces the latter - see the method-set
- * section of this header for the full reasoning, unchanged by this story).
+ * section of this header for the full reasoning, unchanged by this change).
  *
  * ## Capability advertisement: `capabilities.extensions`, not the SDK's
  * deprecated `capabilities.tasks`
@@ -140,7 +140,7 @@
  * matching the spec's own "eventually consistent - the ack may arrive
  * before the task's observable status reflects the requested change"
  * contract for `CancelTaskResult`, rather than reading a fresh snapshot
- * back the way this adapter did before this story.
+ * back the way this adapter did before this change.
  *
  * BOUNDARY, unwidened from `kill`'s own already-disclosed scope (see
  * `src/tools/kill.ts`'s extensive docs on this): cancelling means
@@ -627,7 +627,7 @@ function buildGhantikaResultExtras(record: JobRecord): GhantikaResultExtras {
 /**
  * Projects a real `JobRecord` into the discriminated `DetailedTaskResult`
  * union - the shape `tasks/get` (via `buildGetTaskResult`) actually
- * returns, and, as of this story, ALSO the exact shape the real
+ * returns, and, as of this change, ALSO the exact shape the real
  * `notifications/tasks` notification's own `params` carries (see
  * `startTaskStatusNotifier`, below): the spec's own
  * `TaskStatusNotificationParams = NotificationParams & Task` is a bare
@@ -635,7 +635,7 @@ function buildGhantikaResultExtras(record: JobRecord): GhantikaResultExtras {
  * would have returned for that same task at that same moment - so this
  * function is reused rather than duplicated for the notification path,
  * exported for exactly that reuse (previously module-local, since nothing
- * outside `getTask` needed it before this story). Pure: reads `jobStore`'s
+ * outside `getTask` needed it before this change). Pure: reads `jobStore`'s
  * own already-existing, real state (`getOutputWatchStopInfo`/
  * `getOutputCounts`) and the record's own fields, writes nothing.
  *
@@ -939,7 +939,7 @@ export function taskUpdateParamsSchema(): StandardSchemaV1<unknown, TaskUpdatePa
 // rename is the only change this section makes to that mechanism.
 //
 // (2) `notifications/tasks` (below, `TASKS_NOTIFICATION_METHOD`) - the
-// REAL, spec-defined status notification, added by this story. Carries a
+// REAL, spec-defined status notification, added by this change. Carries a
 // complete `DetailedTask` snapshot (via `buildDetailedTaskResult`, reused
 // from `getTask`'s own path) per status TRANSITION, including the
 // terminal one - see `startTaskStatusNotifier`, below, for the full
@@ -985,7 +985,7 @@ export const WATCH_STOP_REASON_FIREHOSE = "firehose";
  * deliberately namespaced under `ghantika`, never under `tasks`, so it can
  * never be mistaken for the extension's own wire vocabulary by a
  * conformant client reading the method name alone. Was
- * `notifications/tasks/status` before this story (see this section's own
+ * `notifications/tasks/status` before this change (see this section's own
  * header for why that name was retired, not merely relocated). Optional:
  * a client MUST NOT rely on receiving it and continues to poll
  * `tasks/get`/`output`/`tail` regardless (see this section's own docs on
@@ -1205,7 +1205,7 @@ function startTaskWatch(taskId: string, notifier: TaskWakeNotifier): void {
     // No GHANTIKA_OUTPUT_WAKE_METHOD wake fires for the terminal transition
     // itself - this watch's whole job is the output-delta accelerator
     // (stdout and stderr both), never a status announcement of its own, and
-    // that stays true after this story. A SEPARATE notification genuinely
+    // that stays true after this change. A SEPARATE notification genuinely
     // DOES fire on the terminal transition now - see `startTaskStatusNotifier`,
     // below, which subscribes independently (never through this watch's own
     // listener) specifically so a firehose-triggered stop of THIS watch can
@@ -1354,7 +1354,7 @@ function extractJobId(result: CallToolResult): string | undefined {
  * carries no `content`/`structuredContent` members, and the vendored
  * schema's `createTaskResult` $def locks `additionalProperties: false`
  * against a property set that does not include either). GROUNDED against
- * the installed SDK's own runtime for this story, not merely inferred
+ * the installed SDK's own runtime for this adapter, not merely inferred
  * from the spec text: `stampResultType` (the SDK's own encode-contract
  * step, confirmed by reading `@modelcontextprotocol/server`'s bundled
  * source directly) treats `tools/call` as one of

@@ -803,7 +803,7 @@ test("green control: a bounded stream UNDER FIREHOSE_LINES_PER_SEC runs to its o
 // The released spec's own `notifications/tasks` per-transition status
 // notification (src/tasksAdapter.ts's startTaskStatusNotifier) - a
 // genuinely SEPARATE surface from the GHANTIKA_OUTPUT_WAKE_METHOD wake
-// tested above, added by this story. Proves the terminal transition IS
+// tested above, added by this change. Proves the terminal transition IS
 // notified on this surface (unlike the output-delta wake, which never
 // itself announces it - see this file's own tests above), that the
 // payload matches tasks/get's own snapshot at that instant field-for-field,
@@ -1018,7 +1018,7 @@ const golden = JSON.parse(readFileSync(GOLDEN_PATH, "utf8")) as Record<string, u
 // always compare as present (or always absent) would fabricate a
 // determinism the real wire protocol does not have - which would silently
 // paper over a genuine regression in their presence rather than prove
-// anything about it. None of the four is something this story's wake layer
+// anything about it. None of the four is something this change's wake layer
 // could plausibly regress (already governed by test/kill.test.ts and
 // friends) - excluding them keeps this comparison scoped to the
 // wake-additivity property it exists to prove.
@@ -1501,7 +1501,7 @@ interface TasksGetResponseBody {
  * either file's own docs in full): the shutdown test below drives two
  * tasks to a real terminal transition on a Tasks-capable connection - the
  * short-lived control task (`command: ["true"]`) minted mid-test, and the
- * live task itself once shutdown's own reap kills it - and this story's
+ * live task itself once shutdown's own reap kills it - and this change's
  * `notifications/tasks` (see `src/tasksAdapter.ts`'s own
  * `startTaskStatusNotifier` docs) fires unconditionally on each. Either
  * notification can land on this raw stdio wire in between any two of this
