@@ -541,8 +541,20 @@ test(
         ? "sends a real SIGSTOP and reads real pgrep output, POSIX-only"
         : false,
   },
-  async () => {
+  async (t) => {
     const server = tracked();
+    // Guaranteed cleanup for any path that never reaches this test's own
+    // explicit server.child.kill() below - see test/modern-handshake.test.ts's
+    // the guaranteed-cleanup fix in test/modern-handshake.test.ts for the
+    // full rationale (a thrown assertion here would
+    // otherwise leave a live server referenced only by the module-scope
+    // `spawned` array, which keeps the whole test-runner process's event
+    // loop non-empty and can prevent this file's own process.on("exit")
+    // backstop from ever firing). A backstop only: server.child.killed is
+    // already true by the time this runs on every normal green pass.
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    });
     await completeHandshake(server);
 
     const dir = makeTempDir("ghantika-kill-e2e-");

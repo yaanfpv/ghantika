@@ -125,8 +125,18 @@ interface DiscoverResultBody {
 // server/discover succeeds and advertises the modern revision
 // ---------------------------------------------------------------------------
 
-test("server/discover over the real wire returns a successful result advertising the 2026-07-28 revision and the tools capability", async () => {
+test("server/discover over the real wire returns a successful result advertising the 2026-07-28 revision and the tools capability", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below (a thrown assertion, in particular -
+  // exactly this gap once let one assertion failure
+  // present as a 180-second whole-suite idle-watchdog hang instead of a
+  // fast, named failure). A backstop only: server.child.killed is already
+  // true by the time this runs on every normal green pass, since the
+  // explicit kill below fires first in the test's own synchronous flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   server.send(discoverRequest(1));
   const line = await server.nextLine();
   assert.equal(line.parseError, undefined, `expected valid JSON, got: ${line.parseError}`);
@@ -154,8 +164,18 @@ test("server/discover over the real wire returns a successful result advertising
   server.child.kill("SIGKILL");
 });
 
-test("regression check, modern side: the legacy initialize handshake is completely unaffected by a connection that never sends server/discover at all - reruns the exact legacy assertion e2e-server.test.ts already covers, here for direct side-by-side proof both eras are served by the SAME real binary", async () => {
+test("regression check, modern side: the legacy initialize handshake is completely unaffected by a connection that never sends server/discover at all - reruns the exact legacy assertion e2e-server.test.ts already covers, here for direct side-by-side proof both eras are served by the SAME real binary", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below (a thrown assertion, in particular -
+  // exactly this gap once let one assertion failure
+  // present as a 180-second whole-suite idle-watchdog hang instead of a
+  // fast, named failure). A backstop only: server.child.killed is already
+  // true by the time this runs on every normal green pass, since the
+  // explicit kill below fires first in the test's own synchronous flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   const response = await completeHandshake(server);
   const body = response.parsed as {
     result?: { protocolVersion?: string; capabilities?: { tools?: unknown } };
@@ -173,8 +193,18 @@ test("regression check, modern side: the legacy initialize handshake is complete
 // pre-connect trust-anchor shortcut).
 // ---------------------------------------------------------------------------
 
-test("legacy handshake, under serveStdio: tools/call sent before the initialize/initialized handshake completes is STILL rejected, proving the gate observers correctly chained onto serveStdio's own StdioConnectionChannel proxy rather than the raw wire transport", async () => {
+test("legacy handshake, under serveStdio: tools/call sent before the initialize/initialized handshake completes is STILL rejected, proving the gate observers correctly chained onto serveStdio's own StdioConnectionChannel proxy rather than the raw wire transport", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below (a thrown assertion, in particular -
+  // exactly this gap once let one assertion failure
+  // present as a 180-second whole-suite idle-watchdog hang instead of a
+  // fast, named failure). A backstop only: server.child.killed is already
+  // true by the time this runs on every normal green pass, since the
+  // explicit kill below fires first in the test's own synchronous flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   server.send({
     jsonrpc: "2.0",
     id: 1,
@@ -196,8 +226,18 @@ test("legacy handshake, under serveStdio: tools/call sent before the initialize/
   server.child.kill("SIGKILL");
 });
 
-test("legacy handshake, under serveStdio: a real initialize + notifications/initialized still opens the gate normally - the observer chaining does not break the legitimate handshake either", async () => {
+test("legacy handshake, under serveStdio: a real initialize + notifications/initialized still opens the gate normally - the observer chaining does not break the legitimate handshake either", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below (a thrown assertion, in particular -
+  // exactly this gap once let one assertion failure
+  // present as a 180-second whole-suite idle-watchdog hang instead of a
+  // fast, named failure). A backstop only: server.child.killed is already
+  // true by the time this runs on every normal green pass, since the
+  // explicit kill below fires first in the test's own synchronous flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   await completeHandshake(server);
   server.send({
     jsonrpc: "2.0",
@@ -221,8 +261,18 @@ test("legacy handshake, under serveStdio: a real initialize + notifications/init
   server.child.kill("SIGKILL");
 });
 
-test("modern handshake: tools/call immediately after a successful server/discover succeeds - the modern era's own trust anchor (serveStdio's pre-connect setNegotiatedProtocolVersion) opens the gate with no initialize/initialized exchange, which this era has none of", async () => {
+test("modern handshake: tools/call immediately after a successful server/discover succeeds - the modern era's own trust anchor (serveStdio's pre-connect setNegotiatedProtocolVersion) opens the gate with no initialize/initialized exchange, which this era has none of", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below (a thrown assertion, in particular -
+  // exactly this gap once let one assertion failure
+  // present as a 180-second whole-suite idle-watchdog hang instead of a
+  // fast, named failure). A backstop only: server.child.killed is already
+  // true by the time this runs on every normal green pass, since the
+  // explicit kill below fires first in the test's own synchronous flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   server.send(discoverRequest(1));
   const discoverLine = await server.nextLine();
   const discoverBody = discoverLine.parsed as DiscoverResultBody;
@@ -267,8 +317,18 @@ test("modern handshake: tools/call immediately after a successful server/discove
 // the identical connection does not.
 // ---------------------------------------------------------------------------
 
-test("modern handshake: a tools/call whose OWN request envelope declares io.modelcontextprotocol/tasks mints a real Task result whose taskId is a real, present string, on the RAW wire shape - no structuredContent at all, resultType:'task' genuinely present (this raw stdio harness reads bytes directly, with no @modelcontextprotocol/client decode/strip involved, unlike test/tasks.test.ts's own InMemoryTransport-based proof, which has to build its own wire tap precisely because the SDK Client strips resultType before a caller ever sees it)", async () => {
+test("modern handshake: a tools/call whose OWN request envelope declares io.modelcontextprotocol/tasks mints a real Task result whose taskId is a real, present string, on the RAW wire shape - no structuredContent at all, resultType:'task' genuinely present (this raw stdio harness reads bytes directly, with no @modelcontextprotocol/client decode/strip involved, unlike test/tasks.test.ts's own InMemoryTransport-based proof, which has to build its own wire tap precisely because the SDK Client strips resultType before a caller ever sees it)", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below (a thrown assertion, in particular -
+  // exactly this gap once let one assertion failure
+  // present as a 180-second whole-suite idle-watchdog hang instead of a
+  // fast, named failure). A backstop only: server.child.killed is already
+  // true by the time this runs on every normal green pass, since the
+  // explicit kill below fires first in the test's own synchronous flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   server.send(discoverRequest(1));
   const discoverLine = await server.nextLine();
   const discoverBody = discoverLine.parsed as DiscoverResultBody;
@@ -348,8 +408,18 @@ test("modern handshake: a tools/call whose OWN request envelope declares io.mode
   server.child.kill("SIGKILL");
 });
 
-test("modern handshake: on the SAME connection, a tools/call whose OWN request envelope declares NO capabilities gets the plain poll floor, never a minted Task - proving the negotiation above is genuinely per-request, not cached at the connection level", async () => {
+test("modern handshake: on the SAME connection, a tools/call whose OWN request envelope declares NO capabilities gets the plain poll floor, never a minted Task - proving the negotiation above is genuinely per-request, not cached at the connection level", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below (a thrown assertion, in particular -
+  // exactly this gap once let one assertion failure
+  // present as a 180-second whole-suite idle-watchdog hang instead of a
+  // fast, named failure). A backstop only: server.child.killed is already
+  // true by the time this runs on every normal green pass, since the
+  // explicit kill below fires first in the test's own synchronous flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   server.send(discoverRequest(1));
   const discoverLine = await server.nextLine();
   assert.ok(
@@ -442,8 +512,18 @@ test("modern handshake: on the SAME connection, a tools/call whose OWN request e
 // never fed from.
 // ---------------------------------------------------------------------------
 
-test("modern handshake: a tools/call whose own request envelope declares ONLY the SDK-deprecated capabilities.tasks shape (never extensions/experimental) still gets the plain poll floor, not the extension - the modern era's own per-request envelope read, not the legacy connection-level one", async () => {
+test("modern handshake: a tools/call whose own request envelope declares ONLY the SDK-deprecated capabilities.tasks shape (never extensions/experimental) still gets the plain poll floor, not the extension - the modern era's own per-request envelope read, not the legacy connection-level one", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below (a thrown assertion, in particular -
+  // exactly this gap once let one assertion failure
+  // present as a 180-second whole-suite idle-watchdog hang instead of a
+  // fast, named failure). A backstop only: server.child.killed is already
+  // true by the time this runs on every normal green pass, since the
+  // explicit kill below fires first in the test's own synchronous flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   server.send(discoverRequest(1));
   const discoverLine = await server.nextLine();
   assert.ok(
@@ -498,8 +578,18 @@ test("modern handshake: a tools/call whose own request envelope declares ONLY th
 // Tasks support only under `experimental` never mints a Task result.
 // ---------------------------------------------------------------------------
 
-test("modern handshake: a tools/call whose own request envelope declares Tasks support ONLY under the older experimental bag (never extensions) still gets the plain poll floor, not the extension", async () => {
+test("modern handshake: a tools/call whose own request envelope declares Tasks support ONLY under the older experimental bag (never extensions) still gets the plain poll floor, not the extension", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below (a thrown assertion, in particular -
+  // exactly this gap once let one assertion failure
+  // present as a 180-second whole-suite idle-watchdog hang instead of a
+  // fast, named failure). A backstop only: server.child.killed is already
+  // true by the time this runs on every normal green pass, since the
+  // explicit kill below fires first in the test's own synchronous flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   server.send(discoverRequest(1));
   const discoverLine = await server.nextLine();
   assert.ok(
@@ -557,8 +647,18 @@ test("modern handshake: a tools/call whose own request envelope declares Tasks s
 // connection is not itself sufficient to make any OTHER tool mint.
 // ---------------------------------------------------------------------------
 
-test("modern handshake: six-tool mint rule on the real wire - run() mints while status/output/tail/kill/list each stay plain, even with Tasks capability declared on their OWN request too, on the SAME connection where run() just minted", async () => {
+test("modern handshake: six-tool mint rule on the real wire - run() mints while status/output/tail/kill/list each stay plain, even with Tasks capability declared on their OWN request too, on the SAME connection where run() just minted", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below (a thrown assertion, in particular -
+  // exactly this gap once let one assertion failure
+  // present as a 180-second whole-suite idle-watchdog hang instead of a
+  // fast, named failure). A backstop only: server.child.killed is already
+  // true by the time this runs on every normal green pass, since the
+  // explicit kill below fires first in the test's own synchronous flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   server.send(discoverRequest(1));
   const discoverLine = await server.nextLine();
   assert.ok(
@@ -699,8 +799,18 @@ test("modern handshake: six-tool mint rule on the real wire - run() mints while 
 // exercise both fully.
 // ---------------------------------------------------------------------------
 
-test("modern wire: tasks/get and tasks/cancel are UNROUTABLE on the 2026-07-28 era - a real, measured installed-SDK dispatch fact (the base Protocol class's own era-registry check), never a Tasks-capability gate this codebase applies, proven by the SAME outcome with and without capability declared", async () => {
+test("modern wire: tasks/get and tasks/cancel are UNROUTABLE on the 2026-07-28 era - a real, measured installed-SDK dispatch fact (the base Protocol class's own era-registry check), never a Tasks-capability gate this codebase applies, proven by the SAME outcome with and without capability declared", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below (a thrown assertion, in particular -
+  // exactly this gap once let one assertion failure
+  // present as a 180-second whole-suite idle-watchdog hang instead of a
+  // fast, named failure). A backstop only: server.child.killed is already
+  // true by the time this runs on every normal green pass, since the
+  // explicit kill below fires first in the test's own synchronous flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   server.send(discoverRequest(1));
   const discoverLine = await server.nextLine();
   assert.ok((discoverLine.parsed as DiscoverResultBody).result, "discover must succeed first");
@@ -774,8 +884,18 @@ test("modern wire: tasks/get and tasks/cancel are UNROUTABLE on the 2026-07-28 e
   server.child.kill("SIGKILL");
 });
 
-test("modern wire: tasks/update - the one task method the legacy vocabulary never defined - reaches this codebase's own handler normally on the modern era, and succeeds with NO Tasks capability declared on its own request, proving the second capability path is genuinely gate-free for the one method the wire itself does not block", async () => {
+test("modern wire: tasks/update - the one task method the legacy vocabulary never defined - reaches this codebase's own handler normally on the modern era, and succeeds with NO Tasks capability declared on its own request, proving the second capability path is genuinely gate-free for the one method the wire itself does not block", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below (a thrown assertion, in particular -
+  // exactly this gap once let one assertion failure
+  // present as a 180-second whole-suite idle-watchdog hang instead of a
+  // fast, named failure). A backstop only: server.child.killed is already
+  // true by the time this runs on every normal green pass, since the
+  // explicit kill below fires first in the test's own synchronous flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   server.send(discoverRequest(1));
   const discoverLine = await server.nextLine();
   assert.ok((discoverLine.parsed as DiscoverResultBody).result, "discover must succeed first");
@@ -853,8 +973,18 @@ test("modern wire: tasks/update - the one task method the legacy vocabulary neve
   server.child.kill("SIGKILL");
 });
 
-test("legacy wire: tasks/get, tasks/update, and tasks/cancel all succeed with NO Tasks capability declared on their own connection - the legacy era's own capability model is connection-level (see resolveRunClientCapabilities's own docs), and the three task methods are unaffected by it either way since none of them reads capability at all; also confirms the real kill-and-reap effect on a still-running task, and closes the AC's own dual-capability-path premise for tasks/get and tasks/cancel where the modern wire itself cannot", async () => {
+test("legacy wire: tasks/get, tasks/update, and tasks/cancel all succeed with NO Tasks capability declared on their own connection - the legacy era's own capability model is connection-level (see resolveRunClientCapabilities's own docs), and the three task methods are unaffected by it either way since none of them reads capability at all; also confirms the real kill-and-reap effect on a still-running task, and closes the AC's own dual-capability-path premise for tasks/get and tasks/cancel where the modern wire itself cannot", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below (a thrown assertion, in particular -
+  // exactly this gap once let one assertion failure
+  // present as a 180-second whole-suite idle-watchdog hang instead of a
+  // fast, named failure). A backstop only: server.child.killed is already
+  // true by the time this runs on every normal green pass, since the
+  // explicit kill below fires first in the test's own synchronous flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   await completeHandshake(server); // a plain legacy handshake, declaring no capabilities at all
 
   server.send({
@@ -941,8 +1071,18 @@ test("legacy wire: tasks/get, tasks/update, and tasks/cancel all succeed with NO
   server.child.kill("SIGKILL");
 });
 
-test("an unknown taskId on tasks/get, tasks/update, and tasks/cancel each fail closed with -32602 on the legacy era, matching the released spec's shared error code for both an unknown and an expired-and-purged id (the modern era cannot exercise tasks/get/tasks/cancel at all - see the unroutable-methods test above - so this is legacy-only, deliberately, rather than parameterized across both eras)", async () => {
+test("an unknown taskId on tasks/get, tasks/update, and tasks/cancel each fail closed with -32602 on the legacy era, matching the released spec's shared error code for both an unknown and an expired-and-purged id (the modern era cannot exercise tasks/get/tasks/cancel at all - see the unroutable-methods test above - so this is legacy-only, deliberately, rather than parameterized across both eras)", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below (a thrown assertion, in particular -
+  // exactly this gap once let one assertion failure
+  // present as a 180-second whole-suite idle-watchdog hang instead of a
+  // fast, named failure). A backstop only: server.child.killed is already
+  // true by the time this runs on every normal green pass, since the
+  // explicit kill below fires first in the test's own synchronous flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   await completeHandshake(server);
   const bogusTaskId = "00000000-0000-0000-0000-000000000000";
 
@@ -976,8 +1116,18 @@ test("an unknown taskId on tasks/get, tasks/update, and tasks/cancel each fail c
 // from the discarded probe's own (successful) discover exchange.
 // ---------------------------------------------------------------------------
 
-test("probe (server/discover) then fallback (initialize): the fallback instance's gate is genuinely fresh, requiring its OWN complete handshake, with no state leaking across the discard", async () => {
+test("probe (server/discover) then fallback (initialize): the fallback instance's gate is genuinely fresh, requiring its OWN complete handshake, with no state leaking across the discard", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below (a thrown assertion, in particular -
+  // exactly this gap once let one assertion failure
+  // present as a 180-second whole-suite idle-watchdog hang instead of a
+  // fast, named failure). A backstop only: server.child.killed is already
+  // true by the time this runs on every normal green pass, since the
+  // explicit kill below fires first in the test's own synchronous flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
 
   // 1) Probe: open with server/discover, get a real successful result -
   // this pins a "probe" instance (serveStdio's own terminology) from the
@@ -1070,8 +1220,18 @@ test("probe (server/discover) then fallback (initialize): the fallback instance'
 // serveStdio-based binary and still green).
 // ---------------------------------------------------------------------------
 
-test("modern context: a malformed line arriving AFTER a successful server/discover still gets -32700, and the modern connection survives to serve the next request correctly", async () => {
+test("modern context: a malformed line arriving AFTER a successful server/discover still gets -32700, and the modern connection survives to serve the next request correctly", async (t) => {
   const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below (a thrown assertion, in particular -
+  // exactly this gap once let one assertion failure
+  // present as a 180-second whole-suite idle-watchdog hang instead of a
+  // fast, named failure). A backstop only: server.child.killed is already
+  // true by the time this runs on every normal green pass, since the
+  // explicit kill below fires first in the test's own synchronous flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
   server.send(discoverRequest(1));
   const discoverLine = await server.nextLine();
   assert.ok((discoverLine.parsed as DiscoverResultBody).result, "discover must succeed first");
@@ -1117,8 +1277,15 @@ test(
         ? "confirms reap via a real process.kill(pid, 0) existence probe; matches every other reap test's own skip"
         : false,
   },
-  async () => {
+  async (t) => {
     const server = tracked([NEGATIVE_CONTROL_FIXTURE, "no-gate"]);
+    // Guaranteed backstop only - this test's own SIGTERM + waitForExit
+    // sequence below IS the behaviour under test (the real reap effect),
+    // so it keeps its explicit, deliberate kill; this only covers a path
+    // that throws before ever reaching it.
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    });
     server.send({
       jsonrpc: "2.0",
       id: 1,
@@ -1213,8 +1380,15 @@ test(
         ? "confirms reap via a real process.kill(pid, 0) existence probe; matches every other reap test's own skip"
         : false,
   },
-  async () => {
+  async (t) => {
     const server = tracked([NEGATIVE_CONTROL_FIXTURE, "no-parse-wrap"]);
+    // Guaranteed backstop only - this test's own SIGTERM + waitForExit
+    // sequence below IS the behaviour under test (the real reap effect),
+    // so it keeps its explicit, deliberate kill; this only covers a path
+    // that throws before ever reaching it.
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    });
 
     // Unrelated guarantee, exercised first: this variant keeps the real
     // initialize gate, so a pre-handshake tools/call is still rejected,
@@ -1320,8 +1494,15 @@ test(
         ? "confirms via a real process.kill(pid, 0) existence probe; matches every other reap test's own skip"
         : false,
   },
-  async () => {
+  async (t) => {
     const server = tracked([NEGATIVE_CONTROL_FIXTURE, "no-reap"]);
+    // Guaranteed backstop only - this test's own SIGTERM + waitForExit
+    // sequence below IS the behaviour under test (the real reap effect),
+    // so it keeps its explicit, deliberate kill; this only covers a path
+    // that throws before ever reaching it.
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    });
 
     // Unrelated guarantee: this variant's own gate must still reject a
     // pre-handshake tools/call.
