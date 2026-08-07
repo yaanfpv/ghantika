@@ -59,10 +59,11 @@ test("FROZEN_MODULES lists exactly sixteen modules: seven core files, six tool h
     "tools/status.ts",
     "tools/tail.ts",
   ]);
-  assert.deepEqual(
-    [...wake].sort(),
-    ["wake/appServerTransport.ts", "wake/desktopIpcTransport.ts", "wake/wakeTransport.ts"]
-  );
+  assert.deepEqual([...wake].sort(), [
+    "wake/appServerTransport.ts",
+    "wake/desktopIpcTransport.ts",
+    "wake/wakeTransport.ts",
+  ]);
 });
 
 // --- file-COUNT mutants (collapse/split), via a real scratch src/ tree ---
