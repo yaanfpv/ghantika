@@ -28,36 +28,36 @@
  * individually marked `@deprecated 2025-11-25 wire vocabulary with no SDK
  * runtime; kept importable for interoperability only` in the package's own
  * `.d.mts` - confirmed by reading the installed declaration file directly,
- * not inferred. Concretely: `RequestMethod` (the type
- * `setRequestHandler`'s typed overload accepts) is defined as
- * `Exclude<ClientRequest['method'] | ServerRequest['method'],
- * TaskRequestMethod>` - the SDK deliberately EXCLUDES `tasks/get`,
- * `tasks/result`, `tasks/list`, `tasks/cancel` from its own typed request-
- * handler surface, and offers no `tasks/update` method at all (the old
- * vocabulary's fourth method is `tasks/result`, not `tasks/update`). So
- * there is no SDK-provided task-registration mechanism this adapter could
- * delegate to even if it wanted one: this adapter's own method set
- * (`tasks/get` / `tasks/update` / `tasks/cancel`, never `tasks/list` or
- * `tasks/result`) was chosen as a forward-looking design against a spec
- * revision that had not yet finalized at the time, pinned here as a
- * vendored, digest-verified schema (`schema/tasks-extension.schema.json`,
- * `config/tasks-schema-digest.json`) rather than borrowed from the SDK's
- * own deprecated shape.
+ * not inferred (re-confirmed here: `type Task = ...`, `type
+ * CreateTaskResult = ...`, `type GetTaskResult = ...`, `type CancelTaskResult
+ * = ...` all still carry that exact tag in the currently-installed SDK).
+ * Concretely: `RequestMethod` (the type `setRequestHandler`'s typed overload
+ * accepts) is defined as `Exclude<ClientRequest['method'] |
+ * ServerRequest['method'], TaskRequestMethod>` - the SDK deliberately
+ * EXCLUDES `tasks/get`, `tasks/result`, `tasks/list`, `tasks/cancel` from
+ * its own typed request-handler surface, and offers no `tasks/update`
+ * method at all (the old vocabulary's fourth method is `tasks/result`, not
+ * `tasks/update`). So there is no SDK-provided task-registration mechanism
+ * this adapter could delegate to even if it wanted one: this adapter's own
+ * method set (`tasks/get` / `tasks/update` / `tasks/cancel`, never
+ * `tasks/list` or `tasks/result`) matches the FINALIZED extension's own
+ * method-set change (see below), pinned here as a vendored, digest-verified
+ * schema (`schema/tasks-extension.schema.json`, `config/tasks-schema-digest.json`)
+ * rather than borrowed from the SDK's own deprecated shape.
  *
  * **The Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663)
- * finalized on 2026-07-28.** This adapter's METHOD SET independently
- * matches the finalized extension's own method-set change on all four of
- * its points: `tasks/get` retained, `tasks/update` added (we have it),
- * `tasks/list` removed (we omit it), `tasks/result` replaced (we omit it).
- * That is a narrower claim than full wire compatibility, and it is
- * deliberately stated that narrowly: this adapter's capability
- * negotiation, result shapes, status vocabulary, and notification/
- * subscription protocol were designed before finalization and have not
- * been reconciled against the finalized extension's own shapes yet. The
- * decision on what to do about that is already made, not open: bring this
- * adapter into official wire conformance with the released extension. This
- * file has not yet been rewritten to match; that rewrite is separate,
- * tracked work this comment does not resolve.
+ * finalized on 2026-07-28, and this adapter is now built directly against
+ * that released contract** - not against a pre-finalization
+ * guess. `schema/tasks-extension.schema.json` pins the spec's own generated
+ * schema, measured directly (not summarized) against
+ * `modelcontextprotocol/ext-tasks`; every result shape, status vocabulary,
+ * and request/response shape below is checked against it in
+ * `test/tasks.test.ts`. The one thing this adapter still deliberately
+ * narrows from the full spec: `TASK_STATUSES` emits four of the spec's five
+ * `taskStatus` values (never `input_required` - see that constant's own
+ * docs for why), and `tasks/list`/`tasks/result` stay unregistered (the
+ * spec eliminates the former and replaces the latter - see the method-set
+ * section of this header for the full reasoning, unchanged by this story).
  *
  * ## Capability advertisement: `capabilities.extensions`, not the SDK's
  * deprecated `capabilities.tasks`
@@ -103,27 +103,44 @@
  * `tasks/get(taskId)` and `status(job_id)` can never observe two different
  * truths about the same job.
  *
- * ## tasks/get and tasks/update stay pure reads; tasks/cancel is real
+ * ## tasks/get is a pure read; tasks/update is a pure existence/TTL check
+ * plus a fixed ack; tasks/cancel is real
  *
- * `tasks/get` and `tasks/update` are two separately REGISTERED JSON-RPC
- * methods that both route through this file's one `getTask` snapshot
- * function - a PURE read with no write path anywhere in this module. That
- * is not a shortcut: a job-backed task has no client-updatable state at
- * all, so `tasks/update`'s complete behavior IS this read-only snapshot,
- * and always will be.
+ * `tasks/get` is the one place this file constructs the full, discriminated
+ * `GetTaskResult` snapshot - a PURE read with no write path anywhere in
+ * this module (aside from the lazy TTL purge - see `getTask`'s own docs).
+ *
+ * `tasks/update`, per the RELEASED spec, is a real client->server request
+ * (`{taskId, inputResponses}`) whose response is an empty acknowledgement,
+ * eventually consistent with the task's own observable state - never a
+ * snapshot read. ghantika's own job-backed tasks have no client-updatable
+ * state at all (no `input_required` step ever occurs - see `TASK_STATUSES`'s
+ * own docs), so `updateTask`'s COMPLETE behavior is: validate the taskId
+ * exists and has not expired (by delegating to `getTask` and discarding its
+ * result - the same existence/TTL check every other method here shares),
+ * then return the fixed `ACK_RESULT`. `inputResponses` is accepted at the
+ * request-validation boundary (`taskUpdateParamsSchema`, below) because the
+ * spec's own request shape requires it be a legal param, but it is
+ * structurally never read or interpreted here - there is nothing for it to
+ * mean when no `input_required` step can ever occur.
  *
  * `tasks/cancel` is different: it is the one place this file has a REAL
  * side effect. `cancelTask` (below) resolves `taskId` the same way every
- * other function here does (a `jobStore` `job_id` read, never a second
- * table), then delegates the actual termination to `src/tools/kill.ts`'s
- * own exported `handler` - the SAME POSIX-process-group kill/reap
- * containment the `kill` tool already provides (grace-period SIGTERM,
- * SIGKILL escalation, the pre-signal and escalation identity gates, the
- * external `pgrep`-based reap confirmation) - rather than reimplementing
- * any of it here. This file still never gains persistent state of its
- * own: `killTool.handler` performs the one real write (through
- * `jobStore`), and `cancelTask` only reads the result back through the
- * SAME `buildTaskResult` projection `getTask` already uses.
+ * other function here does (a `jobStore` `job_id` read via `getTask`,
+ * never a second table - and, per the same existence/TTL check, never
+ * attempts a kill for a taskId with nothing left to terminate), then
+ * delegates the actual termination to `src/tools/kill.ts`'s own exported
+ * `handler` - the SAME POSIX-process-group kill/reap containment the
+ * `kill` tool already provides (grace-period SIGTERM, SIGKILL escalation,
+ * the pre-signal and escalation identity gates, the external
+ * `pgrep`-based reap confirmation) - rather than reimplementing any of it
+ * here. This file still never gains persistent state of its own:
+ * `killTool.handler` performs the one real write (through `jobStore`), and
+ * `cancelTask` returns the SAME fixed `ACK_RESULT` `updateTask` does,
+ * matching the spec's own "eventually consistent - the ack may arrive
+ * before the task's observable status reflects the requested change"
+ * contract for `CancelTaskResult`, rather than reading a fresh snapshot
+ * back the way this adapter did before this story.
  *
  * BOUNDARY, unwidened from `kill`'s own already-disclosed scope (see
  * `src/tools/kill.ts`'s extensive docs on this): cancelling means
@@ -139,7 +156,10 @@
  * refusal) as a reason to fail this call itself - a kill attempt that
  * could not proceed simply leaves the job exactly as a fresh `getTask`
  * read would find it, the same honest, retry-friendly shape `kill` itself
- * already provides for a caller that calls it again.
+ * already provides for a caller that calls it again; since the ack is now
+ * a FIXED value regardless of outcome (matching the spec's own
+ * eventually-consistent contract), this file no longer needs to inspect
+ * `killTool.handler`'s return value at all to decide what to send back.
  */
 import type {
   CallToolResult,
@@ -147,6 +167,7 @@ import type {
   JSONObject,
   StandardSchemaV1,
 } from "@modelcontextprotocol/server";
+import { ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
 
 import {
   type JobRecord,
@@ -174,15 +195,17 @@ import * as killTool from "./tools/kill.js";
 export const TASKS_EXTENSION_URI = "io.modelcontextprotocol/tasks";
 
 /**
- * Minimal, honest capability descriptor for the `extensions` bag: the
- * three method names this server actually registers, so a Tasks-capable
- * host can discover the exact surface without guessing. Never the SDK's
- * deprecated `{list, cancel, requests}` shape - this is this adapter's own
- * vocabulary.
+ * The `extensions` bag's own capability descriptor for this URI - the
+ * spec's real, generated `TasksExtensionCapability` schema (measured
+ * against `modelcontextprotocol/ext-tasks`, see
+ * `schema/tasks-extension.schema.json`) is an EMPTY object with
+ * `additionalProperties: false`: it forbids any key at all, not merely
+ * "does not require one." This constant used to carry
+ * `{methods: [...]}`, an honest but non-conformant addition this adapter
+ * invented before the extension finalized - the released contract does not
+ * tolerate it, so it is gone, not merely unused.
  */
-export const TASKS_CAPABILITY_DESCRIPTOR: JSONObject = Object.freeze({
-  methods: Object.freeze(["tasks/get", "tasks/update", "tasks/cancel"]),
-}) as unknown as JSONObject;
+export const TASKS_CAPABILITY_DESCRIPTOR: JSONObject = Object.freeze({}) as unknown as JSONObject;
 
 /**
  * The `ServerOptions.capabilities` fragment `src/server.ts` spreads into
@@ -246,22 +269,45 @@ function hasTasksExtensionKey(bag: Record<string, unknown> | undefined): boolean
 }
 
 // ---------------------------------------------------------------------------
-// Task status - a closed, four-value set matching the vendored schema's own
-// status enum EXACTLY, by set-equality. 'expired' is never a member: a task
-// past its TTL is REMOVED (see getTask's own docs on the frozen
-// TTL-vs-timeout separation), not transitioned into some fifth status - a
-// task that no longer resolves to a job (whether it never existed, or a TTL
-// purge just reclaimed it) simply reads as task_not_found rather than
-// surfacing its own terminal status.
+// Task status - a closed, four-value set this adapter EMITS, a strict
+// SUBSET of the spec's own closed, five-value `taskStatus` enum
+// (`working | input_required | completed | cancelled | failed` - see the
+// vendored `schema/tasks-extension.schema.json`'s `taskStatus` $def).
+// 'expired' is never a member of either: a task past its TTL is REMOVED
+// (see getTask's own docs on the frozen TTL-vs-timeout separation), not
+// transitioned into some sixth status - a task that no longer resolves to
+// a job (whether it never existed, or a TTL purge just reclaimed it)
+// simply throws task_not_found rather than surfacing its own terminal
+// status.
 // ---------------------------------------------------------------------------
 
 /**
  * The closed status set this adapter ever produces, as a real runtime
  * array (the same "type union alone is compile-time-only" reasoning
- * `src/jobStore.ts`'s own `ALL_JOB_STATES` already documents) - so
- * `test/tasks.test.ts` can assert this SET deep-equals the vendored
- * schema's own `taskStatus` enum by reading the schema file, not by
- * hand-copying the four strings a second time.
+ * `src/jobStore.ts`'s own `ALL_JOB_STATES` already documents).
+ *
+ * This is a SUBSET of the released spec's own `taskStatus` enum, never an
+ * equal set: `test/tasks.test.ts` asserts this array is a subset of the
+ * vendored schema's `taskStatus.enum` (reading the real schema file, not a
+ * hand-copied description of it), never a deep-equals - deep-equals was
+ * correct only while this adapter's own schema documented OUR shape;
+ * the schema above now pins the SPEC's shape instead, and the spec's
+ * enum genuinely has a fifth value this adapter cannot produce.
+ *
+ * `input_required` is the excluded member, and it is excluded because it
+ * is STRUCTURALLY UNREACHABLE for this adapter, never merely unobserved so
+ * far: `input_required` exists in the spec for a task that needs the
+ * CLIENT to supply more information mid-run (an elicitation, a tool
+ * confirmation) before the server can continue - but every ghantika task
+ * is backed by a `jobStore` job (a spawned OS process), and a spawned
+ * process has no protocol-level step where it pauses to ask the calling
+ * MCP client for input. `mapJobStateToTaskStatus` (below) has no branch
+ * that could ever produce it: `JobState`'s own closed five-value enum
+ * (`starting`/`running`/`exited`/`killed`/`failed`) contains nothing an
+ * `input_required` task's own lifecycle would require. So this is a design
+ * fact about what a job-backed task CAN be, not a claim that no client
+ * would ever recognize the value - a conformant Tasks-capable client must
+ * still handle `input_required` from OTHER MCP servers in general.
  */
 export const TASK_STATUSES = Object.freeze([
   "working",
@@ -282,19 +328,21 @@ export function isTaskStatusValue(value: unknown): value is TaskStatusValue {
  * both `working` (a task in progress reports one uniform in-progress
  * status); `exited` is `completed` REGARDLESS of the job's real exit code
  * (a task that ran to completion is a completed task - the actual
- * `exitCode` travels separately in the result, see `buildTaskResult`,
- * never folded into the status itself); `failed` is the task-level
- * `failed` - see `src/jobStore.ts`'s `JobDiagnosticReason` docs for the
- * full reason set. Most `failed` jobs never spawned at all (a cwd/executable
- * preflight rejection, a genuine async spawn failure, or a command the
- * policy gate denied), but `watcher/runtime-error` is a legal producer of
- * `failed` too for a command that DID genuinely spawn and run - e.g. one
- * terminated by its own execution deadline before finishing naturally (see
- * `run.ts`'s deadline handling). `failed` at the task level therefore means
- * "the task did not run to natural completion", not "the task never ran";
- * `killed` is `cancelled` (an explicit kill, whether via the `kill` tool
- * today or a real cooperative cancel layered on top of `tasks/cancel`
- * later, is a cancellation at the task level).
+ * `exitCode` travels separately in the result, nested under
+ * `CompletedTaskResult.result` per the spec's own free-form `result`
+ * container - see `GhantikaResultExtras`, never folded into the status
+ * itself); `failed` is the task-level `failed` - see `src/jobStore.ts`'s
+ * `JobDiagnosticReason` docs for the full reason set. Most `failed` jobs
+ * never spawned at all (a cwd/executable preflight rejection, a genuine
+ * async spawn failure, or a command the policy gate denied), but
+ * `watcher/runtime-error` is a legal producer of `failed` too for a
+ * command that DID genuinely spawn and run - e.g. one terminated by its
+ * own execution deadline before finishing naturally (see `run.ts`'s
+ * deadline handling). `failed` at the task level therefore means "the task
+ * did not run to natural completion", not "the task never ran"; `killed`
+ * is `cancelled` (an explicit kill, whether via the `kill` tool today or a
+ * real cooperative cancel layered on top of `tasks/cancel` later, is a
+ * cancellation at the task level).
  */
 function mapJobStateToTaskStatus(state: JobState): TaskStatusValue {
   switch (state) {
@@ -320,9 +368,12 @@ function mapJobStateToTaskStatus(state: JobState): TaskStatusValue {
 
 // ---------------------------------------------------------------------------
 // Result shapes - structurally match schema/tasks-extension.schema.json's
-// taskResult/taskNotFound $defs exactly (validated in test/tasks.test.ts
-// against the real, digest-verified schema file, never a hand-copied
-// description of it)
+// $defs exactly (validated in test/tasks.test.ts against the real,
+// digest-verified schema file, never a hand-copied description of it).
+// Every variant below restates its own fields in full rather than composing
+// a shared base type, mirroring the schema's own header note on why it does
+// the same (this repo's hand-rolled test validator does not implement
+// `allOf`).
 // ---------------------------------------------------------------------------
 
 export interface TaskOutputCounts {
@@ -332,71 +383,169 @@ export interface TaskOutputCounts {
   readonly stderr_bytes: number;
 }
 
-/** Present once this adapter's own output-driven notification WATCH auto-stopped early (currently only ever for a sustained firehose rate - see `WATCH_STOP_REASON_FIREHOSE`) - never means the backing job stopped. The job stays alive/pollable regardless; only the wake accelerator itself stopped. Absent for the ordinary lifetime of a task that never firehosed. */
+/** Present once this adapter's own output-driven notification WATCH auto-stopped early (currently only ever for a sustained firehose rate - see `WATCH_STOP_REASON_FIREHOSE`) - never means the backing job stopped. The job stays alive/pollable regardless; only the wake accelerator itself stopped. Absent for the ordinary lifetime of a task that never firehosed. Matches the vendored schema's `watchStoppedInfo` $def. */
 export interface WatchStoppedInfo {
   readonly reason: string;
   readonly stoppedAt: string;
 }
 
-export interface TaskResult {
-  readonly [key: string]: unknown;
-  readonly extension: typeof TASKS_EXTENSION_URI;
-  readonly taskId: string;
-  readonly status: TaskStatusValue;
-  readonly createdAt: string;
-  readonly pollIntervalMs?: number;
+/**
+ * ghantika's own additions inside the spec's free-form `CompletedTask.result`
+ * / `FailedTask.error` JSONObject - matches the vendored schema's
+ * `ghantikaResultExtras` $def exactly. Never top-level `Task` fields: the
+ * spec's base `Task`/`WorkingTask`/`CancelledTask` interfaces carry no such
+ * container, and every top-level field this adapter emits must be one the
+ * spec itself defines.
+ */
+export interface GhantikaResultExtras {
   readonly exitCode?: number;
   readonly output?: TaskOutputCounts;
   readonly watchStopped?: WatchStoppedInfo;
 }
 
-export interface TaskNotFound {
+/** The spec's `WorkingTask`, restated in full - see this file's header on why never composed via a shared base. The index signature (here and on every sibling variant below) is required so this shape satisfies the SDK's own generic `Result` return type at `server.setRequestHandler`'s call sites in `src/server.ts` - the installed SDK's typed request-handler surface has no notion of a Task-shaped result (see this file's header), so it types every untyped-method handler's return against a plain string-indexed record. */
+export interface WorkingTaskResult {
   readonly [key: string]: unknown;
-  readonly extension: typeof TASKS_EXTENSION_URI;
-  readonly error: "task_not_found";
   readonly taskId: string;
+  readonly status: "working";
+  readonly statusMessage?: string;
+  readonly createdAt: string;
+  readonly lastUpdatedAt: string;
+  readonly ttlMs: number | null;
+  readonly pollIntervalMs?: number;
 }
+
+/** The spec's `CompletedTask`, restated in full. See `WorkingTaskResult`'s own docs for why the index signature is required. */
+export interface CompletedTaskResult {
+  readonly [key: string]: unknown;
+  readonly taskId: string;
+  readonly status: "completed";
+  readonly statusMessage?: string;
+  readonly createdAt: string;
+  readonly lastUpdatedAt: string;
+  readonly ttlMs: number | null;
+  readonly pollIntervalMs?: number;
+  readonly result: GhantikaResultExtras;
+}
+
+/** The spec's `FailedTask`, restated in full. See `WorkingTaskResult`'s own docs for why the index signature is required. */
+export interface FailedTaskResult {
+  readonly [key: string]: unknown;
+  readonly taskId: string;
+  readonly status: "failed";
+  readonly statusMessage?: string;
+  readonly createdAt: string;
+  readonly lastUpdatedAt: string;
+  readonly ttlMs: number | null;
+  readonly pollIntervalMs?: number;
+  readonly error: GhantikaResultExtras;
+}
+
+/** The spec's `CancelledTask`, restated in full. See `WorkingTaskResult`'s own docs for why the index signature is required. */
+export interface CancelledTaskResult {
+  readonly [key: string]: unknown;
+  readonly taskId: string;
+  readonly status: "cancelled";
+  readonly statusMessage?: string;
+  readonly createdAt: string;
+  readonly lastUpdatedAt: string;
+  readonly ttlMs: number | null;
+  readonly pollIntervalMs?: number;
+}
+
+/**
+ * The spec's `DetailedTask` discriminated union, narrowed to the four
+ * variants ghantika's job model can ever actually produce (never
+ * `InputRequiredTask` - see `TASK_STATUSES`'s own docs on why that variant
+ * is structurally unreachable here).
+ */
+export type DetailedTaskResult =
+  WorkingTaskResult | CompletedTaskResult | FailedTaskResult | CancelledTaskResult;
+
+/**
+ * `CreateTaskResult = Result & Task` per the spec: the FLAT base-`Task`
+ * shape - `taskId`/`status`/`createdAt`/`lastUpdatedAt`/`ttlMs`, never a
+ * `DetailedTaskResult` variant - plus `resultType: "task"`. A freshly
+ * minted task carries no `result`/`error` at all, even if the backing job
+ * happened to already be terminal at mint time (a job that started
+ * already-failed, e.g. a bad cwd caught before ever spawning): the spec's
+ * own `CreateTaskResult` shape has no `result`/`error` member for ANY
+ * status, unlike `DetailedTaskResult`'s terminal variants - see
+ * `buildCreateTaskResult`'s own docs.
+ *
+ * This name deliberately matches (and shadows, within this file only) the
+ * SDK's own `@deprecated` `CreateTaskResult` export - this file never
+ * imports that symbol (see this file's header), so there is no runtime or
+ * compile-time collision; the shared name simply makes cross-referencing
+ * the vendored schema's own `createTaskResult` $def easy for a reader.
+ */
+export interface CreateTaskResult {
+  readonly taskId: string;
+  readonly status: TaskStatusValue;
+  readonly statusMessage?: string;
+  readonly createdAt: string;
+  readonly lastUpdatedAt: string;
+  readonly ttlMs: number | null;
+  readonly pollIntervalMs?: number;
+  readonly resultType: "task";
+}
+
+/** `GetTaskResult`'s `working` branch: `WorkingTaskResult` plus `resultType: "complete"`. */
+export interface GetTaskResultWorking extends WorkingTaskResult {
+  readonly resultType: "complete";
+}
+
+/** `GetTaskResult`'s `completed` branch. */
+export interface GetTaskResultCompleted extends CompletedTaskResult {
+  readonly resultType: "complete";
+}
+
+/** `GetTaskResult`'s `failed` branch. */
+export interface GetTaskResultFailed extends FailedTaskResult {
+  readonly resultType: "complete";
+}
+
+/** `GetTaskResult`'s `cancelled` branch. */
+export interface GetTaskResultCancelled extends CancelledTaskResult {
+  readonly resultType: "complete";
+}
+
+/**
+ * `GetTaskResult = Result & DetailedTask` per the spec: `resultType:
+ * "complete"` flattened alongside whichever `DetailedTaskResult` variant
+ * matches the task's current status. Returned by `tasks/get` - the ONLY
+ * one of the three registered methods that still returns a full snapshot
+ * (see this file's header for why `tasks/update`/`tasks/cancel` return the
+ * fixed `AckResult` instead).
+ */
+export type GetTaskResult =
+  GetTaskResultWorking | GetTaskResultCompleted | GetTaskResultFailed | GetTaskResultCancelled;
+
+/**
+ * `UpdateTaskResult` / `CancelTaskResult` per the spec: an empty
+ * acknowledgement carrying `resultType: "complete"`. Both are
+ * eventually-consistent per the spec - the ack may arrive before the
+ * task's observable status reflects the requested change. This is the
+ * EMISSION-level shape - what this adapter's `updateTask`/`cancelTask`
+ * actually produce, `additionalProperties: false` and nothing else, ever
+ * (matching the vendored schema's `emittedAckResult` $def, the narrower
+ * sibling of `ackResult`, which pins the more permissive CONTRACT the spec
+ * itself tolerates).
+ */
+export interface AckResult {
+  // See `WorkingTaskResult`'s own docs for why this index signature is
+  // required - it is a TypeScript-only widening for `setRequestHandler`'s
+  // generic Result typing and changes nothing about the real object
+  // `ACK_RESULT` (below) actually carries at runtime.
+  readonly [key: string]: unknown;
+  readonly resultType: "complete";
+}
+
+/** The one, frozen `AckResult` value every real `updateTask`/`cancelTask` call returns - a single shared constant rather than a fresh object literal per call, since it is never mutated and always identical. */
+const ACK_RESULT: AckResult = Object.freeze({ resultType: "complete" });
 
 /** The poll-interval hint minted results and live snapshots both carry - a plain constant, never derived from anything Tasks-specific. */
 export const DEFAULT_POLL_INTERVAL_MS = 500;
-
-/**
- * Projects a real `JobRecord` into this adapter's `TaskResult` shape. Pure:
- * reads `jobStore.getOutputCounts`/`jobStore.getOutputWatchStopInfo`
- * (already-existing, real state this adapter drives elsewhere in this
- * file - never invented here) and the record's own fields, writes nothing.
- * `exitCode`/`output` are included only once the task is terminal
- * (mirroring `PublicJobProjection`'s own optional-field pattern for
- * `exit_code`), so a still-working task never carries a stale/zeroed
- * placeholder for either. `watchStopped`, by contrast, is checked
- * REGARDLESS of terminal state: a firehose can auto-stop the watch while
- * the task is still genuinely `working` - the auto-stop only silences
- * the notification wake, it never changes `task.status` itself.
- */
-function buildTaskResult(record: JobRecord): TaskResult {
-  const terminal = isTerminalJobState(record.state);
-  const watchStop = jobStore.getOutputWatchStopInfo(record.job_id);
-  const base: TaskResult = {
-    extension: TASKS_EXTENSION_URI,
-    taskId: record.job_id,
-    status: mapJobStateToTaskStatus(record.state),
-    createdAt: record.started_at,
-    pollIntervalMs: DEFAULT_POLL_INTERVAL_MS,
-    ...(watchStop !== undefined ? { watchStopped: watchStop } : {}),
-  };
-  if (!terminal) return base;
-
-  const counts = jobStore.getOutputCounts(record.job_id);
-  return {
-    ...base,
-    ...(record.exit_code !== undefined ? { exitCode: record.exit_code } : {}),
-    output: counts,
-  };
-}
-
-function taskNotFound(taskId: string): TaskNotFound {
-  return { extension: TASKS_EXTENSION_URI, error: "task_not_found", taskId };
-}
 
 /**
  * How long a TERMINAL task's record is retained before a task-layer TTL
@@ -405,15 +554,176 @@ function taskNotFound(taskId: string): TaskNotFound {
  * `deadline_ms`, see `run.ts`): that timeout kills a still-running JOB,
  * transitioning it to `failed`, which is an entirely different effect than
  * this purge's "remove the now-stale, already-terminal completed record".
- * NEVER an 'expired' task
- * status: a still-`working` task is NEVER purged regardless of age (see
- * `isExpiredTerminalRecord`'s own terminal-only guard, which is what makes
- * that true) - only a genuinely completed/terminal record is reclaimed,
- * and only once it is actually READ again past this age (a lazy, read-time
- * purge - see `getTask`'s own docs for why this needs no separate
- * scheduled sweep).
+ * NEVER an 'expired' task status: a still-`working` task is NEVER purged
+ * regardless of age (see `isExpiredTerminalRecord`'s own terminal-only
+ * guard, which is what makes that true) - only a genuinely
+ * completed/terminal record is reclaimed, and only once it is actually
+ * READ again past this age (a lazy, read-time purge - see `getTask`'s own
+ * docs for why this needs no separate scheduled sweep).
+ *
+ * This is also the value genuinely EXPOSED to a client, via `ttlMs`
+ * on every terminal task-shaped response (`ttlMsFor`, below) -
+ * previously it was a private constant this adapter consulted but
+ * never surfaced. It is deliberately NOT exposed on a still-`working`
+ * task: `ttlMs`'s meaning per this adapter's own purge design is "time
+ * remaining before this TERMINAL record is reclaimed," and that clock has
+ * not started for a task with no terminal instant to measure from yet - a
+ * still-working task genuinely has no TTL in force, so its `ttlMs` is
+ * `null` (a legal spec value, not an omission - see `ttlMsFor`).
  */
 export const TASK_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The `ttlMs` value for a task currently at `status` - `null` for
+ * `working` (this adapter's TTL purge only ever counts down on a
+ * TERMINAL record, from its own `ended_at` - see `TASK_TTL_MS`'s own
+ * docs - so a still-working task has no real countdown to report, and
+ * `null` is the schema-legal way to say so, never a fabricated number),
+ * `TASK_TTL_MS` for every terminal status (`completed`/`failed`/
+ * `cancelled`), since the purge clock genuinely starts running the instant
+ * a job's `ended_at` is written.
+ */
+function ttlMsFor(status: TaskStatusValue): number | null {
+  return status === "working" ? null : TASK_TTL_MS;
+}
+
+/**
+ * Renders `info` (this adapter's own firehose watch-stop annotation - see
+ * `WatchStoppedInfo`'s own docs) as human-readable text for a still-working
+ * task's `statusMessage` field - the spec-legal, otherwise-unused free-text
+ * field `WorkingTaskResult` carries (see that interface's own docs and the
+ * vendored schema's matching comment on `workingTask.statusMessage`), used
+ * here because `WorkingTaskResult` has no structured `result`/`error`
+ * container the way a terminal variant does. A TERMINAL task carries the
+ * SAME fact structurally instead, nested under `result.watchStopped` /
+ * `error.watchStopped` (see `buildGhantikaResultExtras`) - this function is
+ * for the pre-terminal case alone.
+ */
+function renderWatchStoppedStatusMessage(info: WatchStoppedInfo): string {
+  return `output watch auto-stopped (${info.reason}) at ${info.stoppedAt}`;
+}
+
+/**
+ * Builds the `GhantikaResultExtras` container for a TERMINAL record - the
+ * spec's free-form `CompletedTask.result` / `FailedTask.error` JSONObject.
+ * `exitCode` is included only when the record actually carries one
+ * (mirroring `PublicJobProjection`'s own optional-field pattern - a
+ * `killed`/spawn-failed job never has one), `output` is always included on
+ * a terminal record (the real, live per-stream counts - always meaningful
+ * once terminal, never a placeholder), and `watchStopped` is included only
+ * when this adapter's own output watch actually auto-stopped early for
+ * this job.
+ */
+function buildGhantikaResultExtras(record: JobRecord): GhantikaResultExtras {
+  const watchStop = jobStore.getOutputWatchStopInfo(record.job_id);
+  const counts = jobStore.getOutputCounts(record.job_id);
+  return {
+    ...(record.exit_code !== undefined ? { exitCode: record.exit_code } : {}),
+    output: counts,
+    ...(watchStop !== undefined ? { watchStopped: watchStop } : {}),
+  };
+}
+
+/**
+ * Projects a real `JobRecord` into the discriminated `DetailedTaskResult`
+ * union - the shape `tasks/get` (via `buildGetTaskResult`) actually
+ * returns. Pure: reads `jobStore`'s own already-existing, real state
+ * (`getOutputWatchStopInfo`/`getOutputCounts`) and the record's own
+ * fields, writes nothing.
+ *
+ * A still-`working` task carries the pre-terminal watch-stop signal (if
+ * any) rendered as text into `statusMessage` (see
+ * `renderWatchStoppedStatusMessage`) - the ONLY use this adapter makes of
+ * that field. A terminal task carries the SAME underlying fact
+ * structurally instead, nested inside `result`/`error` via
+ * `buildGhantikaResultExtras` - never both at once for the same task,
+ * since a task is either working or terminal, never both.
+ */
+function buildDetailedTaskResult(record: JobRecord): DetailedTaskResult {
+  const status = mapJobStateToTaskStatus(record.state);
+  const base = {
+    taskId: record.job_id,
+    createdAt: record.started_at,
+    lastUpdatedAt: record.last_updated_at,
+    ttlMs: ttlMsFor(status),
+    pollIntervalMs: DEFAULT_POLL_INTERVAL_MS,
+  };
+
+  if (status === "working") {
+    const watchStop = jobStore.getOutputWatchStopInfo(record.job_id);
+    return {
+      ...base,
+      status: "working",
+      ...(watchStop !== undefined
+        ? { statusMessage: renderWatchStoppedStatusMessage(watchStop) }
+        : {}),
+    };
+  }
+
+  if (status === "completed") {
+    return { ...base, status: "completed", result: buildGhantikaResultExtras(record) };
+  }
+
+  if (status === "failed") {
+    return { ...base, status: "failed", error: buildGhantikaResultExtras(record) };
+  }
+
+  // status === "cancelled" - CancelledTaskResult carries no result/error at
+  // all, per the spec's own CancelledTask shape.
+  return { ...base, status: "cancelled" };
+}
+
+/** `tasks/get`'s complete real return shape: `buildDetailedTaskResult`'s snapshot with `resultType: "complete"` flattened alongside it. */
+function buildGetTaskResult(record: JobRecord): GetTaskResult {
+  return { ...buildDetailedTaskResult(record), resultType: "complete" } as GetTaskResult;
+}
+
+/**
+ * Builds the flat `CreateTaskResult` (mint) shape for a freshly-started job
+ * - see that interface's own docs for why it is never a `DetailedTaskResult`
+ * variant, even when the backing job is already terminal at mint time.
+ */
+function buildCreateTaskResult(record: JobRecord): CreateTaskResult {
+  const status = mapJobStateToTaskStatus(record.state);
+  return {
+    taskId: record.job_id,
+    status,
+    createdAt: record.started_at,
+    lastUpdatedAt: record.last_updated_at,
+    ttlMs: ttlMsFor(status),
+    pollIntervalMs: DEFAULT_POLL_INTERVAL_MS,
+    resultType: "task",
+  };
+}
+
+/**
+ * The JSON-RPC error this adapter throws for an unknown OR
+ * expired-and-purged `taskId`. The released spec answers both cases with
+ * the SAME error code, `-32602` (Invalid params) - "the specification does
+ * not differentiate between the two scenarios at the protocol level" - so
+ * this adapter's own former unknown-vs-TTL-purged distinction (a
+ * `TaskNotFound` tagged value with one fixed `error: "task_not_found"`
+ * string, covering both) collapses to one JSON-RPC error code here too,
+ * with only the message text ever differing between the two call sites
+ * (see `getTask`, below) - both are informational only, never part of the
+ * wire contract a client parses.
+ *
+ * `ProtocolError`/`ProtocolErrorCode` are the SAME mechanism
+ * `src/server.ts` already uses to reject a `tools/call` arriving before a
+ * completed handshake (`ProtocolErrorCode.InvalidRequest`) - confirmed
+ * directly against the installed SDK's own declaration file
+ * (`declare enum ProtocolErrorCode { ... InvalidParams =
+ * -32602 ... }`), not guessed: throwing this class from inside a
+ * `setRequestHandler` callback is what the SDK's own request dispatch
+ * turns into a real JSON-RPC error response for that request's id, the
+ * exact mechanism `server.ts`'s `tools/call` gate already relies on.
+ */
+function taskNotFoundError(taskId: string): ProtocolError {
+  return new ProtocolError(
+    ProtocolErrorCode.InvalidParams,
+    `task not found: "${taskId}" is unknown or has expired`
+  );
+}
 
 /**
  * True when `record` is BOTH terminal AND has been terminal for at least
@@ -445,19 +755,24 @@ function isExpiredTerminalRecord(record: JobRecord, now: number): boolean {
 }
 
 /**
- * The one live-read entry point every tasks/* handler in `src/server.ts`
- * calls: directly for `tasks/get`/`tasks/update` (their WHOLE
- * implementation - see this file's header on why sharing this read is what
- * makes `tasks/update`'s state-preservation invariant true by
- * construction), and as `cancelTask`'s own before-and-after read for
- * `tasks/cancel` (below). A PURE read with one deliberate side effect: the
- * lazy TTL purge (see `TASK_TTL_MS`'s own docs) - once a terminal record is
- * read PAST its TTL, this call both reports `task_not_found` AND reclaims
- * the record via `jobStore.deleteJob`, so the SAME expired record is never
- * "found, but reported not-found" more than once; a caller that never
- * reads it again simply leaves it in `jobStore` until the next read (or
- * never, which is an accepted, honest trade-off of a lazy-on-read design
- * over a scheduled sweep - no separate timer is needed per terminal task).
+ * `tasks/get`'s complete implementation, and the shared existence/TTL
+ * check `updateTask`/`cancelTask` (below) both delegate to first - THROWS
+ * (never returns a tagged not-found value) on an unknown or just-TTL-purged
+ * `taskId`, via `taskNotFoundError` (`-32602`, see that function's own
+ * docs). This used to return `TaskResult | TaskNotFound`, a
+ * tagged success value a client had to branch on; the released spec answers
+ * a missing task with a real JSON-RPC error, so this now matches that
+ * contract at the SDK boundary instead of inventing its own success-shaped
+ * "not found."
+ *
+ * A PURE read with one deliberate side effect: the lazy TTL purge (see
+ * `TASK_TTL_MS`'s own docs) - once a terminal record is read PAST its TTL,
+ * this call both THROWS `task_not_found` AND reclaims the record via
+ * `jobStore.deleteJob`, so the SAME expired record is never "found, but
+ * reported not-found" more than once; a caller that never reads it again
+ * simply leaves it in `jobStore` until the next read (or never, which is
+ * an accepted, honest trade-off of a lazy-on-read design over a scheduled
+ * sweep - no separate timer is needed per terminal task).
  *
  * `now` defaults to the real `Date.now()`; a caller never overrides it in
  * production - it exists as a parameter (mirroring
@@ -466,68 +781,75 @@ function isExpiredTerminalRecord(record: JobRecord, now: number): boolean {
  * `node:test`'s `mock.timers`) rather than waiting out `TASK_TTL_MS` in
  * real wall-clock time.
  */
-export function getTask(taskId: string, now: number = Date.now()): TaskResult | TaskNotFound {
+export function getTask(taskId: string, now: number = Date.now()): GetTaskResult {
   const record = jobStore.get(taskId);
-  if (record === undefined) return taskNotFound(taskId);
+  if (record === undefined) throw taskNotFoundError(taskId);
   if (isExpiredTerminalRecord(record, now)) {
     jobStore.deleteJob(taskId);
-    return taskNotFound(taskId);
+    throw taskNotFoundError(taskId);
   }
-  return buildTaskResult(record);
+  return buildGetTaskResult(record);
+}
+
+/**
+ * `tasks/update`'s complete implementation - see this file's header
+ * ("`tasks/get` is a pure read; `tasks/update` is a pure existence/TTL
+ * check plus a fixed ack") for the full design. Delegates existence/TTL
+ * validation to `getTask` (discarding its snapshot - `getTask` itself
+ * throws `task_not_found` for an unknown or expired `taskId`, which
+ * propagates unchanged from here), then returns the fixed `ACK_RESULT`.
+ * `inputResponses` is accepted at the request-validation boundary
+ * (`taskUpdateParamsSchema`) but never read here - see this file's header
+ * for why there is structurally nothing for it to mean on a job-backed
+ * task.
+ */
+export function updateTask(taskId: string, now: number = Date.now()): AckResult {
+  getTask(taskId, now);
+  return ACK_RESULT;
 }
 
 /**
  * The real `tasks/cancel` implementation - see this file's header ("tasks/get
- * and tasks/update stay pure reads; tasks/cancel is real") for the full
- * design. Resolves `taskId` -> `job_id` the SAME way `getTask` does (an
- * unknown or just-TTL-purged taskId returns `task_not_found` WITHOUT ever
- * attempting a kill - there is nothing left to terminate), then delegates
- * the actual termination to `src/tools/kill.ts`'s own exported `handler`,
- * reusing its existing process-group kill/reap containment rather than
- * reimplementing it here.
+ * is a pure read...tasks/cancel is real") for the full design. Resolves
+ * `taskId` -> `job_id` the SAME way `getTask` does (an unknown or
+ * just-TTL-purged taskId throws `task_not_found` WITHOUT ever attempting a
+ * kill - there is nothing left to terminate), then delegates the actual
+ * termination to `src/tools/kill.ts`'s own exported `handler`, reusing its
+ * existing process-group kill/reap containment rather than reimplementing
+ * it here.
  *
- * The value returned is a FRESH `getTask` read taken AFTER that call
- * settles - already the job's real terminal `cancelled` status for an
- * ordinary live job (this codebase's own `kill.ts` claims the terminal
- * state SYNCHRONOUSLY, the instant it actually signals, well before its
- * own external reap-confirmation wait resolves - see that file's
- * "Idempotency and races" docs), or the SAME state a fresh `getTask` call
- * would already report for a job the kill attempt could not (or, for an
- * already-terminal job, did not need to) touch. `killTool.handler`'s own
- * `isError` outcomes are never surfaced as a failure of THIS call (see
- * this file's header) - `cancelTask` simply reads back whatever is
- * actually true of the job afterward.
+ * Returns the SAME fixed `ACK_RESULT` `updateTask` returns, matching the
+ * spec's own `CancelTaskResult` contract (an empty ack, eventually
+ * consistent - the task's observable status may not have caught up to
+ * `cancelled` the instant this call returns, even though this codebase's
+ * own `kill.ts` claims the terminal state SYNCHRONOUSLY, the instant it
+ * actually signals - see that file's "Idempotency and races" docs). This
+ * used to return a FRESH `getTask` snapshot instead; the released
+ * spec's own `UpdateTaskResult`/`CancelTaskResult` shape is a plain ack
+ * with no task fields at all, so this no longer reads one back.
  *
  * `now` is captured ONCE by the caller (or defaults to one real
- * `Date.now()` here) and reused for BOTH the pre-kill existence/TTL check
- * and the post-kill read, so a real-time kill attempt that happens to
- * straddle a TTL boundary is judged consistently against one instant,
- * never two different ones.
+ * `Date.now()` here) for the existence/TTL check, exactly mirroring
+ * `getTask`'s own `now` parameter.
  */
-export async function cancelTask(
-  taskId: string,
-  now: number = Date.now()
-): Promise<TaskResult | TaskNotFound> {
-  const current = getTask(taskId, now);
-  if ("error" in current) return current; // unknown, or just TTL-purged - nothing to kill
-
+export async function cancelTask(taskId: string, now: number = Date.now()): Promise<AckResult> {
+  getTask(taskId, now); // throws task_not_found - nothing to kill otherwise
   await killTool.handler({ job_id: taskId });
-
-  return getTask(taskId, now);
+  return ACK_RESULT;
 }
 
 // ---------------------------------------------------------------------------
 // Registration - a hand-rolled Standard Schema (https://standardschema.dev)
-// for the tiny {taskId: string} params shape every tasks/* method takes.
-// Deliberately NOT zod: zod is a real dependency of the installed
-// @modelcontextprotocol/server package, but never a DIRECT dependency of
-// this repo's own package.json - importing it here would be an undeclared
-// phantom dependency (works only because the SDK happens to hoist it
-// today), exactly the class of drift check-sdk-exact-pin.mjs exists to
-// rule out for the packages it DOES pin. The Standard Schema interface
-// itself is a handful of fields (see the installed SDK's own
-// `StandardSchemaV1` type, confirmed by reading its .d.mts directly), so
-// implementing it by hand for one two-line shape is the honest choice.
+// for the tiny params shapes tasks/* methods take. Deliberately NOT zod:
+// zod is a real dependency of the installed @modelcontextprotocol/server
+// package, but never a DIRECT dependency of this repo's own package.json -
+// importing it here would be an undeclared phantom dependency (works only
+// because the SDK happens to hoist it today), exactly the class of drift
+// check-sdk-exact-pin.mjs exists to rule out for the packages it DOES pin.
+// The Standard Schema interface itself is a handful of fields (see the
+// installed SDK's own `StandardSchemaV1` type, confirmed by reading its
+// .d.mts directly), so implementing it by hand for these two- and
+// three-field shapes is the honest choice.
 // ---------------------------------------------------------------------------
 
 export interface TaskIdParams {
@@ -535,16 +857,17 @@ export interface TaskIdParams {
 }
 
 /**
- * Validates `{taskId: string}` - the only params shape every tasks/* method
- * registered in `src/server.ts` takes. A fresh object per call (never
- * shared/mutated state), matching this module's zero-persistent-state
- * design. `taskId` must be a NON-EMPTY string - the vendored, digest-
- * verified extension schema (`schema/tasks-extension.schema.json`) pins
- * `minLength: 1` on every `taskId` field it describes, so an empty string
- * would flow through `getTask`/`taskNotFound` and produce a response that
- * violates the very schema this adapter's results are pinned against; this
- * is where that constraint is actually enforced, at the request boundary,
- * before an empty taskId ever reaches a live lookup.
+ * Validates `{taskId: string}` - the params shape `tasks/get` and
+ * `tasks/cancel` (registered in `src/server.ts`) take. A fresh object per
+ * call (never shared/mutated state), matching this module's
+ * zero-persistent-state design. `taskId` must be a NON-EMPTY string - the
+ * vendored, digest-verified extension schema (`schema/tasks-extension.schema.json`)
+ * pins `minLength: 1` on every `taskId` field it describes, so an empty
+ * string would flow through `getTask`/`taskNotFoundError` and produce a
+ * response that violates the very schema this adapter's results are
+ * pinned against; this is where that constraint is actually enforced, at
+ * the request boundary, before an empty taskId ever reaches a live
+ * lookup.
  */
 export function taskIdParamsSchema(): StandardSchemaV1<unknown, TaskIdParams> {
   return {
@@ -556,6 +879,32 @@ export function taskIdParamsSchema(): StandardSchemaV1<unknown, TaskIdParams> {
           const taskId = (value as Record<string, unknown>).taskId;
           if (typeof taskId === "string" && taskId.length > 0) {
             return { value: { taskId } };
+          }
+        }
+        return { issues: [{ message: '"taskId" must be a non-empty string' }] };
+      },
+    },
+  };
+}
+
+/** `tasks/update`'s own params shape per the released spec: `{taskId, inputResponses}` - `taskId` validated exactly like `taskIdParamsSchema`, `inputResponses` accepted-but-unvalidated (see `updateTask`'s own docs for why it is never read: no `input_required` step can ever occur for a job-backed task, so there is nothing to validate its shape against). Present in the parsed params only when the caller actually supplied it, so a caller that omits it entirely (the overwhelmingly common real case, since ghantika never solicits one) never carries a stray `undefined`-valued key through. */
+export interface TaskUpdateParams extends TaskIdParams {
+  readonly inputResponses?: unknown;
+}
+
+export function taskUpdateParamsSchema(): StandardSchemaV1<unknown, TaskUpdateParams> {
+  return {
+    "~standard": {
+      version: 1,
+      vendor: "ghantika-tasks-adapter",
+      validate(value: unknown) {
+        if (typeof value === "object" && value !== null) {
+          const record = value as Record<string, unknown>;
+          const taskId = record.taskId;
+          if (typeof taskId === "string" && taskId.length > 0) {
+            return "inputResponses" in record
+              ? { value: { taskId, inputResponses: record.inputResponses } }
+              : { value: { taskId } };
           }
         }
         return { issues: [{ message: '"taskId" must be a non-empty string' }] };
@@ -584,6 +933,12 @@ export function taskIdParamsSchema(): StandardSchemaV1<unknown, TaskIdParams> {
 // exactly that: `getTask` (elsewhere in this file) reads it back on a
 // totally separate invocation, long after `startTaskWatch`'s own closure
 // for that job may never run again.
+//
+// NOTE: this whole section - the firehose watch, its
+// notification method name, and its payload shape - is deliberately
+// UNTOUCHED here even though the released spec's own
+// `notifications/tasks/status` shape does not match what this section
+// builds. That reconciliation is out of scope here.
 // ---------------------------------------------------------------------------
 
 /** Output lines - stdout or stderr, on the SAME shared window - arriving within this many ms of each other collapse into ONE wake, carrying both streams together when both produced lines in that window - the sole batching mechanism (never lifecycle-based: a long-running command gets one wake per closed window, for its whole life, not a single end-of-run wake). */
@@ -634,11 +989,12 @@ function toWakeLine(line: StreamLineEntry): TaskWakeLine {
 /**
  * Builds one wake notification's params from whatever this closed window
  * actually produced. `stdout`/`stderr` are each included only when THIS
- * batch carries at least one line for that stream - mirroring `TaskResult`'s
- * own optional-field house style (`exitCode`/`output`/`watchStopped` above)
- * rather than always emitting an empty array a client would have to filter
- * out. A window that saw only stdout carries `stdout` alone, exactly as
- * before this adapter also woke on stderr; a mixed window carries both.
+ * batch carries at least one line for that stream - mirroring this
+ * adapter's own house style of only ever including an optional field when
+ * it carries a genuine, present value rather than always emitting an
+ * empty array a client would have to filter out. A window that saw only
+ * stdout carries `stdout` alone, exactly as before this adapter also woke
+ * on stderr; a mixed window carries both.
  */
 function buildWakeParams(
   taskId: string,
@@ -825,11 +1181,71 @@ function extractJobId(result: CallToolResult): string | undefined {
  * completely UNCHANGED (a non-capable connection, or - defensively - a
  * shape this adapter cannot read a job_id out of, which should never
  * happen for a call that just went through `run`'s own handler but is
- * never trusted blindly) or replaces its `content`/`structuredContent`
- * with the minted `TaskResult` for the SAME job the plain result already
- * named. Never mints for any job other than the one `result` itself is
- * about, and never touches `jobStore` beyond the SAME kind of read
- * `getTask` performs.
+ * never trusted blindly) or replaces it ENTIRELY with the minted
+ * `CreateTaskResult` for the SAME job the plain result already named.
+ * Never mints for any job other than the one `result` itself is about,
+ * and never touches `jobStore` beyond the SAME kind of read `getTask`
+ * performs.
+ *
+ * REPLACES, never augments alongside, `content`/`structuredContent` - this
+ * was an explicitly flagged open question before this adapter was built
+ * against it (the spec's own `CreateTaskResult = Result & Task` example JSON
+ * carries no `content`/`structuredContent` members, and the vendored
+ * schema's `createTaskResult` $def locks `additionalProperties: false`
+ * against a property set that does not include either). GROUNDED against
+ * the installed SDK's own runtime for this story, not merely inferred
+ * from the spec text: `stampResultType` (the SDK's own encode-contract
+ * step, confirmed by reading `@modelcontextprotocol/server`'s bundled
+ * source directly) treats `tools/call` as one of
+ * `EXTENDED_RESULT_TYPE_METHODS` - a handler-provided `resultType` other
+ * than `"complete"` passes through UNCHANGED, added onto whatever object
+ * shape the handler itself returned via a plain object spread
+ * (`{...result, resultType: "complete"}` when the handler supplied
+ * none). The SDK does not itself validate that a `resultType: "task"`
+ * result also carries `content`/`structuredContent` - it is purely
+ * additive at the top level, and the SDK never enforces that shape either
+ * way. So whether the two coexist is entirely this adapter's own design
+ * choice, not something the SDK forces - and the schema's own
+ * `additionalProperties: false` is what settles it: this adapter must
+ * emit the flat `CreateTaskResult` shape and nothing else, or it violates
+ * its own pinned contract. The cast below (`as unknown as CallToolResult`)
+ * exists ONLY to satisfy the installed SDK's own typed `tools/call`
+ * handler surface, which has no notion of a Task-shaped result at all
+ * (the SDK's own `Task`-family types are marked `@deprecated`, unrelated
+ * to this real, runtime-correct shape - see this file's header) - the
+ * object that actually reaches the wire is the genuine `CreateTaskResult`
+ * this function builds, never a real `CallToolResult`.
+ *
+ * ONE DISCLOSED WIRE ARTIFACT, MEASURED (not inferred) directly against a
+ * real `Client`/`Server` round trip over `InMemoryTransport`:
+ * the installed `@modelcontextprotocol/server@2.0.0`'s own
+ * `tools/call` result encoding runs every handler-returned object missing
+ * `content` through a shared `normalizeContentlessToolResult` step, which
+ * injects a synthetic `content: []` UNLESS the object already carries one
+ * of `["task", "inputRequests", "requestState"]` - the OLDER `input_required`
+ * result family's own escape hatch (SEP-2322 predates this extension and
+ * the SDK has not been taught the Tasks extension's own `resultType:
+ * "task"` as an equivalent second family to protect). This adapter's own
+ * `buildCreateTaskResult` output has neither `content` nor any of those
+ * three keys, so the REAL bytes this codebase sends for a mint carry one
+ * extra key beyond what `buildCreateTaskResult` constructs:
+ * `content: []`. Verified directly (not assumed) by wrapping a real
+ * `InMemoryTransport` pair's outbound `send` and inspecting the raw
+ * pre-decode JSON-RPC message. `test/tasks.test.ts` asserts this precisely
+ * (the schema-conformance check strips exactly that one, bounded,
+ * documented key before validating against `createTaskResult`, and
+ * separately asserts the artifact is bounded to exactly that key with
+ * exactly that value - never a silent broader escape). This is an
+ * SDK-version fact about the installed `@modelcontextprotocol/server`
+ * package's own `tools/call` encode path, not a defect in this adapter's
+ * own construction, and not something touching the vendored schema (which
+ * pins the RELEASED extension's real contract, where `createTaskResult`
+ * legitimately carries no `content` at all) could fix or should paper
+ * over - deliberately never worked around here by stuffing a bogus
+ * `task`/`inputRequests`/`requestState` key into the result purely to
+ * suppress the injection, which would fabricate spec-foreign data to dodge
+ * a benign default and make the real problem (an SDK gap) harder to see,
+ * not easier.
  *
  * Also starts the output-driven wake watch (see `startTaskWatch`'s own
  * docs) for that SAME job, through `notifier` - but only when the backing
@@ -855,9 +1271,6 @@ export function maybeAugmentRunResult(
     startTaskWatch(jobId, notifier);
   }
 
-  const task = buildTaskResult(record);
-  return {
-    content: [{ type: "text", text: JSON.stringify(task, null, 2) }],
-    structuredContent: { ...task },
-  };
+  const minted = buildCreateTaskResult(record);
+  return minted as unknown as CallToolResult;
 }

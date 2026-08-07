@@ -1,6 +1,6 @@
 {
   "file": "schema/tasks-extension.schema.json",
   "algorithm": "sha256",
-  "sha256": "66a29e94f2600c70f3c67c7ec4690b399709d64a1a4bea8f2db674a83dee3a49",
+  "sha256": "833cbd327b0a4d22ac4098c4cf404aeefc36612f152a454701dd253ba3a48e35",
   "note": "Recorded digest of schema/tasks-extension.schema.json's exact bytes, recomputed and compared on every run of scripts/check-sdk-exact-pin.mjs. Re-run the digest-recording step (see that script's checkTasksExtensionSchemaPin) after any edit to the vendored schema - this file must never be hand-edited out of sync with the schema it pins."
 }

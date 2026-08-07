@@ -5097,11 +5097,16 @@ test(
     );
     assert.equal(jobStore.has(jobId), true, "not yet purged - still under TASK_TTL_MS");
 
-    const pastTtl = getTask(jobId, endedAtMs + TASK_TTL_MS + 1000);
-    assert.equal(
-      pastTtl.error,
-      "task_not_found",
-      `expected the deadline-failed record to be purged past TASK_TTL_MS by the ordinary TTL read, got ${JSON.stringify(pastTtl)}`
+    // getTask THROWS (task_not_found, -32602) rather than returning a
+    // tagged success value on the released contract - see
+    // src/tasksAdapter.ts's own taskNotFoundError docs.
+    assert.throws(
+      () => getTask(jobId, endedAtMs + TASK_TTL_MS + 1000),
+      (error: unknown) => {
+        const message = String((error as { message?: unknown })?.message ?? error);
+        return /-32602|not found|task_not_found/i.test(message);
+      },
+      "expected the deadline-failed record to be purged past TASK_TTL_MS by the ordinary TTL read, throwing task_not_found"
     );
     assert.equal(
       jobStore.has(jobId),
