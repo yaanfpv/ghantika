@@ -13,14 +13,28 @@
  *
  * This file covers what those two files structurally cannot: the modern
  * opening exchange itself (`server/discover` succeeding, the
- * probe-then-fallback per-instance-state proof), and three negative
- * controls - a comparison server (`test/fixtures/negative-control-server.ts`)
- * built in three variants, each of which removes exactly one of the
- * three guarantees `src/server.ts` preserves under `serveStdio` while
- * keeping the other two intact (see that file's own doc comment for how),
- * so this file can observe by real execution what the ABSENCE of each
- * guarantee looks like on the wire, with each red result attributable to
- * the one removed guarantee and not to some other missing piece.
+ * probe-then-fallback per-instance-state proof), the three registered task
+ * methods (`tasks/get`/`tasks/update`/`tasks/cancel`) exercised over real
+ * JSON-RPC on both eras rather than only ever minting a handle -
+ * previously untested, so the extension had only ever been proven to MINT,
+ * never to RESOLVE. Driving that resolution over the real modern wire
+ * surfaced a genuine, measured installed-SDK fact rather than confirming
+ * the naive expectation: `tasks/get` and `tasks/cancel` are UNROUTABLE on
+ * the 2026-07-28 era, full stop, because the installed SDK's own base
+ * dispatch recognizes both as belonging to the deprecated 2025-11-25
+ * vocabulary and refuses them before this codebase's own handler is ever
+ * reached; `tasks/update`, which that vocabulary never defined, is
+ * unaffected and reaches this codebase's own handler normally on both
+ * eras. See the task-method tests below, and `src/server.ts`'s own doc
+ * comment at its three `tasks/*` registrations, for the full grounding.
+ * Also three negative controls - a comparison server
+ * (`test/fixtures/negative-control-server.ts`) built in three variants,
+ * each of which removes exactly one of the three guarantees `src/server.ts`
+ * preserves under `serveStdio` while keeping the other two intact (see that
+ * file's own doc comment for how), so this file can observe by real
+ * execution what the ABSENCE of each guarantee looks like on the wire, with
+ * each red result attributable to the one removed guarantee and not to some
+ * other missing piece.
  */
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
@@ -59,6 +73,42 @@ process.on("exit", () => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   }
 });
+
+/**
+ * Reads stdout lines via `server.nextLine()` until a genuine JSON-RPC
+ * RESPONSE arrives - a real object carrying its own `id` field, per
+ * JSON-RPC 2.0 - skipping over any NOTIFICATION (a `method` with no `id`
+ * at all) seen along the way.
+ *
+ * Needed because this change adds `notifications/tasks` (see
+ * `src/tasksAdapter.ts`'s own `startTaskStatusNotifier` docs): a
+ * genuinely UNCONDITIONAL per-transition notification that now fires on
+ * every Tasks-capable-minted task's own terminal transition, regardless
+ * of whether the job ever produced any output at all. The pre-existing
+ * output-delta wake could never interleave with a `["true"]`-style mint in
+ * this file's own tests, since a job with zero output never fires it - but
+ * `notifications/tasks` fires on ANY terminal transition, so a fast-exiting
+ * command's own terminal notification can now land on the real wire in
+ * between two otherwise-sequential request/response pairs a raw harness
+ * reads one at a time. A test that mints a Tasks-capable task and then
+ * chains several further requests against the SAME connection reads
+ * through this helper rather than `server.nextLine()` directly; a test
+ * that never mints on a capable connection, or reads only the mint's own
+ * immediate response with nothing chained after, has no need for it.
+ */
+async function nextResponse(
+  server: SpawnedServer
+): Promise<{ id: unknown; result?: unknown; error?: unknown }> {
+  for (;;) {
+    const line = await server.nextLine();
+    const parsed = line.parsed as { id?: unknown; method?: unknown } | undefined;
+    if (parsed !== undefined && parsed !== null && "id" in parsed) {
+      return parsed as { id: unknown; result?: unknown; error?: unknown };
+    }
+    // A notification (method present, no id at all) - not what this is
+    // waiting for; keep reading.
+  }
+}
 
 interface DiscoverResultBody {
   readonly jsonrpc: string;
@@ -131,6 +181,9 @@ test("legacy handshake, under serveStdio: tools/call sent before the initialize/
     method: "tools/call",
     params: { name: "run", arguments: { command: ["echo", "should-never-run"] } },
   });
+  // A bare nextLine() is safe here under this file's own nextResponse doc
+  // (see its header comment) - the call is rejected before ever reaching
+  // run(), so no job is created and nothing can ever mint or terminate.
   const line = await server.nextLine();
   const body = line.parsed as { error?: { code: number }; result?: unknown };
   assert.ok(body.error, "a pre-handshake tools/call must still be rejected under serveStdio");
@@ -152,6 +205,11 @@ test("legacy handshake, under serveStdio: a real initialize + notifications/init
     method: "tools/call",
     params: { name: "run", arguments: { command: ["true"] } },
   });
+  // A bare nextLine() is safe here - completeHandshake() above declares no
+  // capabilities at all (see initializeRequest's own fixed empty
+  // capabilities:{}), so this legacy connection never achieves Tasks
+  // capability, run() never mints, and startTaskStatusNotifier is never
+  // registered for this job regardless of how it later terminates.
   const line = await server.nextLine();
   const body = line.parsed as { error?: unknown; result?: { isError?: boolean } };
   assert.equal(
@@ -176,6 +234,10 @@ test("modern handshake: tools/call immediately after a successful server/discove
     method: "tools/call",
     params: withModernEnvelope({ name: "run", arguments: { command: ["true"] } }),
   });
+  // A bare nextLine() is safe here - withModernEnvelope's own default
+  // clientCapabilities is empty, so this request declares no Tasks
+  // capability, never mints, and this is the only tools/call on the
+  // connection - nothing to interleave with.
   const line = await server.nextLine();
   const body = line.parsed as {
     error?: unknown;
@@ -221,6 +283,12 @@ test("modern handshake: a tools/call whose OWN request envelope declares io.mode
       { extensions: { [TASKS_EXTENSION_URI]: {} } }
     ),
   });
+  // A bare nextLine() is safe here per this file's own nextResponse doc -
+  // this reads the mint's OWN immediate response (the first and only
+  // tools/call on this connection), and a request's response is always
+  // written synchronously in its own handler, strictly before the async
+  // process-exit that could ever trigger this job's own terminal
+  // notification - there is no earlier job on this connection either.
   const line = await server.nextLine();
   const body = line.parsed as {
     error?: unknown;
@@ -325,8 +393,15 @@ test("modern handshake: on the SAME connection, a tools/call whose OWN request e
     method: "tools/call",
     params: withModernEnvelope({ name: "run", arguments: { command: ["true"] } }),
   });
-  const incapableLine = await server.nextLine();
-  const incapableBody = incapableLine.parsed as {
+  // Reads through nextResponse (never server.nextLine() directly) - the
+  // mint above used `command: ["true"]`, a real backing process that exits
+  // almost immediately, so its own `notifications/tasks` terminal
+  // notification (see startTaskStatusNotifier's own docs) can land on this
+  // wire in between the mint's response and this second request's own
+  // response; nextResponse skips exactly that, and only that - the same
+  // hazard this file's "six-tool mint rule" test documents and guards
+  // against on its own chained reads.
+  const incapableBody = (await nextResponse(server)) as {
     error?: unknown;
     result?: { isError?: boolean; structuredContent?: Record<string, unknown> };
   };
@@ -385,6 +460,9 @@ test("modern handshake: a tools/call whose own request envelope declares ONLY th
     // - the two bags `isConnectionTasksCapable` actually reads.
     params: withModernEnvelope({ name: "run", arguments: { command: ["true"] } }, { tasks: {} }),
   });
+  // A bare nextLine() is safe here - the deprecated `tasks` bag is never
+  // read as a capability signal (see the comment above), so this request
+  // never mints and no notifications/tasks push is ever registered for it.
   const line = await server.nextLine();
   const body = line.parsed as {
     error?: unknown;
@@ -438,6 +516,9 @@ test("modern handshake: a tools/call whose own request envelope declares Tasks s
       { experimental: { [TASKS_EXTENSION_URI]: {} } }
     ),
   });
+  // A bare nextLine() is safe here - the `experimental` bag is never read
+  // as a capability signal either (only `extensions` is), so this request
+  // never mints and no notifications/tasks push is ever registered for it.
   const line = await server.nextLine();
   const body = line.parsed as {
     error?: unknown;
@@ -494,6 +575,9 @@ test("modern handshake: six-tool mint rule on the real wire - run() mints while 
       { extensions: { [TASKS_EXTENSION_URI]: {} } }
     ),
   });
+  // A bare nextLine() is safe here (see this file's own nextResponse doc)
+  // - this is the mint's OWN immediate response, the first tools/call on
+  // this connection, so nothing could have interleaved before it.
   const runLine = await server.nextLine();
   const runBody = runLine.parsed as {
     result?: { taskId?: unknown; resultType?: unknown; structuredContent?: unknown };
@@ -540,8 +624,13 @@ test("modern handshake: six-tool mint rule on the real wire - run() mints while 
         { extensions: { [TASKS_EXTENSION_URI]: {} } }
       ),
     });
-    const line = await server.nextLine();
-    const body = line.parsed as {
+    // Reads through nextResponse (never server.nextLine() directly) - the
+    // mint above used `command: ["true"]`, a real backing process that
+    // exits almost immediately, so its own `notifications/tasks` terminal
+    // notification (see startTaskStatusNotifier's own docs) can land on
+    // this wire in between two of these sequential requests at any point
+    // from here on; nextResponse skips exactly that, and only that.
+    const body = (await nextResponse(server)) as {
       id: number;
       error?: unknown;
       result?: {
@@ -572,6 +661,307 @@ test("modern handshake: six-tool mint rule on the real wire - run() mints while 
       undefined,
       `"${call.name}" must never carry a taskId field either, got: ${JSON.stringify(structured)}`
     );
+  }
+  server.child.kill("SIGKILL");
+});
+
+// ---------------------------------------------------------------------------
+// The three registered task methods (tasks/get, tasks/update, tasks/cancel)
+// on the real modern wire - previously exercised only by MINTING a handle
+// (the test above, and every legacy-era test in test/tasks.test.ts /
+// test/tasks-lifecycle.test.ts), never by RESOLVING one over this era's own
+// raw JSON-RPC. Also settles the second of the two capability paths this
+// codebase has, on the real wire rather than by reading source alone -
+// `tools/call`'s own `run` branch reads a per-request Tasks-capability
+// declaration before minting (the six-tool-mint-rule test above, and
+// test/tasks.test.ts's legacy-era proof); src/server.ts registers
+// tasks/get, tasks/update, and tasks/cancel with NO such check at all
+// (confirmed directly by reading server.ts's own `server.setRequestHandler`
+// calls for the three, which take only a params schema, never a capability
+// read) - BUT driving that claim over the real modern wire surfaces a
+// SEPARATE, more fundamental fact this AC's own premise did not anticipate:
+// `tasks/get` and `tasks/cancel` are UNROUTABLE on the 2026-07-28 era
+// through this connection's own request dispatch, regardless of
+// capability, because the installed SDK's own base `Protocol` class
+// recognizes both as belonging to the deprecated 2025-11-25 vocabulary and
+// refuses them with -32601 "Method not found" BEFORE this codebase's own
+// registered handler is ever consulted (see server.ts's own doc comment at
+// its three `tasks/*` registrations for the full grounding, including the
+// exact installed-SDK mechanism). `tasks/update` has no legacy-era
+// precedent at all, so it is recognized as a spec method by NEITHER era's
+// codec, is never caught by that guard, and reaches this codebase's own
+// handler normally on both eras - which is what actually lets this test
+// demonstrate capability-independence in execution, on the real modern
+// wire, for the one method the wire itself does not block. `tasks/get`'s
+// and `tasks/cancel`'s own capability-independence is demonstrated on the
+// legacy era instead (below), and by the in-process suites this AC's own
+// premise cited (test/tasks.test.ts, test/tasks-lifecycle.test.ts), which
+// exercise both fully.
+// ---------------------------------------------------------------------------
+
+test("modern wire: tasks/get and tasks/cancel are UNROUTABLE on the 2026-07-28 era - a real, measured installed-SDK dispatch fact (the base Protocol class's own era-registry check), never a Tasks-capability gate this codebase applies, proven by the SAME outcome with and without capability declared", async () => {
+  const server = tracked();
+  server.send(discoverRequest(1));
+  const discoverLine = await server.nextLine();
+  assert.ok((discoverLine.parsed as DiscoverResultBody).result, "discover must succeed first");
+
+  // Mint a real task first - WITH capability declared, since minting
+  // itself IS gated (see the six-tool-mint-rule test above). A real taskId
+  // must exist for the calls below to target, even though - as this test
+  // itself proves - that target is never reached for two of the three
+  // methods on this era.
+  server.send({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: withModernEnvelope(
+      { name: "run", arguments: { command: ["true"], label: "modernwire-unroutable-methods" } },
+      { extensions: { [TASKS_EXTENSION_URI]: {} } }
+    ),
+  });
+  // A bare nextLine() is safe here - the mint's OWN immediate response,
+  // the first tools/call on this connection; the loop below reads through
+  // nextResponse() precisely because it is exposed and this read is not.
+  const runLine = await server.nextLine();
+  const runBody = runLine.parsed as { result?: { taskId?: unknown; resultType?: unknown } };
+  assert.equal(
+    runBody.result?.resultType,
+    "task",
+    `setup: run() must genuinely mint on this connection, or this test proves nothing - got: ${JSON.stringify(runBody.result)}`
+  );
+  const taskId = runBody.result?.taskId;
+  assert.equal(typeof taskId, "string", "setup: run() must return a real taskId to target below");
+
+  // Both WITH and WITHOUT Tasks capability declared on the request itself -
+  // the identical -32601 outcome either way is exactly what proves this is
+  // a method-routing fact of the installed SDK's own dispatch, never a
+  // capability gate this codebase applies.
+  const capabilityVariants: ReadonlyArray<Record<string, unknown>> = [
+    { extensions: { [TASKS_EXTENSION_URI]: {} } },
+    {},
+  ];
+  let nextId = 3;
+  for (const method of ["tasks/get", "tasks/cancel"]) {
+    for (const clientCapabilities of capabilityVariants) {
+      const id = nextId;
+      nextId += 1;
+      server.send({
+        jsonrpc: "2.0",
+        id,
+        method,
+        params: withModernEnvelope({ taskId }, clientCapabilities),
+      });
+      // nextResponse, not server.nextLine() directly - see that helper's
+      // own docs: the mint above (`command: ["true"]`) exits almost
+      // immediately, so its own notifications/tasks terminal notification
+      // can land on this wire at any point from here on.
+      const body = (await nextResponse(server)) as {
+        id: number;
+        error?: { code?: number; message?: string };
+        result?: unknown;
+      };
+      assert.equal(body.id, id);
+      assert.equal(
+        body.error?.code,
+        -32601,
+        `expected "${method}" on the modern era to fail with -32601 Method Not Found (capability=${JSON.stringify(clientCapabilities)}), got: ${JSON.stringify(body)}`
+      );
+      assert.equal(body.error?.message, "Method not found");
+      assert.equal(body.result, undefined);
+    }
+  }
+
+  server.child.kill("SIGKILL");
+});
+
+test("modern wire: tasks/update - the one task method the legacy vocabulary never defined - reaches this codebase's own handler normally on the modern era, and succeeds with NO Tasks capability declared on its own request, proving the second capability path is genuinely gate-free for the one method the wire itself does not block", async () => {
+  const server = tracked();
+  server.send(discoverRequest(1));
+  const discoverLine = await server.nextLine();
+  assert.ok((discoverLine.parsed as DiscoverResultBody).result, "discover must succeed first");
+
+  server.send({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: withModernEnvelope(
+      { name: "run", arguments: { command: ["true"], label: "modernwire-tasks-update" } },
+      { extensions: { [TASKS_EXTENSION_URI]: {} } }
+    ),
+  });
+  // A bare nextLine() is safe here - the mint's OWN immediate response,
+  // the first tools/call on this connection; the tasks/update read below
+  // goes through nextResponse() precisely because it is exposed and this
+  // read is not.
+  const runLine = await server.nextLine();
+  const runBody = runLine.parsed as { result?: { taskId?: unknown; resultType?: unknown } };
+  assert.equal(
+    runBody.result?.resultType,
+    "task",
+    `setup: run() must genuinely mint on this connection, or this test proves nothing - got: ${JSON.stringify(runBody.result)}`
+  );
+  const taskId = runBody.result?.taskId;
+  assert.equal(typeof taskId, "string", "setup: run() must return a real taskId to target below");
+
+  // NO Tasks capability declared on THIS request (withModernEnvelope's own
+  // default: a present-but-empty clientCapabilities declaration).
+  // `inputResponses` omitted entirely too - the overwhelmingly common real
+  // case, per taskUpdateParamsSchema's own docs, since no ghantika task
+  // ever reaches `input_required`.
+  server.send({
+    jsonrpc: "2.0",
+    id: 3,
+    method: "tasks/update",
+    params: withModernEnvelope({ taskId }),
+  });
+  // nextResponse, not server.nextLine() directly - see that helper's own
+  // docs: the mint above (`command: ["true"]`) exits almost immediately,
+  // so its own notifications/tasks terminal notification could land on
+  // this wire before this response does.
+  const updateBody = (await nextResponse(server)) as {
+    error?: unknown;
+    result?: Record<string, unknown>;
+  };
+  assert.equal(
+    updateBody.error,
+    undefined,
+    `tasks/update must succeed with no Tasks capability declared on its own request, got: ${JSON.stringify(updateBody)}`
+  );
+  // The real, RAW modern-era wire response - unlike test/tasks.test.ts's
+  // InMemoryTransport-based proofs, this harness reads bytes directly with
+  // no @modelcontextprotocol/client decode/strip involved (see this file's
+  // own mint test's docs for the same distinction) - carries one field
+  // this codebase's own adapter never constructs: the modern era's own
+  // `_meta.io.modelcontextprotocol/serverInfo` envelope decoration, added
+  // by the installed SDK's own outbound encode step to every response on
+  // this era, unconditionally. `tasksAdapter.ACK_RESULT` itself is still
+  // exactly `{resultType: "complete"}` (see that constant's own docs) -
+  // asserted directly below - so this is checked as a disclosed, bounded
+  // SDK-era wire artifact, never folded silently into a looser comparison.
+  assert.equal(updateBody.result?.resultType, "complete");
+  assert.deepEqual(
+    Object.keys(updateBody.result ?? {}).sort(),
+    ["_meta", "resultType"],
+    `expected tasks/update's real modern-era wire result to carry only resultType plus the SDK's own injected _meta, got: ${JSON.stringify(updateBody.result)}`
+  );
+  assert.deepEqual(
+    updateBody.result?._meta,
+    { "io.modelcontextprotocol/serverInfo": { name: "ghantika", version: "0.1.0" } },
+    `expected the SDK's own injected _meta to carry exactly the server's own identity, got: ${JSON.stringify(updateBody.result?._meta)}`
+  );
+
+  server.child.kill("SIGKILL");
+});
+
+test("legacy wire: tasks/get, tasks/update, and tasks/cancel all succeed with NO Tasks capability declared on their own connection - the legacy era's own capability model is connection-level (see resolveRunClientCapabilities's own docs), and the three task methods are unaffected by it either way since none of them reads capability at all; also confirms the real kill-and-reap effect on a still-running task, and closes the AC's own dual-capability-path premise for tasks/get and tasks/cancel where the modern wire itself cannot", async () => {
+  const server = tracked();
+  await completeHandshake(server); // a plain legacy handshake, declaring no capabilities at all
+
+  server.send({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: {
+      name: "run",
+      arguments: {
+        command: [process.execPath, "-e", "setTimeout(() => {}, 600000);"],
+        label: "legacywire-task-methods",
+      },
+    },
+  });
+  // Every bare nextLine() in this test - this one and the tasks/get,
+  // tasks/update, tasks/cancel, and polling-loop reads below - is safe:
+  // this connection never declares Tasks capability (see
+  // completeHandshake's own fixed empty capabilities:{}), so run() never
+  // mints and startTaskStatusNotifier is never registered for this job,
+  // however long it runs or however it is later cancelled.
+  const runLine = await server.nextLine();
+  const runBody = runLine.parsed as { result?: { structuredContent?: { job_id?: unknown } } };
+  const taskId = runBody.result?.structuredContent?.job_id;
+  assert.equal(
+    typeof taskId,
+    "string",
+    `setup: a legacy-era, no-capability run() must still mint a real job_id to target below - got: ${JSON.stringify(runBody.result)}`
+  );
+
+  server.send({ jsonrpc: "2.0", id: 3, method: "tasks/get", params: { taskId } });
+  const getLine = await server.nextLine();
+  const getBody = getLine.parsed as {
+    error?: unknown;
+    result?: { taskId?: unknown; status?: unknown; resultType?: unknown };
+  };
+  assert.equal(
+    getBody.error,
+    undefined,
+    `tasks/get must succeed on the legacy era with no Tasks capability ever declared on this connection, got: ${JSON.stringify(getBody)}`
+  );
+  assert.equal(getBody.result?.taskId, taskId);
+  assert.equal(
+    getBody.result?.status,
+    "working",
+    "expected the idle backing job to still be working"
+  );
+  assert.equal(getBody.result?.resultType, "complete");
+
+  server.send({ jsonrpc: "2.0", id: 4, method: "tasks/update", params: { taskId } });
+  const updateLine = await server.nextLine();
+  const updateBody = updateLine.parsed as { error?: unknown; result?: Record<string, unknown> };
+  assert.equal(updateBody.error, undefined);
+  assert.deepEqual(updateBody.result, { resultType: "complete" });
+
+  server.send({ jsonrpc: "2.0", id: 5, method: "tasks/cancel", params: { taskId } });
+  const cancelLine = await server.nextLine();
+  const cancelBody = cancelLine.parsed as { error?: unknown; result?: Record<string, unknown> };
+  assert.equal(
+    cancelBody.error,
+    undefined,
+    `tasks/cancel must succeed on the legacy era with no Tasks capability ever declared, got: ${JSON.stringify(cancelBody)}`
+  );
+  assert.deepEqual(
+    cancelBody.result,
+    { resultType: "complete" },
+    "tasks/cancel must return exactly the fixed empty acknowledgement, matching tasks/update's own ack"
+  );
+
+  let finalStatus: unknown;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    server.send({ jsonrpc: "2.0", id: 6 + attempt, method: "tasks/get", params: { taskId } });
+    const pollLine = await server.nextLine();
+    const pollBody = pollLine.parsed as { result?: { status?: unknown } };
+    finalStatus = pollBody.result?.status;
+    if (finalStatus !== "working") break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(
+    finalStatus,
+    "cancelled",
+    `expected tasks/cancel to actually terminate the job, got final status ${JSON.stringify(finalStatus)}`
+  );
+
+  server.child.kill("SIGKILL");
+});
+
+test("an unknown taskId on tasks/get, tasks/update, and tasks/cancel each fail closed with -32602 on the legacy era, matching the released spec's shared error code for both an unknown and an expired-and-purged id (the modern era cannot exercise tasks/get/tasks/cancel at all - see the unroutable-methods test above - so this is legacy-only, deliberately, rather than parameterized across both eras)", async () => {
+  const server = tracked();
+  await completeHandshake(server);
+  const bogusTaskId = "00000000-0000-0000-0000-000000000000";
+
+  const cases: ReadonlyArray<{ method: string; id: number }> = [
+    { method: "tasks/get", id: 2 },
+    { method: "tasks/update", id: 3 },
+    { method: "tasks/cancel", id: 4 },
+  ];
+  for (const { method, id } of cases) {
+    server.send({ jsonrpc: "2.0", id, method, params: { taskId: bogusTaskId } });
+    const line = await server.nextLine();
+    const body = line.parsed as { id: number; error?: { code?: number }; result?: unknown };
+    assert.equal(body.id, id);
+    assert.equal(
+      body.error?.code,
+      -32602,
+      `expected ${method} on an unknown taskId to fail with -32602, got: ${JSON.stringify(body)}`
+    );
+    assert.equal(body.result, undefined);
   }
   server.child.kill("SIGKILL");
 });

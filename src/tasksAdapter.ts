@@ -57,7 +57,7 @@
  * `taskStatus` values (never `input_required` - see that constant's own
  * docs for why), and `tasks/list`/`tasks/result` stay unregistered (the
  * spec eliminates the former and replaces the latter - see the method-set
- * section of this header for the full reasoning, unchanged by this story).
+ * section of this header for the full reasoning, unchanged by this change).
  *
  * ## Capability advertisement: `capabilities.extensions`, not the SDK's
  * deprecated `capabilities.tasks`
@@ -140,7 +140,7 @@
  * matching the spec's own "eventually consistent - the ack may arrive
  * before the task's observable status reflects the requested change"
  * contract for `CancelTaskResult`, rather than reading a fresh snapshot
- * back the way this adapter did before this story.
+ * back the way this adapter did before this change.
  *
  * BOUNDARY, unwidened from `kill`'s own already-disclosed scope (see
  * `src/tools/kill.ts`'s extensive docs on this): cancelling means
@@ -627,9 +627,17 @@ function buildGhantikaResultExtras(record: JobRecord): GhantikaResultExtras {
 /**
  * Projects a real `JobRecord` into the discriminated `DetailedTaskResult`
  * union - the shape `tasks/get` (via `buildGetTaskResult`) actually
- * returns. Pure: reads `jobStore`'s own already-existing, real state
- * (`getOutputWatchStopInfo`/`getOutputCounts`) and the record's own
- * fields, writes nothing.
+ * returns, and, as of this change, ALSO the exact shape the real
+ * `notifications/tasks` notification's own `params` carries (see
+ * `startTaskStatusNotifier`, below): the spec's own
+ * `TaskStatusNotificationParams = NotificationParams & Task` is a bare
+ * `DetailedTask` with no further wrapping, identical to what `tasks/get`
+ * would have returned for that same task at that same moment - so this
+ * function is reused rather than duplicated for the notification path,
+ * exported for exactly that reuse (previously module-local, since nothing
+ * outside `getTask` needed it before this change). Pure: reads `jobStore`'s
+ * own already-existing, real state (`getOutputWatchStopInfo`/
+ * `getOutputCounts`) and the record's own fields, writes nothing.
  *
  * A still-`working` task carries the pre-terminal watch-stop signal (if
  * any) rendered as text into `statusMessage` (see
@@ -639,7 +647,7 @@ function buildGhantikaResultExtras(record: JobRecord): GhantikaResultExtras {
  * `buildGhantikaResultExtras` - never both at once for the same task,
  * since a task is either working or terminal, never both.
  */
-function buildDetailedTaskResult(record: JobRecord): DetailedTaskResult {
+export function buildDetailedTaskResult(record: JobRecord): DetailedTaskResult {
   const status = mapJobStateToTaskStatus(record.state);
   const base = {
     taskId: record.job_id,
@@ -914,11 +922,31 @@ export function taskUpdateParamsSchema(): StandardSchemaV1<unknown, TaskUpdatePa
 }
 
 // ---------------------------------------------------------------------------
-// The output-driven wake - a coalesced, rate-bounded, firehose-guarded,
-// terminal-flush-ordered accelerator built entirely on jobStore.ts's two
-// generic hooks (`onOutputArrival`/`onJobTerminal`) plus its generic
-// watch-stop annotation. Every named constant below is EXPORTED so a test
-// can assert against it directly, never a magic literal.
+// Two genuinely distinct notifications, on two genuinely distinct wire
+// method names, reconciled against the released spec here.
+//
+// (1) The output-driven wake - a coalesced, rate-bounded, firehose-guarded
+// accelerator built entirely on jobStore.ts's two generic hooks
+// (`onOutputArrival`/`onJobTerminal`) plus its generic watch-stop
+// annotation, carrying a per-batch stdout/stderr DELTA. This existed
+// before the extension finalized and used to travel under
+// `notifications/tasks/status` - a name that reads as spec vocabulary but
+// was never IN the spec (the real, released method is `notifications/tasks`,
+// singular, no `/status` suffix - see `TASKS_NOTIFICATION_METHOD` below).
+// Renamed to `GHANTIKA_OUTPUT_WAKE_METHOD`, a name that cannot be mistaken
+// for extension wire vocabulary. The firehose guard and its coalescing
+// behavior are preserved UNCHANGED here, under the new name, and this
+// rename is the only change this section makes to that mechanism.
+//
+// (2) `notifications/tasks` (below, `TASKS_NOTIFICATION_METHOD`) - the
+// REAL, spec-defined status notification, added by this change. Carries a
+// complete `DetailedTask` snapshot (via `buildDetailedTaskResult`, reused
+// from `getTask`'s own path) per status TRANSITION, including the
+// terminal one - see `startTaskStatusNotifier`, below, for the full
+// design and the field-by-field comparison against the released contract.
+//
+// Every named constant below is EXPORTED so a test can assert against it
+// directly, never a magic literal.
 //
 // `startTaskWatch` is deliberately the ONLY place in this file that holds
 // any per-task MUTABLE state, and even there it is pure closure state (a
@@ -932,13 +960,9 @@ export function taskUpdateParamsSchema(): StandardSchemaV1<unknown, TaskUpdatePa
 // watch) lives in `jobStore.ts` instead - the watch-stop annotation is
 // exactly that: `getTask` (elsewhere in this file) reads it back on a
 // totally separate invocation, long after `startTaskWatch`'s own closure
-// for that job may never run again.
-//
-// NOTE: this whole section - the firehose watch, its
-// notification method name, and its payload shape - is deliberately
-// UNTOUCHED here even though the released spec's own
-// `notifications/tasks/status` shape does not match what this section
-// builds. That reconciliation is out of scope here.
+// for that job may never run again. `startTaskStatusNotifier` (below)
+// holds no mutable state of its own at all - it is a single
+// `onJobTerminal` subscription with no closure variables to track.
 // ---------------------------------------------------------------------------
 
 /** Output lines - stdout or stderr, on the SAME shared window - arriving within this many ms of each other collapse into ONE wake, carrying both streams together when both produced lines in that window - the sole batching mechanism (never lifecycle-based: a long-running command gets one wake per closed window, for its whole life, not a single end-of-run wake). */
@@ -956,8 +980,29 @@ export const FIREHOSE_SUSTAINED_MS = 2000;
 /** The exact `watchStopped.reason` literal this adapter ever produces. */
 export const WATCH_STOP_REASON_FIREHOSE = "firehose";
 
-/** The extension's real notification method name - exact-string wire identity, never a substring/prefix a client should match against. Optional: a client MUST NOT rely on receiving it and continues to poll `tasks/get`/`output`/`tail` regardless (see this section's own docs on the poll floor). */
-export const TASKS_STATUS_NOTIFICATION_METHOD = "notifications/tasks/status";
+/**
+ * ghantika's own pre-existing, non-spec output-delta wake's method name -
+ * deliberately namespaced under `ghantika`, never under `tasks`, so it can
+ * never be mistaken for the extension's own wire vocabulary by a
+ * conformant client reading the method name alone. Was
+ * `notifications/tasks/status` before this change (see this section's own
+ * header for why that name was retired, not merely relocated). Optional:
+ * a client MUST NOT rely on receiving it and continues to poll
+ * `tasks/get`/`output`/`tail` regardless (see this section's own docs on
+ * the poll floor) - unchanged by the rename.
+ */
+export const GHANTIKA_OUTPUT_WAKE_METHOD = "notifications/ghantika/outputWake";
+
+/**
+ * The released extension's REAL notification method name - exact-string
+ * wire identity, matching `specification/draft/tasks.md`'s own
+ * `TaskStatusNotification.method` const precisely (`method:
+ * "notifications/tasks";`, confirmed by reading the spec text directly,
+ * not inferred): singular `tasks`, no `/status` suffix. See
+ * `startTaskStatusNotifier`, below, for what actually sends it and the
+ * full field-by-field comparison against the released contract.
+ */
+export const TASKS_NOTIFICATION_METHOD = "notifications/tasks";
 
 /** One output line (stdout or stderr) as carried in a wake notification's payload - the SAME shape (seq/text/partial) `src/tools/output.ts`'s own `OutputEvent` uses for either stream, so the wake never carries state the poll floor can't independently surface. */
 export interface TaskWakeLine {
@@ -968,13 +1013,22 @@ export interface TaskWakeLine {
 
 /**
  * The one thing `maybeAugmentRunResult` needs from `src/server.ts` to
- * actually deliver a wake: a thin function wrapping the real connected
- * `Server`'s own `notification()` call. Keeping this a plain function type
- * (rather than importing the `Server` class itself) is what lets this file
- * stay unaware of the SDK's server wiring beyond the generic types it
- * already imports.
+ * actually deliver a notification of either kind this file sends: a thin
+ * function wrapping the real connected `Server`'s own `notification()`
+ * call. Keeping this a plain function type (rather than importing the
+ * `Server` class itself) is what lets this file stay unaware of the SDK's
+ * server wiring beyond the generic types it already imports.
+ *
+ * Takes `method` as its own explicit argument, rather than being one
+ * notifier per method, because this file now sends TWO genuinely distinct
+ * notifications on two genuinely distinct method names
+ * (`GHANTIKA_OUTPUT_WAKE_METHOD` from `startTaskWatch`'s own `flush`,
+ * `TASKS_NOTIFICATION_METHOD` from `startTaskStatusNotifier`) through the
+ * SAME underlying `server.notification(...)` call - `src/server.ts` never
+ * needs to know which method is being sent for any given call, only how
+ * to relay whatever this file hands it.
  */
-export type TaskWakeNotifier = (params: Record<string, unknown>) => void;
+export type TaskWakeNotifier = (method: string, params: Record<string, unknown>) => void;
 
 function isPartialTerminator(terminator: StreamLineTerminator): boolean {
   return terminator === "stream-end" || terminator === "oversized-split";
@@ -1063,7 +1117,7 @@ function startTaskWatch(taskId: string, notifier: TaskWakeNotifier): void {
     const stderrLines = pendingStderrLines;
     pendingStdoutLines = [];
     pendingStderrLines = [];
-    notifier(buildWakeParams(taskId, stdoutLines, stderrLines));
+    notifier(GHANTIKA_OUTPUT_WAKE_METHOD, buildWakeParams(taskId, stdoutLines, stderrLines));
   };
 
   const scheduleWindow = (): void => {
@@ -1148,10 +1202,117 @@ function startTaskWatch(taskId: string, notifier: TaskWakeNotifier): void {
     if (stopped) return;
     flush(); // any pending open-window lines flush BEFORE the terminal close
     stopWatch(); // also unsubscribes this same terminal listener - see its own docs
-    // No wake fires for the terminal transition itself - the terminal
-    // status is observable via tasks/get / the poll floor; this
-    // watch's whole job is the output-delta accelerator (stdout and
-    // stderr both), not a status announcement of its own.
+    // No GHANTIKA_OUTPUT_WAKE_METHOD wake fires for the terminal transition
+    // itself - this watch's whole job is the output-delta accelerator
+    // (stdout and stderr both), never a status announcement of its own, and
+    // that stays true after this change. A SEPARATE notification genuinely
+    // DOES fire on the terminal transition now - see `startTaskStatusNotifier`,
+    // below, which subscribes independently (never through this watch's own
+    // listener) specifically so a firehose-triggered stop of THIS watch can
+    // never also silence that one - and the terminal status is, either way,
+    // always observable via tasks/get / the poll floor regardless of
+    // whether anything is watching for either notification.
+  });
+}
+
+/**
+ * Starts the RELEASED spec's own `notifications/tasks` per-transition
+ * status notification for a freshly-minted task - called only from
+ * `maybeAugmentRunResult`, alongside (never instead of) `startTaskWatch`,
+ * and under the identical guard: only when the backing job is not ALREADY
+ * terminal at mint time (a job with no further transition ahead of it has
+ * nothing left to notify about).
+ *
+ * Deliberately a SEPARATE `jobStore.onJobTerminal` subscription from
+ * `startTaskWatch`'s own, rather than piggy-backing on that watch's
+ * existing terminal listener - this is what keeps the firehose guard from
+ * ever silencing it: `startTaskWatch`'s firehose guard can auto-stop and
+ * unsubscribe ITS OWN output-delta watch
+ * (including its own terminal listener, torn down together via
+ * `stopWatch()`) without that ever reaching this subscription, which keeps
+ * running independently and still fires when the job's real terminal
+ * transition eventually happens. The firehose guard governs the
+ * output-delta wake ONLY - it has no bearing here, since this notification
+ * fires AT MOST ONCE per task regardless of how much output the job ever
+ * produced, so there is nothing for a rate guard to protect against.
+ *
+ * Fires exactly once per task, on the SAME state transition `getTask`
+ * would observe if it were read at that exact instant - `buildDetailedTaskResult`
+ * (this file's own, reused unchanged) is what makes that guarantee real:
+ * the notification's `params` and a `tasks/get` response captured at the
+ * same moment are never two different projections of the same record, they
+ * are the SAME projection, called twice.
+ *
+ * ## Field-by-field comparison against the released contract
+ *
+ * Method name: `TASKS_NOTIFICATION_METHOD` ("notifications/tasks") is the
+ * EXACT string `specification/draft/tasks.md`'s own
+ * `TaskStatusNotification.method` const carries - no divergence.
+ *
+ * Payload shape: the spec defines `TaskStatusNotificationParams =
+ * NotificationParams & Task` - a bare `DetailedTask` (the spec's own
+ * worked example shows a `completed`-status notification body with no
+ * wrapper beyond the task fields themselves: `taskId`/`status`/
+ * `createdAt`/`lastUpdatedAt`/`ttlMs`/`pollIntervalMs`/`result`). This
+ * adapter's `params` (below) is `buildDetailedTaskResult(record)` passed
+ * through UNCHANGED - the exact same object `tasks/get` builds for the
+ * same task, narrowed to this adapter's own four reachable statuses (see
+ * `TASK_STATUSES`'s own docs on why `input_required` never appears) - no
+ * divergence on any field the spec defines. `NotificationParams`'s own
+ * generic base (an optional `_meta` bag every JSON-RPC notification may
+ * carry) is never populated here, matching this adapter's house style of
+ * omitting an optional field this adapter has nothing genuine to put in
+ * it, rather than emitting an empty placeholder.
+ *
+ * Subscription/unsubscription protocol: THIS is where this adapter
+ * genuinely diverges, and the divergence is disclosed rather than hidden.
+ * The released spec ties delivery to an explicit `subscriptions/listen`
+ * request naming task IDs, acknowledged via
+ * `notifications/subscriptions/acknowledged` with the honored subset
+ * echoed back. ghantika delivers `notifications/tasks` to every
+ * Tasks-capable connection for tasks that connection minted,
+ * UNCONDITIONALLY - the same unconditional delivery model this file's own
+ * pre-existing `GHANTIKA_OUTPUT_WAKE_METHOD` wake already used, extended
+ * to this notification rather than reinvented. This is not an oversight:
+ * `subscriptions/listen` is ALREADY live-wired on ghantika's stdio
+ * connection today, automatically, by the installed SDK's own
+ * `serveStdio` entry (`stdio.mjs`'s `tryServeListen`, intercepted before
+ * any of this codebase's own request handlers ever see it) - but that
+ * SDK-level routing has ZERO knowledge of task notifications at all,
+ * confirmed by reading the installed SDK's own source directly: its
+ * `CHANGE_NOTIFICATION_METHODS`/`honoredSubset()` machinery covers exactly
+ * four unrelated core methods (the `tools`/`prompts`/`resources`
+ * list-changed family plus `resources/updated`), and grepping the WHOLE
+ * installed SDK's `dist/` for `taskIds` (the spec's own filter field name)
+ * returns zero occurrences anywhere. So a client that sends
+ * `subscriptions/listen` naming this connection's task IDs gets a real
+ * SDK-generated acknowledgement back, but that acknowledgement's own
+ * honored set can never list those task IDs - no code path that exists
+ * anywhere in the installed SDK could ever populate it. Building
+ * ghantika-side `taskIds`-filtering machinery to gate this notification
+ * against a listen mechanism the installed SDK cannot honor for tasks was
+ * considered and explicitly rejected: it would couple this adapter to the
+ * SDK's own undocumented internals to work around a gap that is the SDK's
+ * to close, for a filtering behavior a client could never actually confirm
+ * via the acknowledgement it would receive either way. ghantika delivers
+ * task notifications to every Tasks-capable connection for tasks that
+ * connection minted, unconditionally. A client that sends
+ * `subscriptions/listen` naming specific task IDs will receive an
+ * acknowledgement that does not list them among the honored set, and
+ * should not rely on that acknowledgement to determine whether it receives
+ * notifications.
+ */
+function startTaskStatusNotifier(taskId: string, notifier: TaskWakeNotifier): void {
+  jobStore.onJobTerminal(taskId, () => {
+    const record = jobStore.get(taskId);
+    // Defensive only - the record that just transitioned into a terminal
+    // state must still exist at this exact synchronous instant (this
+    // listener runs as part of the SAME `fireJobTerminal` dispatch that
+    // just wrote the terminal state); a genuinely undefined read here would
+    // mean the record was deleted between the transition and this
+    // synchronous callback, which no code path in this codebase does.
+    if (record === undefined) return;
+    notifier(TASKS_NOTIFICATION_METHOD, buildDetailedTaskResult(record));
   });
 }
 
@@ -1193,7 +1354,7 @@ function extractJobId(result: CallToolResult): string | undefined {
  * carries no `content`/`structuredContent` members, and the vendored
  * schema's `createTaskResult` $def locks `additionalProperties: false`
  * against a property set that does not include either). GROUNDED against
- * the installed SDK's own runtime for this story, not merely inferred
+ * the installed SDK's own runtime for this adapter, not merely inferred
  * from the spec text: `stampResultType` (the SDK's own encode-contract
  * step, confirmed by reading `@modelcontextprotocol/server`'s bundled
  * source directly) treats `tools/call` as one of
@@ -1247,14 +1408,22 @@ function extractJobId(result: CallToolResult): string | undefined {
  * a benign default and make the real problem (an SDK gap) harder to see,
  * not easier.
  *
- * Also starts the output-driven wake watch (see `startTaskWatch`'s own
- * docs) for that SAME job, through `notifier` - but only when the backing
- * job is not ALREADY terminal at mint time (a job that started already-
- * failed, e.g. a bad cwd caught before ever spawning, has no "life" left
- * to wake about; see `src/jobStore.ts`'s `createFailedJob`). `notifier` is
- * always passed by `server.ts` regardless of capability - it is simply
- * never invoked when this function returns early above, so passing it
- * unconditionally costs nothing.
+ * Also starts BOTH of this file's own notification mechanisms for that
+ * SAME job, through `notifier` - but only when the backing job is not
+ * ALREADY terminal at mint time (a job that started already-failed, e.g.
+ * a bad cwd caught before ever spawning, has no "life" left to notify
+ * about; see `src/jobStore.ts`'s `createFailedJob`): the pre-existing
+ * output-driven wake watch (`startTaskWatch`, ghantika's own
+ * `GHANTIKA_OUTPUT_WAKE_METHOD`, unconditional, non-spec, an accelerator
+ * on top of the poll floor), and the released spec's own per-transition
+ * `notifications/tasks` status notification (`startTaskStatusNotifier`,
+ * see that function's own docs for the full field-by-field grounding
+ * against the released contract). The two are deliberately INDEPENDENT
+ * subscriptions - see `startTaskStatusNotifier`'s own docs for why a
+ * firehose-triggered stop of the first can never silence the second.
+ * `notifier` is always passed by `server.ts` regardless of capability - it
+ * is simply never invoked when this function returns early above, so
+ * passing it unconditionally costs nothing.
  */
 export function maybeAugmentRunResult(
   result: CallToolResult,
@@ -1269,6 +1438,7 @@ export function maybeAugmentRunResult(
 
   if (!isTerminalJobState(record.state)) {
     startTaskWatch(jobId, notifier);
+    startTaskStatusNotifier(jobId, notifier);
   }
 
   const minted = buildCreateTaskResult(record);
