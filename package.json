@@ -45,6 +45,7 @@
     "guard:sha-parity": "node scripts/check-sha-parity.mjs",
     "guard:typescript-peer-range": "node scripts/check-typescript-peer-range.mjs",
     "guard:typescript-tracking-signal": "node scripts/check-typescript-tracking-signal.mjs",
+    "guard:wake-transport-boundaries": "node scripts/check-wake-transport-boundaries.mjs",
     "verify:install-repro": "node scripts/verify-install-reproducibility.mjs",
     "verify:workflow-topology": "node scripts/verify-workflow-topology.mjs",
     "lint:workflow-jobs": "node scripts/lint-workflow-jobs.mjs",

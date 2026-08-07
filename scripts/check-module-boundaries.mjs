@@ -2,11 +2,20 @@
 /**
  * Guards the frozen module ownership for `src/`: exactly the modules
  * named in FROZEN_MODULES below (`server.ts`, `registry.ts`, `jobStore.ts`,
- * `process.ts`, `policy.ts`, `scheduler.ts`, `tasksAdapter.ts`, and the six
- * `tools/*.ts` handler files), no more, no fewer - `src/index.ts` is deliberately
- * excluded, since it's the package's public entry point (`package.json`'s
- * `"main"`/`"types"`), not one of the six-tool architecture's internal
- * modules.
+ * `process.ts`, `policy.ts`, `scheduler.ts`, `tasksAdapter.ts`, the six
+ * `tools/*.ts` handler files, and `wake/wakeTransport.ts`), no more, no
+ * fewer - `src/index.ts` is deliberately excluded, since it's the
+ * package's public entry point (`package.json`'s `"main"`/`"types"`), not
+ * one of the six-tool architecture's internal modules.
+ *
+ * `wake/wakeTransport.ts` is admitted here the same way
+ * `tasksAdapter.ts` was: this check governs WHICH FILES may exist, not a
+ * blanket ban on new modules - a type-only interface file with zero
+ * runtime exports carries no state and imports nothing, so it is scanned
+ * by the persistent-state check below like every other root-level file and
+ * will always pass. Its OWN boundary (no transport-specific symbol may
+ * leak outside `src/wake/`) is a distinct concern enforced separately by
+ * `scripts/check-wake-transport-boundaries.mjs`, not by this file.
  *
  * Three checks, matching this repo's established guard style (see
  * scripts/check-npm-ci-usage.mjs): pure, exported functions that operate
@@ -103,6 +112,7 @@ export const FROZEN_MODULES = [
   "tools/run.ts",
   "tools/status.ts",
   "tools/tail.ts",
+  "wake/wakeTransport.ts",
 ];
 
 export const TOOLS_SUBDIR = "tools";
