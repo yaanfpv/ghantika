@@ -5,15 +5,16 @@
  * through any published API.
  *
  * NOT to be confused with `src/tasksAdapter.ts`'s own
- * `notifications/tasks/status` wake-on-output mechanism, which tells an
- * MCP CLIENT that its next poll would return new data - a notification
- * sent one layer up the stack, over this server's own existing MCP
- * connection, to whatever client is already talking to it. This module
- * does something unrelated: it reaches ACROSS to a completely different,
- * unrelated OS process (the desktop app) to resume an idle AGENT SESSION
- * sitting open in one of its windows. Same English word, two different
- * mechanisms, matching `wakeTransport.ts`'s own header note on exactly
- * this ambiguity.
+ * `notifications/ghantika/outputWake` wake-on-output mechanism, or with
+ * the released Tasks extension's own `notifications/tasks` status
+ * notification, which tell an MCP CLIENT that its next poll would return
+ * new data (or a task's own current status) - notifications sent one layer
+ * up the stack, over this server's own existing MCP connection, to
+ * whatever client is already talking to it. This module does something
+ * unrelated: it reaches ACROSS to a completely different, unrelated OS
+ * process (the desktop app) to resume an idle AGENT SESSION sitting open
+ * in one of its windows. Same English word, unrelated mechanisms, matching
+ * `wakeTransport.ts`'s own header note on exactly this ambiguity.
  *
  * ## Why this is explicitly best-effort, not a stable integration
  *

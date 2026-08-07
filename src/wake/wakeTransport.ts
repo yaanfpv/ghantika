@@ -8,13 +8,17 @@
  * enforces this the same way `check-module-boundaries.mjs` enforces
  * `jobStore`'s single-writer boundary.
  *
- * NOT to be confused with the Tasks extension's own `notifications/tasks/status`
- * wake-on-output-arrival mechanism (`src/tasksAdapter.ts`, exercised by
- * `test/wake-integration.test.ts`), which is unrelated: that "wake" tells an
- * MCP client its poll would now return new data. THIS module wakes an idle
- * AGENT SESSION on the host machine - a Codex thread or a backgrounded
- * Claude Code turn - so it resumes without a human re-invoking it. Same
- * English word, two different mechanisms, never conflated in code or prose.
+ * NOT to be confused with `src/tasksAdapter.ts`'s own output-driven
+ * wake-on-output-arrival mechanism (`notifications/ghantika/outputWake` -
+ * ghantika's own, non-spec accelerator, exercised by
+ * `test/wake-integration.test.ts`) or with the released Tasks extension's
+ * own `notifications/tasks` per-transition status notification (the same
+ * file, same test suite) - both are unrelated: either one tells an MCP
+ * CLIENT its poll would now return new data, over this server's own
+ * existing MCP connection. THIS module wakes an idle AGENT SESSION on the
+ * host machine - a Codex thread or a backgrounded Claude Code turn - so it
+ * resumes without a human re-invoking it. Same English word, unrelated
+ * mechanisms, never conflated in code or prose.
  */
 
 /**

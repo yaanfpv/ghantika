@@ -8,14 +8,16 @@
  * LSP-style framing a reader familiar with other JSON-RPC-over-stdio
  * protocols might expect).
  *
- * NOT to be confused with `src/tasksAdapter.ts`'s `notifications/tasks/status`
- * wake-on-output-arrival mechanism (see `wakeTransport.ts`'s own header for
- * that distinction in full). That module tells an MCP CLIENT its poll would
- * now return new data. THIS module wakes an idle AGENT SESSION - a Codex
- * thread that has gone idle waiting for its next turn - so it resumes and
- * does real work without a human re-invoking it. Same English word, two
- * unrelated mechanisms; this file never imports anything from
- * `tasksAdapter.ts` and `tasksAdapter.ts` never imports anything from here.
+ * NOT to be confused with `src/tasksAdapter.ts`'s own notification
+ * mechanisms (`notifications/ghantika/outputWake` and the released Tasks
+ * extension's own `notifications/tasks` - see `wakeTransport.ts`'s own
+ * header for that distinction in full). Either of those tells an MCP
+ * CLIENT its poll would now return new data. THIS module wakes an idle
+ * AGENT SESSION - a Codex thread that has gone idle waiting for its next
+ * turn - so it resumes and does real work without a human re-invoking it.
+ * Same English word, unrelated mechanisms; this file never imports
+ * anything from `tasksAdapter.ts` and `tasksAdapter.ts` never imports
+ * anything from here.
  *
  * THE MECHANISM: sending `thread/goal/set` with `status: "active"` for an
  * IDLE thread starts a model turn on that thread, and the `objective` text

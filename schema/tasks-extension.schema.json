@@ -35,7 +35,7 @@
     },
     "watchStoppedInfo": {
       "type": "object",
-      "description": "Present once this adapter's own output-driven notification WATCH (the wake accelerator - see notifications/tasks/status) has auto-stopped early - currently only ever for a sustained firehose rate. Never means the backing job stopped. ghantika's own extension of the spec's free-form result/error JSONObject on a TERMINAL task. On a still-'working' task, the SAME fact (reason plus timestamp) is rendered as text into that variant's spec-legal, otherwise-unused `statusMessage` field instead - see workingTask below - since WorkingTask locks `additionalProperties: false` and has no free-form container of its own to carry this structured shape.",
+      "description": "Present once this adapter's own output-driven notification WATCH (the wake accelerator - see notifications/ghantika/outputWake, ghantika's own non-spec method, never the spec's own notifications/tasks) has auto-stopped early - currently only ever for a sustained firehose rate. Never means the backing job stopped. ghantika's own extension of the spec's free-form result/error JSONObject on a TERMINAL task. On a still-'working' task, the SAME fact (reason plus timestamp) is rendered as text into that variant's spec-legal, otherwise-unused `statusMessage` field instead - see workingTask below - since WorkingTask locks `additionalProperties: false` and has no free-form container of its own to carry this structured shape.",
       "properties": {
         "reason": { "const": "firehose" },
         "stoppedAt": { "type": "string", "minLength": 1 }

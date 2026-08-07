@@ -353,24 +353,23 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
     receivedInitializedNotification = true;
   };
 
-  // The one thing tasksAdapter.ts's output-driven wake needs from THIS
-  // connection's real `Server` instance - see maybeAugmentRunResult's own
-  // docs for why the adapter itself never imports `Server`. A thin,
-  // fire-and-forget wrapper: a wake is a best-effort accelerator (the poll
-  // floor stays authoritative regardless - see tasksAdapter.ts's own
-  // header on the notification being optional), so a failed send is
-  // logged to stderr and never allowed to propagate into the tool-call
-  // response path that triggered it.
-  const sendTaskWakeNotification = (params: Record<string, unknown>): void => {
-    server
-      .notification({ method: tasksAdapter.TASKS_STATUS_NOTIFICATION_METHOD, params })
-      .catch((error: unknown) => {
-        console.error(
-          "[ghantika] error sending",
-          tasksAdapter.TASKS_STATUS_NOTIFICATION_METHOD,
-          error
-        );
-      });
+  // The one thing tasksAdapter.ts's two notification mechanisms (the
+  // pre-existing output-driven wake AND the released spec's own
+  // per-transition `notifications/tasks` status notification - see
+  // tasksAdapter.ts's own header on the two, and maybeAugmentRunResult's
+  // own docs for why the adapter itself never imports `Server`) need from
+  // THIS connection's real `Server` instance. A thin, fire-and-forget
+  // wrapper that relays whichever `method` the adapter hands it - this
+  // file stays unaware of which notification is which, exactly as it
+  // stays unaware of every other Tasks-shaped detail (see this file's own
+  // header). Both notifications are best-effort accelerators on top of the
+  // poll floor, which stays authoritative regardless (see tasksAdapter.ts's
+  // own header), so a failed send is logged to stderr and never allowed to
+  // propagate into the tool-call response path that triggered it.
+  const sendTaskNotification = (method: string, params: Record<string, unknown>): void => {
+    server.notification({ method, params }).catch((error: unknown) => {
+      console.error("[ghantika] error sending", method, error);
+    });
   };
 
   server.setRequestHandler("tools/list", async () => ({
@@ -408,7 +407,7 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
       const capable = tasksAdapter.isConnectionTasksCapable(
         resolveRunClientCapabilities(server, ctx, servedModernEra)
       );
-      return tasksAdapter.maybeAugmentRunResult(result, capable, sendTaskWakeNotification);
+      return tasksAdapter.maybeAugmentRunResult(result, capable, sendTaskNotification);
     }
     return result;
   });
@@ -429,6 +428,49 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
   // before doing anything else) - the SDK's own request dispatch turns
   // that thrown ProtocolError into a real JSON-RPC error response, the
   // same mechanism the tools/call gate above already relies on.
+  //
+  // NONE of the three is gated by Tasks capability at this registration -
+  // each takes only its own params schema, never a capability read, unlike
+  // the `run` branch of tools/call above. This is deliberate: a taskId is
+  // an opaque, unguessable jobStore job_id, so the meaningful boundary is
+  // "does this taskId resolve to something real", which tasksAdapter.getTask
+  // already enforces on every one of these three, not "did this connection
+  // declare the extension."
+  //
+  // A REAL, MEASURED WIRE FACT about the installed SDK, disclosed here
+  // rather than left to surprise a future reader: on the 2026-07-28 era
+  // specifically, `tasks/get` and `tasks/cancel` are UNROUTABLE regardless
+  // of what this file registers. Confirmed by reading the installed
+  // `@modelcontextprotocol/server` package's own dispatch source directly,
+  // then reproduced end to end against the real built server: `tasks/get`
+  // and `tasks/cancel` (but not `tasks/update`, which the legacy vocabulary
+  // never defined) are members of the SDK's own 2025-11-25-era
+  // `requestMethodKeys` registry - the deprecated get/result/list/cancel
+  // vocabulary this codebase's own adapter deliberately never imports (see
+  // tasksAdapter.ts's own header) - but ABSENT from the 2026-07-28 era's
+  // own registry, which lists only core methods
+  // (`tools/*`/`prompts/*`/`resources/*`/`completion/complete`/
+  // `server/discover`/`subscriptions/listen`). The base `Protocol` class's
+  // own request dispatch checks `isSpecRequestMethod(method) &&
+  // !codec.hasRequestMethod(method)` BEFORE ever consulting this file's own
+  // `_requestHandlers` map, and replies -32601 "Method not found" the
+  // instant that holds - so a modern-era `tasks/get`/`tasks/cancel` request
+  // never reaches `tasksAdapter.getTask`/`cancelTask` at all, with or
+  // without Tasks capability declared (the block fires on the METHOD NAME
+  // alone, before any capability is even read). `tasks/update` has no
+  // legacy-era precedent at all, so it is recognized as a spec method by
+  // NEITHER codec, falls through that guard entirely, and reaches this
+  // file's own handler normally on both eras - reproduced directly: a real
+  // modern-wire `tasks/update` call against a real minted task returns the
+  // genuine `{resultType: "complete"}` ack, while `tasks/get`/`tasks/cancel`
+  // against that SAME task on that SAME connection both return -32601. See
+  // `test/modern-handshake.test.ts`'s own task-method tests for the
+  // reproduction. This is an installed-SDK routing fact about the era, not
+  // a defect in this file's own registration or a capability gate this
+  // codebase applies - a legacy-era connection, or any in-process
+  // `InMemoryTransport` test, reaches all three normally, and that is
+  // where `tasks/get`/`tasks/cancel` are actually exercised end to end
+  // today.
   server.setRequestHandler(
     "tasks/get",
     { params: tasksAdapter.taskIdParamsSchema() },
