@@ -327,6 +327,50 @@ async function pollUntilTerminal(
   throw new Error(`job ${jobId} never reached a terminal state within ${maxAttempts} polls`);
 }
 
+/**
+ * Calls `kill` again for the SAME `jobId` (never re-signals once a job is
+ * already terminal - see `src/tools/kill.ts`'s own doc comment: a repeat
+ * "kill" call against an already-terminal record only re-checks whether
+ * the group has since become empty, it never sends another signal)
+ * repeatedly, until `kill_confirmed` has actually settled to something
+ * other than `undefined` - never a single unconditional read right after
+ * the FIRST kill call resolves.
+ *
+ * Why this is needed at all: `kill_confirmed` is written by an async
+ * confirmation callback inside `kill`'s own implementation, and
+ * `src/tools/kill.ts`'s own doc comment on the field is explicit that the
+ * gap between the process group actually emptying and that confirmation
+ * write landing is real event-loop scheduling latency - "deliberately
+ * never stated as a wall-clock bound." Reading `kill_confirmed` from a
+ * single, synchronously-captured response can therefore race a real,
+ * observed (not hypothetical) non-determinism on a loaded CI runner.
+ * `test/kill.test.ts`'s own "root-exits-first" poll loop (waiting on the
+ * eager reap's confirmation, the same field/gap under a different
+ * trigger) already solves this with the identical shape this mirrors,
+ * adapted here to the MCP client (`client.callTool`) instead of raw
+ * JSON-RPC lines.
+ */
+async function pollUntilKillConfirmed(
+  client: Client,
+  jobId: string,
+  deadlineMs = 5000
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + deadlineMs;
+  for (;;) {
+    const result = await client.callTool({ name: "kill", arguments: { job_id: jobId } });
+    const last = runResultStructured(result);
+    if (last.kill_confirmed !== undefined) {
+      return last;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(
+        `timed out waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(last)}`
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The vendored schema itself - loaded fresh from disk, never hand-copied,
 // so every assertion below that "validates against the schema" or "matches
@@ -1991,6 +2035,17 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
       `expected kill's response to deep-equal the real PublicJobProjection key set exactly, got: ${JSON.stringify(Object.keys(killResult).sort())}`
     );
 
+    // The checks below read `killResult` - the FIRST, synchronously
+    // captured kill() response - directly, on purpose, never the later
+    // poll-settled one: `src/tools/kill.ts`'s own doc comment is explicit
+    // that the job's "killed" state (and, with it, started_at/ended_at,
+    // which are only ever touched by a real state transition) is reported
+    // SYNCHRONOUSLY, at kill-time, regardless of when the separate async
+    // `kill_confirmed`/`identity_confirmed` confirmation later lands. So
+    // this wall-clock bracket - captured around this FIRST call alone -
+    // stays the right one to check against even though the poll below can
+    // take real additional time afterward: nothing it does changes
+    // started_at/ended_at, only kill_confirmed.
     assert.ok(
       Date.parse(killResult.ended_at as string) >= Date.parse(killResult.started_at as string),
       `expected kill's ended_at (${JSON.stringify(killResult.ended_at)}) to be at or after started_at (${JSON.stringify(killResult.started_at)})`
@@ -2005,6 +2060,12 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
       killEndedAtMs >= beforeSecondJobMs && killEndedAtMs <= afterKillMs,
       `expected kill's ended_at (${JSON.stringify(killResult.ended_at)}) to fall inside the real wall-clock bracket [${beforeSecondJobMs}, ${afterKillMs}] this test captured around the killed job's actual run`
     );
+    // identity_confirmed/identity_capture are read from the same FIRST
+    // `killResult` too - this test has never observed these two flaking
+    // the way kill_confirmed does, and they are excluded from the final
+    // deep-equal below anyway (deleted before the comparison, exactly as
+    // before), so there is nothing riding on their exact settle timing
+    // here.
     assert.equal(
       typeof killResult.identity_confirmed,
       "boolean",
@@ -2014,7 +2075,23 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
       ["pending", "captured", "unavailable"].includes(killResult.identity_capture as string),
       `expected kill's identity_capture to be one of pending/captured/unavailable, got: ${JSON.stringify(killResult.identity_capture)}`
     );
-    const killResultWithoutIdentityFields = { ...killResult };
+
+    // THE FIX: `kill_confirmed` is written by an async confirmation
+    // callback inside kill's OWN implementation (see
+    // `pollUntilKillConfirmed`'s own doc comment above, and
+    // `src/tools/kill.ts`'s doc comment on the field itself) - the write
+    // can genuinely lag this call's own promise resolution by real
+    // event-loop scheduling latency, so `killResult.kill_confirmed` above
+    // can legitimately still read `undefined` on a loaded CI runner even
+    // though every OTHER field checked above is already final. Poll
+    // (via repeated, idempotent `kill` calls against the same job_id -
+    // never a second signal, see the poll helper's own docs) until it has
+    // actually settled, and use THAT settled response - never the
+    // original `killResult` - for the exact-value comparison below, which
+    // is the one assertion that actually depends on kill_confirmed's real
+    // value.
+    const confirmedKillResult = await pollUntilKillConfirmed(pair.client, secondTaskId);
+    const killResultWithoutIdentityFields = { ...confirmedKillResult };
     delete killResultWithoutIdentityFields.identity_confirmed;
     delete killResultWithoutIdentityFields.identity_capture;
     assert.deepEqual(
@@ -2032,7 +2109,7 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
         kill_confirmed: true,
         escalation_refused_reason: undefined,
       },
-      `expected kill's response to deep-equal its real, complete values, not just the right key set - got: ${JSON.stringify(killResult)}`
+      `expected kill's response to deep-equal its real, complete values, not just the right key set - got: ${JSON.stringify(confirmedKillResult)}`
     );
   } finally {
     await pair.close();

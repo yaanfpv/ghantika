@@ -633,12 +633,46 @@ test(
       [],
       `expected zero surviving process-group members after kill, pgrep still saw: ${JSON.stringify(afterMembers)}`
     );
+
     // The tool's OWN result must honestly agree with what pgrep just
-    // independently proved - the "killed-confirmed" disclosure.
+    // independently proved - the "killed-confirmed" disclosure. But
+    // `killBody` above was captured BEFORE the pgrep wait just ran, and
+    // `waitForPgrepGroupMembers` only ever reads the process table - it
+    // never re-reads this job's own record, so that wait gives the
+    // `kill_confirmed` field zero protection even though it sits right
+    // above this assertion. `kill_confirmed` is written by an async
+    // confirmation callback inside kill's own implementation, and
+    // `src/tools/kill.ts`'s own doc comment on the field is explicit that
+    // the gap between the group actually emptying and that confirmation
+    // write landing is real event-loop scheduling latency -
+    // "deliberately never stated as a wall-clock bound." Poll a fresh
+    // `status()` call instead, exactly like the eager-reap tests further
+    // down this file (e.g. the "root-exits-first" test's own poll loop),
+    // until `kill_confirmed` has actually settled - never re-assert on
+    // the stale `killBody` snapshot above.
+    const confirmDeadline = Date.now() + 5000;
+    let confirmedBody: RunResponseBody | undefined;
+    for (;;) {
+      server.send({
+        jsonrpc: "2.0",
+        id: 502,
+        method: "tools/call",
+        params: { name: "status", arguments: { job_id: jobId } },
+      });
+      const statusLine = await server.nextLine();
+      confirmedBody = statusLine.parsed as RunResponseBody;
+      if (confirmedBody.result?.structuredContent?.kill_confirmed !== undefined) break;
+      if (Date.now() > confirmDeadline) {
+        throw new Error(
+          `timed out waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(confirmedBody?.result?.structuredContent)}`
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     assert.equal(
-      killBody.result?.structuredContent?.kill_confirmed,
+      confirmedBody.result?.structuredContent?.kill_confirmed,
       true,
-      `expected kill_confirmed: true given pgrep independently confirmed zero survivors, got: ${JSON.stringify(killBody.result?.structuredContent)}`
+      `expected kill_confirmed: true given pgrep independently confirmed zero survivors, got: ${JSON.stringify(confirmedBody.result?.structuredContent)}`
     );
 
     server.child.kill("SIGKILL");
@@ -789,6 +823,15 @@ test(
     // automatically, at leader-exit, with NO kill() call made anywhere.
     // `kill_confirmed` is already `true`, and a real, external
     // `pgrep -g <pgid>` already shows zero survivors.
+    //
+    // EVIDENCED SKIP (reviewed for the kill_confirmed-staleness class
+    // fixed above at this file's own "process-group reap" test): this
+    // read is safe, unlike that one. `statusBody` here comes from the
+    // poll loop just above, whose OWN break condition already requires
+    // `killConfirmed !== undefined` before it ever exits (see the loop's
+    // own doc comment) - there is no capture-then-later-wait-then-stale-
+    // read gap the way there was in the fixed test, because nothing runs
+    // between the loop breaking and this assertion.
     assert.equal(
       statusBody?.result?.structuredContent?.kill_confirmed,
       true,
@@ -824,6 +867,15 @@ test(
       `kill() on an already-reaped terminal record must still succeed as a no-op: ${JSON.stringify(killBody)}`
     );
     assert.equal(killBody.result?.structuredContent?.state, "exited");
+    // EVIDENCED SKIP: `kill_confirmed` was already proven `true` on this
+    // job's record above, BEFORE this second kill() call was ever sent -
+    // and per src/jobStore.ts's `reapProcessGroupOnce`, a job whose reap
+    // has already been attempted takes its "already-attempted" branch,
+    // which is a plain synchronous in-memory read
+    // (`this.jobs.get(jobId)?.kill_confirmed === true`) with no further
+    // await, no signal, and no fresh confirmation wait. So this second
+    // call's own response can only ever echo the value already settled
+    // above - there is nothing async left for this read to race.
     assert.equal(
       killBody.result?.structuredContent?.kill_confirmed,
       true,
@@ -919,6 +971,25 @@ test(
     // this test does not distinguish which), and once genuinely
     // terminal, BOTH fields are eventually PRESENT (real booleans), never
     // left absent, on both real wire surfaces.
+    //
+    // EVIDENCED SKIP (reviewed for the kill_confirmed-staleness class):
+    // this `killBody` read is safe, unlike the fixed "process-group reap"
+    // test above - and for a DIFFERENT reason than the "already-attempted"
+    // no-op reads elsewhere in this file. An explicit non-SIGTERM signal
+    // (src/tools/kill.ts's own custom-signal branch) `await`s
+    // `confirmProcessGroupReapedPosix` DIRECTLY, in-line, inside the same
+    // handler call that produces this response - `setKillConfirmation` is
+    // only ever called (gated behind that same await's result) BEFORE
+    // `return toolSuccess(...)` runs, never as a separate fire-and-forget
+    // callback the way the eager reap at natural leader-exit is. So there
+    // is no async gap between this response being generated and
+    // kill_confirmed's value being decided: whatever this call returns IS
+    // the settled value, with no later write that could still be
+    // in-flight. (A SIGKILL that failed to confirm within kill's own
+    // internal bound would read `undefined`, not stale-`true`-then-
+    // overwritten - a different, genuine failure this assertion would
+    // still correctly catch, not the capture-then-later-wait class this
+    // sweep is scoped to.)
     assert.equal(
       killBody.result?.structuredContent?.state,
       "killed",
@@ -1080,6 +1151,13 @@ test(
     // leader-exit - `kill_confirmed` is already `true`, and a real,
     // external pgrep -g <pgid> already shows zero survivors, with NO
     // kill() call having been made anywhere above.
+    //
+    // EVIDENCED SKIP (reviewed for the kill_confirmed-staleness class):
+    // safe for the same reason as the sibling "root-exits-first" test
+    // above - the poll loop just above this assertion already requires
+    // `killConfirmed !== undefined` before it breaks, so `statusBody` is
+    // guaranteed settled by construction, and nothing runs between the
+    // loop breaking and this read.
     assert.equal(
       statusBody?.result?.structuredContent?.kill_confirmed,
       true,
@@ -1123,6 +1201,11 @@ test(
       endedAtBeforeKill,
       `expected the record's ended_at to remain untouched by the later no-op kill() (no re-transition/double-emit), before=${JSON.stringify(endedAtBeforeKill)} after=${JSON.stringify(killBody.result?.structuredContent?.ended_at)}`
     );
+    // EVIDENCED SKIP: same reasoning as the sibling "process-group reap"
+    // test's own second kill() call above - `kill_confirmed` was already
+    // proven `true` before this call was sent, so `reapProcessGroupOnce`'s
+    // "already-attempted" branch (a plain synchronous in-memory read, no
+    // fresh confirmation wait) is all this second call can ever hit.
     assert.equal(
       killBody.result?.structuredContent?.kill_confirmed,
       true,
@@ -1226,9 +1309,21 @@ test(
         `expected a real numeric pgid from the marker file, got: ${JSON.stringify(pgidText)}`
       );
 
-      // Poll status() until the job RECORD itself is genuinely terminal -
-      // never assumed from a fixed sleep, matching the live-descendants
-      // test above.
+      // Poll status() until the job RECORD is genuinely terminal AND the
+      // eager reap's own async confirmation has landed - a bare
+      // terminal-state check is NOT enough here, matching the
+      // live-descendants test above (see that test's own poll loop docs
+      // for why both conditions are needed). This job's leader has no
+      // descendants at all ("no exec, no backgrounded descendants" per
+      // this test's own shellCommand comment above), so it IS the last
+      // member of its own group and the group empties at exactly its own
+      // exit - precisely the "no continuity reaches this server's own
+      // callback" case src/tools/kill.ts's own doc comment describes,
+      // with a real gap, "deliberately never stated as a wall-clock
+      // bound", before `kill_confirmed` settles. FIX: this loop
+      // previously broke on `state` alone, which left the very next
+      // assertion (kill_confirmed === true, below) reading a snapshot
+      // that could still be mid-race - now fixed to match its sibling.
       const statusDeadline = Date.now() + 5000;
       let statusBody: RunResponseBody | undefined;
       for (;;) {
@@ -1241,9 +1336,13 @@ test(
         const statusLine = await server.nextLine();
         statusBody = statusLine.parsed as RunResponseBody;
         const state = statusBody.result?.structuredContent?.state as string | undefined;
-        if (state !== undefined && state !== "starting" && state !== "running") break;
+        const killConfirmed = statusBody.result?.structuredContent?.kill_confirmed;
+        const isTerminal = state !== undefined && state !== "starting" && state !== "running";
+        if (isTerminal && killConfirmed !== undefined) break;
         if (Date.now() > statusDeadline) {
-          throw new Error("timed out waiting for the job's own record to go terminal");
+          throw new Error(
+            `timed out waiting for the job's own record to go terminal AND the eager reap's confirmation to land, last saw: ${JSON.stringify(statusBody?.result?.structuredContent)}`
+          );
         }
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
@@ -1258,7 +1357,9 @@ test(
       // with nothing to reap at all: `kill_confirmed` means the process
       // group was OBSERVED EMPTY, a STATE, never that an action ("a kill")
       // was performed - so it is already `true` here, before any kill()
-      // call, exactly as honestly as the live-descendants test above.
+      // call, exactly as honestly as the live-descendants test above. The
+      // poll loop just above is what actually guarantees this value has
+      // settled by the time this assertion runs.
       assert.equal(
         statusBody?.result?.structuredContent?.kill_confirmed,
         true,
@@ -1318,6 +1419,12 @@ test(
         endedAtBeforeKill,
         `expected the record's ended_at to be untouched (no re-transition/double-emit), before=${JSON.stringify(endedAtBeforeKill)} after=${JSON.stringify(killBody.result?.structuredContent?.ended_at)}`
       );
+      // EVIDENCED SKIP: safe for the same reason as the other second-
+      // kill()-call assertions in this file - `kill_confirmed` was
+      // already proven `true` (via the now-fixed poll loop above) before
+      // this second kill() call was ever sent, so `reapProcessGroupOnce`'s
+      // "already-attempted" branch (a plain synchronous in-memory read,
+      // no fresh confirmation wait) is all this call can ever hit.
       assert.equal(
         killBody.result?.structuredContent?.kill_confirmed,
         true,
@@ -1718,6 +1825,15 @@ test(
 
       // HALF 1: the GROUP-SCOPED guarantee holds - the job's OWN group is
       // confirmed gone, and kill_confirmed is truthful about that.
+      //
+      // EVIDENCED SKIP (reviewed for the kill_confirmed-staleness class):
+      // same reasoning as the other explicit-SIGKILL site above (see its
+      // own comment) - the custom-signal branch in src/tools/kill.ts
+      // `await`s `confirmProcessGroupReapedPosix` in-line before ever
+      // returning this response, so `kill_confirmed` is already decided
+      // (never a separate fire-and-forget write racing this read) by the
+      // time `killBody` is captured, with no wait sitting between capture
+      // and this assertion either.
       assert.equal(
         killBody.result?.structuredContent?.state,
         "killed",
