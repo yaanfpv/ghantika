@@ -181,6 +181,9 @@ test("legacy handshake, under serveStdio: tools/call sent before the initialize/
     method: "tools/call",
     params: { name: "run", arguments: { command: ["echo", "should-never-run"] } },
   });
+  // A bare nextLine() is safe here under this file's own nextResponse doc
+  // (see its header comment) - the call is rejected before ever reaching
+  // run(), so no job is created and nothing can ever mint or terminate.
   const line = await server.nextLine();
   const body = line.parsed as { error?: { code: number }; result?: unknown };
   assert.ok(body.error, "a pre-handshake tools/call must still be rejected under serveStdio");
@@ -202,6 +205,11 @@ test("legacy handshake, under serveStdio: a real initialize + notifications/init
     method: "tools/call",
     params: { name: "run", arguments: { command: ["true"] } },
   });
+  // A bare nextLine() is safe here - completeHandshake() above declares no
+  // capabilities at all (see initializeRequest's own fixed empty
+  // capabilities:{}), so this legacy connection never achieves Tasks
+  // capability, run() never mints, and startTaskStatusNotifier is never
+  // registered for this job regardless of how it later terminates.
   const line = await server.nextLine();
   const body = line.parsed as { error?: unknown; result?: { isError?: boolean } };
   assert.equal(
@@ -226,6 +234,10 @@ test("modern handshake: tools/call immediately after a successful server/discove
     method: "tools/call",
     params: withModernEnvelope({ name: "run", arguments: { command: ["true"] } }),
   });
+  // A bare nextLine() is safe here - withModernEnvelope's own default
+  // clientCapabilities is empty, so this request declares no Tasks
+  // capability, never mints, and this is the only tools/call on the
+  // connection - nothing to interleave with.
   const line = await server.nextLine();
   const body = line.parsed as {
     error?: unknown;
@@ -271,6 +283,12 @@ test("modern handshake: a tools/call whose OWN request envelope declares io.mode
       { extensions: { [TASKS_EXTENSION_URI]: {} } }
     ),
   });
+  // A bare nextLine() is safe here per this file's own nextResponse doc -
+  // this reads the mint's OWN immediate response (the first and only
+  // tools/call on this connection), and a request's response is always
+  // written synchronously in its own handler, strictly before the async
+  // process-exit that could ever trigger this job's own terminal
+  // notification - there is no earlier job on this connection either.
   const line = await server.nextLine();
   const body = line.parsed as {
     error?: unknown;
@@ -442,6 +460,9 @@ test("modern handshake: a tools/call whose own request envelope declares ONLY th
     // - the two bags `isConnectionTasksCapable` actually reads.
     params: withModernEnvelope({ name: "run", arguments: { command: ["true"] } }, { tasks: {} }),
   });
+  // A bare nextLine() is safe here - the deprecated `tasks` bag is never
+  // read as a capability signal (see the comment above), so this request
+  // never mints and no notifications/tasks push is ever registered for it.
   const line = await server.nextLine();
   const body = line.parsed as {
     error?: unknown;
@@ -495,6 +516,9 @@ test("modern handshake: a tools/call whose own request envelope declares Tasks s
       { experimental: { [TASKS_EXTENSION_URI]: {} } }
     ),
   });
+  // A bare nextLine() is safe here - the `experimental` bag is never read
+  // as a capability signal either (only `extensions` is), so this request
+  // never mints and no notifications/tasks push is ever registered for it.
   const line = await server.nextLine();
   const body = line.parsed as {
     error?: unknown;
@@ -551,6 +575,9 @@ test("modern handshake: six-tool mint rule on the real wire - run() mints while 
       { extensions: { [TASKS_EXTENSION_URI]: {} } }
     ),
   });
+  // A bare nextLine() is safe here (see this file's own nextResponse doc)
+  // - this is the mint's OWN immediate response, the first tools/call on
+  // this connection, so nothing could have interleaved before it.
   const runLine = await server.nextLine();
   const runBody = runLine.parsed as {
     result?: { taskId?: unknown; resultType?: unknown; structuredContent?: unknown };
@@ -692,6 +719,9 @@ test("modern wire: tasks/get and tasks/cancel are UNROUTABLE on the 2026-07-28 e
       { extensions: { [TASKS_EXTENSION_URI]: {} } }
     ),
   });
+  // A bare nextLine() is safe here - the mint's OWN immediate response,
+  // the first tools/call on this connection; the loop below reads through
+  // nextResponse() precisely because it is exposed and this read is not.
   const runLine = await server.nextLine();
   const runBody = runLine.parsed as { result?: { taskId?: unknown; resultType?: unknown } };
   assert.equal(
@@ -759,6 +789,10 @@ test("modern wire: tasks/update - the one task method the legacy vocabulary neve
       { extensions: { [TASKS_EXTENSION_URI]: {} } }
     ),
   });
+  // A bare nextLine() is safe here - the mint's OWN immediate response,
+  // the first tools/call on this connection; the tasks/update read below
+  // goes through nextResponse() precisely because it is exposed and this
+  // read is not.
   const runLine = await server.nextLine();
   const runBody = runLine.parsed as { result?: { taskId?: unknown; resultType?: unknown } };
   assert.equal(
@@ -835,6 +869,12 @@ test("legacy wire: tasks/get, tasks/update, and tasks/cancel all succeed with NO
       },
     },
   });
+  // Every bare nextLine() in this test - this one and the tasks/get,
+  // tasks/update, tasks/cancel, and polling-loop reads below - is safe:
+  // this connection never declares Tasks capability (see
+  // completeHandshake's own fixed empty capabilities:{}), so run() never
+  // mints and startTaskStatusNotifier is never registered for this job,
+  // however long it runs or however it is later cancelled.
   const runLine = await server.nextLine();
   const runBody = runLine.parsed as { result?: { structuredContent?: { job_id?: unknown } } };
   const taskId = runBody.result?.structuredContent?.job_id;
