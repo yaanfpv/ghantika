@@ -14,7 +14,7 @@
  *   1. Real wake delivery: `run()` starts a real `fswatch <path>`
  *      process (the same bare, unfiltered command shape a real external
  *      doorbell watcher uses), and the Tasks-capable client genuinely
- *      gets pushed a `notifications/tasks/status` wake the moment that
+ *      gets pushed a `notifications/ghantika/outputWake` wake the moment that
  *      process reports the scratch mailbox file changed - never a poll
  *      loop standing in for that. A freshly-generated nonce, written into
  *      the watched file, correlates this specific write to the observed
@@ -66,7 +66,7 @@ import { fileURLToPath } from "node:url";
 import {
   DEFAULT_POLL_INTERVAL_MS,
   TASKS_EXTENSION_URI,
-  TASKS_STATUS_NOTIFICATION_METHOD,
+  GHANTIKA_OUTPUT_WAKE_METHOD,
 } from "../dist/tasksAdapter.js";
 // The SAME identity-gated pre-signal primitives `kill()`'s own production
 // path uses (see src/process.ts's own `evaluatePreSignalIdentityGate`
@@ -247,14 +247,46 @@ async function callTool(
     method: "tools/call",
     params: { name: toolName, arguments: args },
   });
-  const line = await server.nextLine();
-  const body = line.parsed as JsonRpcToolResponse;
-  assert.equal(
-    body.id,
-    id,
-    `expected the response for request id ${id}, got ${JSON.stringify(body)}`
-  );
-  return body;
+  const body = await nextResponse(server, id);
+  return body as JsonRpcToolResponse;
+}
+
+/**
+ * Reads stdout lines via `server.nextLine()` until a genuine JSON-RPC
+ * RESPONSE arrives (a real object carrying its own `id` field, per
+ * JSON-RPC 2.0) - skipping over any NOTIFICATION (a `method` with no `id`
+ * at all) seen along the way, and asserting the response's own id matches
+ * `expectedId`.
+ *
+ * Needed for the SAME reason `test/modern-handshake.test.ts`'s own
+ * identically-named helper exists (see that file's docs in full): this
+ * story's `notifications/tasks` per-transition status notification (see
+ * `src/tasksAdapter.ts`'s own `startTaskStatusNotifier` docs) fires on
+ * this job's own real terminal transition (the `kill` call below), and can
+ * land on the wire in between the kill response and this file's own
+ * subsequent `status` polls - a bare `server.nextLine()` here would read
+ * that notification as if it were the next tool response and fail the id
+ * check with `undefined !== id`, exactly the same shape that bit
+ * `test/modern-handshake.test.ts`'s own six-tool-mint-rule test.
+ * `waitForWakeNotification` (below) already loop-skips any non-matching
+ * line by its own design and needs no change; this is the response-reading
+ * counterpart every `callTool` invocation in this file goes through.
+ */
+async function nextResponse(server: SpawnedServer, expectedId: number): Promise<unknown> {
+  for (;;) {
+    const line = await server.nextLine();
+    const parsed = line.parsed as { id?: unknown; method?: unknown } | undefined;
+    if (parsed !== undefined && parsed !== null && "id" in parsed) {
+      assert.equal(
+        parsed.id,
+        expectedId,
+        `expected the response for request id ${expectedId}, got ${JSON.stringify(parsed)}`
+      );
+      return parsed;
+    }
+    // A notification (method present, no id at all) - not what this is
+    // waiting for; keep reading.
+  }
 }
 
 function structuredContentOf(response: JsonRpcToolResponse): Record<string, unknown> {
@@ -274,7 +306,7 @@ interface WakeNotification {
   readonly params: Record<string, unknown>;
 }
 
-/** Reads real stdout lines until one is the exact `notifications/tasks/status` wake (never a substring/prefix match - see src/tasksAdapter.ts's own TASKS_STATUS_NOTIFICATION_METHOD docs on why the wire identity must be exact), bounded by one overall deadline. Any other line seen along the way is not what this is waiting for and is simply skipped - there shouldn't be any, since nothing else is in flight while this is called, but skipping rather than failing on an unexpected line keeps this helper honest about what it actually asserts. */
+/** Reads real stdout lines until one is the exact `notifications/ghantika/outputWake` wake (never a substring/prefix match - see src/tasksAdapter.ts's own GHANTIKA_OUTPUT_WAKE_METHOD docs on why the wire identity must be exact), bounded by one overall deadline. Any other line seen along the way is not what this is waiting for and is simply skipped - there shouldn't be any, since nothing else is in flight while this is called, but skipping rather than failing on an unexpected line keeps this helper honest about what it actually asserts. */
 async function waitForWakeNotification(
   server: SpawnedServer,
   timeoutMs = 8000
@@ -284,16 +316,12 @@ async function waitForWakeNotification(
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
       throw new Error(
-        `timed out after ${timeoutMs}ms waiting for a real "${TASKS_STATUS_NOTIFICATION_METHOD}" wake notification`
+        `timed out after ${timeoutMs}ms waiting for a real "${GHANTIKA_OUTPUT_WAKE_METHOD}" wake notification`
       );
     }
     const line = await server.nextLine(remaining);
     const parsed = line.parsed as { method?: unknown; params?: unknown } | undefined;
-    if (
-      parsed !== undefined &&
-      parsed !== null &&
-      parsed.method === TASKS_STATUS_NOTIFICATION_METHOD
-    ) {
+    if (parsed !== undefined && parsed !== null && parsed.method === GHANTIKA_OUTPUT_WAKE_METHOD) {
       return { method: parsed.method, params: (parsed.params ?? {}) as Record<string, unknown> };
     }
   }

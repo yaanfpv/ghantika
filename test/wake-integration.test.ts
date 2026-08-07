@@ -30,6 +30,16 @@
  *     auto-resume; a real host's own auto-resume remains a separate,
  *     disclosed-pending verification, gated on an actual such host
  *     existing to test against).
+ *   - the released spec's own `notifications/tasks` per-transition status
+ *     notification (added by a later story than the one this file's header
+ *     otherwise describes): that it fires exactly once, on the terminal
+ *     transition, with a payload matching `tasks/get`'s own snapshot at
+ *     that instant field-for-field; that the pre-existing output-delta
+ *     wake (renamed `GHANTIKA_OUTPUT_WAKE_METHOD`, away from the
+ *     spec-vocabulary-shaped name it used before) never itself carries a
+ *     terminal announcement; and that the firehose guard governing that
+ *     output-delta wake has no bearing on this genuinely separate
+ *     subscription.
  *
  * Same real-client/real-server/`InMemoryTransport` pattern
  * `test/tasks-lifecycle.test.ts` and `test/tasks.test.ts` already
@@ -57,8 +67,9 @@ import { isProcessAlive, killProcessGroupPosix } from "../dist/process.js";
 import {
   FIREHOSE_LINES_PER_SEC,
   FIREHOSE_SUSTAINED_MS,
+  GHANTIKA_OUTPUT_WAKE_METHOD,
   TASKS_EXTENSION_URI,
-  TASKS_STATUS_NOTIFICATION_METHOD,
+  TASKS_NOTIFICATION_METHOD,
   WAKE_COALESCE_WINDOW_MS,
   WATCH_STOP_REASON_FIREHOSE,
 } from "../dist/tasksAdapter.js";
@@ -224,7 +235,20 @@ interface WakeNotification {
 function registerWakeSpy(client: Client): WakeNotification[] {
   const received: WakeNotification[] = [];
   client.setNotificationHandler(
-    TASKS_STATUS_NOTIFICATION_METHOD,
+    GHANTIKA_OUTPUT_WAKE_METHOD,
+    { params: passthroughSchema() },
+    (params) => {
+      received.push({ params: params as Record<string, unknown> });
+    }
+  );
+  return received;
+}
+
+/** The SAME registration shape as `registerWakeSpy` above, for the released spec's own `notifications/tasks` status notification - a separate helper (rather than a parameterized one) since several tests below need to listen for both notifications independently, on the SAME client, and tell them apart by which spy recorded what. */
+function registerTaskStatusNotificationSpy(client: Client): WakeNotification[] {
+  const received: WakeNotification[] = [];
+  client.setNotificationHandler(
+    TASKS_NOTIFICATION_METHOD,
     { params: passthroughSchema() },
     (params) => {
       received.push({ params: params as Record<string, unknown> });
@@ -299,7 +323,7 @@ test("run()'s CreateTaskResult response is observed before any wake (a genuine r
     // forces an order between it and the run() response - only whatever
     // the real adapter actually delivers first does.
     pair.client.setNotificationHandler(
-      TASKS_STATUS_NOTIFICATION_METHOD,
+      GHANTIKA_OUTPUT_WAKE_METHOD,
       { params: passthroughSchema() },
       () => {
         recordOrder("wake");
@@ -771,6 +795,172 @@ test("green control: a bounded stream UNDER FIREHOSE_LINES_PER_SEC runs to its o
     if (jobId !== undefined && jobStore.getChildHandle(jobId) !== undefined) {
       await killAndReapRealChild(jobId);
     }
+    await pair.close();
+  }
+});
+
+// =============================================================================
+// The released spec's own `notifications/tasks` per-transition status
+// notification (src/tasksAdapter.ts's startTaskStatusNotifier) - a
+// genuinely SEPARATE surface from the GHANTIKA_OUTPUT_WAKE_METHOD wake
+// tested above, added by this story. Proves the terminal transition IS
+// notified on this surface (unlike the output-delta wake, which never
+// itself announces it - see this file's own tests above), that the
+// payload matches tasks/get's own snapshot at that instant field-for-field,
+// and that the firehose guard governing the output-delta wake has no
+// bearing on this one.
+// =============================================================================
+
+test("the released spec's own `notifications/tasks` status notification fires exactly once, on the terminal transition, carrying a snapshot identical to tasks/get at that instant - while ghantika's own pre-existing output-delta wake (GHANTIKA_OUTPUT_WAKE_METHOD) never itself carries a terminal announcement, proving the two notifications are genuinely independent surfaces", async () => {
+  const pair = await startPair(true);
+  let jobId: string | undefined;
+  try {
+    const minted = await mintJob(pair.client, {
+      command: [process.execPath, "-e", "process.stdout.write('terminal-notif-line\\n');"],
+      label: "terminal-notification",
+    });
+    jobId = minted.taskId as string;
+
+    const taskStatusReceived = registerTaskStatusNotificationSpy(pair.client);
+    const outputWakeReceived = registerWakeSpy(pair.client);
+
+    const finalGet = await pollTaskUntilTerminal(pair.client, jobId);
+    // Settle any pending microtask delivery the poll loop's own terminal
+    // read might have raced - the notification send is fire-and-forget
+    // async even though jobStore's own terminal transition (and this
+    // file's own subscription callback) already ran synchronously.
+    for (let attempt = 0; taskStatusReceived.length === 0 && attempt < 50; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    assert.equal(
+      taskStatusReceived.length,
+      1,
+      `expected exactly one notifications/tasks status notification, got ${taskStatusReceived.length}`
+    );
+    const notified = taskStatusReceived[0]!.params;
+    assert.equal(notified.taskId, jobId);
+    assert.equal(notified.status, finalGet.status);
+    assert.equal(notified.createdAt, finalGet.createdAt);
+    assert.equal(notified.lastUpdatedAt, finalGet.lastUpdatedAt);
+    assert.equal(notified.ttlMs, finalGet.ttlMs);
+    assert.equal(notified.pollIntervalMs, finalGet.pollIntervalMs);
+    assert.deepEqual(notified.result, finalGet.result);
+    // A bare DetailedTask, never the GetTaskResult wrapper - see
+    // src/tasksAdapter.ts's own startTaskStatusNotifier docs for why: the
+    // notification's params is buildDetailedTaskResult's own return value,
+    // which carries no resultType field at all, unlike tasks/get's own
+    // response (whose resultType the SDK Client strips before this file's
+    // own tasksGet helper ever sees it anyway - see this file's own header
+    // and test/tasks.test.ts's, so this is checked directly instead of
+    // relying on that stripping to make the two look alike by coincidence).
+    assert.equal(notified.resultType, undefined);
+    assert.deepEqual(
+      Object.keys(notified).sort(),
+      ["createdAt", "lastUpdatedAt", "pollIntervalMs", "result", "status", "taskId", "ttlMs"],
+      `expected the notification's own key set to match tasks/get's minus resultType, got ${JSON.stringify(Object.keys(notified).sort())}`
+    );
+
+    // ghantika's own pre-existing wake still ran too (this job produced a
+    // real stdout line), but its OWN payload shape is the delta shape
+    // (extension/taskId/stdout - see buildWakeParams's own docs), never a
+    // status/terminal announcement of its own.
+    assert.ok(
+      outputWakeReceived.length > 0,
+      "expected at least one output-delta wake for this job's real stdout line"
+    );
+    for (const wake of outputWakeReceived) {
+      assert.equal(
+        wake.params.status,
+        undefined,
+        "the output-delta wake must never carry a status field - that is the OTHER notification's job"
+      );
+    }
+  } finally {
+    if (jobId !== undefined) await killAndReapRealChild(jobId);
+    await pair.close();
+  }
+});
+
+test("notifications/tasks still fires on the real terminal transition even after a firehose has already auto-stopped GHANTIKA_OUTPUT_WAKE_METHOD's own watch for the SAME job - proving the two notifications are independent subscriptions, never torn down together, since the firehose guard governs the output-delta wake only and this notification fires at most once regardless of output volume", async () => {
+  const pair = await startPair(true);
+  let jobId: string | undefined;
+  try {
+    const minted = await mintJob(pair.client, {
+      command: IDLE_COMMAND,
+      label: "firehose-independence",
+    });
+    jobId = minted.taskId as string;
+    const outputWakeReceived = registerWakeSpy(pair.client);
+    const taskStatusReceived = registerTaskStatusNotificationSpy(pair.client);
+
+    // Drive the SAME sustained-rate firehose this file's own earlier test
+    // uses, derived from the imported constants - never a hardcoded number.
+    const TICK_MS = 1000;
+    const LINES_PER_TICK = Math.ceil(((FIREHOSE_LINES_PER_SEC * TICK_MS) / 1000) * 1.2);
+    const TICKS_NEEDED = Math.ceil(FIREHOSE_SUSTAINED_MS / TICK_MS);
+
+    function manyLines(count: number): Buffer {
+      const parts: Buffer[] = [];
+      for (let i = 0; i < count; i += 1) parts.push(Buffer.from(`f${i}\n`));
+      return Buffer.concat(parts);
+    }
+
+    mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+    try {
+      jobStore.appendOutput(jobId, "stdout", manyLines(LINES_PER_TICK));
+      for (let i = 0; i < TICKS_NEEDED; i += 1) {
+        mock.timers.tick(TICK_MS);
+        jobStore.appendOutput(jobId, "stdout", manyLines(LINES_PER_TICK));
+      }
+    } finally {
+      mock.timers.reset();
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.ok(
+      outputWakeReceived.length > 0,
+      "expected the output-delta watch to have genuinely been live and delivering before the firehose auto-stopped it - otherwise the auto-stop below proves nothing about an active watch"
+    );
+
+    const midGet = await tasksGet(pair.client, jobId);
+    assert.equal(
+      midGet.status,
+      "working",
+      "the job must still be working - only the output-delta watch stopped"
+    );
+    const statusMessage = midGet.statusMessage as string | undefined;
+    assert.ok(
+      statusMessage?.includes(WATCH_STOP_REASON_FIREHOSE),
+      `expected the output-delta watch to have auto-stopped from the firehose, got ${JSON.stringify(midGet)}`
+    );
+    assert.equal(
+      taskStatusReceived.length,
+      0,
+      "the spec notification must not fire early just because the OTHER watch auto-stopped"
+    );
+
+    // Now drive the job to its real terminal transition (a genuine kill,
+    // going through jobStore's own state machine exactly like any other
+    // terminated job) and confirm notifications/tasks STILL fires - proving
+    // the firehose stop above only ever silenced its OWN
+    // (GHANTIKA_OUTPUT_WAKE_METHOD) subscription, never this one.
+    await pair.client.callTool({ name: "kill", arguments: { job_id: jobId } });
+    const finalGet = await pollTaskUntilTerminal(pair.client, jobId);
+    assert.equal(finalGet.status, "cancelled");
+
+    for (let attempt = 0; taskStatusReceived.length === 0 && attempt < 50; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(
+      taskStatusReceived.length,
+      1,
+      "expected notifications/tasks to fire exactly once on the real terminal transition, even though the sibling output-delta watch had already auto-stopped from the firehose"
+    );
+    assert.equal(taskStatusReceived[0]!.params.taskId, jobId);
+    assert.equal(taskStatusReceived[0]!.params.status, "cancelled");
+  } finally {
+    if (jobId !== undefined) await killAndReapRealChild(jobId);
     await pair.close();
   }
 });
@@ -1300,6 +1490,47 @@ interface TasksGetResponseBody {
   readonly result?: Record<string, unknown>;
 }
 
+/**
+ * Reads stdout lines via `server.nextLine()` until a genuine JSON-RPC
+ * RESPONSE arrives - a real object carrying its own `id` field, per
+ * JSON-RPC 2.0 - skipping over any NOTIFICATION (a `method` with no `id`
+ * at all) seen along the way.
+ *
+ * Needed for the SAME reason `test/modern-handshake.test.ts`'s and
+ * `test/dogfood.test.ts`'s own identically-shaped helpers exist (see
+ * either file's own docs in full): the shutdown test below drives two
+ * tasks to a real terminal transition on a Tasks-capable connection - the
+ * short-lived control task (`command: ["true"]`) minted mid-test, and the
+ * live task itself once shutdown's own reap kills it - and this story's
+ * `notifications/tasks` (see `src/tasksAdapter.ts`'s own
+ * `startTaskStatusNotifier` docs) fires unconditionally on each. Either
+ * notification can land on this raw stdio wire in between any two of this
+ * test's own sequential request/response pairs; a bare `server.nextLine()`
+ * from that point on would read it as if it were the next expected
+ * response and silently misread `result` as `undefined` (or, once enough
+ * reads have drifted out of alignment, as a genuine but STALE response
+ * left over from an earlier unconsumed request) - the exact drift that
+ * produced this test's own real, observed failure before this helper
+ * existed: the live task's own poll loop read the control task's
+ * already-`completed` response instead of its own, because one earlier
+ * notification-as-response misread had already shifted every later read
+ * one line out of step with what each `server.send` actually expected
+ * back.
+ */
+async function nextResponse(
+  server: SpawnedServer
+): Promise<{ id: unknown; result?: unknown; error?: unknown }> {
+  for (;;) {
+    const line = await server.nextLine();
+    const parsed = line.parsed as { id?: unknown; method?: unknown } | undefined;
+    if (parsed !== undefined && parsed !== null && "id" in parsed) {
+      return parsed as { id: unknown; result?: unknown; error?: unknown };
+    }
+    // A notification (method present, no id at all) - not what this is
+    // waiting for; keep reading.
+  }
+}
+
 test(
   "shutdown finitely reaps a genuinely-live task's real backing job within a bounded deadline on POSIX (a hang is a distinct failure from a skip) - the real process is confirmed dead via the reused pgrep oracle, and an already-terminal task alongside it is read AGAIN mid-shutdown and found byte-for-byte unchanged",
   { skip: PGREP_ORACLE_SKIP },
@@ -1324,8 +1555,7 @@ test(
         arguments: { command: shellCommand, shell: true, label: "shutdown-live-task" },
       },
     });
-    const liveRunLine = await server.nextLine();
-    const liveRunBody = liveRunLine.parsed as RunResponseBody;
+    const liveRunBody = (await nextResponse(server)) as RunResponseBody;
     assert.notEqual(
       liveRunBody.result?.isError,
       true,
@@ -1342,8 +1572,7 @@ test(
     );
 
     server.send({ jsonrpc: "2.0", id: 11, method: "tasks/get", params: { taskId: liveTaskId } });
-    const liveGetLine = await server.nextLine();
-    const liveGetBody = liveGetLine.parsed as TasksGetResponseBody;
+    const liveGetBody = (await nextResponse(server)) as TasksGetResponseBody;
     assert.equal(
       liveGetBody.result?.status,
       "working",
@@ -1370,8 +1599,7 @@ test(
         arguments: { command: ["true"], label: "shutdown-terminal-control" },
       },
     });
-    const terminalRunLine = await server.nextLine();
-    const terminalRunBody = terminalRunLine.parsed as RunResponseBody;
+    const terminalRunBody = (await nextResponse(server)) as RunResponseBody;
     const terminalTaskId = terminalRunBody.result?.taskId as string;
     assert.equal(typeof terminalTaskId, "string");
 
@@ -1387,8 +1615,7 @@ test(
         method: "tasks/get",
         params: { taskId: terminalTaskId },
       });
-      const line = await server.nextLine();
-      const body = line.parsed as TasksGetResponseBody;
+      const body = (await nextResponse(server)) as TasksGetResponseBody;
       if (body.result?.status === "completed") terminalRecordBeforeShutdown = body.result;
       else await new Promise((resolve) => setTimeout(resolve, 20));
     }
@@ -1433,8 +1660,7 @@ test(
         method: "tasks/get",
         params: { taskId: liveTaskId },
       });
-      const pollLine = await server.nextLine();
-      const pollBody = pollLine.parsed as TasksGetResponseBody;
+      const pollBody = (await nextResponse(server)) as TasksGetResponseBody;
       const status = pollBody.result?.status;
       if (status !== "working") liveStatusAfterKill = status as string;
       else await new Promise((resolve) => setTimeout(resolve, 20));
@@ -1451,8 +1677,7 @@ test(
       method: "tasks/get",
       params: { taskId: terminalTaskId },
     });
-    const afterLine = await server.nextLine();
-    const afterBody = afterLine.parsed as TasksGetResponseBody;
+    const afterBody = (await nextResponse(server)) as TasksGetResponseBody;
     assert.deepEqual(
       afterBody.result,
       terminalRecordBeforeShutdown,

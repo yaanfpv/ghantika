@@ -74,8 +74,9 @@ import {
   DEFAULT_POLL_INTERVAL_MS,
   FIREHOSE_LINES_PER_SEC,
   FIREHOSE_SUSTAINED_MS,
+  GHANTIKA_OUTPUT_WAKE_METHOD,
   TASKS_EXTENSION_URI,
-  TASKS_STATUS_NOTIFICATION_METHOD,
+  TASKS_NOTIFICATION_METHOD,
   TASK_TTL_MS,
   WAKE_COALESCE_WINDOW_MS,
   WAKE_MAX_RATE_PER_SEC,
@@ -354,15 +355,31 @@ interface WakeNotification {
 function registerWakeSpy(client: Client): WakeNotification[] {
   const received: WakeNotification[] = [];
   client.setNotificationHandler(
-    TASKS_STATUS_NOTIFICATION_METHOD,
+    GHANTIKA_OUTPUT_WAKE_METHOD,
     { params: passthroughSchema() },
     (params) => {
       received.push({ params: params as Record<string, unknown> });
     }
   );
+  // The released spec's own `notifications/tasks` per-transition status
+  // notification (src/tasksAdapter.ts's own startTaskStatusNotifier, added
+  // by a later story than this file's own tests otherwise cover - see
+  // test/wake-integration.test.ts for the tests that actually exercise
+  // this surface) fires on the SAME terminal transitions many of this
+  // file's own tests already drive, on a GENUINELY SEPARATE subscription
+  // from the one above. Registered here with a real, silently-discarding
+  // handler purely so it never routes to `fallbackNotificationHandler`
+  // below - that handler exists to catch a mistyped/near-miss METHOD NAME
+  // on GHANTIKA_OUTPUT_WAKE_METHOD itself (this file's own exact-string
+  // proof, below), never to assert that no OTHER, entirely legitimate
+  // notification this codebase now also sends could ever exist.
+  client.setNotificationHandler(TASKS_NOTIFICATION_METHOD, { params: passthroughSchema() }, () => {
+    // Intentionally discarded - not this file's concern, see the comment
+    // above.
+  });
   client.fallbackNotificationHandler = async (notification) => {
     assert.fail(
-      `received a notification via a method OTHER than the exact "${TASKS_STATUS_NOTIFICATION_METHOD}" string: ${JSON.stringify(notification)}`
+      `received a notification via a method OTHER than the exact "${GHANTIKA_OUTPUT_WAKE_METHOD}" or "${TASKS_NOTIFICATION_METHOD}" strings: ${JSON.stringify(notification)}`
     );
   };
   return received;
@@ -589,7 +606,7 @@ test("TTL purge REFUSES a job whose concurrency slot is still stranded, however 
 // scheduling jitter.
 // ---------------------------------------------------------------------------
 
-test("the wake's notification method is the EXACT string 'notifications/tasks/status' - a mistyped/near-miss method would route to the fallback handler instead, which is asserted to never fire", async () => {
+test("the output-delta wake's notification method is the EXACT string 'notifications/ghantika/outputWake' - a mistyped/near-miss method would route to the fallback handler instead, which is asserted to never fire", async () => {
   const pair = await startPair(true);
   let jobId: string | undefined;
   try {
@@ -944,11 +961,23 @@ test("a sustained firehose rate rate-limits wakes and auto-stops ONLY the notifi
       // this point too - not merely inert, genuinely unsubscribed. A prior
       // version left it registered until the job's own eventual TTL purge,
       // since its callback's own "if (stopped) return" guard made it inert
-      // without ever removing it from jobStore.
+      // without ever removing it from jobStore. The count this asserts is
+      // now 1, not 0 (this test previously asserted 0, back when the
+      // watch's own terminal listener was the ONLY onJobTerminal subscriber
+      // this codebase ever registered for a job): this story adds a
+      // genuinely SEPARATE `notifications/tasks` per-transition status
+      // notifier (startTaskStatusNotifier, see its own docs) that
+      // subscribes onJobTerminal for this SAME still-working job
+      // independently, by design - it must still be live here,
+      // since the job has not reached its real terminal transition yet,
+      // only the OTHER watch auto-stopped. The regression this test still
+      // guards is unchanged: if startTaskWatch's own listener were ever
+      // left registered instead of genuinely unsubscribed, this count would
+      // read 2 (the leaked one plus the notifier's live one), not 1.
       assert.equal(
         jobStore.getJobTerminalListenerCount(jobId),
-        0,
-        "the terminal listener must be unsubscribed the moment the watch auto-stops, not merely left inert"
+        1,
+        "expected exactly the independent notifications/tasks status notifier's own terminal listener to remain - the auto-stopped watch's own listener must be genuinely unsubscribed, not merely left inert"
       );
     } finally {
       mock.timers.reset();
@@ -1183,10 +1212,10 @@ test("the wake path is proven here via a SIMULATED/mock capable client and the p
   //
   //   PROVEN HERE (simulated/mock):
   //     - a mock @modelcontextprotocol/client, driven entirely by this
-  //       test file, receives notifications/tasks/status wakes with the
-  //       exact delta on either stream (stdout, stderr, or both together
-  //       in one window), respects the coalescing window, rate-limits and
-  //       auto-stops under a firehose,
+  //       test file, receives notifications/ghantika/outputWake wakes with
+  //       the exact delta on either stream (stdout, stderr, or both
+  //       together in one window), respects the coalescing window,
+  //       rate-limits and auto-stops under a firehose,
   //       and the poll floor (tasks/get + output/tail) surfaces
   //       everything regardless of whether the wake handler is
   //       registered at all.
