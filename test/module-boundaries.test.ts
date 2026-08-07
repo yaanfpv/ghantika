@@ -37,10 +37,11 @@ test("the real src/ tree has zero module-boundary violations", () => {
   assert.deepEqual(checkModuleBoundaries(), []);
 });
 
-test("FROZEN_MODULES lists exactly thirteen modules: seven core files plus six tool handlers", () => {
-  assert.equal(FROZEN_MODULES.length, 13);
-  const core = FROZEN_MODULES.filter((f) => !f.startsWith("tools/"));
+test("FROZEN_MODULES lists exactly fourteen modules: seven core files, six tool handlers, and the one wake-transport contract file", () => {
+  assert.equal(FROZEN_MODULES.length, 14);
+  const core = FROZEN_MODULES.filter((f) => !f.startsWith("tools/") && !f.startsWith("wake/"));
   const tools = FROZEN_MODULES.filter((f) => f.startsWith("tools/"));
+  const wake = FROZEN_MODULES.filter((f) => f.startsWith("wake/"));
   assert.deepEqual([...core].sort(), [
     "jobStore.ts",
     "policy.ts",
@@ -58,6 +59,7 @@ test("FROZEN_MODULES lists exactly thirteen modules: seven core files plus six t
     "tools/status.ts",
     "tools/tail.ts",
   ]);
+  assert.deepEqual([...wake], ["wake/wakeTransport.ts"]);
 });
 
 // --- file-COUNT mutants (collapse/split), via a real scratch src/ tree ---
