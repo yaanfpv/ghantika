@@ -3,9 +3,9 @@
  * Guards the frozen module ownership for `src/`: exactly the modules
  * named in FROZEN_MODULES below (`server.ts`, `registry.ts`, `jobStore.ts`,
  * `process.ts`, `policy.ts`, `scheduler.ts`, `tasksAdapter.ts`, the six
- * `tools/*.ts` handler files, and `wake/wakeTransport.ts` +
- * `wake/appServerTransport.ts`), no more, no fewer - `src/index.ts` is
- * deliberately excluded, since it's the package's public entry point
+ * `tools/*.ts` handler files, `wake/wakeTransport.ts`,
+ * `wake/appServerTransport.ts`, and `wake/desktopIpcTransport.ts`), no
+ * more, no fewer - `src/index.ts` is
  * (`package.json`'s `"main"`/`"types"`), not one of the six-tool
  * architecture's internal modules.
  *
@@ -29,6 +29,15 @@
  * boundary (no transport-specific symbol may leak outside `src/wake/`) is
  * a distinct concern enforced separately by
  * `scripts/check-wake-transport-boundaries.mjs`, not by this file.
+ *
+ * `wake/desktopIpcTransport.ts` is admitted the same way: the first
+ * CONCRETE `WakeTransport` implementation, carrying real runtime state
+ * (`IpcConnection`'s own `pending`/`fatal` fields, `IpcFrameDecoder`'s own
+ * `buffer`) - all of it genuinely per-connection instance state on classes
+ * this file's own state scan never treats specially, never a module-scope
+ * Map/Set/mutable accumulator of the shape this check actually forbids, so
+ * it passes the persistent-state scan on its own merits rather than
+ * needing an exclusion.
  *
  * Three checks, matching this repo's established guard style (see
  * scripts/check-npm-ci-usage.mjs): pure, exported functions that operate
@@ -126,6 +135,7 @@ export const FROZEN_MODULES = [
   "tools/status.ts",
   "tools/tail.ts",
   "wake/appServerTransport.ts",
+  "wake/desktopIpcTransport.ts",
   "wake/wakeTransport.ts",
 ];
 
