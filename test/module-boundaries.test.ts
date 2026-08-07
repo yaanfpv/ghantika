@@ -37,8 +37,8 @@ test("the real src/ tree has zero module-boundary violations", () => {
   assert.deepEqual(checkModuleBoundaries(), []);
 });
 
-test("FROZEN_MODULES lists exactly sixteen modules: seven core files, six tool handlers, and three wake-transport files (the shared contract plus the two concrete transports)", () => {
-  assert.equal(FROZEN_MODULES.length, 16);
+test("FROZEN_MODULES lists exactly seventeen modules: seven core files, six tool handlers, and four wake-transport files (the shared contract, the two concrete transports, and the selector)", () => {
+  assert.equal(FROZEN_MODULES.length, 17);
   const core = FROZEN_MODULES.filter((f) => !f.startsWith("tools/") && !f.startsWith("wake/"));
   const tools = FROZEN_MODULES.filter((f) => f.startsWith("tools/"));
   const wake = FROZEN_MODULES.filter((f) => f.startsWith("wake/"));
@@ -62,6 +62,7 @@ test("FROZEN_MODULES lists exactly sixteen modules: seven core files, six tool h
   assert.deepEqual([...wake].sort(), [
     "wake/appServerTransport.ts",
     "wake/desktopIpcTransport.ts",
+    "wake/selectTransport.ts",
     "wake/wakeTransport.ts",
   ]);
 });
