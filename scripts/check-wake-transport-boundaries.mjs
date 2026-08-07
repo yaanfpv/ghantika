@@ -116,7 +116,11 @@ function isRealPathInsideWakeDir(candidateRealPath, wakeDirRealPath) {
  * @param {string} [wakeDirAbsPath]
  * @returns {string[]} the raw specifier text of each violation found
  */
-export function findWakeBoundaryImports(sourceText, importingFileAbsPath, wakeDirAbsPath = path.join(SRC_DIR, WAKE_SUBDIR)) {
+export function findWakeBoundaryImports(
+  sourceText,
+  importingFileAbsPath,
+  wakeDirAbsPath = path.join(SRC_DIR, WAKE_SUBDIR)
+) {
   const hits = [];
   const sourceFile = parseSourceFile(importingFileAbsPath, sourceText);
   const wakeDirReal = realpathOrSelf(wakeDirAbsPath);
@@ -174,7 +178,9 @@ export function checkWakeTransportBoundaries(srcDir = SRC_DIR, testDir = TEST_DI
   if (!existsSync(wakeDirAbs)) {
     violations.push("src/wake/ does not exist - nothing to guard, which is itself the violation");
   } else if (!existsSync(path.join(wakeDirAbs, WAKE_PUBLIC_FILE))) {
-    violations.push(`src/wake/${WAKE_PUBLIC_FILE} does not exist - the one permitted door is missing`);
+    violations.push(
+      `src/wake/${WAKE_PUBLIC_FILE} does not exist - the one permitted door is missing`
+    );
   }
 
   return violations;
@@ -189,7 +195,9 @@ function main() {
     process.exitCode = 1;
     return;
   }
-  console.log(`wake transport boundaries clean: only src/wake/${WAKE_PUBLIC_FILE} is reachable from outside src/wake/`);
+  console.log(
+    `wake transport boundaries clean: only src/wake/${WAKE_PUBLIC_FILE} is reachable from outside src/wake/`
+  );
 }
 
 if (isMainModule(import.meta.url)) {

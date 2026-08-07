@@ -37,7 +37,10 @@ function buildFixtureWakeDir() {
   const dir = mkdtempSync(path.join(tmpdir(), "ghantika-wake-boundary-"));
   const wakeDir = path.join(dir, "wake");
   mkdirSync(wakeDir, { recursive: true });
-  writeFileSync(path.join(wakeDir, WAKE_PUBLIC_FILE), "export type Capability = { available: boolean };\n");
+  writeFileSync(
+    path.join(wakeDir, WAKE_PUBLIC_FILE),
+    "export type Capability = { available: boolean };\n"
+  );
   writeFileSync(
     path.join(wakeDir, "secretTransport.ts"),
     "export const SOCKET_PATH = '/tmp/whatever.sock';\n"
@@ -80,7 +83,11 @@ test("findWakeBoundaryImports does not flag an import of a file outside src/wake
   try {
     writeFileSync(path.join(dir, "jobStore.ts"), "export const x = 1;\n");
     const callerAbs = path.join(dir, "server.ts");
-    const hits = findWakeBoundaryImports("import { x } from './jobStore.js';\n", callerAbs, wakeDir);
+    const hits = findWakeBoundaryImports(
+      "import { x } from './jobStore.js';\n",
+      callerAbs,
+      wakeDir
+    );
     assert.deepEqual(hits, []);
   } finally {
     rmSync(dir, { recursive: true, force: true });

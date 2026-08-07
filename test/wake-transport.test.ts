@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { Capability, WakeOutcome, WakeResult, WakeTarget, WakeTransport } from "../dist/wake/wakeTransport.js";
+import type {
+  Capability,
+  WakeOutcome,
+  WakeResult,
+  WakeTarget,
+  WakeTransport,
+} from "../dist/wake/wakeTransport.js";
 
 // NO TRANSPORT IS REQUIRED FOR THE MODULE TO LOAD. This file
 // is the proof, not a claim in a doc comment. Two things must be true
@@ -40,13 +46,21 @@ class FixtureTransport implements WakeTransport {
   async probe(): Promise<Capability> {
     this.#probedCount += 1;
     if (!this.#available) {
-      return { available: false, reason: "fixture configured unavailable", probedAt: new Date().toISOString() };
+      return {
+        available: false,
+        reason: "fixture configured unavailable",
+        probedAt: new Date().toISOString(),
+      };
     }
     return { available: true, probedAt: new Date().toISOString() };
   }
 
   async wake(target: WakeTarget, payload: string): Promise<WakeResult> {
-    return { outcome: "delivered" as WakeOutcome, detail: `${target}:${payload}`, transportName: this.name };
+    return {
+      outcome: "delivered" as WakeOutcome,
+      detail: `${target}:${payload}`,
+      transportName: this.name,
+    };
   }
 
   get probedCount(): number {
