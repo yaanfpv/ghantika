@@ -23,7 +23,13 @@
  */
 import { AppServerGoalWakeTransport } from "./appServerTransport.js";
 import { DesktopIpcWakeTransport } from "./desktopIpcTransport.js";
-import type { Capability, WakeResult, WakeTarget, WakeTransport } from "./wakeTransport.js";
+import type {
+  Capability,
+  WakeOutcome,
+  WakeResult,
+  WakeTarget,
+  WakeTransport,
+} from "./wakeTransport.js";
 
 /**
  * The `transportName` recorded on the aggregate `WakeResult` this module
@@ -89,6 +95,79 @@ interface Attempt {
 }
 
 /**
+ * True only when THIS process is itself running as a stdio MCP server
+ * subprocess Claude Code spawned - the one signal Claude Code documents as
+ * set for that case (confirmed by fetching
+ * https://code.claude.com/docs/en/env-vars.md: "Set to 1 in subprocesses
+ * Claude Code spawns (Bash and PowerShell tools, tmux sessions, hook
+ * commands, status line commands, stdio MCP server subprocesses)").
+ * ghantika itself runs exactly that way when Claude Code is the caller, so
+ * this env var is a real, first-party fact about this process's own
+ * parentage - never a platform or harness guess. Read on demand rather
+ * than cached at module load: nothing in this module needs the answer
+ * before the exhaustion path below actually runs, and a fresh read costs
+ * nothing measurable.
+ *
+ * Deliberately the ONLY signal this function checks. A second heuristic
+ * stacked on top (a parent-process name sniff, another env var) would only
+ * widen the surface for a false read without adding real confidence - this
+ * one is already a documented, first-party fact rather than an inference.
+ *
+ * Used for exactly one thing: composing the exhaustion `detail` string
+ * below. See `selectAndWake`'s own doc comment for the hard boundary this
+ * respects - it never changes which transports are tried, in what order,
+ * or what `outcome` this function returns.
+ */
+function isRunningUnderClaudeCode(): boolean {
+  return process.env.CLAUDECODE === "1";
+}
+
+/**
+ * Composes the aggregate `detail` string for `selectAndWake`'s exhaustion
+ * path - called only after the loop above has confirmed nothing delivered,
+ * with `outcome` already decided by the caller and passed in read-only.
+ * This function never influences that decision, only how it reads.
+ *
+ * On `"unavailable"` specifically - never `"refused"`, since a refusal
+ * means some live transport actually answered, and that answer belongs in
+ * the log verbatim and unqualified, never reframed - this leads with a
+ * plain-language summary when `isRunningUnderClaudeCode()` is true: none
+ * of today's `DEFAULT_TRANSPORTS` serve that harness at all (both are
+ * Codex-specific), so "tried 2, here's why each individually fell short"
+ * reads as two unrelated near-misses when the honest fact is one absent
+ * capability - this client has no configured push-wake mechanism at all,
+ * and the caller's real working path is the poll floor
+ * (`status`/`output`/`tail`). The full per-transport log still follows,
+ * unchanged, for a reader who wants the mechanical detail underneath -
+ * this PREPENDS the clearer summary rather than replacing the log, so
+ * nothing already true about this run is lost.
+ *
+ * Every other case (a non-empty attempt list on any other outcome, or an
+ * empty one) returns exactly the wording this produced before this
+ * function existed - see `test/wake-select-transport.test.ts` for the
+ * exact strings this is pinned against.
+ */
+function buildExhaustionDetail(attempts: readonly Attempt[], outcome: WakeOutcome): string {
+  if (attempts.length === 0) {
+    return "no transports were configured to try";
+  }
+
+  const perTransportLog = `tried ${attempts.length} in order - ${attempts
+    .map((attempt) => attempt.summary)
+    .join("; ")}`;
+
+  if (outcome === "unavailable" && isRunningUnderClaudeCode()) {
+    return (
+      `no transport delivered; this process is running under Claude Code, and none of the ` +
+      `${attempts.length} configured transport(s) serve that client - there is no push-wake ` +
+      `mechanism available here, poll status/output/tail instead. ${perTransportLog}`
+    );
+  }
+
+  return `no transport delivered; ${perTransportLog}`;
+}
+
+/**
  * Tries each transport in `transports`, strictly in array order, one at a
  * time - never concurrently, since a later transport is only ever worth
  * trying once an earlier one has conclusively failed to deliver for this
@@ -140,6 +219,17 @@ interface Attempt {
  * An empty `transports` array returns cleanly with a non-`"delivered"`
  * outcome and a detail explaining nothing was configured to try - the
  * loop below simply never runs, so this needs no special-cased branch.
+ *
+ * The exhaustion `detail` string itself is built by `buildExhaustionDetail`
+ * below, which on the `"unavailable"` outcome may lead with a plain-
+ * language summary when the CURRENT PROCESS is running under Claude Code
+ * (see `isRunningUnderClaudeCode`'s own doc comment) - today's
+ * `DEFAULT_TRANSPORTS` are both Codex-specific, so on that harness a bare
+ * per-transport enumeration reads as "two things broke" rather than "this
+ * client has no push-wake mechanism at all." This affects MESSAGE TEXT
+ * ONLY: it changes no branch above, decides no `outcome`, and requires no
+ * caller of this function to know or pass in which harness it runs on -
+ * this function's own signature is unchanged.
  */
 export async function selectAndWake(
   transports: readonly WakeTransport[],
@@ -197,16 +287,11 @@ export async function selectAndWake(
   }
 
   const anyGenuineRefusal = attempts.some((attempt) => attempt.wasRefused);
-  const detail =
-    attempts.length === 0
-      ? "no transports were configured to try"
-      : `no transport delivered; tried ${attempts.length} in order - ${attempts
-          .map((attempt) => attempt.summary)
-          .join("; ")}`;
+  const outcome: WakeOutcome = anyGenuineRefusal ? "refused" : "unavailable";
 
   return {
-    outcome: anyGenuineRefusal ? "refused" : "unavailable",
-    detail,
+    outcome,
+    detail: buildExhaustionDetail(attempts, outcome),
     transportName: SELECTOR_TRANSPORT_NAME,
   };
 }
