@@ -4,8 +4,8 @@
  * named in FROZEN_MODULES below (`server.ts`, `registry.ts`, `jobStore.ts`,
  * `process.ts`, `policy.ts`, `scheduler.ts`, `tasksAdapter.ts`, the six
  * `tools/*.ts` handler files, `wake/wakeTransport.ts`,
- * `wake/appServerTransport.ts`, and `wake/desktopIpcTransport.ts`), no
- * more, no fewer - `src/index.ts` is
+ * `wake/appServerTransport.ts`, `wake/desktopIpcTransport.ts`, and
+ * `wake/selectTransport.ts`), no more, no fewer - `src/index.ts` is
  * (`package.json`'s `"main"`/`"types"`), not one of the six-tool
  * architecture's internal modules.
  *
@@ -38,6 +38,31 @@
  * Map/Set/mutable accumulator of the shape this check actually forbids, so
  * it passes the persistent-state scan on its own merits rather than
  * needing an exclusion.
+ *
+ * `wake/selectTransport.ts` is admitted the same way, and is the first
+ * module in `src/wake/` that is genuinely a CALLER of the other transport
+ * files rather than a peer of them: it imports both
+ * `wake/appServerTransport.ts` and `wake/desktopIpcTransport.ts` to build
+ * `DEFAULT_TRANSPORTS` and to hand a caller-supplied transport list to
+ * `selectAndWake`. That import pattern is fine here for the same reason
+ * `src/tools/*.ts` importing `registry.ts` is fine - this file's own
+ * sibling-import rule only governs `src/tools/*.ts` reaching another
+ * `src/tools/*.ts` file, never a `src/wake/*.ts` file reaching another
+ * `src/wake/*.ts` file (that boundary, and the narrower one restricting
+ * what may reach INTO `src/wake/` from OUTSIDE it, is
+ * `scripts/check-wake-transport-boundaries.mjs`'s job, not this file's).
+ * `DEFAULT_TRANSPORTS` is a top-level `const` array, but a non-empty one
+ * (`[new AppServerGoalWakeTransport(), new DesktopIpcWakeTransport()]`),
+ * so the persistent-state scan below - which only flags a `let`/`var`
+ * declaration or a `const` bound to an EMPTY array/object literal at
+ * module scope, the structural signature of a growable accumulator, never
+ * a non-empty literal - does not flag it, the same carve-out
+ * `registry.ts`'s own frozen `TOOL_MODULES` list already relies on. The
+ * selector function itself (`selectAndWake`) holds zero state of its own
+ * anywhere - it takes its transport list as a plain parameter on every
+ * call rather than reading a module-level array, specifically so nothing
+ * about a single invocation's transport list can leak into, or be
+ * mistaken for, persistent module state.
  *
  * Three checks, matching this repo's established guard style (see
  * scripts/check-npm-ci-usage.mjs): pure, exported functions that operate
@@ -136,6 +161,7 @@ export const FROZEN_MODULES = [
   "tools/tail.ts",
   "wake/appServerTransport.ts",
   "wake/desktopIpcTransport.ts",
+  "wake/selectTransport.ts",
   "wake/wakeTransport.ts",
 ];
 

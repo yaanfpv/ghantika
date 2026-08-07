@@ -1,18 +1,29 @@
 #!/usr/bin/env node
 /**
- * Guards the `src/wake/` boundary: `wakeTransport.ts`
- * is the ONLY file under `src/wake/` whose exports may be imported from
- * outside `src/wake/` itself. Every other file that comes to live there (a
- * concrete transport - a future app-server transport, a future IPC
- * transport, a future selector that picks among them) is "its own module"
- * in that sense, and its symbols may appear only inside `src/wake/` or
- * inside a `test/wake-*.test.ts` file written to exercise it directly.
+ * Guards the `src/wake/` boundary: `WAKE_PUBLIC_FILES` names the exact,
+ * small set of files under `src/wake/` whose exports may be imported from
+ * outside `src/wake/` itself - today, `wakeTransport.ts` (the shared,
+ * type-only contract every transport and the selector implement against)
+ * and `selectTransport.ts` (the ordered-selection function a real caller
+ * actually invokes to request a wake). Two public doors, not one: the
+ * selector has to import both concrete transports to do its job, which no
+ * single-file design can satisfy without either breaking
+ * `wakeTransport.ts`'s own zero-runtime contract or exposing a transport's
+ * internals directly. Every OTHER file that comes to live in `src/wake/`
+ * (today: `appServerTransport.ts`, `desktopIpcTransport.ts`; tomorrow, any
+ * further transport) is "its own module" in that sense, and its symbols
+ * may appear only inside `src/wake/` or inside a `test/wake-*.test.ts`
+ * file written to exercise it directly.
  *
- * With zero transports built yet, this check has
- * nothing to flag - it exists now, real and running, so the FIRST transport
- * file that gets imported from outside the family is caught the moment it
- * lands, rather than relying on every future PR remembering the boundary by
- * hand. Same shape and same shared AST toolkit as
+ * Two transports are built now (`appServerTransport.ts`,
+ * `desktopIpcTransport.ts`), plus the selector that orders between them
+ * (`selectTransport.ts`) - but nothing outside `src/wake/` imports either
+ * concrete transport directly yet, so this check still has nothing to
+ * flag in the real tree today. It exists anyway, real and running, so the
+ * moment a transport-specific file (rather than one of the two admitted
+ * public doors) gets imported from outside the family, it is caught the
+ * instant it lands, rather than relying on every future PR remembering
+ * the boundary by hand. Same shape and same shared AST toolkit as
  * `scripts/check-module-boundaries.mjs`'s sibling-import scan, inverted: that
  * guard stops `src/tools/*.ts` files reaching each other, this one stops
  * everything ELSE reaching INTO `src/wake/`'s non-public files.
@@ -22,14 +33,15 @@
  *   1. findWakeBoundaryImports - scans every `.ts` file under `src/` and
  *      `test/` (excluding `src/wake/` itself, and excluding any
  *      `test/wake-*.test.ts`) for a module-loading construct whose RESOLVED
- *      TARGET sits inside `src/wake/` and is not `wakeTransport.ts`. Uses
- *      the same real resolver as `check-module-boundaries.mjs`
+ *      TARGET sits inside `src/wake/` and is not one of `WAKE_PUBLIC_FILES`.
+ *      Uses the same real resolver as `check-module-boundaries.mjs`
  *      (`resolveModuleSpecifierRealPath`), so a symlink, an absolute path,
  *      or an extensionless/directory specifier resolving into `src/wake/`
  *      is caught exactly as a plain relative specifier would be.
- *   2. an inline existence check - `src/wake/` and its public file must
- *      exist at all; an empty check that always passes because the
- *      directory never existed would be worse than no check.
+ *   2. an inline existence check - `src/wake/` and every file named in
+ *      `WAKE_PUBLIC_FILES` must exist; an empty check that always passes
+ *      because the directory (or one of its public files) never existed
+ *      would be worse than no check.
  *
  * Disclosed scope boundary: this resolves specifiers against `src/` and
  * `test/` source text only - the same surface `check-module-boundaries.mjs`
@@ -60,8 +72,16 @@ const SRC_DIR = path.join(REPO_ROOT, "src");
 const TEST_DIR = path.join(REPO_ROOT, "test");
 const WAKE_SUBDIR = "wake";
 
-/** The one file under `src/wake/` whose exports may cross the boundary - see this file's header. */
-export const WAKE_PUBLIC_FILE = "wakeTransport.ts";
+/**
+ * The exact, small set of files under `src/wake/` whose exports may cross
+ * the boundary - see this file's header. Deliberately a `Set`, not a
+ * single string: keep this narrow and explicit by construction, since a
+ * boundary guard that admits "everything under `src/wake/`" is no guard
+ * at all. Never add a file here for convenience - only for a genuine
+ * second (or later) public door that needs to be reachable from outside
+ * the family, the same bar `selectTransport.ts` had to clear.
+ */
+export const WAKE_PUBLIC_FILES = new Set(["wakeTransport.ts", "selectTransport.ts"]);
 
 /**
  * `realpathSync`, falling back to `path.resolve(absPath)` when the path
@@ -109,7 +129,7 @@ function isRealPathInsideWakeDir(candidateRealPath, wakeDirRealPath) {
  * Scans `sourceText` (the contents of `importingFileAbsPath`, a file OUTSIDE
  * `src/wake/` and not a permitted wake test) for every module-loading
  * construct whose resolved target is a real file inside `src/wake/` other
- * than `WAKE_PUBLIC_FILE`.
+ * than one of `WAKE_PUBLIC_FILES`.
  *
  * @param {string} sourceText
  * @param {string} importingFileAbsPath
@@ -124,14 +144,18 @@ export function findWakeBoundaryImports(
   const hits = [];
   const sourceFile = parseSourceFile(importingFileAbsPath, sourceText);
   const wakeDirReal = realpathOrSelf(wakeDirAbsPath);
-  const publicFileReal = realpathOrSelf(path.join(wakeDirAbsPath, WAKE_PUBLIC_FILE));
+  const publicFileReals = new Set(
+    [...WAKE_PUBLIC_FILES].map((publicFile) =>
+      realpathOrSelf(path.join(wakeDirAbsPath, publicFile))
+    )
+  );
 
   for (const { text: specifier } of collectModuleSpecifiers(sourceFile)) {
     if (specifier === undefined) continue;
 
     const resolvedReal = resolveModuleSpecifierRealPath(specifier, importingFileAbsPath);
     if (resolvedReal === undefined) continue;
-    if (resolvedReal === publicFileReal) continue; // the one permitted door
+    if (publicFileReals.has(resolvedReal)) continue; // one of the permitted doors
     if (isRealPathInsideWakeDir(resolvedReal, wakeDirReal)) {
       hits.push(specifier);
     }
@@ -151,6 +175,7 @@ export function findWakeBoundaryImports(
 export function checkWakeTransportBoundaries(srcDir = SRC_DIR, testDir = TEST_DIR) {
   const violations = [];
   const wakeDirAbs = path.join(srcDir, WAKE_SUBDIR);
+  const publicDoorList = [...WAKE_PUBLIC_FILES].map((file) => `src/wake/${file}`).join(" or ");
 
   for (const file of listTsFilesUnder(srcDir)) {
     if (file.startsWith(`${WAKE_SUBDIR}/`)) continue; // src/wake/ never scans itself
@@ -158,7 +183,7 @@ export function checkWakeTransportBoundaries(srcDir = SRC_DIR, testDir = TEST_DI
     const text = readFileSync(abs, "utf8");
     for (const specifier of findWakeBoundaryImports(text, abs, wakeDirAbs)) {
       violations.push(
-        `src/${file}: imports "${specifier}" - only src/wake/${WAKE_PUBLIC_FILE} may be imported from outside src/wake/`
+        `src/${file}: imports "${specifier}" - only ${publicDoorList} may be imported from outside src/wake/`
       );
     }
   }
@@ -170,17 +195,19 @@ export function checkWakeTransportBoundaries(srcDir = SRC_DIR, testDir = TEST_DI
     const text = readFileSync(abs, "utf8");
     for (const specifier of findWakeBoundaryImports(text, abs, wakeDirAbs)) {
       violations.push(
-        `test/${file}: imports "${specifier}" - only src/wake/${WAKE_PUBLIC_FILE} may be imported outside a test/wake-*.test.ts file`
+        `test/${file}: imports "${specifier}" - only ${publicDoorList} may be imported outside a test/wake-*.test.ts file`
       );
     }
   }
 
   if (!existsSync(wakeDirAbs)) {
     violations.push("src/wake/ does not exist - nothing to guard, which is itself the violation");
-  } else if (!existsSync(path.join(wakeDirAbs, WAKE_PUBLIC_FILE))) {
-    violations.push(
-      `src/wake/${WAKE_PUBLIC_FILE} does not exist - the one permitted door is missing`
-    );
+  } else {
+    for (const publicFile of WAKE_PUBLIC_FILES) {
+      if (!existsSync(path.join(wakeDirAbs, publicFile))) {
+        violations.push(`src/wake/${publicFile} does not exist - a permitted door is missing`);
+      }
+    }
   }
 
   return violations;
@@ -195,8 +222,9 @@ function main() {
     process.exitCode = 1;
     return;
   }
+  const publicDoorList = [...WAKE_PUBLIC_FILES].map((file) => `src/wake/${file}`).join(" and ");
   console.log(
-    `wake transport boundaries clean: only src/wake/${WAKE_PUBLIC_FILE} is reachable from outside src/wake/`
+    `wake transport boundaries clean: only ${publicDoorList} are reachable from outside src/wake/`
   );
 }
 
