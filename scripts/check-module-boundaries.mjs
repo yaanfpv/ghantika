@@ -3,18 +3,31 @@
  * Guards the frozen module ownership for `src/`: exactly the modules
  * named in FROZEN_MODULES below (`server.ts`, `registry.ts`, `jobStore.ts`,
  * `process.ts`, `policy.ts`, `scheduler.ts`, `tasksAdapter.ts`, the six
- * `tools/*.ts` handler files, and `wake/wakeTransport.ts`), no more, no
- * fewer - `src/index.ts` is deliberately excluded, since it's the
- * package's public entry point (`package.json`'s `"main"`/`"types"`), not
- * one of the six-tool architecture's internal modules.
+ * `tools/*.ts` handler files, and `wake/wakeTransport.ts` +
+ * `wake/appServerTransport.ts`), no more, no fewer - `src/index.ts` is
+ * deliberately excluded, since it's the package's public entry point
+ * (`package.json`'s `"main"`/`"types"`), not one of the six-tool
+ * architecture's internal modules.
  *
  * `wake/wakeTransport.ts` is admitted here the same way
  * `tasksAdapter.ts` was: this check governs WHICH FILES may exist, not a
  * blanket ban on new modules - a type-only interface file with zero
  * runtime exports carries no state and imports nothing, so it is scanned
  * by the persistent-state check below like every other root-level file and
- * will always pass. Its OWN boundary (no transport-specific symbol may
- * leak outside `src/wake/`) is a distinct concern enforced separately by
+ * will always pass. `wake/appServerTransport.ts` is admitted the same way,
+ * one layer down: it is a real, stateful module (it owns a spawned `codex
+ * app-server` child's request/response bookkeeping and a live-child
+ * registry for crash-safety reaping), but its state is scoped to PRIVATE
+ * INSTANCE FIELDS on its own classes - never a module-top-level
+ * `let`/`var` or a `new Map`/`new Set`/`Array()`/`Object()` construction
+ * anywhere in the file - so it satisfies the persistent-state scan below
+ * on its own merits, the same as every other admitted module, rather than
+ * needing any exclusion from that scan (unlike `jobStore.ts`, which is
+ * `STATE_SCAN_EXCLUDED_ROOT_FILES`'s one deliberate carve-out because its
+ * whole job IS to hold that specific state - job/output bookkeeping - and
+ * exists nowhere else this check would need to tolerate it). Its OWN
+ * boundary (no transport-specific symbol may leak outside `src/wake/`) is
+ * a distinct concern enforced separately by
  * `scripts/check-wake-transport-boundaries.mjs`, not by this file.
  *
  * Three checks, matching this repo's established guard style (see
@@ -112,6 +125,7 @@ export const FROZEN_MODULES = [
   "tools/run.ts",
   "tools/status.ts",
   "tools/tail.ts",
+  "wake/appServerTransport.ts",
   "wake/wakeTransport.ts",
 ];
 
