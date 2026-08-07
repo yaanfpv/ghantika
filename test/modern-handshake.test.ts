@@ -375,8 +375,15 @@ test("modern handshake: on the SAME connection, a tools/call whose OWN request e
     method: "tools/call",
     params: withModernEnvelope({ name: "run", arguments: { command: ["true"] } }),
   });
-  const incapableLine = await server.nextLine();
-  const incapableBody = incapableLine.parsed as {
+  // Reads through nextResponse (never server.nextLine() directly) - the
+  // mint above used `command: ["true"]`, a real backing process that exits
+  // almost immediately, so its own `notifications/tasks` terminal
+  // notification (see startTaskStatusNotifier's own docs) can land on this
+  // wire in between the mint's response and this second request's own
+  // response; nextResponse skips exactly that, and only that - the same
+  // hazard this file's "six-tool mint rule" test documents and guards
+  // against on its own chained reads.
+  const incapableBody = (await nextResponse(server)) as {
     error?: unknown;
     result?: { isError?: boolean; structuredContent?: Record<string, unknown> };
   };
