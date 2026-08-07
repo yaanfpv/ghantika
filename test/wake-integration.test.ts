@@ -1098,9 +1098,10 @@ test("all six tools' plain-poll responses stay byte-identical (canonical project
   }
 });
 
-test("run/status/output/tail/kill stay byte-identical (canonical projection) to the SAME frozen golden, and so does list's own scenario-owned entry, even while the Tasks adapter is ACTIVELY engaged elsewhere in the same process (a separate capable connection minting and wake-watching its own job) - every OTHER entry in the real process-wide list response is confirmed to share that entry's canonical key shape, not compared against a golden value", async () => {
+test("run/status/output/tail/kill stay byte-identical (canonical projection) to the SAME frozen golden, and so does list's own scenario-owned entry, even while the Tasks adapter is ACTIVELY engaged elsewhere in the same process (a separate capable connection minting and wake-watching its own job) - every OTHER entry in the real process-wide list response is confirmed to share that entry's canonical key shape, not compared against a golden value; and the plain, non-capable connection receives ZERO wake notifications of its own, proving the push path is gated on capability negotiation rather than on any per-job state the plain connection could incidentally share", async () => {
   const capablePair = await startPair(true);
   const plainPair = await startPair(false);
+  const plainReceived = registerWakeSpy(plainPair.client);
   let capableJobId: string | undefined;
   try {
     const mintedCapable = await mintJob(capablePair.client, {
@@ -1119,6 +1120,16 @@ test("run/status/output/tail/kill stay byte-identical (canonical projection) to 
       mock.timers.reset();
     }
     await new Promise((resolve) => setImmediate(resolve));
+    // The plain connection registered no interest in Tasks and shares this
+    // process with the capable connection whose job just woke - so this is
+    // the one point in the suite that can catch `startTaskWatch` being
+    // reached before the capability guard: that regression would push this
+    // exact notification here, at zero cost to every assertion above.
+    assert.strictEqual(
+      plainReceived.length,
+      0,
+      "a non-capable connection must never receive a Tasks status notification, even while sharing a process with an actively-waking capable one"
+    );
 
     const live = await runPlainPollScenarios(plainPair.client, "plain-poll-present");
     assertPlainPollByteIdentical(live, "a separate capable connection actively engaged elsewhere");
