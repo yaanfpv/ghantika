@@ -855,6 +855,24 @@ const RACY_IN_PRESENCE_CONFIRMATION_FIELDS = new Set([
  * placeholder value) - see that constant's own docs for why deletion, not
  * masking, is the honest choice for a field whose real PRESENCE is racy,
  * not just its value.
+ *
+ * `pid` (status only - see `src/tools/status.ts`'s `StatusProjection`) is
+ * a real, per-run OS process id, so it is masked to a stable placeholder
+ * the same way `job_id` is - its PRESENCE is deterministic (set
+ * synchronously by `run()` before this file's own `runJob` helper ever
+ * returns), only its numeric value varies between runs. `birth_identity`
+ * (same source file) is masked WHOLE, never recursed into: unlike `pid`
+ * its real value can legitimately take one of several different SHAPES
+ * depending purely on timing (still `"pending"`, or already `"captured"`
+ * with a platform-tagged identity payload whose own fields - a raw
+ * kernel tick count on Linux, a captured timestamp/elapsed-seconds pair
+ * everywhere else - are themselves real and non-reproducible) - the same
+ * underlying async birth-identity capture `identity_capture` already
+ * names, just carrying the settled payload alongside the state instead of
+ * a bare string. A single flat placeholder collapses every legitimate
+ * outcome to one canonical token, exactly like the other masked fields,
+ * without needing this file to also special-case `identity_capture`'s
+ * PRESENCE-racing treatment for a field whose presence here is not racy.
  */
 function canonicalizePlainPollResponse(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalizePlainPollResponse);
@@ -866,6 +884,8 @@ function canonicalizePlainPollResponse(value: unknown): unknown {
       if (key === "job_id") out[key] = "<JOB_ID>";
       else if (key === "started_at" || key === "ended_at") out[key] = "<TIMESTAMP>";
       else if (key === "label") out[key] = "<LABEL>";
+      else if (key === "pid") out[key] = "<PID>";
+      else if (key === "birth_identity") out[key] = "<BIRTH_IDENTITY>";
       else out[key] = canonicalizePlainPollResponse(v);
     }
     return out;
