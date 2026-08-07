@@ -115,6 +115,39 @@ function unreachableWake(): Promise<WakeResult> {
   throw new Error("wake() should never have been called for this transport");
 }
 
+// --- CLAUDECODE env-var seam, following test/process.test.ts's own established save/mutate/restore convention for GHANTIKA_CWD_ROOTS ---
+
+const CLAUDE_CODE_ENV_VAR_NAME = "CLAUDECODE";
+
+/**
+ * Saves, sets (or deletes), runs `fn`, then restores CLAUDECODE around a
+ * single test - the exact save/mutate/restore-in-finally shape
+ * test/process.test.ts already uses for GHANTIKA_CWD_ROOTS, adapted for an
+ * async body since selectAndWake is async. Never relies on the ambient
+ * value: CLAUDECODE=1 is genuinely set in this repo's own real Bash-tool
+ * subprocess environment (Claude Code sets it for every stdio MCP server
+ * subprocess AND every Bash/PowerShell tool subprocess it spawns - see
+ * https://code.claude.com/docs/en/env-vars.md), so a test that wants a
+ * SPECIFIC value - present or absent - must state it explicitly rather
+ * than trust whatever the invoking shell happens to carry. node:test's
+ * default per-file process isolation means this mutation never crosses
+ * into a sibling test file's own process.
+ */
+async function withClaudeCodeEnv(
+  value: string | undefined,
+  fn: () => Promise<void>
+): Promise<void> {
+  const original = process.env[CLAUDE_CODE_ENV_VAR_NAME];
+  try {
+    if (value === undefined) delete process.env[CLAUDE_CODE_ENV_VAR_NAME];
+    else process.env[CLAUDE_CODE_ENV_VAR_NAME] = value;
+    await fn();
+  } finally {
+    if (original === undefined) delete process.env[CLAUDE_CODE_ENV_VAR_NAME];
+    else process.env[CLAUDE_CODE_ENV_VAR_NAME] = original;
+  }
+}
+
 // --- 1. first delivers, second never touched ---
 
 test("first transport probes available and delivers - returns its exact WakeResult, second transport's probe/wake are never called", async () => {
@@ -390,4 +423,127 @@ test("DEFAULT_TRANSPORTS contains exactly the two real transports, app-server fi
   assert.ok(DEFAULT_TRANSPORTS[1] instanceof DesktopIpcWakeTransport);
   assert.equal(DEFAULT_TRANSPORTS[0].name, "codex-app-server-goal");
   assert.equal(DEFAULT_TRANSPORTS[1].name, "chatgpt-desktop-ipc");
+});
+
+// --- 11. harness-aware exhaustion detail (CLAUDECODE) ---
+
+test("under Claude Code (CLAUDECODE=1), when every transport is unavailable the aggregate detail names both the client mismatch and the poll floor - not a vacuous non-empty string", async () => {
+  await withClaudeCodeEnv("1", async () => {
+    const first = new FakeTransport(
+      "first",
+      unavailableCapability("no app-server running"),
+      unreachableWake
+    );
+    const second = new FakeTransport(
+      "second",
+      unavailableCapability("no socket present"),
+      unreachableWake
+    );
+
+    const result = await selectAndWake([first, second], "thread-1", "resume");
+
+    assert.equal(result.outcome, "unavailable");
+
+    // Names the client-mismatch reason - real, checkable wording, never a
+    // bare non-empty-string check that would pass on any message at all.
+    assert.ok(
+      result.detail?.includes("Claude Code"),
+      `detail should name Claude Code as the reason no transport serves this client: ${result.detail}`
+    );
+
+    // Names the poll floor as the working path a caller should actually use.
+    assert.ok(
+      /\bpoll\b/i.test(result.detail ?? "") &&
+        result.detail?.includes("status") &&
+        result.detail?.includes("output") &&
+        result.detail?.includes("tail"),
+      `detail should name the poll floor (poll/status/output/tail): ${result.detail}`
+    );
+
+    // The full per-transport log is still present underneath, unchanged -
+    // nothing informative already true about this run is lost.
+    assert.ok(result.detail?.includes("first"));
+    assert.ok(result.detail?.includes("no app-server running"));
+    assert.ok(result.detail?.includes("second"));
+    assert.ok(result.detail?.includes("no socket present"));
+    assert.equal(first.wakeCallCount, 0);
+    assert.equal(second.wakeCallCount, 0);
+  });
+});
+
+test("when CLAUDECODE is unset, the exhaustion detail is exactly the original generic per-transport enumeration - the new harness-aware wording is additive, never a silent behavior change for a caller that is not Claude Code", async () => {
+  await withClaudeCodeEnv(undefined, async () => {
+    const first = new FakeTransport(
+      "first",
+      unavailableCapability("no app-server running"),
+      unreachableWake
+    );
+    const second = new FakeTransport(
+      "second",
+      unavailableCapability("no socket present"),
+      unreachableWake
+    );
+
+    const result = await selectAndWake([first, second], "thread-1", "resume");
+
+    assert.equal(result.outcome, "unavailable");
+    // Exact-string pin against the pre-existing wording (identical to what
+    // this selector produced before this story, and to what the "all
+    // transports probe unavailable" test above still asserts by substring).
+    assert.equal(
+      result.detail,
+      "no transport delivered; tried 2 in order - first: skipped, probe reported unavailable - no app-server running; second: skipped, probe reported unavailable - no socket present"
+    );
+    assert.ok(!result.detail?.includes("Claude Code"));
+  });
+});
+
+test('when CLAUDECODE is set to a value other than the exact string "1", the exhaustion detail stays the original generic wording - the check is an exact match, never a truthy/falsy env-var check', async () => {
+  await withClaudeCodeEnv("0", async () => {
+    const first = new FakeTransport("first", unavailableCapability("gone"), unreachableWake);
+    const result = await selectAndWake([first], "thread-1", "resume");
+    assert.equal(result.outcome, "unavailable");
+    assert.ok(!result.detail?.includes("Claude Code"));
+    assert.equal(
+      result.detail,
+      "no transport delivered; tried 1 in order - first: skipped, probe reported unavailable - gone"
+    );
+  });
+});
+
+test('under Claude Code, a genuine refusal keeps its own refused detail unqualified - the harness-aware summary applies only to "unavailable", never to "refused"', async () => {
+  await withClaudeCodeEnv("1", async () => {
+    const first = new FakeTransport("first", available, refuses("first", "owner gate closed"));
+    const second = new FakeTransport("second", available, refuses("second", "no owning client"));
+
+    const result = await selectAndWake([first, second], "thread-1", "resume");
+
+    assert.equal(result.outcome, "refused");
+    // Untouched: exactly the pre-existing refused wording, never rewritten
+    // to mention Claude Code or the poll floor even though CLAUDECODE=1.
+    assert.ok(!result.detail?.includes("Claude Code"));
+    assert.ok(!result.detail?.includes("poll"));
+    assert.ok(result.detail?.includes("owner gate closed"));
+    assert.ok(result.detail?.includes("no owning client"));
+  });
+});
+
+test('under Claude Code, an empty transports array still returns the original "no transports were configured to try" - the harness-aware summary never applies when nothing was even configured to try', async () => {
+  await withClaudeCodeEnv("1", async () => {
+    const result = await selectAndWake([], "thread-1", "resume");
+    assert.equal(result.outcome, "unavailable");
+    assert.equal(result.detail, "no transports were configured to try");
+  });
+});
+
+test("under Claude Code, a mix of unavailable and a genuine refusal is still aggregate refused, unqualified - one live refusal outranks the harness-aware unavailable summary exactly as it outranked the generic one before this story", async () => {
+  await withClaudeCodeEnv("1", async () => {
+    const first = new FakeTransport("first", available, reportsUnavailable("first"));
+    const second = new FakeTransport("second", available, refuses("second", "declined"));
+
+    const result = await selectAndWake([first, second], "thread-1", "resume");
+
+    assert.equal(result.outcome, "refused");
+    assert.ok(!result.detail?.includes("Claude Code"));
+  });
 });
