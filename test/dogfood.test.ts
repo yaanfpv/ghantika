@@ -462,10 +462,27 @@ test(
       command: ["fswatch", triggerPath],
       label: "dogfood-fswatch",
     });
-    const minted = structuredContentOf(runResponse);
+    // A mint response is the flat CreateTaskResult shape, not the plain
+    // {content, structuredContent} envelope structuredContentOf() reads for
+    // every OTHER call in this file: resultType:"task" REPLACES that
+    // envelope entirely (the SDK's own normalizeContentlessToolResult step
+    // injects a synthetic content:[] alongside it, disclosed and asserted
+    // in test/tasks.test.ts's own raw-wire-shape tests - never structured
+    // Content). See src/tasksAdapter.ts's buildCreateTaskResult docs for
+    // the full reasoning; this file reads the same flat fields those tests
+    // already validate against the real, digest-verified vendored schema.
+    assert.ok(runResponse.result, `expected a tool result, got: ${JSON.stringify(runResponse)}`);
+    const minted = runResponse.result as unknown as Record<string, unknown>;
+    // resultType:"task" is the actual wire-level discriminator for a mint
+    // (CreateTaskResult = Result & Task per the spec; it has no `extension`
+    // field at all - that key belongs only to buildWakeParams's later
+    // notification payload, a different object entirely). Confirmed against
+    // test/tasks.test.ts's own "the wire-level resultType discriminator
+    // must be 'task'" assertion on the real, digest-verified vendored
+    // schema.
     assert.equal(
-      minted.extension,
-      TASKS_EXTENSION_URI,
+      minted.resultType,
+      "task",
       "on a Tasks-capable connection, run() must mint a real TaskResult, not the plain {job_id} shape - this is the six-tool mint rule from src/tasksAdapter.ts"
     );
     assert.equal(typeof minted.taskId, "string");
