@@ -124,6 +124,68 @@ async function waitForBirthIdentity(jobId: string): Promise<void> {
 }
 
 /**
+ * Calls `killTool.handler` again for the SAME `jobId` (never re-signals
+ * once a job is already terminal - see `src/tools/kill.ts`'s own doc
+ * comment: a repeat `kill` call against an already-terminal record only
+ * re-checks whether the group has since become empty, it never sends
+ * another signal) repeatedly, until `kill_confirmed` has actually settled
+ * to something other than `undefined` - never a single unconditional read
+ * right after the FIRST `kill()` call resolves. Mirrors
+ * `test/tasks.test.ts`'s own `pollUntilKillConfirmed` (established by
+ * commit c12b111, "Poll for kill_confirmed to settle instead of asserting
+ * a stale kill() snapshot"), adapted here to a direct `killTool.handler`
+ * call instead of `client.callTool` over the wire - the underlying race is
+ * the same regardless of which surface issues the call.
+ *
+ * Why this file's own direct-`killTool.handler`-call tests need this too:
+ * every job here is spawned through the REAL `runTool.handler`, which goes
+ * through `src/tools/run.ts`'s `beginSpawn` - the SAME eager,
+ * fire-and-forget `jobStore.reapProcessGroupOnce` call at the child's own
+ * OS-level exit that `test/tasks.test.ts`'s own "six-tool mint rule" test
+ * (both its exited-naturally AND its explicitly-killed job) is exposed to.
+ * `JobStore.setKillConfirmation`/`.setIdentityConfirmation` (see their own
+ * doc comments in `src/jobStore.ts`) each only ever WRITE once the job's
+ * own record has ALREADY transitioned to a terminal state - a transition
+ * this eager reap does not itself perform, but whose OWN observation
+ * (`jobStore.reapProcessGroupOnce`'s "already gone" fast path, and this
+ * codebase's own external `isProcessGroupAlive` check that feeds it) can
+ * genuinely race ahead of the SEPARATE, asynchronous OS-level
+ * child-process `exit` notification that `beginSpawn`'s `onExit` callback
+ * (and, through it, `jobStore.markKilled`/`markExited`) depends on - two
+ * independent observers of the same real process death, with no ordering
+ * guarantee between them. `kill.ts`'s own explicit write can therefore
+ * reach `setKillConfirmation`'s terminal-state guard before that guard's
+ * own precondition has landed, silently no-opping the write for THIS
+ * call's own response even though the call as a whole still succeeds.
+ * Retrying (never re-signaling, see above) gives that transition time to
+ * land and the write a real second chance.
+ */
+async function pollUntilKillConfirmed(
+  jobId: string,
+  deadlineMs = 5000
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + deadlineMs;
+  for (;;) {
+    const result = await killTool.handler({ job_id: jobId });
+    assert.notEqual(
+      result.isError,
+      true,
+      `kill() must succeed for job ${jobId} while polling for kill_confirmed to settle: ${JSON.stringify(result)}`
+    );
+    const structured = result.structuredContent as Record<string, unknown>;
+    if (structured.kill_confirmed !== undefined) {
+      return structured;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(
+        `timed out waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(structured)}`
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+/**
  * Builds a real, executable fake `ps` at `<dir>/ps` running `scriptBody` (a
  * `#!/bin/sh` script) - the same "shadow a binary on a temp PATH entry"
  * pattern this codebase's own test suite already uses elsewhere (see
@@ -277,16 +339,24 @@ test(
     const pid = handle!.pid;
     assert.equal(isProcessAlive(pid), true);
 
-    const killResult = await killTool.handler({ job_id: jobId });
-    assert.notEqual(killResult.isError, true, `kill() must succeed: ${JSON.stringify(killResult)}`);
-    const structured = killResult.structuredContent as Record<string, unknown>;
-    assert.equal(structured.state, "killed");
+    // Poll (never a single unconditional read of the first kill() call's
+    // own response) until `kill_confirmed` has actually settled - see
+    // `pollUntilKillConfirmed`'s own docs above for why this job, spawned
+    // through the real `run()`/`beginSpawn`, is exposed to the same
+    // eager-reap-vs-terminal-transition race `test/tasks.test.ts`'s
+    // "six-tool mint rule" test guards against. `identity_confirmed` is
+    // read from that SAME settled response, never the original,
+    // potentially-unsettled `killResult` - it shares the identical
+    // terminal-state-gated write (`JobStore.setIdentityConfirmation`) that
+    // makes `kill_confirmed` racy here.
+    const confirmedKillResult = await pollUntilKillConfirmed(jobId);
+    assert.equal(confirmedKillResult.state, "killed");
     assert.equal(
-      structured.identity_confirmed,
+      confirmedKillResult.identity_confirmed,
       true,
       "run()'s own captured identity must be what kill() actually compared against - a fresh Date.now()-derived value at kill time would still happen to match here, distinct from the observer-failure/degraded cases exercised separately"
     );
-    assert.equal(structured.kill_confirmed, true);
+    assert.equal(confirmedKillResult.kill_confirmed, true);
     assert.equal(isProcessAlive(pid), false);
   }
 );
@@ -364,6 +434,26 @@ test(
     // succeed via the honest DEGRADED path (see src/process.ts's
     // evaluatePreSignalIdentityGate) - identity was never captured, so it
     // can never be confirmed, but the job is still fully killable.
+    // EVIDENCED SKIP (no `pollUntilKillConfirmed` here, unlike the sibling
+    // test above): this test checks `identity_confirmed` alone -
+    // `kill_confirmed` is never read here at all. `JobStore.
+    // setIdentityConfirmation` shares `setKillConfirmation`'s identical
+    // terminal-state guard (see both setters' own doc comments in
+    // `src/jobStore.ts`), and for THIS scenario - a genuinely alive target
+    // (`sleep 5`) signaled by the default terminating path, whose
+    // `onSignaled` callback calls `jobStore.markKilled` SYNCHRONOUSLY,
+    // immediately after the send, well before this same handler's later,
+    // awaited confirmation step ever runs `setIdentityConfirmation` - that
+    // guard's own precondition should already have landed by the time the
+    // write is attempted, with nothing able to interleave in between
+    // (single-threaded, no `await` separates the two). Commit c12b111's
+    // own "six-tool mint rule" fix (`test/tasks.test.ts`) independently
+    // records the matching empirical fact for this same structural
+    // scenario: "this test has never observed these two [identity_confirmed/
+    // identity_capture] flaking the way kill_confirmed does." This
+    // reasoning does not extend to `kill_confirmed` - see this file's own
+    // `pollUntilKillConfirmed` docs, which apply it wherever that field IS
+    // checked.
     const killResult = await killTool.handler({ job_id: jobId });
     assert.notEqual(
       killResult.isError,
@@ -555,8 +645,21 @@ test(
     fs.writeFileSync(releaseFile, "go");
     const killResult = await killPromise;
     assert.notEqual(killResult.isError, true, `kill() must succeed: ${JSON.stringify(killResult)}`);
-    const structured = killResult.structuredContent as Record<string, unknown>;
-    assert.equal(structured.state, "killed");
+    const firstStructured = killResult.structuredContent as Record<string, unknown>;
+    assert.equal(firstStructured.state, "killed");
+    // `killPromise` above is THE call this test exists to exercise (kill()
+    // genuinely racing ahead of the still-pending capture) - it must stay
+    // exactly as started. But its own `kill_confirmed` can independently
+    // still be unsettled for the SAME reason `pollUntilKillConfirmed`'s own
+    // docs describe (this job is spawned through the real `run()`/
+    // `beginSpawn`, so it is exposed to the eager-reap-vs-terminal-
+    // transition race regardless of this test's own identity-capture
+    // timing), so only fall through to polling (never re-signaling) if
+    // this exact call did not already settle it.
+    const structured =
+      firstStructured.kill_confirmed !== undefined
+        ? firstStructured
+        : await pollUntilKillConfirmed(jobId);
     assert.equal(
       structured.identity_confirmed,
       true,
@@ -638,7 +741,17 @@ test(
       true,
       `kill() must still succeed via the degraded path: ${JSON.stringify(killResult)}`
     );
-    const structured = killResult.structuredContent as Record<string, unknown>;
+    const firstStructured = killResult.structuredContent as Record<string, unknown>;
+    // Poll for `kill_confirmed` to settle (see `pollUntilKillConfirmed`'s
+    // own docs) rather than reading it off this single, potentially-
+    // unsettled response - this job is spawned through the real `run()`/
+    // `beginSpawn`, the same exposure as this file's earlier
+    // "captured identity round-trips" test. Falls through to polling
+    // (never re-signaling) only if THIS call did not already settle it.
+    const structured =
+      firstStructured.kill_confirmed !== undefined
+        ? firstStructured
+        : await pollUntilKillConfirmed(jobId);
     assert.equal(structured.state, "killed");
     assert.equal(
       structured.identity_confirmed,
