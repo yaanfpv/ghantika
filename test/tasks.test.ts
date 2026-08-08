@@ -371,6 +371,95 @@ async function pollUntilKillConfirmed(
   }
 }
 
+/**
+ * The number of consecutive, identical `counts` reads `pollUntilCountsSettled`
+ * requires before it accepts the value as genuinely final - see that
+ * function's own docs for why more than one match is worth requiring even
+ * though the underlying counters are monotonically non-decreasing.
+ */
+const COUNTS_STABLE_READS_REQUIRED = 3;
+
+/**
+ * Polls `status()` for an ALREADY-terminal `jobId` (see `pollUntilTerminal`
+ * above - this never checks `state` itself, it assumes the caller already
+ * confirmed terminality) until its `counts` field has stopped changing
+ * across `COUNTS_STABLE_READS_REQUIRED` consecutive reads, then returns
+ * that settled response - never a single read taken immediately after
+ * `state` turns terminal.
+ *
+ * Why this is needed even though `pollUntilTerminal` already waited for a
+ * terminal `state`: `counts.stdout_lines`/`.stdout_bytes`/`.stderr_lines`/
+ * `.stderr_bytes` are populated by `JobStore.appendOutput`/`.finalizeStream`
+ * (see `src/jobStore.ts`), a code path entirely independent of the `state`
+ * transition `pollUntilTerminal` waits on. `src/tools/run.ts`'s own
+ * `createTerminalMarkGate` documents exactly why: in the ordinary case the
+ * terminal mark (`jobStore.markExited`/`markKilled`) fires only once BOTH
+ * stdout and stderr have actually ENDED (and, with them, been finalized via
+ * `jobStore.finalizeStream`, which flushes any still-pending partial final
+ * line into `linesEverMaterialized`) - but that SAME gate has a documented
+ * "disclosed residual" branch that accepts a still-open stream once the
+ * process group's reap has settled and one full scheduling tick has passed
+ * with no further stream progress, WITHOUT ever waiting for that stream's
+ * real `end` event. For an ordinary (non-orphaned) job the real `end` event
+ * - and the `finalizeStream` flush it triggers - still lands shortly after,
+ * but strictly AFTER `state` has already read terminal. So `counts` can
+ * genuinely still be incomplete for a short (real, event-loop-scheduling-
+ * dependent, never a stated wall-clock bound) window right after a terminal
+ * `status()` read - this is the exact, measured shape of the failure this
+ * helper fixes: `state` already "exited" while
+ * `counts.stdout_lines` still read 0 for a job that had already written its
+ * one byte, on macos-latest/node-24, in a PR run where the very same job's
+ * `kill_confirmed`-equivalent race (fixed by `pollUntilKillConfirmed` above,
+ * for a DIFFERENT job in this same file) never happened to trip.
+ *
+ * `StreamBufferState.linesEverMaterialized`/`.bytesEverReceived` (see their
+ * own docs in `src/jobStore.ts`) are both documented as monotonically
+ * NON-DECREASING for a job's whole life - never reset, never decremented,
+ * not even by retention eviction. That invariant is what makes "stable
+ * across several consecutive reads" a sound completion signal here, not a
+ * coincidence: a value that can only grow can never settle at a stale
+ * reading and then silently revert to something smaller, so once it has
+ * held steady across `COUNTS_STABLE_READS_REQUIRED` separate polls it has
+ * either genuinely finished, or (for a truly escaped descendant that keeps
+ * a pipe open forever, out of scope for any job this test file ever spawns)
+ * will keep reading "still stable" right up to this poll's own deadline,
+ * which then THROWS rather than silently accepting a stale value as final -
+ * never the reverse (a real completion masquerading as still-changing).
+ * Requiring several consecutive matches, not just two, narrows the
+ * already-narrow residual risk of catching an early plateau inside the
+ * single short window `createTerminalMarkGate`'s own residual-accept tick
+ * opens.
+ */
+async function pollUntilCountsSettled(
+  client: Client,
+  jobId: string,
+  deadlineMs = 5000
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + deadlineMs;
+  let lastCountsKey: string | undefined;
+  let stableStreak = 0;
+  for (;;) {
+    const result = await client.callTool({ name: "status", arguments: { job_id: jobId } });
+    const structured = runResultStructured(result);
+    const countsKey = JSON.stringify(structured.counts);
+    if (countsKey === lastCountsKey) {
+      stableStreak += 1;
+      if (stableStreak >= COUNTS_STABLE_READS_REQUIRED) {
+        return structured;
+      }
+    } else {
+      lastCountsKey = countsKey;
+      stableStreak = 1;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(
+        `timed out waiting for counts to settle for job ${jobId} (last observed: ${JSON.stringify(structured.counts)}, required ${COUNTS_STABLE_READS_REQUIRED} identical consecutive reads)`
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The vendored schema itself - loaded fresh from disk, never hand-copied,
 // so every assertion below that "validates against the schema" or "matches
@@ -1496,6 +1585,17 @@ test("after the backing job reaches a REAL terminal state (known exit code, know
     );
     const output = result!.output as Record<string, number> | undefined;
     assert.ok(output, "expected real output counts under result.output on a terminal task");
+    // A `> 0` threshold, not `pollUntilCountsSettled`'s exact-value shape:
+    // `stdout_bytes` (`JobStore`'s `bytesEverReceived`) is bumped
+    // synchronously on every raw chunk ARRIVAL (`appendChunkToBuffer`),
+    // independent of the stream ending or `finalizeStream` ever running -
+    // unlike `stdout_lines` (`linesEverMaterialized`), which specifically
+    // needs a trailing-newline-less final fragment to be FLUSHED at stream
+    // end. This job's write happens well before its process exits, so the
+    // byte has already arrived (and been counted) long before
+    // `pollUntilTerminal` above could observe a terminal state at all -
+    // a value written synchronously and safe to sample once, just via
+    // chunk-arrival timing rather than the state transition itself.
     assert.ok(
       output!.stdout_bytes > 0,
       `expected non-zero stdout_bytes reflecting real output, got ${JSON.stringify(output)}`
@@ -1861,9 +1961,40 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
     // which is what actually proves status gained fields kill did not.
     const STATUS_PROJECTION_KEYS = [...PUBLIC_JOB_PROJECTION_KEYS, "pid", "birth_identity"].sort();
 
-    const statusResult = runResultStructured(
-      await pair.client.callTool({ name: "status", arguments: { job_id: taskId } })
-    );
+    // TWO further async-materialized fields the deep-equal below pins to an
+    // exact value, neither of which `pollUntilTerminal` above ever waited
+    // on (it only watches `state`) - a SIBLING of this same test's own
+    // `kill_confirmed` fix a little further down (the SECOND job's
+    // `kill_confirmed`), found here by sweeping this test by the general
+    // shape of the race rather than by the specific `stdout_lines` field
+    // name PR #88's measured failure happened to name.
+    //
+    // `kill_confirmed`: this job was never explicitly killed - it exits on
+    // its own - so its `kill_confirmed` is populated ENTIRELY by
+    // `src/tools/run.ts`'s `beginSpawn`'s own eager, fire-and-forget
+    // `jobStore.reapProcessGroupOnce` call at the child's OS-level exit,
+    // never awaited by any client-facing call. `createTerminalMarkGate`'s
+    // "both streams already ended" FAST PATH can mark `state` "exited"
+    // with NO dependency on that reap promise at all, so a plain
+    // `pollUntilTerminal` can observe a terminal `state` before the reap's
+    // own `JobStore.setKillConfirmation` write (itself gated on the job
+    // already being terminal - see that setter's own doc comment) has
+    // landed. Poll via `pollUntilKillConfirmed` (established by commit
+    // c12b111 for exactly this class, just triggered there by an explicit
+    // `kill()` call instead of the natural-exit eager reap) exactly like
+    // this test's own second job does below.
+    //
+    // `counts`: see `pollUntilCountsSettled`'s own docs immediately above
+    // for the full mechanism - this is the exact failure PR #88 measured
+    // (actual `stdout_lines` value 0, expected 1).
+    //
+    // Order matters only in that both must settle before `statusResult` is
+    // captured for the deep-equal below; `pollUntilCountsSettled`'s own
+    // status() reads happen strictly after `pollUntilKillConfirmed`
+    // resolves, so its returned snapshot reflects both settled fields at
+    // once.
+    await pollUntilKillConfirmed(pair.client, taskId);
+    const statusResult = await pollUntilCountsSettled(pair.client, taskId);
     const afterFirstJobMs = Date.now();
     assert.equal(statusResult.job_id, taskId);
     assert.deepEqual(
@@ -2094,6 +2225,15 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
     const killResultWithoutIdentityFields = { ...confirmedKillResult };
     delete killResultWithoutIdentityFields.identity_confirmed;
     delete killResultWithoutIdentityFields.identity_capture;
+    // `counts` below needs no `pollUntilCountsSettled`-style wait, unlike
+    // the first job above: this job's own command
+    // (`setTimeout(() => {}, 60000)`) never writes a single byte to either
+    // stream for its whole life, so `linesEverMaterialized`/
+    // `bytesEverReceived` (see `pollUntilCountsSettled`'s own docs) start
+    // at their all-zero initial value and have nothing to ever
+    // materialize - there is no async output-arrival path in flight here
+    // for a poll to race, only the SIGTERM handling's own kill_confirmed
+    // gap this poll already covers.
     assert.deepEqual(
       withTimestampFieldsChecked(killResultWithoutIdentityFields, ["started_at", "ended_at"]),
       {
