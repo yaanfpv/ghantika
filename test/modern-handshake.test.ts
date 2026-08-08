@@ -635,19 +635,19 @@ test("modern handshake: a tools/call whose own request envelope declares Tasks s
 });
 
 // ---------------------------------------------------------------------------
-// The six-tool mint rule, on the MODERN wire: run() mints, and
-// status/output/tail/kill/list each stay plain - regardless of Tasks
-// capability being declared on THEIR OWN request too. src/server.ts's
+// The seven-tool mint rule, on the MODERN wire: run() mints, and
+// status/output/tail/kill/list/follow each stay plain - regardless of
+// Tasks capability being declared on THEIR OWN request too. src/server.ts's
 // own tools/call handler branches on `request.params.name === "run"`
 // before any capability read even happens, so this is a structural
-// guarantee independent of era - but test/tasks.test.ts's own six-tool
+// guarantee independent of era - but test/tasks.test.ts's own seven-tool
 // mint rule proof exercises only the legacy (InMemoryTransport/SDK
 // Client) wire. This is the real-stdio modern-wire counterpart, on the
 // SAME connection where run() has just genuinely minted, so a capable
 // connection is not itself sufficient to make any OTHER tool mint.
 // ---------------------------------------------------------------------------
 
-test("modern handshake: six-tool mint rule on the real wire - run() mints while status/output/tail/kill/list each stay plain, even with Tasks capability declared on their OWN request too, on the SAME connection where run() just minted", async (t) => {
+test("modern handshake: seven-tool mint rule on the real wire - run() mints while status/output/tail/kill/list/follow each stay plain, even with Tasks capability declared on their OWN request too, on the SAME connection where run() just minted", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
   // explicit server.child.kill() below (a thrown assertion, in particular -
@@ -706,6 +706,12 @@ test("modern handshake: six-tool mint rule on the real wire - run() mints while 
     { name: "tail", arguments: { job_id: jobId } },
     { name: "kill", arguments: { job_id: jobId } },
     { name: "list", arguments: {} },
+    // By this point the job (a bare `true`, exiting near-instantly) has
+    // long since gone terminal - the earlier status/output/tail/kill/list
+    // round trips already guarantee that - so this resolves through
+    // follow's own immediate-return path. The bounded timeout_ms is a
+    // safety margin only, never something this test relies on hitting.
+    { name: "follow", arguments: { job_id: jobId, timeout_ms: 2000 } },
   ];
 
   let nextId = 3;
@@ -719,7 +725,7 @@ test("modern handshake: six-tool mint rule on the real wire - run() mints while 
       params: withModernEnvelope(
         { name: call.name, arguments: call.arguments },
         // Tasks capability declared on THIS request too - proving the
-        // six-tool mint rule is a per-tool-name guarantee, not merely
+        // seven-tool mint rule is a per-tool-name guarantee, not merely
         // "the earlier request in this test happened not to declare it."
         { extensions: { [TASKS_EXTENSION_URI]: {} } }
       ),

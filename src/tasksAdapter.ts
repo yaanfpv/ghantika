@@ -82,16 +82,18 @@
  * support only under the older, free-form `experimental` bag is not
  * recognized as capable.
  *
- * ## The six-tool mint rule and the universal poll floor
+ * ## The seven-tool mint rule and the universal poll floor
  *
  * `run()` is the only tool `src/server.ts` ever asks this adapter to
- * augment - `status`/`output`/`tail`/`kill`/`list` are never touched by
- * this file at all, so the plain poll floor (status/output/tail on a
- * job_id) is reachable on every connection, capable or not, exactly as it
- * was before this capability existed. `maybeAugmentRunResult` is a pure
- * pass-through unless the connection is capable AND a real job_id can be
- * read back out of the plain result it was just handed - never inventing
- * a handle from nothing, never mutating jobStore itself.
+ * augment - `status`/`output`/`tail`/`kill`/`list`/`follow` are never
+ * touched by this file at all (seven tools total: `run` mints, the other
+ * six - including `follow`, the newest - stay plain), so the plain poll
+ * floor (status/output/tail on a job_id) is reachable on every
+ * connection, capable or not, exactly as it was before this capability
+ * existed. `maybeAugmentRunResult` is a pure pass-through unless the
+ * connection is capable AND a real job_id can be read back out of the
+ * plain result it was just handed - never inventing a handle from
+ * nothing, never mutating jobStore itself.
  *
  * ## taskId == job_id, one handle namespace
  *

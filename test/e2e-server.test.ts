@@ -137,7 +137,7 @@ test(
   }
 );
 
-test("tools/list, after initialization, advertises exactly the six frozen tools with explicit input JSON Schemas", async () => {
+test("tools/list, after initialization, advertises exactly the seven frozen tools with explicit input JSON Schemas", async () => {
   const server = tracked();
   await completeHandshake(server);
   server.send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
@@ -146,7 +146,7 @@ test("tools/list, after initialization, advertises exactly the six frozen tools 
     result: { tools: Array<{ name: string; inputSchema: { type: string } }> };
   };
   const names = body.result.tools.map((t) => t.name).sort();
-  assert.deepEqual(names, ["kill", "list", "output", "run", "status", "tail"]);
+  assert.deepEqual(names, ["follow", "kill", "list", "output", "run", "status", "tail"]);
   for (const tool of body.result.tools) {
     assert.equal(
       tool.inputSchema.type,

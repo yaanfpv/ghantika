@@ -2,11 +2,11 @@
 /**
  * Guards the frozen module ownership for `src/`: exactly the modules
  * named in FROZEN_MODULES below (`server.ts`, `registry.ts`, `jobStore.ts`,
- * `process.ts`, `policy.ts`, `scheduler.ts`, `tasksAdapter.ts`, the six
+ * `process.ts`, `policy.ts`, `scheduler.ts`, `tasksAdapter.ts`, the seven
  * `tools/*.ts` handler files, `wake/wakeTransport.ts`,
  * `wake/appServerTransport.ts`, `wake/desktopIpcTransport.ts`, and
  * `wake/selectTransport.ts`), no more, no fewer - `src/index.ts` is
- * (`package.json`'s `"main"`/`"types"`), not one of the six-tool
+ * (`package.json`'s `"main"`/`"types"`), not one of the seven-tool
  * architecture's internal modules.
  *
  * `wake/wakeTransport.ts` is admitted here the same way
@@ -72,7 +72,7 @@
  *
  *   1. checkFrozenModuleSet - the exact set of `.ts` files under `src/`
  *      (excluding index.ts) must equal FROZEN_MODULES. Catches both an
- *      extra file appearing anywhere in `src/` and the six tool handlers
+ *      extra file appearing anywhere in `src/` and the seven tool handlers
  *      being collapsed into fewer files (or split into more).
  *   2. findSiblingToolImports - no file under `src/tools/` may load
  *      (however it does so - a static/dynamic import, `import.meta.resolve`,
@@ -153,6 +153,7 @@ export const FROZEN_MODULES = [
   "scheduler.ts",
   "server.ts",
   "tasksAdapter.ts",
+  "tools/follow.ts",
   "tools/kill.ts",
   "tools/list.ts",
   "tools/output.ts",

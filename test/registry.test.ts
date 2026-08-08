@@ -12,16 +12,16 @@ import { ProtocolError } from "@modelcontextprotocol/server";
 // `npm run build` first for exactly this reason (see package.json).
 import { TOOL_NAMES, dispatchToolCall, listToolDefinitions } from "../dist/registry.js";
 
-const EXPECTED_TOOL_NAMES = ["run", "status", "list", "output", "tail", "kill"];
+const EXPECTED_TOOL_NAMES = ["run", "status", "list", "output", "tail", "kill", "follow"];
 
-test("exactly the six frozen tools are registered, by name", () => {
+test("exactly the seven frozen tools are registered, by name", () => {
   assert.deepEqual([...TOOL_NAMES].sort(), [...EXPECTED_TOOL_NAMES].sort());
-  assert.equal(TOOL_NAMES.length, 6);
+  assert.equal(TOOL_NAMES.length, 7);
 });
 
-test("listToolDefinitions returns all six tools, each with a name, description, and object-typed input schema", () => {
+test("listToolDefinitions returns all seven tools, each with a name, description, and object-typed input schema", () => {
   const tools = listToolDefinitions();
-  assert.equal(tools.length, 6);
+  assert.equal(tools.length, 7);
   for (const tool of tools) {
     assert.equal(typeof tool.name, "string");
     assert.ok(tool.name.length > 0);
@@ -36,10 +36,10 @@ test("listToolDefinitions returns all six tools, each with a name, description, 
   assert.deepEqual(tools.map((t) => t.name).sort(), [...EXPECTED_TOOL_NAMES].sort());
 });
 
-test("run and status and output and tail and kill each require a job-identifying or command argument in their schema", () => {
+test("run and status and output and tail and kill and follow each require a job-identifying or command argument in their schema", () => {
   const tools = new Map(listToolDefinitions().map((t) => [t.name, t]));
   assert.deepEqual(tools.get("run")?.inputSchema.required, ["command"]);
-  for (const name of ["status", "output", "tail", "kill"]) {
+  for (const name of ["status", "output", "tail", "kill", "follow"]) {
     assert.deepEqual(
       tools.get(name)?.inputSchema.required,
       ["job_id"],
@@ -80,7 +80,7 @@ test("dispatching an unknown tool name throws ProtocolError with code -32602 (In
   );
 });
 
-test("mutation control: the SAME unknown-tool-name check, applied to each of the six real tool names, never throws", async () => {
+test("mutation control: the SAME unknown-tool-name check, applied to each of the seven real tool names, never throws", async () => {
   for (const name of EXPECTED_TOOL_NAMES) {
     // Every real name must dispatch successfully (resolve, not reject) -
     // proves the -32602 path is reached only for names NOT in the

@@ -12,8 +12,8 @@
  *
  * Threading a `JobStore` instance through `src/server.ts` -> `registry.ts`
  * -> each tool handler would mean giving `registry.ts`'s `ToolModule`
- * handler signature (and therefore EVERY one of the six tool modules,
- * including the five `run` itself does not touch) a store parameter - a
+ * handler signature (and therefore EVERY one of the seven tool modules,
+ * including the six `run` itself does not touch) a store parameter - a
  * much wider surface than a single shared store needs. Exporting a
  * single module-level instance from this file gets the same property
  * (exactly one instance, and tool handlers are the only code that

@@ -3,7 +3,7 @@
  * registers the `tools/list`/`tools/call` handlers, connects it to a
  * stdio transport, and attaches shutdown handling. This is the only file
  * that touches the SDK's `Server`/`StdioServerTransport`/`serveStdio`
- * classes directly - `src/registry.ts` owns what the six tools ARE, this
+ * classes directly - `src/registry.ts` owns what the seven tools ARE, this
  * file owns wiring them onto the wire.
  *
  * This file also wires in the `io.modelcontextprotocol/tasks` capability
@@ -189,7 +189,7 @@
  *   SEPARATE, higher-level concern `serveStdio` itself owns (-32602
  *   `Invalid _meta envelope: ...`), not this file's classification above.
  * - An unknown TOOL NAME (`tools/call` naming something other than one of
- *   the six registered tools) is -32602, thrown by `registry.dispatchToolCall`
+ *   the seven registered tools) is -32602, thrown by `registry.dispatchToolCall`
  *   - a valid method (`tools/call`) with an invalid parameter (the tool
  *   name).
  * - A known tool whose ARGUMENTS fail its own schema is never a JSON-RPC

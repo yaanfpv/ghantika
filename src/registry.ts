@@ -1,6 +1,6 @@
 /**
- * Owns the six tools' schema declarations and dispatches a `tools/call` to
- * the right handler. This is the only file that imports
+ * Owns the seven tools' schema declarations and dispatches a `tools/call`
+ * to the right handler. This is the only file that imports
  * more than one file under `src/tools/` - each tool module stays
  * self-contained and unaware of its siblings; `registry.ts` is what
  * assembles them into the single list/dispatch surface `src/server.ts`
@@ -9,6 +9,7 @@
 import { ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
 import type { CallToolResult, Tool } from "@modelcontextprotocol/server";
 
+import * as followTool from "./tools/follow.js";
 import * as killTool from "./tools/kill.js";
 import * as listTool from "./tools/list.js";
 import * as outputTool from "./tools/output.js";
@@ -25,9 +26,15 @@ interface ToolModule {
 }
 
 /**
- * The six tools this server exposes, frozen by design: run, status, list,
- * output, tail, kill - no more, no fewer. Order here is also the order
- * `tools/list` advertises them in.
+ * Seven tools, frozen by design except for this one deliberate addition:
+ * run, status, list, output, tail, kill, follow - no more, no fewer. The
+ * freeze is real - it is not routinely reopened - but `follow` is not the
+ * freeze being quietly disregarded either: it is a genuinely new
+ * capability (a bounded wait, closing the one gap the other six can't -
+ * waiting for something to happen without a fixed sleep-and-recheck loop),
+ * a deliberate, considered reopening of a real constraint, not a freeze
+ * quietly disregarded. Order here is also the order `tools/list`
+ * advertises them in; `follow` sits last, as the newest addition.
  */
 const TOOL_MODULES: readonly ToolModule[] = [
   runTool,
@@ -36,6 +43,7 @@ const TOOL_MODULES: readonly ToolModule[] = [
   outputTool,
   tailTool,
   killTool,
+  followTool,
 ];
 
 if (new Set(TOOL_MODULES.map((tool) => tool.name)).size !== TOOL_MODULES.length) {
@@ -62,7 +70,7 @@ export function listToolDefinitions(): Tool[] {
  * Dispatches a `tools/call` to the named tool's handler.
  *
  * @throws {ProtocolError} with `ProtocolErrorCode.InvalidParams` (-32602)
- *   when `name` isn't one of the six registered tools. This is
+ *   when `name` isn't one of the seven registered tools. This is
  *   deliberately a THROW (a JSON-RPC protocol-level error), not a
  *   returned `{ isError: true }` result: an unknown tool name is an
  *   invalid PARAMETER to the (valid, recognized) `tools/call` method,
