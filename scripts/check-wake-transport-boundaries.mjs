@@ -12,8 +12,11 @@
  * internals directly. Every OTHER file that comes to live in `src/wake/`
  * (today: `appServerTransport.ts`, `desktopIpcTransport.ts`; tomorrow, any
  * further transport) is "its own module" in that sense, and its symbols
- * may appear only inside `src/wake/` or inside a `test/wake-*.test.ts`
- * file written to exercise it directly.
+ * may appear only inside `src/wake/`, inside a `test/wake-*.test.ts` file
+ * written to exercise it directly, or inside a `test/fixtures/wake-*.ts`
+ * fixture one of those test files spawns as a real, separate OS process
+ * (see "Disclosed scope boundary" below for the one, already-real, case of
+ * this).
  *
  * Two transports are built now (`appServerTransport.ts`,
  * `desktopIpcTransport.ts`), plus the selector that orders between them
@@ -31,9 +34,11 @@
  * Two checks, both run by `checkWakeTransportBoundaries`:
  *
  *   1. findWakeBoundaryImports - scans every `.ts` file under `src/` and
- *      `test/` (excluding `src/wake/` itself, and excluding any
- *      `test/wake-*.test.ts`) for a module-loading construct whose RESOLVED
- *      TARGET sits inside `src/wake/` and is not one of `WAKE_PUBLIC_FILES`.
+ *      `test/` (excluding `src/wake/` itself, and excluding any file
+ *      `isPermittedWakeTestFile` admits - a `test/wake-*.test.ts` file, or
+ *      a `test/fixtures/wake-*.ts` fixture one of those spawns) for a
+ *      module-loading construct whose RESOLVED TARGET sits inside
+ *      `src/wake/` and is not one of `WAKE_PUBLIC_FILES`.
  *      Uses the same real resolver as `check-module-boundaries.mjs`
  *      (`resolveModuleSpecifierRealPath`), so a symlink, an absolute path,
  *      or an extensionless/directory specifier resolving into `src/wake/`
@@ -45,15 +50,25 @@
  *
  * Disclosed scope boundary: this resolves specifiers against `src/` and
  * `test/` source text only - the same surface `check-module-boundaries.mjs`
- * covers for its own sibling-import rule. A `test/*.test.ts` file that
- * reaches a non-public transport's COMPILED output directly (this repo's
- * established `../dist/<module>.js` runtime-import convention, used
- * throughout `test/` for every other module) is not resolved back to its
- * `src/wake/` source and is not caught here. Production code never uses
- * that convention - only `src/`-relative specifiers, which this DOES
- * cover - so the live risk this guard exists for (a caller in `src/`
- * reaching into a transport's internals) is covered; a test author
- * deliberately routing around the public interface via `dist/` is not.
+ * covers for its own sibling-import rule. A test file that reaches a
+ * non-public transport's COMPILED output directly (this repo's established
+ * `../dist/<module>.js` runtime-import convention, used throughout `test/`
+ * for every other module) is not resolved back to its `src/wake/` source
+ * and is not caught here - and this is not a hypothetical: `test/fixtures/
+ * wake-app-server-crash-harness.ts` already does exactly this, importing
+ * `appServerTransport.ts` (a non-public file) via
+ * `../../dist/wake/appServerTransport.js` so it can run as a genuinely
+ * separate OS process rather than in-process code the test runner loaded
+ * (see that file's own header comment). `isPermittedWakeTestFile` names
+ * this fixture, and the narrow `test/fixtures/wake-*.ts` convention it
+ * belongs to, an explicit exemption for exactly this reason, rather than
+ * leaving it an accident of this scope boundary alone. Production code
+ * never uses the `dist/` convention - only `src/`-relative specifiers,
+ * which this DOES cover - so the live risk this guard exists for (a caller
+ * in `src/` reaching into a transport's internals) is covered; a test
+ * file's own `dist/`-routed reach into a non-public transport, to run it
+ * as a real subprocess, is a known and accepted route, not a gap this
+ * guard is trying to close.
  */
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
@@ -105,14 +120,32 @@ function realpathOrSelf(absPath) {
   }
 }
 
-/** True when `filePathPosix` (posix-relative to the repo root) is a `test/wake-*.test.ts` file - the one class of file outside `src/wake/` permitted to reach a non-public wake file directly, to unit-test it. */
+/**
+ * True when `filePathPosix` (posix-relative to the repo root) is one of the
+ * two classes of file outside `src/wake/` permitted to reach a non-public
+ * wake file directly:
+ *
+ *   - a `test/wake-*.test.ts` file, written to unit-test a transport
+ *     directly, or
+ *   - a `test/fixtures/wake-*.ts` fixture spawned as a real, separate OS
+ *     process by one of those test files - `test/fixtures/
+ *     wake-app-server-crash-harness.ts` is the live instance of this today
+ *     (see this file's header, "Disclosed scope boundary").
+ *
+ * Deliberately narrow on both branches - `wake-` only, directly under
+ * `test/` or `test/fixtures/` respectively, never every file those two
+ * directories happen to contain.
+ */
 export function isPermittedWakeTestFile(filePathPosix) {
+  const dir = path.posix.dirname(filePathPosix);
   const base = path.posix.basename(filePathPosix);
-  return (
-    path.posix.dirname(filePathPosix) === "test" &&
-    base.startsWith("wake-") &&
-    base.endsWith(".test.ts")
-  );
+  if (dir === "test" && base.startsWith("wake-") && base.endsWith(".test.ts")) {
+    return true;
+  }
+  if (dir === "test/fixtures" && base.startsWith("wake-") && base.endsWith(".ts")) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -166,7 +199,9 @@ export function findWakeBoundaryImports(
 /**
  * Runs the boundary scan across the real repo tree: every `.ts` file under
  * `src/` (excluding `src/wake/` itself) and every `.ts` file under `test/`
- * (excluding `test/wake-*.test.ts`).
+ * (excluding whatever `isPermittedWakeTestFile` admits - a
+ * `test/wake-*.test.ts` file, or a `test/fixtures/wake-*.ts` fixture one of
+ * those spawns).
  *
  * @param {string} [srcDir]
  * @param {string} [testDir]
@@ -190,12 +225,12 @@ export function checkWakeTransportBoundaries(srcDir = SRC_DIR, testDir = TEST_DI
 
   for (const file of listTsFilesUnder(testDir)) {
     const filePosix = path.posix.join("test", file);
-    if (isPermittedWakeTestFile(filePosix)) continue; // a wake-*.test.ts may reach its own transport directly
+    if (isPermittedWakeTestFile(filePosix)) continue; // a wake-*.test.ts, or a test/fixtures/wake-*.ts fixture it spawns, may reach its own transport directly
     const abs = path.join(testDir, file);
     const text = readFileSync(abs, "utf8");
     for (const specifier of findWakeBoundaryImports(text, abs, wakeDirAbs)) {
       violations.push(
-        `test/${file}: imports "${specifier}" - only ${publicDoorList} may be imported outside a test/wake-*.test.ts file`
+        `test/${file}: imports "${specifier}" - only ${publicDoorList} may be imported outside a test/wake-*.test.ts file or a test/fixtures/wake-*.ts fixture it spawns`
       );
     }
   }

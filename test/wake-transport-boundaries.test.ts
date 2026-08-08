@@ -32,6 +32,19 @@ test("isPermittedWakeTestFile rejects a non-wake test, a nested wake test, and a
   assert.equal(isPermittedWakeTestFile("test/wake-notes.ts"), false);
 });
 
+test("isPermittedWakeTestFile accepts a wake-*.ts fixture directly under test/fixtures/ - the live case is test/fixtures/wake-app-server-crash-harness.ts, which reaches appServerTransport.ts via dist/ to run it as a real subprocess", () => {
+  assert.equal(isPermittedWakeTestFile("test/fixtures/wake-app-server-crash-harness.ts"), true);
+  assert.equal(isPermittedWakeTestFile("test/fixtures/wake-desktop-ipc-crash-harness.ts"), true);
+});
+
+test("isPermittedWakeTestFile rejects a test/fixtures/ file that does not match the wake- convention, and a wake-*.ts file nested deeper than test/fixtures/ itself (the exemption is narrow, not a blanket allowance for test/fixtures/)", () => {
+  // real siblings of the live fixture, neither of which reaches into src/wake/
+  assert.equal(isPermittedWakeTestFile("test/fixtures/mock-app-server.ts"), false);
+  assert.equal(isPermittedWakeTestFile("test/fixtures/negative-control-server.ts"), false);
+  // a wake-*.ts file one directory deeper than test/fixtures/ itself
+  assert.equal(isPermittedWakeTestFile("test/fixtures/nested/wake-thing.ts"), false);
+});
+
 // --- findWakeBoundaryImports: negative control (fixture-based, proves the check actually fires) ---
 
 /**
@@ -155,6 +168,83 @@ test("checkWakeTransportBoundaries reports a missing src/wake/ directory as a vi
       violations.some((v) => v.includes("does not exist")),
       true,
       `expected a "does not exist" violation, got: ${JSON.stringify(violations)}`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- checkWakeTransportBoundaries end-to-end: the new test/fixtures/
+// wake-*.ts exemption, exercised through the real scanning pipeline rather
+// than isPermittedWakeTestFile's return value alone. ---
+//
+// Deliberately uses a plain src/-relative specifier here, not a literal
+// dist/ one: this guard's own disclosed scope boundary (see the guard's
+// header comment) never resolves a dist/-targeting specifier back into
+// src/wake/ at all, for ANY file, permitted or not - so a dist/-style
+// import can never produce a violation through this pipeline regardless of
+// this exemption, and could not tell a red case from a green one. A
+// src/-relative specifier IS inside findWakeBoundaryImports's resolution
+// scope, so it is what actually exercises the exemption's real effect. The
+// genuine, literal dist/-reaching case is already covered above: the real
+// tree - including the live test/fixtures/wake-app-server-crash-harness.ts
+// fixture - is asserted clean by this file's very first test.
+
+/**
+ * A scratch `<dir>/src/wake/` carrying both admitted public files (see
+ * `WAKE_PUBLIC_FILES` - required so the inline existence check doesn't add
+ * its own "a permitted door is missing" violations to the count) plus one
+ * non-public file, and an empty `<dir>/test/fixtures/`, laid out so a
+ * `../../src/wake/nonPublicFile.js` specifier written from a file placed
+ * directly in `<dir>/test/fixtures/` resolves for real.
+ */
+function buildFixtureTreeWithFixturesDir() {
+  const dir = mkdtempSync(path.join(tmpdir(), "ghantika-wake-boundary-fixtures-"));
+  const srcDir = path.join(dir, "src");
+  const testDir = path.join(dir, "test");
+  const wakeDir = path.join(srcDir, "wake");
+  const fixturesDir = path.join(testDir, "fixtures");
+  mkdirSync(wakeDir, { recursive: true });
+  mkdirSync(fixturesDir, { recursive: true });
+  for (const publicFile of WAKE_PUBLIC_FILES) {
+    writeFileSync(
+      path.join(wakeDir, publicFile),
+      "export type Capability = { available: boolean };\n"
+    );
+  }
+  writeFileSync(path.join(wakeDir, "nonPublicFile.ts"), "export const SECRET = 1;\n");
+  return { dir, srcDir, testDir, fixturesDir };
+}
+
+test("checkWakeTransportBoundaries permits a test/fixtures/wake-*.ts fixture that reaches a non-public wake file directly (green: the new exemption's real effect on the actual scan)", () => {
+  const { dir, srcDir, testDir, fixturesDir } = buildFixtureTreeWithFixturesDir();
+  try {
+    writeFileSync(
+      path.join(fixturesDir, "wake-scratch-harness.ts"),
+      'import "../../src/wake/nonPublicFile.js";\n'
+    );
+    assert.deepEqual(checkWakeTransportBoundaries(srcDir, testDir), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("checkWakeTransportBoundaries still flags a test/fixtures/ file that does NOT match the wake- convention reaching the same non-public wake file (red: the exemption stays narrow, proven against the real scan rather than the predicate alone)", () => {
+  const { dir, srcDir, testDir, fixturesDir } = buildFixtureTreeWithFixturesDir();
+  try {
+    writeFileSync(
+      path.join(fixturesDir, "scratch-harness.ts"),
+      'import "../../src/wake/nonPublicFile.js";\n'
+    );
+    const violations = checkWakeTransportBoundaries(srcDir, testDir);
+    assert.equal(
+      violations.length,
+      1,
+      `expected exactly one violation, got: ${JSON.stringify(violations)}`
+    );
+    assert.match(
+      violations[0],
+      /^test\/fixtures\/scratch-harness\.ts: imports "\.\.\/\.\.\/src\/wake\/nonPublicFile\.js"/
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
