@@ -92,20 +92,29 @@
  * ## Cancellation tears down every subscription; a process-wide budget
  * bounds how many calls may wait at once
  *
- * `handler`'s second parameter is the calling MCP request's real
- * `AbortSignal` (`src/server.ts`'s `tools/call` dispatch forwards
- * `ctx.mcpReq.signal`, which the installed SDK fires when the client sends
- * `notifications/cancelled` for this exact request). If the request is
- * already cancelled before this handler even starts, nothing is ever
- * subscribed and no admission-budget slot is ever consumed - see
- * `handler`'s own body for exactly where that check runs, and why it runs
- * before the budget check below. Otherwise, once this call is genuinely
- * about to wait, an abort listener is registered alongside the output/
- * terminal subscriptions; firing it unsubscribes both, clears the pending
- * timer, and releases the admission slot immediately, rather than letting
- * the subscriptions and timer run to their own natural bound for a
- * response nobody will ever read (the SDK itself discards whatever a
- * cancelled request's handler returns).
+ * `handler`'s second parameter is a COMBINED `AbortSignal`
+ * (`src/server.ts`'s `tools/call` dispatch builds it as
+ * `AbortSignal.any([ctx.mcpReq.signal, ourController.signal])`): the
+ * installed SDK's own signal fires when it recognizes the client's
+ * `notifications/cancelled`, and `server.ts`'s own independent leg covers
+ * the one case that guard misses - a legal falsy request id (`0` or
+ * `""`), which the installed SDK's own dispatch drops (see `server.ts`'s
+ * own doc comments for why). If the request is already cancelled before
+ * this handler even starts, nothing is ever subscribed and no
+ * admission-budget slot is ever consumed - see `handler`'s own body for
+ * exactly where that check runs, and why it runs before the budget check
+ * below. Otherwise, once this call is genuinely about to wait, an abort
+ * listener is registered alongside the output/terminal subscriptions;
+ * firing it unsubscribes both, clears the pending timer, and releases the
+ * admission slot immediately, rather than letting the subscriptions and
+ * timer run to their own natural bound. Whether the caller ever receives
+ * a response after that depends on the cancelled request's id: for every
+ * id but the two falsy ones, the installed SDK's own response suppression
+ * discards whatever this handler returns, so the response genuinely goes
+ * unread; for `0` and `""` specifically that suppression never triggers -
+ * it reads the same broken falsy guard as the dispatch above - so a
+ * normal response, carrying this file's own cancellation text, is still
+ * sent and read.
  *
  * Because a subscribed-and-waiting `follow` call is the one thing this
  * server does that is NOT near-instant, this store also enforces a
@@ -249,12 +258,10 @@ export async function handler(
   // subscription...") and `src/jobStore.ts`'s own `tryAdmitFollow` docs for
   // why this check runs BEFORE the budget gate below, not after. A normal
   // outcome, never an error: the caller already knows it cancelled the
-  // call, and the MCP SDK itself never delivers whatever this handler
-  // returns for an aborted request anyway (see `src/server.ts`'s
-  // `tools/call` dispatch, which checks `abortController.signal.aborted`
-  // before sending any response at all) - a plain, cheap, non-error text
-  // result is returned here rather than a full `FollowProjection`, since
-  // nobody ever reads it either way.
+  // call, so a plain, cheap, non-error text result is returned here rather
+  // than a full `FollowProjection` - whether that response is actually
+  // delivered depends on the cancelled request's id, per this file's
+  // header doc.
   if (signal?.aborted === true) {
     return alreadyCancelledBeforeStartResult();
   }
@@ -364,13 +371,12 @@ export async function handler(
     // `onAbort` already performed every bit of cleanup this call owes -
     // both listeners unsubscribed, the timer cleared, the admission slot
     // released, all before `settlement` resolved. Nothing reads `reason`
-    // on this path (it is a fixed placeholder, not a real outcome), and
-    // nobody reads this response either - the same "the SDK discards a
-    // cancelled request's result" fact the already-aborted-at-start
-    // branch above documents. A minimal, non-error result closes this
-    // call out cleanly regardless - see `cancelledWhileWaitingResult`'s
-    // own doc comment for why this path has its own text rather than
-    // reusing `alreadyCancelledBeforeStartResult`'s.
+    // on this path (it is a fixed placeholder, not a real outcome). A
+    // minimal, non-error result closes this call out cleanly regardless -
+    // see `cancelledWhileWaitingResult`'s own doc comment for why this
+    // path has its own text rather than reusing
+    // `alreadyCancelledBeforeStartResult`'s, and this file's header doc
+    // for whether that response is actually delivered.
     return cancelledWhileWaitingResult();
   }
 
@@ -550,11 +556,11 @@ function toolSuccess(projection: FollowProjection): CallToolResult {
 /**
  * The minimal, non-error result returned when the calling MCP request was
  * already cancelled BEFORE this handler even started - see `handler`'s
- * own docs for why a full `FollowProjection` is never built on this path:
- * the MCP SDK itself discards whatever a cancelled request's handler
- * returns (`src/server.ts`'s `tools/call` dispatch), so nothing ever
- * reads this result either way. Deliberately NOT shaped as a
- * `FollowProjection` and carries no `reason` value at all - inventing a
+ * own docs for why a full `FollowProjection` is never built on this path,
+ * and this file's header doc for whether the caller actually receives
+ * this result (it depends on the cancelled request's id). Deliberately
+ * NOT shaped as a `FollowProjection` and carries no `reason` value at all
+ * - inventing a
  * new public `reason` enum member for "cancelled" is out of scope for
  * this fix (the contract stays `"output" | "terminal" | "timeout"`,
  * unchanged), and reusing `"timeout"` here would misrepresent what
