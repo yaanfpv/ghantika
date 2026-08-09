@@ -46,6 +46,7 @@
     "guard:typescript-peer-range": "node scripts/check-typescript-peer-range.mjs",
     "guard:typescript-tracking-signal": "node scripts/check-typescript-tracking-signal.mjs",
     "guard:wake-transport-boundaries": "node scripts/check-wake-transport-boundaries.mjs",
+    "guard:no-bounded-kill-confirmed-wait": "node scripts/check-no-bounded-kill-confirmed-wait.mjs",
     "verify:install-repro": "node scripts/verify-install-reproducibility.mjs",
     "verify:workflow-topology": "node scripts/verify-workflow-topology.mjs",
     "lint:workflow-jobs": "node scripts/lint-workflow-jobs.mjs",

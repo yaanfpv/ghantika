@@ -659,7 +659,18 @@ test(
     // down this file (e.g. the "root-exits-first" test's own poll loop),
     // until `kill_confirmed` has actually settled - never re-assert on
     // the stale `killBody` snapshot above.
-    const confirmDeadline = Date.now() + 5000;
+    //
+    // No fixed deadline: this explicit kill() sends a real signal, and the
+    // process's own OS-level exit (whether from that signal or otherwise)
+    // independently triggers `run.ts`'s `onExit` fire-and-forget eager
+    // reap - the SAME unbounded-latency path a natural exit takes. Which
+    // of that path or `kill.ts`'s own in-call confirmation actually lands
+    // first is a real race with no ordering guarantee, so this poll is
+    // exposed to the identical hazard as a natural exit, not a lesser one.
+    // A one-line breadcrumb to stderr on a fixed cadence (never a
+    // threshold) keeps a runner-level timeout legible if it ever fires.
+    const confirmBreadcrumbIntervalMs = 5000;
+    let confirmLastBreadcrumbAt = Date.now();
     let confirmedBody: RunResponseBody | undefined;
     for (;;) {
       server.send({
@@ -671,10 +682,11 @@ test(
       const statusLine = await server.nextLine();
       confirmedBody = statusLine.parsed as RunResponseBody;
       if (confirmedBody.result?.structuredContent?.kill_confirmed !== undefined) break;
-      if (Date.now() > confirmDeadline) {
-        throw new Error(
-          `timed out waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(confirmedBody?.result?.structuredContent)}`
+      if (Date.now() - confirmLastBreadcrumbAt >= confirmBreadcrumbIntervalMs) {
+        console.error(
+          `still waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(confirmedBody?.result?.structuredContent)}`
         );
+        confirmLastBreadcrumbAt = Date.now();
       }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
@@ -807,7 +819,14 @@ test(
     // only on state would read that natural gap as a failure. Nothing here
     // is assumed from a fixed sleep, and NO kill() call has been made at
     // any point before this.
-    const statusDeadline = Date.now() + 5000;
+    //
+    // No fixed deadline: `reapProcessGroupOnce`'s confirmation write is
+    // real event-loop scheduling latency with no stated upper bound (see
+    // src/tools/kill.ts's own doc comment) - a fixed number here asserts a
+    // bound the contract declines to give. A breadcrumb on a fixed cadence
+    // (never a threshold) keeps a runner-level timeout legible if it fires.
+    const statusBreadcrumbIntervalMs = 5000;
+    let statusLastBreadcrumbAt = Date.now();
     let statusBody: RunResponseBody | undefined;
     for (;;) {
       server.send({
@@ -822,10 +841,11 @@ test(
       const killConfirmed = statusBody.result?.structuredContent?.kill_confirmed;
       const isTerminal = state !== undefined && state !== "starting" && state !== "running";
       if (isTerminal && killConfirmed !== undefined) break;
-      if (Date.now() > statusDeadline) {
-        throw new Error(
-          `timed out waiting for the leader's own job record to go terminal AND the eager reap's confirmation to land, last saw: ${JSON.stringify(statusBody?.result?.structuredContent)}`
+      if (Date.now() - statusLastBreadcrumbAt >= statusBreadcrumbIntervalMs) {
+        console.error(
+          `still waiting for the leader's own job record to go terminal AND the eager reap's confirmation to land for job ${jobId}, last saw: ${JSON.stringify(statusBody?.result?.structuredContent)}`
         );
+        statusLastBreadcrumbAt = Date.now();
       }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
@@ -1152,7 +1172,12 @@ test(
     // eager reap's own async confirmation has landed (see the test
     // above's own docs for why both conditions are needed) - never
     // assumed from a fixed sleep, and NO kill() call has been made yet.
-    const statusDeadline = Date.now() + 5000;
+    //
+    // No fixed deadline: same unbounded reap-confirmation latency as the
+    // test above (see its own note); a breadcrumb on a fixed cadence
+    // (never a threshold) keeps a runner-level timeout legible if it fires.
+    const statusBreadcrumbIntervalMs = 5000;
+    let statusLastBreadcrumbAt = Date.now();
     let statusBody: RunResponseBody | undefined;
     for (;;) {
       server.send({
@@ -1167,10 +1192,11 @@ test(
       const killConfirmed = statusBody.result?.structuredContent?.kill_confirmed;
       const isTerminal = state !== undefined && state !== "starting" && state !== "running";
       if (isTerminal && killConfirmed !== undefined) break;
-      if (Date.now() > statusDeadline) {
-        throw new Error(
-          `timed out waiting for the leader's own job record to go terminal AND the eager reap's confirmation to land, last saw: ${JSON.stringify(statusBody?.result?.structuredContent)}`
+      if (Date.now() - statusLastBreadcrumbAt >= statusBreadcrumbIntervalMs) {
+        console.error(
+          `still waiting for the leader's own job record to go terminal AND the eager reap's confirmation to land for job ${jobId}, last saw: ${JSON.stringify(statusBody?.result?.structuredContent)}`
         );
+        statusLastBreadcrumbAt = Date.now();
       }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
@@ -1369,7 +1395,12 @@ test(
       // previously broke on `state` alone, which left the very next
       // assertion (kill_confirmed === true, below) reading a snapshot
       // that could still be mid-race - now fixed to match its sibling.
-      const statusDeadline = Date.now() + 5000;
+      //
+      // No fixed deadline: a breadcrumb on a fixed cadence (never a
+      // threshold) keeps a runner-level timeout legible if it fires,
+      // without asserting a bound the contract declines to give.
+      const statusBreadcrumbIntervalMs = 5000;
+      let statusLastBreadcrumbAt = Date.now();
       let statusBody: RunResponseBody | undefined;
       for (;;) {
         server.send({
@@ -1384,10 +1415,11 @@ test(
         const killConfirmed = statusBody.result?.structuredContent?.kill_confirmed;
         const isTerminal = state !== undefined && state !== "starting" && state !== "running";
         if (isTerminal && killConfirmed !== undefined) break;
-        if (Date.now() > statusDeadline) {
-          throw new Error(
-            `timed out waiting for the job's own record to go terminal AND the eager reap's confirmation to land, last saw: ${JSON.stringify(statusBody?.result?.structuredContent)}`
+        if (Date.now() - statusLastBreadcrumbAt >= statusBreadcrumbIntervalMs) {
+          console.error(
+            `still waiting for the job's own record to go terminal AND the eager reap's confirmation to land for job ${jobId}, last saw: ${JSON.stringify(statusBody?.result?.structuredContent)}`
           );
+          statusLastBreadcrumbAt = Date.now();
         }
         await new Promise((resolve) => setTimeout(resolve, 25));
       }

@@ -297,8 +297,8 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-      # Needed before the guards run: four of them load the TypeScript
-      # compiler out of node_modules to parse src/.
+      # Needed before the guards run: five of them load the TypeScript
+      # compiler out of node_modules to parse src/ and/or test/.
       - run: npm ci
       - run: npm run guard:npm-ci
       - run: npm run guard:sdk-pin
@@ -307,6 +307,7 @@ jobs:
       - run: npm run guard:stdio-purity
       - run: npm run guard:typescript-tracking-signal
       - run: npm run guard:wake-transport-boundaries
+      - run: npm run guard:no-bounded-kill-confirmed-wait
 
   # Confirms the checked-out commit really is the pull request's head rather
   # than the synthetic merge commit a pull_request event checks out by

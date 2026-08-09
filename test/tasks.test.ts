@@ -349,23 +349,36 @@ async function pollUntilTerminal(
  * trigger) already solves this with the identical shape this mirrors,
  * adapted here to the MCP client (`client.callTool`) instead of raw
  * JSON-RPC lines.
+ *
+ * This loop carries NO wall-clock deadline and never throws on elapsed
+ * time - a fixed bound here would assert a limit on a quantity the
+ * contract above says has none, so any number picked is arbitrary and can
+ * lose under enough scheduling pressure regardless of size. It waits for
+ * as long as the surrounding test is willing to run; a genuine hang is
+ * caught by the test runner's own timeout, not by this function. To keep
+ * that outer failure legible if it ever fires, this writes a breadcrumb to
+ * stderr on a fixed logging cadence (never a threshold) while still
+ * waiting, carrying the same job snapshot a bound would have reported -
+ * so a runner-level timeout still explains itself instead of naming only
+ * a job id.
  */
 async function pollUntilKillConfirmed(
   client: Client,
-  jobId: string,
-  deadlineMs = 5000
+  jobId: string
 ): Promise<Record<string, unknown>> {
-  const deadline = Date.now() + deadlineMs;
+  const breadcrumbIntervalMs = 5000;
+  let lastBreadcrumbAt = Date.now();
   for (;;) {
     const result = await client.callTool({ name: "kill", arguments: { job_id: jobId } });
     const last = runResultStructured(result);
     if (last.kill_confirmed !== undefined) {
       return last;
     }
-    if (Date.now() > deadline) {
-      throw new Error(
-        `timed out waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(last)}`
+    if (Date.now() - lastBreadcrumbAt >= breadcrumbIntervalMs) {
+      console.error(
+        `still waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(last)}`
       );
+      lastBreadcrumbAt = Date.now();
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }

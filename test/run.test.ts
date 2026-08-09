@@ -159,12 +159,22 @@ async function waitForBirthIdentity(jobId: string): Promise<void> {
  * call's own response even though the call as a whole still succeeds.
  * Retrying (never re-signaling, see above) gives that transition time to
  * land and the write a real second chance.
+ *
+ * This loop carries NO wall-clock deadline and never throws on elapsed
+ * time. Every job here goes through the same fire-and-forget eager reap
+ * at OS-level exit (see this doc comment's own paragraph above) whose
+ * confirmation write is real event-loop scheduling latency with no
+ * stated upper bound - a fixed deadline would assert a bound the
+ * contract declines to give, whether the job was explicitly killed or
+ * exited on its own. It waits for as long as the surrounding test is
+ * willing to run; a genuine hang is caught by the test runner's own
+ * timeout, not by this function. To keep that outer failure legible if
+ * it ever fires, this writes a breadcrumb to stderr on a fixed logging
+ * cadence (never a threshold) while still waiting.
  */
-async function pollUntilKillConfirmed(
-  jobId: string,
-  deadlineMs = 5000
-): Promise<Record<string, unknown>> {
-  const deadline = Date.now() + deadlineMs;
+async function pollUntilKillConfirmed(jobId: string): Promise<Record<string, unknown>> {
+  const breadcrumbIntervalMs = 5000;
+  let lastBreadcrumbAt = Date.now();
   for (;;) {
     const result = await killTool.handler({ job_id: jobId });
     assert.notEqual(
@@ -176,10 +186,11 @@ async function pollUntilKillConfirmed(
     if (structured.kill_confirmed !== undefined) {
       return structured;
     }
-    if (Date.now() > deadline) {
-      throw new Error(
-        `timed out waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(structured)}`
+    if (Date.now() - lastBreadcrumbAt >= breadcrumbIntervalMs) {
+      console.error(
+        `still waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(structured)}`
       );
+      lastBreadcrumbAt = Date.now();
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
