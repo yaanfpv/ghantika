@@ -266,6 +266,59 @@ test('follow: a reason other than "timeout" never carries a note field at all', 
 });
 
 // ---------------------------------------------------------------------------
+// THE CONTRACT: output arrival means a newly materialized line, never raw
+// byte arrival - see follow.ts's own header ("Deliberately narrower than
+// output/tail") and README.md's follow section for the exact wording this
+// proves. A buffered fragment with no terminator must NOT wake the call on
+// its own; only finalizing the selected stream (the same `stream-end`
+// partial mechanism test/output-tail.test.ts's own partial-final-line test
+// exercises via jobStore.appendOutput + jobStore.finalizeStream) turns it
+// into a partial event.
+// ---------------------------------------------------------------------------
+
+test("follow: an unterminated fragment does not wake the call on its own - only finalizing the stream does, surfacing a partial: true event", async () => {
+  const jobId = makeJob();
+  jobStore.appendOutput(jobId, "stdout", Buffer.from("no newline yet"));
+
+  const boundMs = 150;
+  const start = Date.now();
+  const timeoutResult = structuredOf(
+    await followTool.handler({ job_id: jobId, cursor: 0, stream: "stdout", timeout_ms: boundMs })
+  );
+  const elapsed = Date.now() - start;
+  assert.equal(
+    timeoutResult.reason,
+    "timeout",
+    "a buffered fragment with no terminator must never wake the call on its own"
+  );
+  assert.deepEqual(timeoutResult.events, []);
+  assert.ok(
+    elapsed >= boundMs && elapsed < boundMs + 900,
+    `expected to resolve close to the ${boundMs}ms bound (never early, on the unterminated write), took ${elapsed}ms`
+  );
+
+  jobStore.finalizeStream(jobId, "stdout");
+
+  const wakeResult = structuredOf(
+    await followTool.handler({
+      job_id: jobId,
+      cursor: 0,
+      stream: "stdout",
+      timeout_ms: NEVER_HIT_TIMEOUT_MS,
+    })
+  );
+  assert.equal(
+    wakeResult.reason,
+    "output",
+    "finalizing the stream must materialize the pending fragment and wake the call"
+  );
+  const events = wakeResult.events as Array<Record<string, unknown>>;
+  assert.equal(events.length, 1);
+  assert.equal(events[0]!.text, "no newline yet");
+  assert.equal(events[0]!.partial, true);
+});
+
+// ---------------------------------------------------------------------------
 // THE STREAM-FILTER FIX - the single most important new test (see
 // follow.ts's own header, "The stream filter is on the SUBSCRIPTION, not
 // just the response"). With stream:"stdout" set, an arrival on stderr

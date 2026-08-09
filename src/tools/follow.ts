@@ -21,18 +21,25 @@
  * The one correctness property this whole tool rests on: a client must
  * never miss an event that happens to land in the gap between "read the
  * job's current state" and "start listening for the next change." The
- * fix is ORDERING, not locking - subscribe to both `onOutputArrival` and
- * `onJobTerminal` FIRST, synchronously, before reading anything about the
- * job's current state at all; THEN, with NO `await` between the subscribe
- * call and the read, check whether either condition is ALREADY true. A
- * single-threaded event loop guarantees zero wall-clock time passes
- * between two synchronous statements with no `await` between them, so
- * there is no gap for an event to land in unobserved: anything that
- * happens after the subscribe call either fires the listener (caught by
- * the subscription) or happens before it and is caught by the immediate
- * check. Only once BOTH come back false does this handler ever start a
- * timer and actually wait - see `handler`'s own body below for the exact
- * sequence, which mirrors the design one step at a time.
+ * real sequence has three synchronous steps, not two: first, an initial
+ * snapshot read of the job's current state - the cursor default, when
+ * `cursor` is omitted, needs the job's CURRENT head seq to resolve at all
+ * (see `currentHeadSeq`'s own docs) - THEN subscribe to both
+ * `onOutputArrival` and `onJobTerminal`; THEN, with NO `await` between the
+ * subscribe call and this last step, an immediate recheck of whether
+ * either condition is ALREADY true against that same current state. The
+ * safety property rests on that second pair - subscribe immediately
+ * followed by recheck, with no `await` between them - never on the
+ * stronger-sounding but false claim that no state was read before
+ * subscribing at all. A single-threaded event loop guarantees zero
+ * wall-clock time passes between two synchronous statements with no
+ * `await` between them, so there is no gap for an event to land in
+ * unobserved across that pair: anything that happens after the subscribe
+ * call either fires the listener (caught by the subscription) or happens
+ * before it and is caught by the immediate recheck. Only once BOTH come
+ * back false does this handler ever start a timer and actually wait - see
+ * `handler`'s own body below for the exact sequence, which mirrors the
+ * design one step at a time.
  *
  * ## The stream filter is on the SUBSCRIPTION, not just the response
  *
@@ -101,7 +108,7 @@ import {
 export const name = "follow";
 
 export const description =
-  'Wait, bounded, for a background job started by run to have something new to report: new output on the selected stream(s), the job reaching a terminal state (exited/killed/failed), or this call\'s own bound elapsing - whichever happens first. A timeout is a normal, non-error result, never a hang: it means nothing happened within the bound, nothing more. status, output, and tail remain the complete way to check a job\'s state and output, whether or not follow is ever called - before this call, after it, or instead of it. cursor, if given, only counts output strictly newer than that seq; omit it to wait for output past whatever already exists on the selected stream(s) at the moment of this call - never for output that already existed before this call started, so a bare call never trivially returns on old backlog. stream picks which stream(s) count toward a return: "stdout", "stderr", or "both" (the default) - this selection scopes the underlying subscription itself, not just what the response later shows, so an arrival on a stream you did not select can never end this call early. timeout_ms bounds how long this one call may wait before returning on its own: omitted, it defaults to 45000ms, a value safe to rely on for any caller; an explicit value above the hard ceiling of 3600000ms (one hour) is silently clamped down to it rather than rejected, since that ceiling only bounds this one call\'s own subscription lifetime and has no other significance. Asking for longer than the default only pays off with a caller whose own setup actually lets one tool call stay outstanding that long - this tool has no way to see that, and claims nothing about it either way.';
+  'Wait, bounded, for a background job started by run to have something new to report: new output on the selected stream(s), the job reaching a terminal state (exited/killed/failed), or this call\'s own bound elapsing - whichever happens first. A timeout is a normal, non-error result, never a hang: it means nothing happened within the bound, nothing more. status, output, and tail remain the complete way to check a job\'s state and output, whether or not follow is ever called - before this call, after it, or instead of it. cursor, if given, only counts output strictly newer than that seq; omit it to wait for output past whatever already exists on the selected stream(s) at the moment of this call - never for output that already existed before this call started, so a bare call never trivially returns on old backlog. stream picks which stream(s) count toward a return: "stdout", "stderr", or "both" (the default) - this selection scopes the underlying subscription itself, not just what the response later shows, so an arrival on a stream you did not select can never end this call early. Output arrival means a newly materialized line on the selected stream; a buffered fragment without a terminator does not wake the call on its own, but becomes a partial event when the selected stream finalizes; terminal state can still settle the call. timeout_ms bounds how long this one call may wait before returning on its own: omitted, it defaults to 45000ms, a value safe to rely on for any caller; an explicit value above the hard ceiling of 3600000ms (one hour) is silently clamped down to it rather than rejected, since that ceiling only bounds this one call\'s own subscription lifetime and has no other significance. Asking for longer than the default only pays off with a caller whose own setup actually lets one tool call stay outstanding that long - this tool has no way to see that, and claims nothing about it either way. A caller whose own execution context cannot leave a tool call outstanding for the requested duration - a subagent or background-task turn reclaimed or torn down before this call would return - never gets this tool\'s benefit, the same as any other call that context cannot hold open that long; that is simply how a tool call behaves there, not something this tool detects or works around.';
 
 export const DEFAULT_TIMEOUT_MS = 45_000;
 /** A hard sanity ceiling on `timeout_ms`, bounding a single subscription's own lifetime - see `description` above for why this is silently clamped to, never an error. */
