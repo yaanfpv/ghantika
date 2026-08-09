@@ -31,15 +31,20 @@
  * safety property rests on that second pair - subscribe immediately
  * followed by recheck, with no `await` between them - never on the
  * stronger-sounding but false claim that no state was read before
- * subscribing at all. A single-threaded event loop guarantees zero
- * wall-clock time passes between two synchronous statements with no
- * `await` between them, so there is no gap for an event to land in
- * unobserved across that pair: anything that happens after the subscribe
- * call either fires the listener (caught by the subscription) or happens
- * before it and is caught by the immediate recheck. Only once BOTH come
- * back false does this handler ever start a timer and actually wait - see
- * `handler`'s own body below for the exact sequence, which mirrors the
- * design one step at a time.
+ * subscribing at all. The actual property a single-threaded event loop
+ * guarantees is narrower, and different in kind, from "zero time passes":
+ * no OTHER callback - not a timer, not an I/O completion, not some other
+ * listener - can run between two synchronous statements with no `await`
+ * between them. Real wall-clock time can still pass while those
+ * statements themselves execute (ordinary CPU work is never free), but
+ * nothing else gets a turn to run in between. So there is no gap for an
+ * event to land in UNOBSERVED across that pair: anything that happens
+ * after the subscribe call either fires the listener (caught by the
+ * subscription, since nothing else could have run first to remove it) or
+ * happens before it and is caught by the immediate recheck. Only once
+ * BOTH come back false does this handler ever start a timer and actually
+ * wait - see `handler`'s own body below for the exact sequence, which
+ * mirrors the design one step at a time.
  *
  * ## The stream filter is on the SUBSCRIPTION, not just the response
  *
@@ -84,6 +89,41 @@
  * from importing another), so this reimplementation is kept deliberately
  * small rather than mirroring `output.ts` in full.
  *
+ * ## Cancellation tears down every subscription; a process-wide budget
+ * bounds how many calls may wait at once
+ *
+ * `handler`'s second parameter is the calling MCP request's real
+ * `AbortSignal` (`src/server.ts`'s `tools/call` dispatch forwards
+ * `ctx.mcpReq.signal`, which the installed SDK fires when the client sends
+ * `notifications/cancelled` for this exact request). If the request is
+ * already cancelled before this handler even starts, nothing is ever
+ * subscribed and no admission-budget slot is ever consumed - see
+ * `handler`'s own body for exactly where that check runs, and why it runs
+ * before the budget check below. Otherwise, once this call is genuinely
+ * about to wait, an abort listener is registered alongside the output/
+ * terminal subscriptions; firing it unsubscribes both, clears the pending
+ * timer, and releases the admission slot immediately, rather than letting
+ * the subscriptions and timer run to their own natural bound for a
+ * response nobody will ever read (the SDK itself discards whatever a
+ * cancelled request's handler returns).
+ *
+ * Because a subscribed-and-waiting `follow` call is the one thing this
+ * server does that is NOT near-instant, this store also enforces a
+ * process-wide cap on how many may be outstanding at once
+ * (`src/jobStore.ts`'s `MAX_OUTSTANDING_FOLLOWS`/`tryAdmitFollow`/
+ * `releaseFollowAdmission`) - a call made once that cap is already reached
+ * is REJECTED outright with a tool error, never queued or coalesced with
+ * an existing outstanding call on the same job (a waiter-sharing design
+ * was considered and is explicitly out of scope for this fix - heavier
+ * machinery than the resource-exhaustion problem this closes calls for).
+ * The cap is process-wide, not per-connection or per-client - this server
+ * tracks no connection/client identity today - so a single misbehaving
+ * client can still exhaust it and deny `follow` to every other connection;
+ * it can no longer do so silently or without bound, but per-connection
+ * fairness stays explicitly out of scope, disclosed here rather than left
+ * to be discovered. See `MAX_OUTSTANDING_FOLLOWS`'s own docs for the full
+ * rationale and `description` below for the caller-facing contract.
+ *
  * ## Never mints a Tasks handle, structurally
  *
  * `src/server.ts`'s `tools/call` dispatch only ever hands a result to
@@ -102,13 +142,14 @@ import {
   type StreamLineTerminator,
   isTerminalJobState,
   jobStore,
+  MAX_OUTSTANDING_FOLLOWS,
   toPublicProjection,
 } from "../jobStore.js";
 
 export const name = "follow";
 
 export const description =
-  'Wait, bounded, for a background job started by run to have something new to report: new output on the selected stream(s), the job reaching a terminal state (exited/killed/failed), or this call\'s own bound elapsing - whichever happens first. A timeout is a normal, non-error result, never a hang: it means nothing happened within the bound, nothing more. status, output, and tail remain the complete way to check a job\'s state and output, whether or not follow is ever called - before this call, after it, or instead of it. cursor, if given, only counts output strictly newer than that seq; omit it to wait for output past whatever already exists on the selected stream(s) at the moment of this call - never for output that already existed before this call started, so a bare call never trivially returns on old backlog. stream picks which stream(s) count toward a return: "stdout", "stderr", or "both" (the default) - this selection scopes the underlying subscription itself, not just what the response later shows, so an arrival on a stream you did not select can never end this call early. Output arrival means a newly materialized line on the selected stream; a buffered fragment without a terminator does not wake the call on its own, but becomes a partial event when the selected stream finalizes; terminal state can still settle the call. timeout_ms bounds how long this one call may wait before returning on its own: omitted, it defaults to 45000ms, a value safe to rely on for any caller; an explicit value above the hard ceiling of 3600000ms (one hour) is silently clamped down to it rather than rejected, since that ceiling only bounds this one call\'s own subscription lifetime and has no other significance. Asking for longer than the default only pays off with a caller whose own setup actually lets one tool call stay outstanding that long - this tool has no way to see that, and claims nothing about it either way. A caller whose own execution context cannot leave a tool call outstanding for the requested duration - a subagent or background-task turn reclaimed or torn down before this call would return - never gets this tool\'s benefit, the same as any other call that context cannot hold open that long; that is simply how a tool call behaves there, not something this tool detects or works around.';
+  'Wait, bounded, for a background job started by run to have something new to report: new output on the selected stream(s), the job reaching a terminal state (exited/killed/failed), or this call\'s own bound elapsing - whichever happens first. A timeout is a normal, non-error result, never a hang: it means nothing happened within the bound, nothing more. status, output, and tail remain the complete way to check a job\'s state and output, whether or not follow is ever called - before this call, after it, or instead of it. cursor, if given, only counts output strictly newer than that seq; omit it to wait for output past whatever already exists on the selected stream(s) at the moment of this call - never for output that already existed before this call started, so a bare call never trivially returns on old backlog. stream picks which stream(s) count toward a return: "stdout", "stderr", or "both" (the default) - this selection scopes the underlying subscription itself, not just what the response later shows, so an arrival on a stream you did not select can never end this call early. Output arrival means a newly materialized line on the selected stream; a buffered fragment without a terminator does not wake the call on its own, but becomes a partial event when the selected stream finalizes; terminal state can still settle the call. timeout_ms bounds how long this one call may wait before returning on its own: omitted, it defaults to 45000ms, a value safe to rely on for any caller; an explicit value above the hard ceiling of 3600000ms (one hour) is silently clamped down to it rather than rejected, since that ceiling only bounds this one call\'s own subscription lifetime and has no other significance. Asking for longer than the default only pays off with a caller whose own setup actually lets one tool call stay outstanding that long - this tool has no way to see that, and claims nothing about it either way. A caller whose own execution context cannot leave a tool call outstanding for the requested duration - a subagent or background-task turn reclaimed or torn down before this call would return - never gets this tool\'s benefit, the same as any other call that context cannot hold open that long; that is simply how a tool call behaves there, not something this tool detects or works around. If the calling request is cancelled before this call would otherwise settle, everything it holds open (its subscriptions and its timer) is torn down immediately rather than left to run to its own natural bound. This server also caps how many follow calls may be outstanding (subscribed and waiting) at once, across every connection it serves, at 128; a call made once that cap is already reached is REJECTED outright with a tool error - never queued, never silently delayed - so a caller hitting it should back off and retry shortly, or use status/output/tail instead. That cap is enforced process-wide, not per connection or per client, since this server tracks no connection/client identity today - one connection exhausting it can still deny follow to every other connection, though never silently or without bound.';
 
 export const DEFAULT_TIMEOUT_MS = 45_000;
 /** A hard sanity ceiling on `timeout_ms`, bounding a single subscription's own lifetime - see `description` above for why this is silently clamped to, never an error. */
@@ -175,7 +216,10 @@ export interface FollowProjection extends PublicJobProjection {
 type StreamSelector = ManagedStream | "both";
 type FollowReason = FollowProjection["reason"];
 
-export async function handler(args: Record<string, unknown> | undefined): Promise<CallToolResult> {
+export async function handler(
+  args: Record<string, unknown> | undefined,
+  signal?: AbortSignal
+): Promise<CallToolResult> {
   if (typeof args?.job_id !== "string" || args.job_id.length === 0) {
     return toolError('follow requires a non-empty string "job_id" argument');
   }
@@ -197,6 +241,45 @@ export async function handler(args: Record<string, unknown> | undefined): Promis
     return toolError(`follow: unknown job_id "${jobId}"`);
   }
 
+  // If the calling MCP request was already cancelled before this handler
+  // even started running, there is nothing left to do: nothing has been
+  // subscribed yet, so nothing needs cleanup, and this call never consumes
+  // an admission-budget slot for work it was never going to perform any of
+  // - see this file's header doc ("Cancellation tears down every
+  // subscription...") and `src/jobStore.ts`'s own `tryAdmitFollow` docs for
+  // why this check runs BEFORE the budget gate below, not after. A normal
+  // outcome, never an error: the caller already knows it cancelled the
+  // call, and the MCP SDK itself never delivers whatever this handler
+  // returns for an aborted request anyway (see `src/server.ts`'s
+  // `tools/call` dispatch, which checks `abortController.signal.aborted`
+  // before sending any response at all) - a plain, cheap, non-error text
+  // result is returned here rather than a full `FollowProjection`, since
+  // nobody ever reads it either way.
+  if (signal?.aborted === true) {
+    return toolAlreadyCancelledResult();
+  }
+
+  // The admission budget - a process-wide cap on how many `follow` calls
+  // may sit outstanding at once (see `src/jobStore.ts`'s own
+  // `MAX_OUTSTANDING_FOLLOWS`/`tryAdmitFollow` docs for the full
+  // rationale). Checked here, AFTER the already-aborted early return above
+  // and BEFORE subscribing anything: a rejected call must never subscribe
+  // an output/terminal listener at all. `admitted`/`releaseAdmission`
+  // below are this handler's own LOCAL record of whether it actually holds
+  // a slot - see `releaseFollowAdmission`'s own docs for why the release
+  // side cannot safely infer that on its own.
+  if (!jobStore.tryAdmitFollow()) {
+    return toolError(
+      `follow: the server's outstanding-follow budget (${MAX_OUTSTANDING_FOLLOWS}) is exhausted - retry shortly, or use status/output/tail instead`
+    );
+  }
+  let admitted = true;
+  const releaseAdmission = (): void => {
+    if (!admitted) return;
+    admitted = false;
+    jobStore.releaseFollowAdmission();
+  };
+
   // Resolve the effective cursor - the caller's own explicit value, or
   // (when omitted) the CURRENT head seq for the selected stream(s), so a
   // bare `follow(job_id)` waits only for something NEW rather than
@@ -205,12 +288,16 @@ export async function handler(args: Record<string, unknown> | undefined): Promis
   // the same inputs `output.ts`'s own head computation reads.
   const effectiveCursor = explicitCursor ?? currentHeadSeq(jobId, stream);
 
-  // Subscribe FIRST, synchronously, before any other work - see this
-  // file's header ("Subscribe-then-check") for why the ordering itself is
-  // what closes the lost-wakeup race. `settle` resolves `settlement`
-  // exactly once; every later call to it (from either listener, or the
-  // timer started below) is a harmless no-op, per ordinary Promise
-  // semantics.
+  // Subscribe next, synchronously - see this file's header
+  // ("Subscribe-then-check") for why the ordering relative to the
+  // IMMEDIATE RECHECK just below is what closes the lost-wakeup race: an
+  // initial snapshot read of current state (the cursor resolution above,
+  // and `currentHeadSeq`/`isTerminalJobState` in the recheck), THEN
+  // subscribe, THEN, with NO `await` between the subscribe calls and the
+  // recheck, ask whether either condition is already true. `settle`
+  // resolves `settlement` exactly once; every later call to it (from
+  // either listener, the timer, or an abort - all started below) is a
+  // harmless no-op, per ordinary Promise semantics.
   let settle!: (reason: FollowReason) => void;
   const settlement = new Promise<FollowReason>((resolve) => {
     settle = resolve;
@@ -241,31 +328,57 @@ export async function handler(args: Record<string, unknown> | undefined): Promis
 
   if (alreadyTerminal || alreadyHasOutput) {
     unsubscribeBoth();
+    releaseAdmission();
     const reason: FollowReason = alreadyTerminal ? "terminal" : "output";
     return toolSuccess(buildFollowProjection(jobId, stream, effectiveCursor, reason));
   }
 
-  // Otherwise: start a bounded timer and await whichever of the three
-  // (the output listener, the terminal listener, or this timer) settles
-  // first.
-  //
-  // RESOURCE-SAFETY NOTE: if the calling client abandons/cancels the
-  // underlying MCP call before it settles, this handler has no way to
-  // observe that - there is no cancellation signal wired through the
-  // tool-handler contract (`registry.ts`'s `ToolModule.handler` returns a
-  // plain `CallToolResult | Promise<CallToolResult>`, nothing more). The
-  // subscriptions and this timer still run to their own natural bound and
-  // clean up themselves when they do; nothing leaks, it is simply wasted
-  // work for a response nobody reads. A known, accepted v1 limitation,
-  // not something this story fixes.
+  // Otherwise: start a bounded timer and await whichever of the output
+  // listener, the terminal listener, this timer, or (once `signal` is
+  // provided) an abort of `signal` settles first.
   const timer = setTimeout(() => settle("timeout"), timeoutMs);
+
+  // Register the abort listener only now, once this call is genuinely
+  // about to wait - the two early-return paths above (already cancelled
+  // before this handler even started; already settled at subscribe time)
+  // never reach here, so neither one needs an abort listener registered
+  // and then immediately torn down again. `signal` undefined (a caller
+  // that does not pass one - a future/test caller, say) simply means this
+  // call is never abort-cancellable, the same as before this fix existed.
+  // Firing `onAbort` does every bit of cleanup this call owes on its own:
+  // unsubscribe both listeners, clear the timer, and release the
+  // admission slot - all before `settlement` even resolves.
+  let abortedWhileWaiting = false;
+  const onAbort = (): void => {
+    abortedWhileWaiting = true;
+    unsubscribeBoth();
+    clearTimeout(timer);
+    releaseAdmission();
+    settle("timeout"); // the value passed here is never read - see below
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+
   const reason = await settlement;
-  // The instant one settles, unsubscribe BOTH listeners and clear the
-  // timer unconditionally - defensive cleanup on every path, since
-  // nothing should be left subscribed or pending once this has resolved
-  // (the promise itself only ever resolves once, per the note above).
+
+  if (abortedWhileWaiting) {
+    // `onAbort` already performed every bit of cleanup this call owes.
+    // Nothing reads `reason` on this path (it is a fixed placeholder, not
+    // a real outcome), and nobody reads this response either - the same
+    // "the SDK discards a cancelled request's result" fact the
+    // already-aborted-at-start branch above documents. A minimal,
+    // non-error result closes this call out cleanly regardless.
+    return toolAlreadyCancelledResult();
+  }
+
+  // The instant one settles via a NON-abort path, unsubscribe BOTH
+  // listeners, clear the timer, release the admission slot, and remove
+  // the (still-registered - it never fired) abort listener: unconditional
+  // cleanup on every remaining path, since nothing should be left
+  // subscribed, pending, or holding a slot once this has resolved.
   unsubscribeBoth();
   clearTimeout(timer);
+  releaseAdmission();
+  signal?.removeEventListener("abort", onAbort);
 
   return toolSuccess(buildFollowProjection(jobId, stream, effectiveCursor, reason));
 }
@@ -427,5 +540,32 @@ function toolSuccess(projection: FollowProjection): CallToolResult {
   return {
     content: [{ type: "text", text: JSON.stringify(projection, null, 2) }],
     structuredContent: { ...projection },
+  };
+}
+
+/**
+ * The minimal, non-error result returned when this call never actually
+ * waited on anything because the calling MCP request was already
+ * cancelled before the handler started, or was cancelled while it WAS
+ * waiting - see `handler`'s own docs for why a full `FollowProjection` is
+ * never built on either path: the MCP SDK itself discards whatever a
+ * cancelled request's handler returns (`src/server.ts`'s `tools/call`
+ * dispatch), so nothing ever reads this result either way. Deliberately
+ * NOT shaped as a `FollowProjection` and carries no `reason` value at all
+ * - inventing a new public `reason` enum member for "cancelled" is out of
+ * scope for this fix (the contract stays `"output" | "terminal" |
+ * "timeout"`, unchanged), and reusing `"timeout"` here would misrepresent
+ * what actually happened to anything that DOES inspect this response
+ * directly (a direct-handler test not driven through the real SDK
+ * dispatch this normally goes through, say).
+ */
+function toolAlreadyCancelledResult(): CallToolResult {
+  return {
+    content: [
+      {
+        type: "text",
+        text: "follow: the calling request was cancelled - this call never subscribed to the job and holds no admission-budget slot",
+      },
+    ],
   };
 }

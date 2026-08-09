@@ -17,23 +17,30 @@ import * as runTool from "./tools/run.js";
 import * as statusTool from "./tools/status.js";
 import * as tailTool from "./tools/tail.js";
 
-/** The shape every `src/tools/*.ts` module must export. */
+/**
+ * The shape every `src/tools/*.ts` module must export. `handler`'s second
+ * parameter is the calling MCP request's real `AbortSignal` (see
+ * `src/server.ts`'s `tools/call` dispatch for where it comes from) -
+ * `dispatchToolCall` below always passes it, but it is optional here
+ * because a handler is free to ignore it: `follow.ts` is the one handler
+ * that reads it today, every other tool's signature is unaffected by the
+ * extra argument.
+ */
 interface ToolModule {
   readonly name: string;
   readonly description: string;
   readonly inputSchema: Tool["inputSchema"];
-  handler(args: Record<string, unknown> | undefined): CallToolResult | Promise<CallToolResult>;
+  handler(
+    args: Record<string, unknown> | undefined,
+    signal?: AbortSignal
+  ): CallToolResult | Promise<CallToolResult>;
 }
 
 /**
- * Seven tools, frozen by design except for this one deliberate addition:
- * run, status, list, output, tail, kill, follow - no more, no fewer. The
- * freeze is real - it is not routinely reopened - but `follow` is not the
- * freeze being quietly disregarded either: it is a genuinely new
- * capability (a bounded wait, closing the one gap the other six can't -
- * waiting for something to happen without a fixed sleep-and-recheck loop),
- * a deliberate, considered reopening of a real constraint, not a freeze
- * quietly disregarded. Order here is also the order `tools/list`
+ * Seven tools: run, status, list, output, tail, kill, follow - no more, no
+ * fewer. `follow` is a bounded wait on a job's next event, closing the one
+ * gap the other six can't: waiting for something to happen without a fixed
+ * sleep-and-recheck loop. Order here is also the order `tools/list`
  * advertises them in; `follow` sits last, as the newest addition.
  */
 const TOOL_MODULES: readonly ToolModule[] = [
@@ -81,11 +88,12 @@ export function listToolDefinitions(): Tool[] {
  */
 export function dispatchToolCall(
   name: string,
-  args: Record<string, unknown> | undefined
+  args: Record<string, unknown> | undefined,
+  signal?: AbortSignal
 ): CallToolResult | Promise<CallToolResult> {
   const tool = TOOL_MODULES.find((candidate) => candidate.name === name);
   if (!tool) {
     throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Unknown tool: "${name}"`);
   }
-  return tool.handler(args);
+  return tool.handler(args, signal);
 }

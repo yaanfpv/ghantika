@@ -391,7 +391,27 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
         "tools/call rejected: the client has not completed the initialize/initialized handshake yet"
       );
     }
-    const result = await dispatchToolCall(request.params.name, request.params.arguments);
+    // `ctx.mcpReq.signal` is the real per-request `AbortSignal` the
+    // installed SDK fires when the client sends `notifications/cancelled`
+    // for this exact request id (see the SDK's own `_oncancel`, which maps
+    // `notification.params.requestId` straight to the `AbortController` it
+    // keeps per in-flight request). Forwarded through unconditionally, for
+    // every tool - `dispatchToolCall`/`registry.ts` decide what, if
+    // anything, a given tool does with it; today only `follow.ts` reads it
+    // at all, every other handler's signature simply ignores the extra
+    // argument, same as before this signal ever existed. The SDK itself
+    // already discards whatever this handler eventually returns once
+    // `abortController.signal.aborted` is true by the time the result
+    // settles (see its own dispatch code, `if (abortController.signal
+    // .aborted) return;` on both the success and error branches) - so this
+    // is what lets a handler that actually WANTS to react to cancellation
+    // early (stop waiting, release resources) do so, rather than running
+    // to its own natural bound for a response nobody will ever receive.
+    const result = await dispatchToolCall(
+      request.params.name,
+      request.params.arguments,
+      ctx.mcpReq.signal
+    );
     // ONLY run() is ever handed to the adapter - status/output/tail/kill/
     // list pass straight through unchanged, so the plain poll floor stays
     // reachable on every connection regardless of Tasks capability.

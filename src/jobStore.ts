@@ -1299,6 +1299,37 @@ export function reapOutcomeToReleaseDecision(outcome: ReapOutcome): "confirmed" 
   }
 }
 
+// ---------------------------------------------------------------------------
+// follow() admission budget - process-wide, not per-connection
+// ---------------------------------------------------------------------------
+
+/**
+ * The maximum number of `follow` calls this store will let sit outstanding
+ * (subscribed and waiting on a job's next event) AT ONCE, across every
+ * connection this process serves - see `JobStore.tryAdmitFollow`/
+ * `releaseFollowAdmission`'s own docs for the accounting this bounds, and
+ * `src/tools/follow.ts`'s own `description` for the caller-facing contract:
+ * a call made once this budget is exhausted is REJECTED outright with a
+ * tool error, never queued or coalesced with an existing outstanding call
+ * on the same job. A deliberately modest, round default - disclosed rather
+ * than measured, the same kind of number `follow.ts`'s own
+ * `MAX_TIMEOUT_MS` is for the same reason (see that constant's own docs):
+ * this store has no real production traffic to calibrate a budget against
+ * yet, so 128 is chosen as comfortably above any single well-behaved
+ * caller's own realistic concurrent-wait count, not derived from a load
+ * test. The budget is enforced PROCESS-WIDE, not per-connection or
+ * per-client - this server tracks no connection/client identity today, so
+ * one connection's outstanding `follow` calls draw from the exact same
+ * shared pool every other connection does. A single misbehaving client can
+ * therefore still exhaust this budget and deny `follow` to every other
+ * connection - it can no longer do so silently or without bound (a caller
+ * now gets an immediate, clear rejection instead of this store quietly
+ * accumulating unbounded listeners and timers), but per-connection
+ * fairness is explicitly out of scope for this budget, disclosed here
+ * rather than left to be discovered.
+ */
+export const MAX_OUTSTANDING_FOLLOWS = 128;
+
 /**
  * The sole owner of ghantika's job/output state. Tool handlers use the
  * `jobStore` singleton this module exports below - never construct their
@@ -1538,6 +1569,14 @@ export class JobStore {
   private static readonly STRANDED_SLOT_RETRY_DELAY_MS = 3000;
   /** Whether this store has begun shutting down - see `beginShutdown`'s own docs for exactly what that gates and why it is permanent on a real server. */
   private shuttingDown = false;
+  /**
+   * How many `follow` calls currently hold an admission slot against
+   * `MAX_OUTSTANDING_FOLLOWS` - see `tryAdmitFollow`/`releaseFollowAdmission`'s
+   * own docs for the exactly-once accounting contract this counter depends
+   * on. Process-wide, not keyed by job id or connection - see
+   * `MAX_OUTSTANDING_FOLLOWS`'s own docs for why.
+   */
+  private outstandingFollowCount = 0;
 
   constructor(
     concurrencyConfig: ConcurrencyConfig = loadConcurrencyConfigFromEnv(),
@@ -3381,6 +3420,61 @@ export class JobStore {
   /** The number of listeners currently registered via `onJobTerminal` for `jobId` - 0 if none, or if `jobId` is unknown. A real oracle for a subscriber's own cleanup: a consumer that unsubscribes correctly leaves this at 0 once it is done with the job, regardless of which code path triggered that cleanup. */
   getJobTerminalListenerCount(jobId: string): number {
     return this.jobTerminalListeners.get(jobId)?.size ?? 0;
+  }
+
+  /** The number of listeners currently registered via `onOutputArrival` for `jobId` - 0 if none, or if `jobId` is unknown. The same real-oracle role `getJobTerminalListenerCount` plays for its own subscriber count, applied to the other listener map this store owns. */
+  getOutputArrivalListenerCount(jobId: string): number {
+    return this.outputArrivalListeners.get(jobId)?.size ?? 0;
+  }
+
+  /**
+   * Admits ONE more `follow` call against this store's process-wide budget
+   * (`MAX_OUTSTANDING_FOLLOWS`), or refuses it outright - the caller's own
+   * signal to reject the call rather than let it subscribe anything at
+   * all. Returns `true` and increments `outstandingFollowCount`, in the
+   * SAME synchronous call, when there is room; returns `false` and leaves
+   * the counter untouched otherwise. `src/tools/follow.ts`'s handler calls
+   * this exactly once per call, AFTER its own already-aborted-signal early
+   * return and BEFORE subscribing any output/terminal listener - a refused
+   * admission must never leave anything behind to clean up. See
+   * `releaseFollowAdmission`'s own docs for the matching release contract
+   * every successful admission owes.
+   */
+  tryAdmitFollow(): boolean {
+    if (this.outstandingFollowCount >= MAX_OUTSTANDING_FOLLOWS) return false;
+    this.outstandingFollowCount += 1;
+    return true;
+  }
+
+  /**
+   * Releases ONE admission slot previously granted by `tryAdmitFollow`.
+   * MUST be called EXACTLY ONCE per successful `tryAdmitFollow()` call, on
+   * EVERY path that call's own `follow` invocation can end on - natural
+   * settlement (output/terminal/timeout), an abort, or the handler
+   * throwing/crashing before it ever settles. A caller that admits and
+   * never releases leaks one unit of budget forever, permanently shrinking
+   * how many `follow` calls this process can ever serve at once again; a
+   * caller that releases WITHOUT a matching prior admission corrupts this
+   * counter into the negative, silently granting extra budget nobody
+   * actually freed. Because of that second failure mode, this method has
+   * no way to detect a mismatched call and does not try to - `follow.ts`'s
+   * own handler tracks LOCALLY (a boolean, set only on a genuine
+   * `tryAdmitFollow() === true`) whether it actually holds a slot before
+   * ever calling this.
+   */
+  releaseFollowAdmission(): void {
+    this.outstandingFollowCount -= 1;
+  }
+
+  /**
+   * How many `follow` calls currently hold an admission slot - a test
+   * oracle, matching `getJobTerminalListenerCount`'s own real-oracle role:
+   * a caller that admits and releases correctly leaves this at 0 once
+   * every one of its `follow` calls has ended, regardless of which path
+   * (settlement, abort, rejection) each one took.
+   */
+  getOutstandingFollowCount(): number {
+    return this.outstandingFollowCount;
   }
 
   /**
