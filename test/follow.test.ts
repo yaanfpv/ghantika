@@ -235,6 +235,14 @@ test('follow: a genuine terminal transition DURING the wait resolves promptly wi
 // default), matching this repo's own timer-test tolerance idiom (see
 // test/process.test.ts's confirmProcessGroupReapedPosix/waitForProcessDeath
 // timeout tests: `elapsed >= boundMs && elapsed < boundMs + generous-margin`).
+// The lower bound itself carries a small `- 5` margin, not zero slack -
+// observed on hosted CI (coverage-instrumented run, 2026-08-09): a call
+// with no matching arrival resolved at 149ms against a 150ms bound, one
+// millisecond under, which is ordinary setTimeout/Date.now() measurement
+// jitter under instrumentation overhead, not evidence the call woke early
+// on the wrong signal. A broken filter/guard resolves near-instantly (single-
+// digit ms), which this margin still catches with room to spare - it only
+// forgives genuine scheduler slop at the bound itself.
 // ---------------------------------------------------------------------------
 
 test('follow: nothing happens within a short explicit timeout_ms - resolves with reason "timeout" and a non-empty note, at approximately the bound', async () => {
@@ -247,7 +255,7 @@ test('follow: nothing happens within a short explicit timeout_ms - resolves with
   assert.equal(typeof result.note, "string");
   assert.ok((result.note as string).length > 0, "expected a non-empty note on timeout");
   assert.ok(
-    elapsed >= boundMs && elapsed < boundMs + 900,
+    elapsed >= boundMs - 5 && elapsed < boundMs + 900,
     `expected to resolve close to the ${boundMs}ms bound, took ${elapsed}ms`
   );
   assert.deepEqual(result.events, []);
@@ -293,7 +301,7 @@ test("follow: an unterminated fragment does not wake the call on its own - only 
   );
   assert.deepEqual(timeoutResult.events, []);
   assert.ok(
-    elapsed >= boundMs && elapsed < boundMs + 900,
+    elapsed >= boundMs - 5 && elapsed < boundMs + 900,
     `expected to resolve close to the ${boundMs}ms bound (never early, on the unterminated write), took ${elapsed}ms`
   );
 
@@ -343,7 +351,7 @@ test('follow: stream:"stdout" ignores a stderr-only arrival - the call does NOT 
   );
   assert.deepEqual(result.events, []);
   assert.ok(
-    elapsed >= boundMs && elapsed < boundMs + 900,
+    elapsed >= boundMs - 5 && elapsed < boundMs + 900,
     `expected to resolve close to the ${boundMs}ms bound (never early, on the stderr arrival), took ${elapsed}ms`
   );
 });
