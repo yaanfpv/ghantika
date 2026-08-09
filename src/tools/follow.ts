@@ -256,7 +256,7 @@ export async function handler(
   // result is returned here rather than a full `FollowProjection`, since
   // nobody ever reads it either way.
   if (signal?.aborted === true) {
-    return toolAlreadyCancelledResult();
+    return alreadyCancelledBeforeStartResult();
   }
 
   // The admission budget - a process-wide cap on how many `follow` calls
@@ -361,13 +361,17 @@ export async function handler(
   const reason = await settlement;
 
   if (abortedWhileWaiting) {
-    // `onAbort` already performed every bit of cleanup this call owes.
-    // Nothing reads `reason` on this path (it is a fixed placeholder, not
-    // a real outcome), and nobody reads this response either - the same
-    // "the SDK discards a cancelled request's result" fact the
-    // already-aborted-at-start branch above documents. A minimal,
-    // non-error result closes this call out cleanly regardless.
-    return toolAlreadyCancelledResult();
+    // `onAbort` already performed every bit of cleanup this call owes -
+    // both listeners unsubscribed, the timer cleared, the admission slot
+    // released, all before `settlement` resolved. Nothing reads `reason`
+    // on this path (it is a fixed placeholder, not a real outcome), and
+    // nobody reads this response either - the same "the SDK discards a
+    // cancelled request's result" fact the already-aborted-at-start
+    // branch above documents. A minimal, non-error result closes this
+    // call out cleanly regardless - see `cancelledWhileWaitingResult`'s
+    // own doc comment for why this path has its own text rather than
+    // reusing `alreadyCancelledBeforeStartResult`'s.
+    return cancelledWhileWaitingResult();
   }
 
   // The instant one settles via a NON-abort path, unsubscribe BOTH
@@ -544,27 +548,62 @@ function toolSuccess(projection: FollowProjection): CallToolResult {
 }
 
 /**
- * The minimal, non-error result returned when this call never actually
- * waited on anything because the calling MCP request was already
- * cancelled before the handler started, or was cancelled while it WAS
- * waiting - see `handler`'s own docs for why a full `FollowProjection` is
- * never built on either path: the MCP SDK itself discards whatever a
- * cancelled request's handler returns (`src/server.ts`'s `tools/call`
- * dispatch), so nothing ever reads this result either way. Deliberately
- * NOT shaped as a `FollowProjection` and carries no `reason` value at all
- * - inventing a new public `reason` enum member for "cancelled" is out of
- * scope for this fix (the contract stays `"output" | "terminal" |
- * "timeout"`, unchanged), and reusing `"timeout"` here would misrepresent
- * what actually happened to anything that DOES inspect this response
- * directly (a direct-handler test not driven through the real SDK
- * dispatch this normally goes through, say).
+ * The minimal, non-error result returned when the calling MCP request was
+ * already cancelled BEFORE this handler even started - see `handler`'s
+ * own docs for why a full `FollowProjection` is never built on this path:
+ * the MCP SDK itself discards whatever a cancelled request's handler
+ * returns (`src/server.ts`'s `tools/call` dispatch), so nothing ever
+ * reads this result either way. Deliberately NOT shaped as a
+ * `FollowProjection` and carries no `reason` value at all - inventing a
+ * new public `reason` enum member for "cancelled" is out of scope for
+ * this fix (the contract stays `"output" | "terminal" | "timeout"`,
+ * unchanged), and reusing `"timeout"` here would misrepresent what
+ * actually happened to anything that DOES inspect this response directly
+ * (a direct-handler test not driven through the real SDK dispatch this
+ * normally goes through, say).
+ *
+ * The text below is TRUE only on this path, never on
+ * `cancelledWhileWaitingResult`'s - see that function's own doc comment
+ * for why the two need separate text rather than one shared function.
  */
-function toolAlreadyCancelledResult(): CallToolResult {
+function alreadyCancelledBeforeStartResult(): CallToolResult {
   return {
     content: [
       {
         type: "text",
-        text: "follow: the calling request was cancelled - this call never subscribed to the job and holds no admission-budget slot",
+        text: "follow: the calling request was already cancelled before this call started - it never subscribed to the job and holds no admission-budget slot",
+      },
+    ],
+  };
+}
+
+/**
+ * The minimal, non-error result returned when the calling MCP request was
+ * cancelled WHILE this call was genuinely waiting (subscribed to
+ * `onOutputArrival`/`onJobTerminal` and holding an admission-budget
+ * slot) - see `alreadyCancelledBeforeStartResult`'s own doc comment for
+ * why a full `FollowProjection` is never built here either, and why
+ * `"timeout"` would misrepresent this path too.
+ *
+ * A SEPARATE function from `alreadyCancelledBeforeStartResult`, not a
+ * second call site reusing it: that function's text claims this call
+ * "never subscribed to the job and holds no admission-budget slot," which
+ * is true when cancellation arrives before the handler starts, but FALSE
+ * here - on this path the call DID subscribe and DID hold a slot, then
+ * `onAbort` released both. The original single shared function's name -
+ * `toolAlreadyCancelledResult`, presuming "already" - held only for the
+ * before-start case; reusing it for the mid-wait case silently inherited
+ * that false claim. Fixed here rather than by rewording generically,
+ * since the caller-facing distinction (nothing was ever held, versus
+ * something was held and has now been released) is genuinely useful and
+ * worth keeping.
+ */
+function cancelledWhileWaitingResult(): CallToolResult {
+  return {
+    content: [
+      {
+        type: "text",
+        text: "follow: the calling request was cancelled while this call was waiting - its output/terminal subscriptions and admission-budget slot have been released",
       },
     ],
   };

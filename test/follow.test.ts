@@ -530,6 +530,19 @@ test("follow: aborting mid-wait unsubscribes both listeners, clears the pending 
 
 interface Pair {
   readonly client: Client;
+  /**
+   * The client-side half of the linked `InMemoryTransport` pair, exposed
+   * (in addition to `client`) so a test can drop below the SDK `Client`'s
+   * own high-level API and send/observe RAW JSON-RPC messages directly -
+   * needed for the id-0 regression below, which has to construct a
+   * `tools/call` request carrying the exact literal id `0` and a matching
+   * `notifications/cancelled` naming `requestId: 0`. The installed SDK
+   * `Client` always assigns its own incrementing request ids starting from
+   * 1 and gives callers no way to override that, so `pair.client.callTool`
+   * (as the existing REAL-notifications/cancelled test above uses) can
+   * never itself produce id `0` on the wire.
+   */
+  readonly clientTransport: InMemoryTransport;
   readonly close: () => Promise<void>;
 }
 
@@ -549,6 +562,7 @@ async function startPair(): Promise<Pair> {
 
   return {
     client,
+    clientTransport,
     close: () => instance.shutdown("follow.test.ts cancellation test complete"),
   };
 }
@@ -606,6 +620,131 @@ test("follow: a REAL notifications/cancelled sent over the wire (not an injected
     await waitUntil(() => jobStore.getJobTerminalListenerCount(jobId) === 0);
     assert.equal(jobStore.getOutputArrivalListenerCount(jobId), 0);
     assert.equal(jobStore.getOutstandingFollowCount(), 0);
+  } finally {
+    await pair.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Regression - request id `0`. `0` is a legal JSON-RPC request id (ids are
+// `string | number`, with no reservation on `0`) but it is FALSY in
+// JavaScript, and the installed, pinned SDK's own `Protocol._oncancel` reads
+// `if (!notification.params.requestId) return;` - so a real
+// `notifications/cancelled` naming `requestId: 0` is silently dropped by the
+// SDK's own dispatch, no matter how correctly src/server.ts forwards
+// `ctx.mcpReq.signal`. src/server.ts's own `attachCancelledNotificationObserver`
+// (see its doc comment) exists specifically to observe that SAME wire
+// traffic through a path that checks `requestId` by TYPE rather than
+// truthiness, entirely independent of the SDK's broken guard.
+//
+// This has to be a RAW-WIRE test, not a directly-constructed `AbortSignal`:
+// an injected signal would pass against the broken SDK just as easily as
+// against a correct one, and would prove nothing about the actual bug
+// (which lives in how a real `notifications/cancelled` MESSAGE gets
+// routed, not in whether `follow()` itself honors whatever signal it is
+// handed). The nonzero-id control alongside it is what makes this a
+// regression test rather than a mere demonstration: if a future SDK
+// version repairs `_oncancel`'s own guard upstream, this test's id-0 case
+// keeps passing (this file's own independent observer still tears
+// everything down), and only the id-0-vs-nonzero DISTINCTION - not the
+// underlying assertions themselves - stops being the thing that would have
+// caught a regression in this file's own workaround if it were ever
+// removed.
+// ---------------------------------------------------------------------------
+
+test("follow: a REAL notifications/cancelled naming request id 0 (falsy, but a legal JSON-RPC id) tears down server-side listeners, the timer, and the admission slot exactly like a nonzero id does - reproduces the installed SDK's own known `_oncancel` gap and proves src/server.ts's independent observer closes it", async () => {
+  const pair = await startPair();
+  try {
+    // A response listener CHAINED onto whatever the SDK's own `Client`
+    // already claimed on this transport at `client.connect()` time above -
+    // never a raw reassignment, matching src/server.ts's own established
+    // chain-don't-replace idiom (see `attachCancelledNotificationObserver`'s
+    // doc comment there for why replacing outright would silently discard
+    // whatever handler was already present).
+    const responses = new Map<string | number, unknown>();
+    const previousOnMessage = pair.clientTransport.onmessage;
+    pair.clientTransport.onmessage = (message, extra) => {
+      previousOnMessage?.(message, extra);
+      if (typeof message !== "object" || message === null) return;
+      const candidate = message as { id?: unknown; result?: unknown; error?: unknown };
+      if (typeof candidate.id !== "string" && typeof candidate.id !== "number") return;
+      if (!("result" in candidate) && !("error" in candidate)) return;
+      responses.set(candidate.id, message);
+    };
+
+    // Drives one full raw-wire subscribe-then-cancel sequence for a single
+    // request id, asserting the exact same teardown the existing REAL
+    // notifications/cancelled test above asserts for its client-assigned
+    // id. Used once for `id: 0` (the falsy-but-legal id this bug lives at)
+    // and once more for a nonzero id (the positive control), on
+    // independent jobs so neither run can mask the other.
+    async function exerciseRawCancellation(id: number): Promise<void> {
+      const jobId = makeJob();
+
+      await pair.clientTransport.send({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: "follow", arguments: { job_id: jobId, timeout_ms: 30_000 } },
+      });
+
+      // The call has to actually reach the server and subscribe before
+      // there is anything to cancel - same real-wire-round-trip reasoning
+      // as the existing REAL notifications/cancelled test above.
+      await waitUntil(() => jobStore.getJobTerminalListenerCount(jobId) === 1);
+      assert.equal(
+        jobStore.getOutputArrivalListenerCount(jobId),
+        1,
+        `id ${id}: output-arrival listener must be subscribed before cancelling`
+      );
+      assert.equal(
+        jobStore.getOutstandingFollowCount(),
+        1,
+        `id ${id}: admission-budget slot must be held before cancelling`
+      );
+
+      await pair.clientTransport.send({
+        jsonrpc: "2.0",
+        method: "notifications/cancelled",
+        params: { requestId: id, reason: `raw-wire regression test - id ${id}` },
+      });
+
+      // Server-side cleanup happens on RECEIPT of the notification, which
+      // travels over the wire (in-memory, but still asynchronous) - poll
+      // with a real bound, exactly as the existing test above does, rather
+      // than assuming it has already landed.
+      await waitUntil(() => jobStore.getJobTerminalListenerCount(jobId) === 0);
+      assert.equal(
+        jobStore.getOutputArrivalListenerCount(jobId),
+        0,
+        `id ${id}: output-arrival listener must be torn down after cancellation - this is the exact assertion the installed SDK's falsy-id guard makes fail for id 0 without src/server.ts's independent observer`
+      );
+      assert.equal(
+        jobStore.getOutstandingFollowCount(),
+        0,
+        `id ${id}: admission-budget slot must be released after cancellation`
+      );
+
+      // The server never sends a response for a cancelled request (the
+      // installed SDK suppresses it once its own `abortController.signal
+      // .aborted` is true - see src/server.ts's own doc comment on the
+      // `tools/call` handler), for either id - confirming this test is not
+      // accidentally passing because the call settled normally before
+      // cancellation raced it.
+      assert.equal(
+        responses.has(id),
+        false,
+        `id ${id}: a cancelled call must never receive a response on the wire`
+      );
+    }
+
+    // The falsy-but-legal id this bug lives at.
+    await exerciseRawCancellation(0);
+
+    // Positive-id control, same route, same sequence - see this section's
+    // own header comment for why this pairing is what makes the test a
+    // regression guard rather than a one-off demonstration.
+    await exerciseRawCancellation(7);
   } finally {
     await pair.close();
   }

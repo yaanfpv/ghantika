@@ -346,6 +346,60 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
   // capabilities") for why the two eras need genuinely different sources.
   let servedModernEra = false;
 
+  // A SEPARATE, independent record of one in-flight `tools/call`'s own
+  // AbortController, keyed by its JSON-RPC request id - NOT the SDK's own
+  // internal `_requestHandlerAbortControllers` map, and never read from or
+  // written to it. Exists because the installed, pinned SDK's own
+  // cancellation dispatch (`Protocol._oncancel`) drops a legal numeric
+  // request id of `0`: its guard is `if (!notification.params.requestId)
+  // return;`, and `0` is falsy in JavaScript, so a client that opens its
+  // very first request with id `0` (entirely legal JSON-RPC - ids are
+  // `string | number`, with no reservation on `0`) can never have that
+  // request's cancellation delivered through the SDK's own path, no matter
+  // how correctly this file forwards `ctx.mcpReq.signal`. See
+  // `attachCancelledNotificationObserver`'s own doc comment below for how
+  // this map is populated independently of that broken guard, and the
+  // `tools/call` handler below for where a controller is registered here
+  // and combined with the SDK's own (still-correct-for-every-other-id)
+  // signal via `AbortSignal.any`.
+  //
+  // A PLAIN OBJECT, deliberately never a `Map` - this file is scanned by
+  // scripts/check-module-boundaries.mjs's persistent-state check, which
+  // forbids a `new Map`/`new Set`/`new WeakMap`/`new WeakSet`/`Array(...)`/
+  // `Object(...)` construction ANYWHERE in this file, any scope, precisely
+  // because only jobStore.ts may own a state container (see that script's
+  // own header for the full design rationale - the same reason
+  // `wake/appServerTransport.ts`'s and `wake/desktopIpcTransport.ts`'s
+  // analogous per-connection bookkeeping lives on PRIVATE CLASS INSTANCE
+  // FIELDS rather than a module-level container). This connection's own
+  // in-flight-request bookkeeping is exactly that kind of per-connection,
+  // non-persistent state - it lives and dies with one
+  // `buildGhantikaServerCore()` closure, same as `servedModernEra` and
+  // `receivedInitializedNotification` just below - so a plain object
+  // literal closure-scoped here (never a module-top-level `let`/empty
+  // literal, which IS flagged) is both structurally invisible to that scan
+  // and the honest shape for what this actually is. `cancellationKey`
+  // exists because a plain object's keys are always coerced to strings,
+  // which would otherwise silently collide a numeric id `0` with a string
+  // id `"0"` - something a real `Map` (SameValueZero keyed) never would -
+  // so every key is tagged with its original JSON-RPC id TYPE before
+  // insertion, preserving the same distinction a `Map` would give for
+  // free.
+  const requestCancellationControllers: Record<string, AbortController> = {};
+
+  /**
+   * Tags `id` with its own JSON-RPC type (`"n:"` for `number`, `"s:"` for
+   * `string`) before use as a plain-object key, so a numeric `0` and a
+   * string `"0"` - both legal, distinct JSON-RPC request ids - can never
+   * collide once coerced to an object property key. See
+   * `requestCancellationControllers`'s own doc comment above for why this
+   * is a plain object rather than a `Map` (which would need no such
+   * tagging) in the first place.
+   */
+  function cancellationKey(id: string | number): string {
+    return `${typeof id === "number" ? "n" : "s"}:${id}`;
+  }
+
   const isInitializedForToolCalls = (): boolean =>
     initializeNegotiationSucceeded && receivedInitializedNotification;
 
@@ -395,41 +449,63 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
     // installed SDK fires when the client sends `notifications/cancelled`
     // for this exact request id (see the SDK's own `_oncancel`, which maps
     // `notification.params.requestId` straight to the `AbortController` it
-    // keeps per in-flight request). Forwarded through unconditionally, for
-    // every tool - `dispatchToolCall`/`registry.ts` decide what, if
-    // anything, a given tool does with it; today only `follow.ts` reads it
-    // at all, every other handler's signature simply ignores the extra
-    // argument, same as before this signal ever existed. The SDK itself
-    // already discards whatever this handler eventually returns once
-    // `abortController.signal.aborted` is true by the time the result
-    // settles (see its own dispatch code, `if (abortController.signal
-    // .aborted) return;` on both the success and error branches) - so this
-    // is what lets a handler that actually WANTS to react to cancellation
-    // early (stop waiting, release resources) do so, rather than running
-    // to its own natural bound for a response nobody will ever receive.
-    const result = await dispatchToolCall(
-      request.params.name,
-      request.params.arguments,
-      ctx.mcpReq.signal
-    );
-    // ONLY run() is ever handed to the adapter - status/output/tail/kill/
-    // list pass straight through unchanged, so the plain poll floor stays
-    // reachable on every connection regardless of Tasks capability.
-    // Capability comes from resolveRunClientCapabilities (below) - the
-    // connection's initialize-declared value on the legacy era, or THIS
-    // request's own per-request `_meta` envelope declaration on the
-    // 2026-07-28 era (see that function's own docs, and this file's header
-    // doc "Reading a request's own declared client capabilities," for why
-    // the two eras need genuinely different sources) - never off anything
-    // in `run()`'s own tool arguments, which is what keeps minting free of
-    // a per-call opt-in field on either era.
-    if (request.params.name === "run") {
-      const capable = tasksAdapter.isConnectionTasksCapable(
-        resolveRunClientCapabilities(server, ctx, servedModernEra)
+    // keeps per in-flight request) - correct for every request id EXCEPT
+    // `0` (see `requestCancellationControllers`'s own doc comment above).
+    // `ourController` is this file's own, entirely independent tracking of
+    // the SAME request, registered here and aborted by
+    // `attachCancelledNotificationObserver`'s raw-wire observer - which
+    // sees every `notifications/cancelled` message regardless of what the
+    // SDK's own dispatch does with it, so it fires correctly for id `0`
+    // too. `AbortSignal.any` combines both: whichever fires first wins,
+    // and for every id other than `0` that is still, in practice, the
+    // SDK's own signal, unchanged from before this fix. Forwarded through
+    // unconditionally, for every tool - `dispatchToolCall`/`registry.ts`
+    // decide what, if anything, a given tool does with it; today only
+    // `follow.ts` reads it at all, every other handler's signature simply
+    // ignores the extra argument, same as before this signal ever
+    // existed. The SDK itself already discards whatever this handler
+    // eventually returns once ITS OWN `abortController.signal.aborted` is
+    // true by the time the result settles (see its own dispatch code, `if
+    // (abortController.signal.aborted) return;` on both the success and
+    // error branches) - that check reads the SDK's own controller, not
+    // `ourController`, and this file never touches it, so that existing
+    // suppression behavior is completely unchanged by anything here.
+    const ourController = new AbortController();
+    requestCancellationControllers[cancellationKey(ctx.mcpReq.id)] = ourController;
+    try {
+      const combinedSignal = AbortSignal.any([ctx.mcpReq.signal, ourController.signal]);
+      const result = await dispatchToolCall(
+        request.params.name,
+        request.params.arguments,
+        combinedSignal
       );
-      return tasksAdapter.maybeAugmentRunResult(result, capable, sendTaskNotification);
+      // ONLY run() is ever handed to the adapter - status/output/tail/kill/
+      // list pass straight through unchanged, so the plain poll floor stays
+      // reachable on every connection regardless of Tasks capability.
+      // Capability comes from resolveRunClientCapabilities (below) - the
+      // connection's initialize-declared value on the legacy era, or THIS
+      // request's own per-request `_meta` envelope declaration on the
+      // 2026-07-28 era (see that function's own docs, and this file's header
+      // doc "Reading a request's own declared client capabilities," for why
+      // the two eras need genuinely different sources) - never off anything
+      // in `run()`'s own tool arguments, which is what keeps minting free of
+      // a per-call opt-in field on either era.
+      if (request.params.name === "run") {
+        const capable = tasksAdapter.isConnectionTasksCapable(
+          resolveRunClientCapabilities(server, ctx, servedModernEra)
+        );
+        return tasksAdapter.maybeAugmentRunResult(result, capable, sendTaskNotification);
+      }
+      return result;
+    } finally {
+      // Runs on every path out of the `try` above - the two `return`s and
+      // any thrown error alike - so `requestCancellationControllers` never
+      // retains an entry for a request that has already settled, matching
+      // the SDK's own `_requestHandlerAbortControllers` cleanup at the
+      // corresponding point in its dispatch (see this constant's own doc
+      // comment for why this is a SEPARATE map rather than that one).
+      delete requestCancellationControllers[cancellationKey(ctx.mcpReq.id)];
     }
-    return result;
   });
 
   // The three registered task methods - see tasksAdapter.ts's header for
@@ -517,14 +593,30 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
   // `StdioConnectionChannel` proxy this file never otherwise sees.
   const realConnect = server.connect.bind(server);
   server.connect = async (transport: Transport): Promise<void> => {
+    // `attachCancelledNotificationObserver` is wired on BOTH branches
+    // below, always AFTER `attachInitializeRequestObserver` has already
+    // run wherever that also applies (the legacy branch) - see
+    // `attachCancelledNotificationObserver`'s own doc comment for why it
+    // CHAINS onto whatever `transport.onmessage` is already set to rather
+    // than replacing it: `attachInitializeRequestObserver`'s own raw
+    // assignment (not a chain) would silently discard this observer if
+    // this one ran first. `requestCancellationControllers`'s own doc
+    // comment above explains why this exists at all (the installed SDK's
+    // own cancellation dispatch drops a legal request id of `0`).
     if (server.getNegotiatedProtocolVersion() !== undefined) {
       // A pre-negotiated MODERN connection - see this file's header doc
       // ("Modern era's own trust anchor") for why `serveStdio` setting
       // this BEFORE calling `.connect()` is itself the proof a legacy
-      // connection has no equivalent for and does not need one.
+      // connection has no equivalent for and does not need one. Nothing
+      // else claims `transport.onmessage` on this branch, so this is a
+      // plain (first) assignment, not actually a chain - see this
+      // function's own doc comment.
       servedModernEra = true;
       initializeNegotiationSucceeded = true;
       receivedInitializedNotification = true;
+      attachCancelledNotificationObserver(transport, (requestId, reason) => {
+        requestCancellationControllers[cancellationKey(requestId)]?.abort(reason);
+      });
       return realConnect(transport);
     }
     attachInitializeRequestObserver(transport, (id) => {
@@ -545,6 +637,12 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
         },
       }
     );
+    // Runs AFTER `attachInitializeRequestObserver` above, so it CHAINS onto
+    // that observer's own `transport.onmessage` assignment rather than
+    // silently discarding it - see this function's own doc comment.
+    attachCancelledNotificationObserver(transport, (requestId, reason) => {
+      requestCancellationControllers[cancellationKey(requestId)]?.abort(reason);
+    });
     return realConnect(transport);
   };
 
@@ -973,6 +1071,71 @@ function initializeRequestId(message: JSONRPCMessage): string | number | undefin
   if (candidate.method !== "initialize") return undefined;
   if (typeof candidate.id !== "string" && typeof candidate.id !== "number") return undefined;
   return candidate.id;
+}
+
+/**
+ * Wires an observer onto `transport.onmessage` that fires for every
+ * `notifications/cancelled` message, entirely independent of the SDK's own
+ * routing/dispatch of that SAME message - see
+ * `requestCancellationControllers`'s own doc comment (above, in
+ * `buildGhantikaServerCore`) for why this exists: the installed, pinned
+ * SDK's own `Protocol._oncancel` drops a legal numeric request id of `0`
+ * (`if (!notification.params.requestId) return;` - `0` is falsy), so a
+ * caller relying solely on `ctx.mcpReq.signal` never sees an abort for
+ * that one legal id. This observer changes nothing about what the SDK
+ * itself does with the message - its own `_oncancel` still runs, via its
+ * own separately-registered notification handler, completely unaffected -
+ * this is purely a SECOND, independent read of the same wire traffic.
+ *
+ * CHAINS onto whatever `transport.onmessage` is already set (calls it
+ * first, unconditionally, before this observer's own check), rather than
+ * replacing it outright - the same defensive pattern
+ * `Protocol.connect()` itself uses when it reads whatever `onmessage` was
+ * already present at connect-time (see this file's header doc). Without
+ * this, wiring this observer AFTER `attachInitializeRequestObserver` (which
+ * does a raw, non-chaining assignment) would silently discard that
+ * observer instead of adding to it - see the call sites in `.connect`
+ * above for why ordering there matters.
+ */
+function attachCancelledNotificationObserver(
+  transport: Transport,
+  onCancelled: (requestId: string | number, reason: string | undefined) => void
+): void {
+  const previousOnMessage = transport.onmessage;
+  transport.onmessage = (message) => {
+    previousOnMessage?.(message);
+    const info = cancelledNotificationInfo(message);
+    if (info !== undefined) {
+      onCancelled(info.requestId, info.reason);
+    }
+  };
+}
+
+/**
+ * Returns `{ requestId, reason }` when `message` is a genuine
+ * `notifications/cancelled` NOTIFICATION (has `method ===
+ * "notifications/cancelled"` and NO `id` - a notification never carries
+ * one, per JSON-RPC 2.0), `undefined` otherwise. `requestId` is checked by
+ * TYPE alone (`string` or `number`), deliberately never by truthiness -
+ * that is the exact guard the installed SDK's own `_oncancel` gets wrong
+ * for a legal `requestId` of `0`, and the whole reason this function
+ * exists rather than reusing that one.
+ */
+function cancelledNotificationInfo(
+  message: JSONRPCMessage
+): { requestId: string | number; reason: string | undefined } | undefined {
+  if (typeof message !== "object" || message === null) return undefined;
+  const candidate = message as { method?: unknown; id?: unknown; params?: unknown };
+  if (candidate.method !== "notifications/cancelled") return undefined;
+  if (candidate.id !== undefined) return undefined;
+  const params = candidate.params as { requestId?: unknown; reason?: unknown } | undefined;
+  if (typeof params?.requestId !== "string" && typeof params?.requestId !== "number") {
+    return undefined;
+  }
+  return {
+    requestId: params.requestId,
+    reason: typeof params.reason === "string" ? params.reason : undefined,
+  };
 }
 
 /**
