@@ -1187,10 +1187,11 @@ function initializeRequestId(message: JSONRPCMessage): string | number | undefin
  * routing/dispatch of that SAME message - see
  * `requestCancellationControllers`'s own doc comment (above, in
  * `buildGhantikaServerCore`) for why this exists: the installed, pinned
- * SDK's own `Protocol._oncancel` drops a legal numeric request id of `0`
- * (`if (!notification.params.requestId) return;` - `0` is falsy), so a
- * caller relying solely on `ctx.mcpReq.signal` never sees an abort for
- * that one legal id. This observer changes nothing about what the SDK
+ * SDK's own `Protocol._oncancel` drops a legal request id of `0` or `""`
+ * (`if (!notification.params.requestId) return;` - both are falsy in
+ * JavaScript), so a caller relying solely on `ctx.mcpReq.signal` never
+ * sees an abort for either legal falsy id. This observer changes nothing
+ * about what the SDK
  * itself does with the message - its own `_oncancel` still runs, via its
  * own separately-registered notification handler, completely unaffected -
  * this is purely a SECOND, independent read of the same wire traffic.
@@ -1225,9 +1226,10 @@ function attachCancelledNotificationObserver(
  * "notifications/cancelled"` and NO `id` - a notification never carries
  * one, per JSON-RPC 2.0), `undefined` otherwise. `requestId` is checked by
  * TYPE alone (`string` or `number`), deliberately never by truthiness -
- * that is the exact guard the installed SDK's own `_oncancel` gets wrong
- * for a legal `requestId` of `0`, and the whole reason this function
- * exists rather than reusing that one.
+ * that is the exact guard the installed SDK's own `_oncancel` gets wrong:
+ * it drops any FALSY legal `requestId`, not only `0` - `""` is falsy too
+ * and equally legal - and that is the whole reason this function exists
+ * rather than reusing that one.
  */
 function cancelledNotificationInfo(
   message: JSONRPCMessage
