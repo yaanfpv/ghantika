@@ -223,6 +223,7 @@ import {
 } from "./process.js";
 import { dispatchToolCall, listToolDefinitions } from "./registry.js";
 import * as tasksAdapter from "./tasksAdapter.js";
+import { resolveWakeTarget } from "./wake/resolveWakeTarget.js";
 
 const SERVER_NAME = "ghantika";
 // Kept as a literal here (rather than reading package.json at runtime) so
@@ -407,7 +408,26 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
       const capable = tasksAdapter.isConnectionTasksCapable(
         resolveRunClientCapabilities(server, ctx, servedModernEra)
       );
-      return tasksAdapter.maybeAugmentRunResult(result, capable, sendTaskNotification);
+      // Reads the SAME per-request `_meta` envelope
+      // `resolveRunClientCapabilities` reads (a different key on it -
+      // `threadId`, never `CLIENT_CAPABILITIES_META_KEY` - see
+      // `resolveWakeTarget`'s own doc comment), so this is a second call
+      // against a value already in hand, not a second envelope read. On the
+      // legacy era `ctx.mcpReq.envelope` reads `undefined` (the same
+      // branching fact `resolveRunClientCapabilities` above relies on), and
+      // `resolveWakeTarget(undefined)` correctly answers `{state:
+      // "absent"}` - the right, safe answer for a legacy connection: no
+      // wake attempt, poll floor only, no code path here needs to know
+      // which era served this request.
+      const wakeTargetResolution = resolveWakeTarget(
+        ctx.mcpReq.envelope as Record<string, unknown> | undefined
+      );
+      return tasksAdapter.maybeAugmentRunResult(
+        result,
+        capable,
+        sendTaskNotification,
+        wakeTargetResolution
+      );
     }
     return result;
   });
