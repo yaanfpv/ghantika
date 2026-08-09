@@ -6,7 +6,7 @@
  * singleton-sharing regression already uses) - never a bypass straight to
  * `dispatchToolCall` or `tasksAdapter`'s functions in isolation, because
  * the contract under test is what a real client observes on the wire:
- * capability negotiation, the six-tool mint rule, the three registered
+ * capability negotiation, the run-only mint rule, the three registered
  * task methods, and the always-on plain poll floor.
  *
  * `startPair(capable)` builds one such real Client/Server pair, optionally
@@ -1008,7 +1008,7 @@ test("a client declaring Tasks support ONLY under the older experimental bag (ne
 });
 
 // ---------------------------------------------------------------------------
-// The six-tool mint rule: run() mints unsolicited on a capable connection,
+// The run-only mint rule: run() mints unsolicited on a capable connection,
 // with no per-request opt-in field involved at all
 // ---------------------------------------------------------------------------
 

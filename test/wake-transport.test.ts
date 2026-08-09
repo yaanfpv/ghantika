@@ -14,10 +14,10 @@ import type {
 // simultaneously: (1) importing the module carries zero runtime cost or
 // side effect (it declares types only - `probe()`/`wake()` are never
 // invoked here, nothing is registered, nothing is constructed), and (2)
-// nothing in `src/server.ts` or any of the six tool handlers imports from
+// nothing in `src/server.ts` or any of the seven tool handlers imports from
 // `src/wake/` at all yet, so their own existing tests (unmodified by this
 // change) are the standing proof that ghantika still starts and still serves
-// its six tools with zero transports wired in.
+// its seven tools with zero transports wired in.
 
 test("importing wakeTransport.js has zero runtime footprint - a type-only module compiles to no executable exports", async () => {
   const mod = await import("../dist/wake/wakeTransport.js");

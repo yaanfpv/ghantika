@@ -141,7 +141,7 @@ async function waitForBirthIdentity(jobId: string): Promise<void> {
  * every job here is spawned through the REAL `runTool.handler`, which goes
  * through `src/tools/run.ts`'s `beginSpawn` - the SAME eager,
  * fire-and-forget `jobStore.reapProcessGroupOnce` call at the child's own
- * OS-level exit that `test/tasks.test.ts`'s own "six-tool mint rule" test
+ * OS-level exit that `test/tasks.test.ts`'s own "run-only mint rule" test
  * (both its exited-naturally AND its explicitly-killed job) is exposed to.
  * `JobStore.setKillConfirmation`/`.setIdentityConfirmation` (see their own
  * doc comments in `src/jobStore.ts`) each only ever WRITE once the job's
@@ -344,7 +344,7 @@ test(
     // `pollUntilKillConfirmed`'s own docs above for why this job, spawned
     // through the real `run()`/`beginSpawn`, is exposed to the same
     // eager-reap-vs-terminal-transition race `test/tasks.test.ts`'s
-    // "six-tool mint rule" test guards against. `identity_confirmed` is
+    // "run-only mint rule" test guards against. `identity_confirmed` is
     // read from that SAME settled response, never the original,
     // potentially-unsettled `killResult` - it shares the identical
     // terminal-state-gated write (`JobStore.setIdentityConfirmation`) that
@@ -447,7 +447,7 @@ test(
     // guard's own precondition should already have landed by the time the
     // write is attempted, with nothing able to interleave in between
     // (single-threaded, no `await` separates the two). Commit c12b111's
-    // own "six-tool mint rule" fix (`test/tasks.test.ts`) independently
+    // own "run-only mint rule" fix (`test/tasks.test.ts`) independently
     // records the matching empirical fact for this same structural
     // scenario: "this test has never observed these two [identity_confirmed/
     // identity_capture] flaking the way kill_confirmed does." This

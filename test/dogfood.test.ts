@@ -267,7 +267,7 @@ async function callTool(
  * subsequent `status` polls - a bare `server.nextLine()` here would read
  * that notification as if it were the next tool response and fail the id
  * check with `undefined !== id`, exactly the same shape that bit
- * `test/modern-handshake.test.ts`'s own six-tool-mint-rule test.
+ * `test/modern-handshake.test.ts`'s own run-only-mint-rule test.
  * `waitForWakeNotification` (below) already loop-skips any non-matching
  * line by its own design and needs no change; this is the response-reading
  * counterpart every `callTool` invocation in this file goes through.
@@ -511,7 +511,7 @@ test(
     assert.equal(
       minted.resultType,
       "task",
-      "on a Tasks-capable connection, run() must mint a real TaskResult, not the plain {job_id} shape - this is the six-tool mint rule from src/tasksAdapter.ts"
+      "on a Tasks-capable connection, run() must mint a real TaskResult, not the plain {job_id} shape - this is the run-only mint rule from src/tasksAdapter.ts"
     );
     assert.equal(typeof minted.taskId, "string");
     const jobId = minted.taskId as string;

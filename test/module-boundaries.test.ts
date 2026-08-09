@@ -98,7 +98,7 @@ test("collapsing two tool handlers into one file is caught as a missing module",
   const collapsed = { ...CLEAN_FIXTURE_FILES };
   delete collapsed["tools/tail.ts"];
   // Simulates "kill.ts" absorbing tail's responsibility too - the file
-  // count under tools/ drops from six to five.
+  // count under tools/ drops from seven to six.
   collapsed["tools/kill.ts"] =
     "// now also handles tail, in violation of the one-tool-per-file rule\n";
   const dir = buildFixtureSrc(collapsed);
@@ -111,10 +111,10 @@ test("collapsing two tool handlers into one file is caught as a missing module",
   }
 });
 
-test("splitting a tool handler into a seventh tools/ file is caught as extra", () => {
+test("splitting a tool handler into an eighth tools/ file is caught as extra", () => {
   const split = {
     ...CLEAN_FIXTURE_FILES,
-    "tools/run-helpers.ts": "// a stray seventh file under tools/\n",
+    "tools/run-helpers.ts": "// a stray eighth file under tools/\n",
   };
   const dir = buildFixtureSrc(split);
   try {

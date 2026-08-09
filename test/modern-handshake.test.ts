@@ -469,7 +469,7 @@ test("modern handshake: on the SAME connection, a tools/call whose OWN request e
   // notification (see startTaskStatusNotifier's own docs) can land on this
   // wire in between the mint's response and this second request's own
   // response; nextResponse skips exactly that, and only that - the same
-  // hazard this file's "six-tool mint rule" test documents and guards
+  // hazard this file's "run-only mint rule" test documents and guards
   // against on its own chained reads.
   const incapableBody = (await nextResponse(server)) as {
     error?: unknown;
@@ -779,7 +779,7 @@ test("modern handshake: seven-tool mint rule on the real wire - run() mints whil
 // raw JSON-RPC. Also settles the second of the two capability paths this
 // codebase has, on the real wire rather than by reading source alone -
 // `tools/call`'s own `run` branch reads a per-request Tasks-capability
-// declaration before minting (the six-tool-mint-rule test above, and
+// declaration before minting (the run-only-mint-rule test above, and
 // test/tasks.test.ts's legacy-era proof); src/server.ts registers
 // tasks/get, tasks/update, and tasks/cancel with NO such check at all
 // (confirmed directly by reading server.ts's own `server.setRequestHandler`
@@ -822,7 +822,7 @@ test("modern wire: tasks/get and tasks/cancel are UNROUTABLE on the 2026-07-28 e
   assert.ok((discoverLine.parsed as DiscoverResultBody).result, "discover must succeed first");
 
   // Mint a real task first - WITH capability declared, since minting
-  // itself IS gated (see the six-tool-mint-rule test above). A real taskId
+  // itself IS gated (see the run-only-mint-rule test above). A real taskId
   // must exist for the calls below to target, even though - as this test
   // itself proves - that target is never reached for two of the three
   // methods on this era.

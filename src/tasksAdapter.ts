@@ -230,7 +230,7 @@ export function tasksServerCapabilitiesFragment(): { extensions: Record<string, 
  * file's header on why `experimental` is not read). This is the ONLY
  * signal `maybeAugmentRunResult` consults - never
  * anything in `run()`'s own tool arguments, which is what keeps the
- * six-tool mint rule free of a per-call opt-in field: a bare tool call with
+ * run-only mint rule free of a per-call opt-in field: a bare tool call with
  * no such field of any kind still mints on a capable connection/request,
  * and nothing about `run()`'s own arguments can turn minting on or off.
  *
@@ -1319,7 +1319,7 @@ function startTaskStatusNotifier(taskId: string, notifier: TaskWakeNotifier): vo
 }
 
 // ---------------------------------------------------------------------------
-// Minting - the six-tool mint rule: ONLY run(), ONLY on a capable
+// Minting - the run-only mint rule: ONLY run(), ONLY on a capable
 // connection, and ONLY by wrapping a job_id this call itself just produced
 // (never inventing a handle for a job this call didn't create)
 // ---------------------------------------------------------------------------
