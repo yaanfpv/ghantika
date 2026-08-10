@@ -119,7 +119,11 @@ test("reapProcessGroupOnce on a never-spawned (createFailedJob) job returns no-c
     diagnosticMessage: "command not found or not executable",
   });
 
-  assert.equal(store.get(record.job_id)!.kill_confirmed, undefined, "unset before any reap attempt");
+  assert.equal(
+    store.get(record.job_id)!.kill_confirmed,
+    undefined,
+    "unset before any reap attempt"
+  );
   const outcome = await store.reapProcessGroupOnce(record.job_id);
   assert.deepEqual(outcome, { kind: "no-child" });
   assert.equal(
