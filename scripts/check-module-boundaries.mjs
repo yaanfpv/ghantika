@@ -78,10 +78,13 @@
  * type-only contract - the same shared door `selectTransport.ts` and
  * every transport already import from - so this file adds a new caller
  * of the shared contract, never a new dependency edge into anything else
- * in `src/wake/`. Nothing outside `src/wake/` imports it yet: it is not
- * wired into `server.ts`, `tasksAdapter.ts`, or `selectTransport.ts`
- * itself, so ghantika's runtime behavior is unchanged by its presence -
- * that wiring is separate, later work.
+ * in `src/wake/`. `server.ts` is now its own caller too, reading the
+ * handler-visible non-reserved request `_meta` (`ctx.mcpReq._meta`, never
+ * `ctx.mcpReq.envelope` - see that call site's own doc comment for why)
+ * and passing the result to `tasksAdapter.ts`'s `maybeAugmentRunResult` -
+ * neither of those callers gives this file any state or mutable
+ * dependency of its own; the admission reasoning above (a pure function,
+ * no module-scope state) is unaffected by who calls it.
  *
  * Three checks, matching this repo's established guard style (see
  * scripts/check-npm-ci-usage.mjs): pure, exported functions that operate

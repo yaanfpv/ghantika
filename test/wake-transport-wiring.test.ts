@@ -1,59 +1,34 @@
 /**
- * Proves the transport-layer wake wiring this file exercises - the layer
- * connecting `resolveWakeTarget.ts` (already merged, `test/wake-target-
- * resolution.test.ts` covers its own resolution logic in isolation) and
- * `selectAndWake`/`DEFAULT_TRANSPORTS` (already merged,
- * `test/wake-select-transport.test.ts` covers the selector's own ordering
- * logic in isolation): `src/tasksAdapter.ts`'s new
- * `startTransportWakeOnTerminal` subscriber, its internal-only
- * `GHANTIKA_WAKE_TRANSPORT_ENABLED` opt-in gate, and its fail-closed
- * behavior on every `WakeTargetResolution` state other than `"resolved"`.
+ * Proves `src/tasksAdapter.ts`'s `startTransportWakeOnTerminal` subscriber:
+ * its internal-only `GHANTIKA_WAKE_TRANSPORT_ENABLED` opt-in gate, its
+ * fail-closed behavior on every `WakeTargetResolution` state other than
+ * `"resolved"`, and its dispatch through the real transport selector.
  *
- * DELIBERATELY calls `maybeAugmentRunResult` directly, driving `jobStore`
- * directly too - a real departure from `test/tasks.test.ts`'s own header
- * doc ("never a bypass straight to ... `tasksAdapter`'s functions in
- * isolation, because the contract under test is what a real client
- * observes on the wire"). That rule protects the Tasks EXTENSION contract
- * (capability negotiation, the six-tool mint rule, the wire shape) - none
- * of which this story touches. What this story actually adds is internal
- * gating/dispatch logic inside one function, reachable through TWO real
- * transport classes (`AppServerGoalWakeTransport`, `DesktopIpcWakeTransport`)
- * that speak to a real Codex app-server subprocess or a real desktop IPC
- * socket - reaching a genuinely "resolved" `WakeTargetResolution` through
- * the real wire would require simulating the 2026-07-28 modern era's own
- * per-request `_meta.threadId` (see `test/modern-handshake.test.ts`'s own
- * spawned-process harness), which buys no additional fidelity here: the
- * subject under test is what `maybeAugmentRunResult`/
- * `startTransportWakeOnTerminal` DO with an already-resolved value, not
- * how that value gets resolved (that part is `resolveWakeTarget.ts`'s own
- * job, already proven). The SDK-facing minting/notification behavior this
- * file's sibling test files already cover (`test/tasks.test.ts`,
- * `test/tasks-lifecycle.test.ts`, `test/wake-integration.test.ts`) is
- * completely unchanged by this story and is not re-proven here.
+ * Calls `maybeAugmentRunResult` directly and drives `jobStore` directly,
+ * rather than a real spawned server - this file's subject is internal
+ * gating/dispatch logic inside one function, given an already-resolved
+ * `WakeTargetResolution`. It never re-proves the Tasks-extension wire
+ * contract (capability negotiation, the six-tool mint rule, SDK-facing
+ * minting/notification shapes) - that lives in `test/tasks.test.ts` and its
+ * siblings, unaffected here. Reaching `WakeTargetResolution` from a real
+ * client's actual `_meta.threadId` over the real wire - the server-to-
+ * resolver hand-off itself - is covered separately, end to end, by
+ * `test/modern-handshake.test.ts`'s spawned-process regressions.
  *
- * The two REAL transport classes making up `DEFAULT_TRANSPORTS` are
- * neither frozen nor injected via any seam in `tasksAdapter.ts` (see that
- * file's own `startTransportWakeOnTerminal` docs: it calls
- * `selectAndWake(DEFAULT_TRANSPORTS, ...)` directly, no DI point) - so
- * this file spies on the real, singleton `DEFAULT_TRANSPORTS[0]`/`[1]`
- * instances' own `probe()`/`wake()` methods via `t.mock.method`, the SAME
- * idiom `test/process.test.ts`/`test/jobStore.test.ts` already establish
- * for `process.kill`/`console.error`. Importing `DEFAULT_TRANSPORTS` from
- * `../dist/wake/selectTransport.js` here is the SAME module-cache singleton
- * `../dist/tasksAdapter.js` itself imports and calls
- * `selectAndWake(DEFAULT_TRANSPORTS, ...)` against - Node's own ESM module
- * cache is what makes mutating a method on these instances here visible to
- * the adapter's own internal call, exactly the same "singleton-sharing"
- * property `test/jobStore.test.ts`'s own header doc names for the
- * identical reason applied to `jobStore`.
+ * The two real transport classes making up `DEFAULT_TRANSPORTS` are
+ * neither frozen nor injected via any seam in `tasksAdapter.ts` - it calls
+ * `selectAndWake(DEFAULT_TRANSPORTS, ...)` directly, no DI point - so this
+ * file spies on the real, singleton `DEFAULT_TRANSPORTS[0]`/`[1]` instances'
+ * own `probe()`/`wake()` methods via `t.mock.method`. Importing
+ * `DEFAULT_TRANSPORTS` from `../dist/wake/selectTransport.js` here is the
+ * same module-cache singleton `../dist/tasksAdapter.js` itself imports and
+ * calls `selectAndWake(DEFAULT_TRANSPORTS, ...)` against - Node's own ESM
+ * module cache is what makes mutating a method on these instances here
+ * visible to the adapter's own internal call.
  *
- * Jobs are created and driven terminal DIRECTLY via `jobStore.createJob`/
+ * Jobs are created and driven terminal directly via `jobStore.createJob`/
  * `markExited`/`markKilled` - never a real spawned process, never
- * `requestSlot()` (this file never exercises admission control) - the SAME
- * direct-jobStore-driving technique `test/tasks-lifecycle.test.ts`'s own
- * "TTL purge REFUSES a job whose concurrency slot is still stranded" test
- * already establishes for a test that needs a real `JobRecord` with no
- * real backing process at all.
+ * `requestSlot()` (this file never exercises admission control).
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -545,6 +520,18 @@ test("gate ON + resolution 'resolved' + isCapableConnection FALSE - wake() still
     );
     const [calledTarget] = wakeA.mock.calls[0]!.arguments;
     assert.equal(calledTarget, target);
+    // With isCapableConnection false, this listener is the ONLY one
+    // maybeAugmentRunResult ever registers for this job - startTaskWatch/
+    // startTaskStatusNotifier are both gated behind isCapableConnection (see
+    // that function's own source), so a non-zero count here could only come
+    // from startTransportWakeOnTerminal's own subscription. Proves the fix:
+    // before it, this stayed at 1 - the closure, and the target-resolution
+    // data it captured, retained forever until an unrelated deleteJob.
+    assert.equal(
+      jobStore.getJobTerminalListenerCount(job.job_id),
+      0,
+      "the transport-wake listener must unsubscribe itself once its terminal callback has run, not linger for the job's remaining life"
+    );
   });
 });
 
@@ -576,6 +563,61 @@ test('gate OFF (default) + resolution "resolved" + isCapableConnection FALSE - t
   assert.equal(wakeA.mock.callCount(), 0, "gate OFF must still make zero wake() calls");
   assert.equal(probeB.mock.callCount(), 0);
   assert.equal(wakeB.mock.callCount(), 0);
+  // Same non-confounded oracle as the gate-ON sibling above: with
+  // isCapableConnection false, startTaskWatch/startTaskStatusNotifier never
+  // register, so this listener count reflects startTransportWakeOnTerminal's
+  // own subscription alone. The gate being OFF only makes isTransportWakeEnabled()
+  // return early inside the callback - the callback still runs and must still
+  // unsubscribe first, regardless of what it goes on to do (or not do) next.
+  assert.equal(
+    jobStore.getJobTerminalListenerCount(job.job_id),
+    0,
+    "the transport-wake listener must unsubscribe itself once its terminal callback has run, even when the gate itself is off"
+  );
+});
+
+test("gate ON + resolution 'resolved' + isCapableConnection FALSE + wake() rejects - the listener still unsubscribes, proving the cleanup is unconditional on the async outcome", async (t) => {
+  await withWakeTransportEnabled("1", async () => {
+    t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", available);
+    t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", rejectsAsync("connection reset"));
+    t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", available);
+    t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", rejectsAsync("no owning client"));
+    const errorSpy = t.mock.method(console, "error");
+
+    const job = createNonTerminalJob("non-capable-gate-on-rejects");
+    const resolution: WakeTargetResolution = {
+      state: "resolved",
+      target: "thread-non-capable-rejects",
+    };
+    maybeAugmentRunResult(makeRunResult(job.job_id), false, noopNotifier, resolution);
+
+    jobStore.markExited(job.job_id, 0, null);
+
+    // The unsubscribe call is the callback's own FIRST synchronous
+    // statement, before selectAndWake is even called - markExited's own
+    // fireJobTerminal dispatch is fully synchronous through that point, so
+    // this has already happened by the time markExited returns, well
+    // before selectAndWake's returned promise gets a chance to settle
+    // either way (the settle() below is what lets that promise's own
+    // rejection actually surface).
+    assert.equal(
+      jobStore.getJobTerminalListenerCount(job.job_id),
+      0,
+      "the transport-wake listener must already be unsubscribed synchronously inside its own terminal callback, before selectAndWake's promise has any chance to settle"
+    );
+
+    await settle();
+
+    assert.ok(
+      errorSpy.mock.callCount() > 0,
+      "a fully-exhausted, rejecting transport set must still be logged via console.error"
+    );
+    assert.equal(
+      jobStore.getJobTerminalListenerCount(job.job_id),
+      0,
+      "the listener must stay unsubscribed after selectAndWake's rejected promise settles too - nothing re-registers it"
+    );
+  });
 });
 
 test("regression guard: isCapableConnection FALSE never starts startTaskWatch/startTaskStatusNotifier - notifier is never invoked, even with a resolved transport target and the gate on", async (t) => {

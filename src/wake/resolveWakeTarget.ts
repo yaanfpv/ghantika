@@ -2,11 +2,10 @@
  * Resolves a `WakeTarget` from the raw `_meta` object of an incoming
  * `tools/call` request, without ever fabricating one.
  *
- * A real Codex client (measured against Codex 0.147.0, n=4 across 3
- * independent sessions) sends the calling thread's identity in
+ * A Codex client sends the calling thread's identity in
  * `params._meta.threadId` - a UUID string, stable across multiple calls
  * within one session and distinct across separate sessions, exactly the
- * property a wake target needs. The same `_meta` object also carries a
+ * property a wake target needs. The same `_meta` object may also carry a
  * vendor-specific `x-codex-turn-metadata` block with the same id under
  * `.thread_id`; `threadId` (top-level, spec-shaped) is read instead, since
  * it is the more stable, less vendor-specific of the two.

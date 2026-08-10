@@ -1647,3 +1647,166 @@ test(
     }
   }
 );
+
+// ---------------------------------------------------------------------------
+// Wake-target metadata hand-off - `threadId` is handler material, never
+// envelope material (see `src/server.ts`'s own doc comment at its
+// `resolveWakeTarget` call site), so it can only be proven by a real
+// modern `_meta` object carrying both a reserved envelope key and the
+// non-reserved `threadId` together, exactly as a real client would send
+// them - `withModernEnvelope` above cannot express this (it replaces
+// `_meta` wholesale with just the two reserved keys), so these two tests
+// build the request's `_meta` by hand instead. Both drive a `sleep 0.1`-
+// equivalent short job to a real terminal transition and read the
+// resulting diagnostic off the real spawned process's own stderr - proof
+// against the real server-to-resolver hand-off, which
+// `test/wake-transport-wiring.test.ts`'s hand-constructed
+// `WakeTargetResolution` values cannot reach.
+// ---------------------------------------------------------------------------
+
+/**
+ * Polls `server.stderrText()` for `substring` up to `attempts * 100`ms,
+ * matching this file's own established retry-loop idiom (see the
+ * `tasks/cancel` polling loop above) rather than a bespoke helper. The
+ * malformed-threadId diagnostic below is written synchronously inside
+ * `fireJobTerminal`'s own dispatch (before any `selectAndWake` promise even
+ * exists), but the resolved-threadId diagnostic is written from inside an
+ * un-awaited `.then()/.catch()` continuation - genuinely asynchronous
+ * relative to the terminal transition - so both cases share this one
+ * bounded poll rather than assuming synchronous delivery for one and
+ * inventing a second synchronization strategy for the other.
+ *
+ * The 15s ceiling (150 * 100ms) is generous headroom for the resolved case
+ * specifically: `AppServerGoalWakeTransport.probe()` spawns a real,
+ * throwaway `codex app-server` subprocess and speaks a real handshake to
+ * it (see that transport's own doc comment) - genuine subprocess and IPC
+ * latency, not a fixed in-process computation, and measured live on this
+ * repo's own shared host to occasionally exceed 2s under concurrent load
+ * from other processes on the same machine. The malformed case still
+ * resolves in its first iteration or two regardless of this ceiling.
+ */
+async function pollStderrFor(server: SpawnedServer, substring: string): Promise<boolean> {
+  for (let attempt = 0; attempt < 150; attempt += 1) {
+    if (server.stderrText().includes(substring)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
+}
+
+test("wake-target hand-off, malformed: a real modern tools/call whose own request _meta carries threadId:'' alongside the required envelope keys logs the malformed-target skip diagnostic once the job reaches terminal - proving the resolver saw the caller's actual threadId, not the envelope's reserved keys", async (t) => {
+  const originalGate = process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED;
+  process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED = "1";
+  const server = tracked();
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+    if (originalGate === undefined) delete process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED;
+    else process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED = originalGate;
+  });
+
+  server.send(discoverRequest(1));
+  const discoverBody = (await server.nextLine()).parsed as DiscoverResultBody;
+  assert.ok(discoverBody.result, "server/discover must succeed first");
+
+  server.send({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: {
+      name: "run",
+      arguments: { command: ["true"] },
+      _meta: {
+        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+        "io.modelcontextprotocol/clientCapabilities": {},
+        threadId: "",
+      },
+    },
+  });
+  const mintLine = await server.nextLine();
+  const mintBody = mintLine.parsed as {
+    error?: unknown;
+    result?: { structuredContent?: { job_id?: unknown } };
+  };
+  assert.equal(mintBody.error, undefined, `run must succeed, got: ${JSON.stringify(mintBody)}`);
+  const jobId = mintBody.result?.structuredContent?.job_id;
+  assert.equal(typeof jobId, "string", "expected a real job_id on the run response");
+
+  const found = await pollStderrFor(
+    server,
+    `transport wake skipped for task ${jobId as string}: wake target threadId present but is an empty string, expected non-empty string`
+  );
+  assert.ok(
+    found,
+    `expected the malformed-threadId skip diagnostic on stderr once the job terminalized; got stderr: ${server.stderrText()}`
+  );
+});
+
+test("wake-target hand-off, resolved: a real modern tools/call whose own request _meta carries a real non-empty threadId alongside the required envelope keys reaches selectAndWake (an attempted-wake diagnostic, not silence) once the job reaches terminal - proving a genuine target resolves through the real server-to-adapter path, not only through a hand-built WakeTargetResolution", async (t) => {
+  const originalGate = process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED;
+  process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED = "1";
+  const server = tracked();
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+    if (originalGate === undefined) delete process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED;
+    else process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED = originalGate;
+  });
+
+  server.send(discoverRequest(1));
+  const discoverBody = (await server.nextLine()).parsed as DiscoverResultBody;
+  assert.ok(discoverBody.result, "server/discover must succeed first");
+
+  server.send({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: {
+      name: "run",
+      arguments: { command: ["true"] },
+      _meta: {
+        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+        "io.modelcontextprotocol/clientCapabilities": {},
+        threadId: "thread-real-wire-resolved",
+      },
+    },
+  });
+  const mintLine = await server.nextLine();
+  const mintBody = mintLine.parsed as {
+    error?: unknown;
+    result?: { structuredContent?: { job_id?: unknown } };
+  };
+  assert.equal(mintBody.error, undefined, `run must succeed, got: ${JSON.stringify(mintBody)}`);
+  const jobId = mintBody.result?.structuredContent?.job_id;
+  assert.equal(typeof jobId, "string", "expected a real job_id on the run response");
+
+  // Which of the three non-"delivered" outcomes (refused/unavailable/threw
+  // - `startTransportWakeOnTerminal`'s own WakeResult union, see its doc
+  // comment) a real environment produces is NOT fixed: on a CI runner with
+  // neither a real Codex app-server nor a real ChatGPT desktop IPC socket,
+  // both DEFAULT_TRANSPORTS probes report unavailable. On a dev machine
+  // that happens to have a real `codex app-server` reachable (measured
+  // live on this repo's own shared host, mid-development of this test),
+  // the app-server responds and REFUSES this non-UUID-shaped threadId
+  // instead - a real protocol-level validation error from a real transport,
+  // not a probe failure. Both are "an attempt reached selectAndWake";
+  // neither is "delivered" (this test asserts none of that requires a real
+  // Codex/Desktop session actually receiving a wake). What matters, and
+  // what distinguishes this from the sibling malformed test above, is that
+  // SOME attempted-wake diagnostic fires at all: that only happens when
+  // resolveWakeTarget answered "resolved", never "absent" - so its
+  // presence is direct evidence the real server passed this request's own
+  // threadId through to the resolver, not the envelope's reserved keys.
+  const found = await pollStderrFor(server, `transport wake `);
+  assert.ok(
+    found,
+    `expected some attempted-wake diagnostic on stderr (proving the resolver saw "resolved", not "absent") once the job terminalized; got stderr: ${server.stderrText()}`
+  );
+  const stderrText = server.stderrText();
+  assert.match(
+    stderrText,
+    new RegExp(`transport wake (refused|unavailable|threw) for task ${jobId as string}`),
+    `expected one of the three non-"delivered" outcome diagnostics naming this exact job, got: ${stderrText}`
+  );
+  assert.ok(
+    !stderrText.includes("transport wake skipped for task"),
+    "a resolved, non-empty threadId must never produce the malformed-skip diagnostic"
+  );
+});

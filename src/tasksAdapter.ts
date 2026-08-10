@@ -1364,12 +1364,22 @@ function isTransportWakeEnabled(): boolean {
  * the exact terminal `JobState` it reached) and the concrete next step (the
  * poll floor), nothing about what happens next beyond what is literally
  * true.
+ *
+ * Names only `status`/`output`/`tail`, deliberately never `tasks/get` - this
+ * payload has no way to know which protocol era the RECIPIENT session is
+ * actually running (it travels out-of-band through a real transport, not
+ * back down the connection this job's own request arrived on), and
+ * `tasks/get` is UNROUTABLE on the modern 2026-07-28 era (see
+ * `test/modern-handshake.test.ts`'s own header doc: the installed SDK's
+ * base dispatch refuses it before this codebase's own handler is ever
+ * reached, a fact independent of any capability this codebase controls).
+ * `status`/`output`/`tail` are the plain poll floor and work unconditionally
+ * on every era this codebase serves, so they are the only instruction this
+ * payload can make without risking sending a real recipient into a method
+ * their own connection may not even be able to route.
  */
 function buildTransportWakePayload(taskId: string, record: JobRecord): string {
-  return (
-    `ghantika job ${taskId} reached ${record.state} - call tasks/get or use ` +
-    `status/output/tail to read the result`
-  );
+  return `ghantika job ${taskId} reached ${record.state} - use status/output/tail to read the result`;
 }
 
 /**
@@ -1428,7 +1438,19 @@ function buildTransportWakePayload(taskId: string, record: JobRecord): string {
  * whether this ever fires or what it finds when it does.
  */
 function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetResolution): void {
-  jobStore.onJobTerminal(taskId, () => {
+  const unsubscribeTerminal = jobStore.onJobTerminal(taskId, () => {
+    // Called first, unconditionally, before any of this callback's own
+    // early returns - `onJobTerminal` fires this at most once per task
+    // already, but `fireJobTerminal` never removes a fired listener from
+    // its own Set (see that method's own docs), so without this the
+    // closure - and, for a resolved target, the target-resolution data it
+    // captured - stays registered for the job's whole remaining life,
+    // until an unrelated `deleteJob` eventually clears it. Same class of
+    // leak `stopWatch`'s own `unsubscribeTerminal` call above already
+    // fixed for its sibling subscription; matching it here closes it for
+    // this one too.
+    unsubscribeTerminal();
+
     if (!isTransportWakeEnabled()) return;
 
     if (resolution.state === "absent") return; // Claude Code's ordinary case - silent, nothing to log, nothing attempted
