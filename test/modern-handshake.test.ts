@@ -1720,7 +1720,7 @@ test("wake-target hand-off, malformed: a real modern tools/call whose own reques
   );
 });
 
-test("wake-target hand-off, resolved: a real modern tools/call whose own request _meta carries a real non-empty threadId alongside the required envelope keys reaches selectAndWake (an attempted-wake diagnostic, not silence) once the job reaches terminal", async (t) => {
+test("wake-target hand-off, resolved: a real modern tools/call whose own request _meta carries a non-empty threadId alongside the required envelope keys reaches selectAndWake (an attempted-wake diagnostic, not silence) once the job reaches terminal", async (t) => {
   const originalGate = process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED;
   process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED = "1";
   const server = tracked();

@@ -90,10 +90,14 @@
  * six - including `follow`, the newest - stay plain), so the plain poll
  * floor (status/output/tail on a job_id) is reachable on every
  * connection, capable or not, exactly as it was before this capability
- * existed. `maybeAugmentRunResult` is a pure pass-through unless the
- * connection is capable AND a real job_id can be read back out of the
- * plain result it was just handed - never inventing a handle from
- * nothing, never mutating jobStore itself.
+ * existed. `maybeAugmentRunResult`'s RESPONSE SHAPE is a pure
+ * pass-through unless the connection is capable AND a real job_id can be
+ * read back out of the plain result it was just handed - never
+ * inventing a handle from nothing. It does register a real jobStore side
+ * effect regardless of capability: a terminal-transition listener for
+ * the transport-layer wake (see `startTransportWakeOnTerminal`'s own
+ * docs), whose callback is a no-op unless `GHANTIKA_WAKE_TRANSPORT_ENABLED`
+ * is set.
  *
  * ## taskId == job_id, one handle namespace
  *
@@ -1409,8 +1413,8 @@ function buildTransportWakePayload(taskId: string, record: JobRecord): string {
  * UNDOCUMENTED - see this section's own header comment for why.
  *
  * Fail-closed on every resolution state OTHER than `"resolved"`, whether
- * the gate is on or off: `"absent"` is Claude Code's ordinary, expected
- * case (see `resolveWakeTarget.ts`'s own doc comment) and stays entirely
+ * the gate is on or off: `"absent"` (see `resolveWakeTarget.ts`'s own
+ * doc comment for what makes a request resolve that way) stays entirely
  * silent - nothing to log, nothing attempted. `"malformed"` is logged (a
  * wrong target must be loud, never silently swallowed - matching
  * `sendTaskNotification`'s own `console.error` catch-pattern style) but
@@ -1443,7 +1447,7 @@ function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetReso
 
     if (!isTransportWakeEnabled()) return;
 
-    if (resolution.state === "absent") return; // Claude Code's ordinary case - silent, nothing to log, nothing attempted
+    if (resolution.state === "absent") return; // no target resolved - silent, nothing to log, nothing attempted
 
     if (resolution.state === "malformed") {
       // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- taskId is this codebase's own randomUUID(), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
@@ -1510,8 +1514,12 @@ function extractJobId(result: CallToolResult): string | undefined {
  * never trusted blindly) or replaces it ENTIRELY with the minted
  * `CreateTaskResult` for the SAME job the plain result already named.
  * Never mints for any job other than the one `result` itself is about,
- * and never touches `jobStore` beyond the SAME kind of read `getTask`
- * performs.
+ * and the RETURNED RESULT itself never touches `jobStore` beyond the
+ * SAME kind of read `getTask` performs. This function's own side
+ * effect - a terminal-transition listener registered via
+ * `startTransportWakeOnTerminal` (see its own docs) - is a real
+ * `jobStore` write made unconditionally, independent of what gets
+ * returned.
  *
  * REPLACES, never augments alongside, `content`/`structuredContent` - this
  * was an explicitly flagged open question before this adapter was built

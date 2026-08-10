@@ -10,10 +10,13 @@
  * `WakeTargetResolution`. It never re-proves the Tasks-extension wire
  * contract (capability negotiation, the six-tool mint rule, SDK-facing
  * minting/notification shapes) - that lives in `test/tasks.test.ts` and its
- * siblings, unaffected here. Reaching `WakeTargetResolution` from a real
- * client's actual `_meta.threadId` over the real wire - the server-to-
- * resolver hand-off itself - is covered separately, end to end, by
- * `test/modern-handshake.test.ts`'s spawned-process regressions.
+ * siblings, unaffected here. Reaching `WakeTargetResolution` from a
+ * client-shaped request's `_meta.threadId` over the real wire - the
+ * server-to-resolver hand-off itself - is covered separately, end to
+ * end, by `test/modern-handshake.test.ts`'s spawned-process regressions,
+ * which drive a real request over the real wire protocol; whether any
+ * actual external client sends `threadId` that way is outside what
+ * either file establishes.
  *
  * The two real transport classes making up `DEFAULT_TRANSPORTS` are
  * neither frozen nor injected via any seam in `tasksAdapter.ts` - it calls
