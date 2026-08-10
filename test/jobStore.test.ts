@@ -109,6 +109,26 @@ test("createFailedJob registers an already-terminal failed job with a spawn-erro
   assert.equal(record.ended_at, record.started_at);
 });
 
+test("reapProcessGroupOnce on a never-spawned (createFailedJob) job returns no-child AND sets kill_confirmed true - vacuously, since it never had a process group to check", async () => {
+  const store = new JobStore();
+  const record = store.createFailedJob({
+    argv: ["/no/such/binary"],
+    cwd: "/tmp",
+    env: {},
+    isShell: false,
+    diagnosticMessage: "command not found or not executable",
+  });
+
+  assert.equal(store.get(record.job_id)!.kill_confirmed, undefined, "unset before any reap attempt");
+  const outcome = await store.reapProcessGroupOnce(record.job_id);
+  assert.deepEqual(outcome, { kind: "no-child" });
+  assert.equal(
+    store.get(record.job_id)!.kill_confirmed,
+    true,
+    "a never-spawned job's group trivially holds zero members - true by construction, distinguishable from the degraded false via diagnostic/state, never left undefined for a poller to wait on forever"
+  );
+});
+
 test("multiple distinct jobs are all tracked independently", () => {
   const store = new JobStore();
   const a = store.createJob({ argv: ["echo", "a"], cwd: "/tmp", env: {}, isShell: false });
@@ -272,12 +292,12 @@ test("markExited after markKilled is ALSO a no-op (the reverse race) - first wri
   assert.equal(after.signal, "SIGTERM");
 });
 
-test("setKillConfirmation records true/false on an already-killed job, and ALSO on any other terminal job (e.g. exited) - but is a no-op on a non-terminal (starting/running) job", () => {
+test("setKillConfirmation records true/false regardless of the job's own state, on any job that exists, and reports write success via its return value", () => {
   const store = new JobStore();
 
   const killedRecord = store.createJob({ argv: ["echo"], cwd: "/tmp", env: {}, isShell: false });
   store.markKilled(killedRecord.job_id, "SIGTERM");
-  store.setKillConfirmation(killedRecord.job_id, true);
+  assert.equal(store.setKillConfirmation(killedRecord.job_id, true), true);
   assert.equal(store.get(killedRecord.job_id)!.kill_confirmed, true);
   store.setKillConfirmation(killedRecord.job_id, false);
   assert.equal(
@@ -286,12 +306,19 @@ test("setKillConfirmation records true/false on an already-killed job, and ALSO 
     "must be overwritable - the confirmation is settled once, after the state transition, not locked on first write"
   );
 
+  // The terminal-state guard this method used to carry was removed after a
+  // real, confirmed race was found between the eager reap at process exit
+  // and the record's own stdio-close-gated terminal transition - see this
+  // method's own docs. Every real caller already derives `confirmed` from
+  // a genuine, current external observation, so a non-terminal record here
+  // is not evidence the observation is wrong; it only means the record's
+  // own bookkeeping has not caught up yet.
   const runningRecord = store.createJob({ argv: ["echo"], cwd: "/tmp", env: {}, isShell: false });
-  store.setKillConfirmation(runningRecord.job_id, true);
+  assert.equal(store.setKillConfirmation(runningRecord.job_id, true), true);
   assert.equal(
     store.get(runningRecord.job_id)!.kill_confirmed,
-    undefined,
-    "must never set kill_confirmed on a non-terminal (starting) job"
+    true,
+    "must set kill_confirmed on a non-terminal (starting/running) job - the write no longer waits on the state transition"
   );
 
   // Broadened (from "only a killed job") so a TERMINAL job whose own
@@ -311,6 +338,11 @@ test("setKillConfirmation records true/false on an already-killed job, and ALSO 
   );
 
   assert.doesNotThrow(() => store.setKillConfirmation("nope", true));
+  assert.equal(
+    store.setKillConfirmation("nope", true),
+    false,
+    "a jobId naming no record at all is the only remaining refusal - reports it via the return value rather than silently discarding it"
+  );
 });
 
 test("a killed job's output buffer remains readable afterward - markKilled never touches stream buffers", () => {
@@ -572,6 +604,56 @@ test(
     // No cleanup kill here - same reasoning as the sibling test above:
     // `true` exits almost immediately and forks nothing, so the real
     // group is already gone by this point.
+  }
+);
+
+test(
+  "reapProcessGroupOnce only consumes the reap-attempt flag once setKillConfirmation's write actually lands - a confirmed reaper outcome whose write is lost (the record vanished) must leave the job eligible for a genuine retry, not stranded",
+  {
+    skip:
+      process.platform === "win32"
+        ? "process-group reap-once tracking is POSIX-only - no pgid concept to reuse-guard against on Windows"
+        : false,
+  },
+  async () => {
+    // This forces the exact failure `setKillConfirmation`'s own docs
+    // describe (a write that cannot land because the record is gone) by
+    // deleting the job from inside the injected reaper - proving the
+    // conditional-on-write-landing fix directly, rather than only via the
+    // timing window the real race depends on.
+    const store = new JobStore();
+    const record = store.createJob({ argv: ["true"], cwd: "/tmp", env: {}, isShell: false });
+    const child = spawnManaged(
+      { argv: ["true"], cwd: process.cwd(), env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } },
+      {
+        onSpawn: () => {},
+        onError: () => {},
+        onExit: () => {},
+        onStdoutChunk: () => {},
+        onStderrChunk: () => {},
+        onStdoutEnd: () => {},
+        onStderrEnd: () => {},
+      }
+    );
+    store.attachChild(record.job_id, child!);
+    store.markExited(record.job_id, 0, null);
+
+    const vanishingReaper = async (): Promise<{ confirmed: boolean }> => {
+      store.deleteJob(record.job_id);
+      return { confirmed: true };
+    };
+
+    const outcome = await store.reapProcessGroupOnce(record.job_id, 100, vanishingReaper);
+    assert.deepEqual(
+      outcome,
+      { kind: "unconfirmed" },
+      "a confirmed reaper result whose write never landed must not be reported as confirmed"
+    );
+    assert.equal(
+      store.hasReapBeenAttempted(record.job_id),
+      false,
+      "markReapAttempted must not fire when the write it is supposed to correspond to did not land - the old bug was exactly this pairing coming apart"
+    );
   }
 );
 

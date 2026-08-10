@@ -587,19 +587,25 @@ export async function handler(args: Record<string, unknown> | undefined): Promis
   // `killProcessGroupPosix` already ran it after signaling settled; this
   // just records the honest confirmed/attempted-but-unconfirmed result
   // onto the job, never touching the state machine itself. The PRE-signal
-  // identity gate's own outcome is recorded alongside it.
-  jobStore.setKillConfirmation(jobId, result.confirmed);
-  if (result.confirmed) {
+  // identity gate's own outcome is recorded alongside it. Captures whether
+  // the write actually landed - see `setKillConfirmation`'s own docs for
+  // why it can now return `false` (the record no longer exists) even
+  // though it no longer gates on the record's `state`.
+  const wrote = jobStore.setKillConfirmation(jobId, result.confirmed);
+  if (result.confirmed && wrote) {
     // Consume the one cleanup-reap attempt now, and ONLY now that this
-    // call's own external check actually confirmed zero survivors - see
-    // this block's own header comment above for why this moved off the
-    // front of the call instead of running unconditionally beforehand. An
-    // UNCONFIRMED outcome (including the combined-degraded refused-
-    // escalation cell) leaves this flag UNSET, so a follow-up `kill()`
-    // call reaching this job's already-terminal record finds
+    // call's own external check actually confirmed zero survivors AND the
+    // confirmation actually landed on the record - see this block's own
+    // header comment above for why marking moved off the front of the
+    // call instead of running unconditionally beforehand, and see
+    // `setKillConfirmation`'s own docs for why the write can fail to land
+    // even on a confirmed outcome. Either an UNCONFIRMED outcome (including
+    // the combined-degraded refused-escalation cell) or a confirmed one
+    // whose write did not land leaves this flag UNSET, so a follow-up
+    // `kill()` call reaching this job's already-terminal record finds
     // `hasReapBeenAttempted` still `false` and genuinely re-consults
     // `reapProcessGroupOnce` - rather than finding its one attempt already
-    // spent on a call that never actually reaped anything. That
+    // spent on a call that never actually recorded a reap outcome. That
     // re-consultation NEVER signals again, though - see
     // `reapProcessGroupOnce`'s own "RETRY SAFETY" docs: it can confirm the
     // group is now gone, but a group that still reads alive stays a

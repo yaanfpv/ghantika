@@ -206,14 +206,18 @@ test("kill: ORDERING REGRESSION (explicit-signal branch) - a group that exits na
     undefined,
     "a naturally-exited job must never carry the caller-supplied signal it was never actually delivered"
   );
-  // kill_confirmed stays UNSET here, not true - `setKillConfirmation`
-  // only ever writes onto an ALREADY-terminal record, and at the moment
-  // this handler ran it, the job was still genuinely `running` (the
-  // natural exit is deliberately delayed until after kill() returns, see
-  // above). This is the same honest "never silently upgraded" behavior
-  // the codebase already applies elsewhere - confirmation racing ahead
-  // of terminality writes nothing rather than fabricating a value.
-  assert.equal(finalRecord?.kill_confirmed, undefined);
+  // kill_confirmed IS true here, even though the record was still
+  // genuinely `running` (state-wise) at the exact moment this handler's
+  // own confirmProcessGroupReapedPosix call resolved - the natural exit
+  // is deliberately delayed until after kill() returns, see above.
+  // setKillConfirmation no longer requires the record to already be
+  // terminal (see its own docs): the real, external pgrep check that
+  // produced `confirmed` observed the group genuinely empty at that
+  // moment, and that observation is true independent of whether this
+  // store's own bookkeeping has caught up yet. Writing it honestly here
+  // is the corrected behavior - the old terminal-state guard would have
+  // silently discarded a real, true observation instead.
+  assert.equal(finalRecord?.kill_confirmed, true);
 });
 
 // DEFAULT TERMINATING path, the explicitly-supplied "SIGTERM" half - an
