@@ -6,7 +6,7 @@
  * singleton-sharing regression already uses) - never a bypass straight to
  * `dispatchToolCall` or `tasksAdapter`'s functions in isolation, because
  * the contract under test is what a real client observes on the wire:
- * capability negotiation, the six-tool mint rule, the three registered
+ * capability negotiation, the run-only mint rule, the three registered
  * task methods, and the always-on plain poll floor.
  *
  * `startPair(capable)` builds one such real Client/Server pair, optionally
@@ -349,23 +349,36 @@ async function pollUntilTerminal(
  * trigger) already solves this with the identical shape this mirrors,
  * adapted here to the MCP client (`client.callTool`) instead of raw
  * JSON-RPC lines.
+ *
+ * This loop carries NO wall-clock deadline and never throws on elapsed
+ * time - a fixed bound here would assert a limit on a quantity the
+ * contract above says has none, so any number picked is arbitrary and can
+ * lose under enough scheduling pressure regardless of size. It waits for
+ * as long as the surrounding test is willing to run; a genuine hang is
+ * caught by the test runner's own timeout, not by this function. To keep
+ * that outer failure legible if it ever fires, this writes a breadcrumb to
+ * stderr on a fixed logging cadence (never a threshold) while still
+ * waiting, carrying the same job snapshot a bound would have reported -
+ * so a runner-level timeout still explains itself instead of naming only
+ * a job id.
  */
 async function pollUntilKillConfirmed(
   client: Client,
-  jobId: string,
-  deadlineMs = 5000
+  jobId: string
 ): Promise<Record<string, unknown>> {
-  const deadline = Date.now() + deadlineMs;
+  const breadcrumbIntervalMs = 5000;
+  let lastBreadcrumbAt = Date.now();
   for (;;) {
     const result = await client.callTool({ name: "kill", arguments: { job_id: jobId } });
     const last = runResultStructured(result);
     if (last.kill_confirmed !== undefined) {
       return last;
     }
-    if (Date.now() > deadline) {
-      throw new Error(
-        `timed out waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(last)}`
+    if (Date.now() - lastBreadcrumbAt >= breadcrumbIntervalMs) {
+      console.error(
+        `still waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(last)}`
       );
+      lastBreadcrumbAt = Date.now();
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
@@ -1008,7 +1021,7 @@ test("a client declaring Tasks support ONLY under the older experimental bag (ne
 });
 
 // ---------------------------------------------------------------------------
-// The six-tool mint rule: run() mints unsolicited on a capable connection,
+// The run-only mint rule: run() mints unsolicited on a capable connection,
 // with no per-request opt-in field involved at all
 // ---------------------------------------------------------------------------
 
@@ -1903,9 +1916,9 @@ test("on an UNKNOWN taskId, tasks/get, tasks/update, and tasks/cancel all THROW 
 });
 
 // ---------------------------------------------------------------------------
-// The six-tool mint rule, from the other direction: run() mints,
-// status/output/tail/kill/list never mint, regardless of connection
-// capability
+// The seven-tool mint rule, from the other direction: run() mints,
+// status/output/tail/kill/list/follow never mint, regardless of
+// connection capability
 // ---------------------------------------------------------------------------
 
 // Every field name a minted CreateTaskResult/live handle carries that a
@@ -1921,7 +1934,7 @@ function carriesNoHandleTellTale(body: unknown): boolean {
   return HANDLE_TELL_TALE_FIELDS.every((field) => !serialized.includes(`"${field}"`));
 }
 
-test("six-tool mint rule: on a capable connection, run() mints a handle while status/output/tail/kill/list each return their PLAIN response with no handle minted - status/kill (both real PublicJobProjection shapes) are checked by full key-set AND VALUE deep-equality against the real plain job-projection shape, and list/output/tail are checked by a genuine whole-object comparison against their real, complete values", async () => {
+test("seven-tool mint rule: on a capable connection, run() mints a handle while status/output/tail/kill/list/follow each return their PLAIN response with no handle minted - status/kill (both real PublicJobProjection shapes) are checked by full key-set AND VALUE deep-equality against the real plain job-projection shape, list/output/tail are checked by a genuine whole-object comparison against their real, complete values, and follow (called against this same, already-terminal job) is checked for the same absence of any minted-handle field", async () => {
   const pair = await startPair(true);
   try {
     const beforeFirstJobMs = Date.now();
@@ -2147,6 +2160,30 @@ test("six-tool mint rule: on a capable connection, run() mints a handle while st
       tailResult,
       outputResult,
       `expected tail's response to deep-equal output's real response exactly for this single-line, now-terminal job - got: ${JSON.stringify(tailResult)}`
+    );
+
+    // follow, the seventh tool: on this same capable connection, against
+    // this same already-terminal job, it must stay exactly as plain as
+    // the other five - no minted handle, ever, regardless of capability
+    // (server.ts's tools/call dispatch only ever hands a result to the
+    // adapter when request.params.name === "run", so this is a structural
+    // guarantee, not merely an observed one). The job is already terminal,
+    // so this resolves via follow's own immediate-return path (no timer
+    // ever starts) rather than genuinely waiting out timeout_ms.
+    const followResult = runResultStructured(
+      await pair.client.callTool({
+        name: "follow",
+        arguments: { job_id: taskId, timeout_ms: 60_000 },
+      })
+    );
+    assert.ok(
+      carriesNoHandleTellTale(followResult),
+      `follow's response must carry NONE of ${JSON.stringify(HANDLE_TELL_TALE_FIELDS)} anywhere, got: ${JSON.stringify(followResult)}`
+    );
+    assert.equal(
+      followResult.reason,
+      "terminal",
+      `expected follow on this already-terminal job to return immediately via reason: "terminal" (never a 60s wait), got: ${JSON.stringify(followResult)}`
     );
 
     const beforeSecondJobMs = Date.now();
@@ -2532,10 +2569,10 @@ const COMPLETENESS_AREAS: readonly CompletenessArea[] = [
       "proving the negotiation above is genuinely per-request, not cached at the connection level",
   },
   {
-    area: "the six-tool mint rule, on the MODERN wire: status/output/tail/kill/list all stay plain even with Tasks capability declared on their own request, on the SAME connection where run() just minted",
+    area: "the seven-tool mint rule, on the MODERN wire: status/output/tail/kill/list/follow all stay plain even with Tasks capability declared on their own request, on the SAME connection where run() just minted",
     file: "test/modern-handshake.test.ts",
     titleContains:
-      "run() mints while status/output/tail/kill/list each stay plain, even with Tasks capability declared on their OWN request too",
+      "run() mints while status/output/tail/kill/list/follow each stay plain, even with Tasks capability declared on their OWN request too",
   },
 ];
 

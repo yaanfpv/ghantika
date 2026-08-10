@@ -1138,6 +1138,16 @@ function toCanonicalResultPair(result: {
   };
 }
 
+// `follow` (the 7th tool) is deliberately OUT OF SCOPE for this whole
+// file's golden comparison, on purpose, permanently: the golden was
+// captured from a real build of the commit right before the wake layer
+// merged (see GOLDEN_PATH's own doc comment above), and `follow` did not
+// exist at that commit - there is no frozen pre-wake value for it to
+// match, and inventing a synthetic one would make this golden describe a
+// tool surface that never actually existed at any point in this repo's
+// history. A tool added later earns its own coverage elsewhere
+// (test/follow.test.ts), never a manufactured entry here.
+
 /** Runs the same six deterministic scenarios the golden was captured from, against a PLAIN (non-Tasks-capable) client, and returns each tool's canonicalized {structuredContent, content} pair keyed by tool name. */
 async function runPlainPollScenarios(
   client: Client,

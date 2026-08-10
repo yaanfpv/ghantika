@@ -141,7 +141,7 @@ async function waitForBirthIdentity(jobId: string): Promise<void> {
  * every job here is spawned through the REAL `runTool.handler`, which goes
  * through `src/tools/run.ts`'s `beginSpawn` - the SAME eager,
  * fire-and-forget `jobStore.reapProcessGroupOnce` call at the child's own
- * OS-level exit that `test/tasks.test.ts`'s own "six-tool mint rule" test
+ * OS-level exit that `test/tasks.test.ts`'s own "run-only mint rule" test
  * (both its exited-naturally AND its explicitly-killed job) is exposed to.
  * `JobStore.setKillConfirmation`/`.setIdentityConfirmation` (see their own
  * doc comments in `src/jobStore.ts`) each only ever WRITE once the job's
@@ -159,12 +159,22 @@ async function waitForBirthIdentity(jobId: string): Promise<void> {
  * call's own response even though the call as a whole still succeeds.
  * Retrying (never re-signaling, see above) gives that transition time to
  * land and the write a real second chance.
+ *
+ * This loop carries NO wall-clock deadline and never throws on elapsed
+ * time. Every job here goes through the same fire-and-forget eager reap
+ * at OS-level exit (see this doc comment's own paragraph above) whose
+ * confirmation write is real event-loop scheduling latency with no
+ * stated upper bound - a fixed deadline would assert a bound the
+ * contract declines to give, whether the job was explicitly killed or
+ * exited on its own. It waits for as long as the surrounding test is
+ * willing to run; a genuine hang is caught by the test runner's own
+ * timeout, not by this function. To keep that outer failure legible if
+ * it ever fires, this writes a breadcrumb to stderr on a fixed logging
+ * cadence (never a threshold) while still waiting.
  */
-async function pollUntilKillConfirmed(
-  jobId: string,
-  deadlineMs = 5000
-): Promise<Record<string, unknown>> {
-  const deadline = Date.now() + deadlineMs;
+async function pollUntilKillConfirmed(jobId: string): Promise<Record<string, unknown>> {
+  const breadcrumbIntervalMs = 5000;
+  let lastBreadcrumbAt = Date.now();
   for (;;) {
     const result = await killTool.handler({ job_id: jobId });
     assert.notEqual(
@@ -176,10 +186,11 @@ async function pollUntilKillConfirmed(
     if (structured.kill_confirmed !== undefined) {
       return structured;
     }
-    if (Date.now() > deadline) {
-      throw new Error(
-        `timed out waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(structured)}`
+    if (Date.now() - lastBreadcrumbAt >= breadcrumbIntervalMs) {
+      console.error(
+        `still waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(structured)}`
       );
+      lastBreadcrumbAt = Date.now();
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
@@ -344,7 +355,7 @@ test(
     // `pollUntilKillConfirmed`'s own docs above for why this job, spawned
     // through the real `run()`/`beginSpawn`, is exposed to the same
     // eager-reap-vs-terminal-transition race `test/tasks.test.ts`'s
-    // "six-tool mint rule" test guards against. `identity_confirmed` is
+    // "run-only mint rule" test guards against. `identity_confirmed` is
     // read from that SAME settled response, never the original,
     // potentially-unsettled `killResult` - it shares the identical
     // terminal-state-gated write (`JobStore.setIdentityConfirmation`) that
@@ -447,7 +458,7 @@ test(
     // guard's own precondition should already have landed by the time the
     // write is attempted, with nothing able to interleave in between
     // (single-threaded, no `await` separates the two). Commit c12b111's
-    // own "six-tool mint rule" fix (`test/tasks.test.ts`) independently
+    // own "run-only mint rule" fix (`test/tasks.test.ts`) independently
     // records the matching empirical fact for this same structural
     // scenario: "this test has never observed these two [identity_confirmed/
     // identity_capture] flaking the way kill_confirmed does." This

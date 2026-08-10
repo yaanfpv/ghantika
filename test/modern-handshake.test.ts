@@ -469,7 +469,7 @@ test("modern handshake: on the SAME connection, a tools/call whose OWN request e
   // notification (see startTaskStatusNotifier's own docs) can land on this
   // wire in between the mint's response and this second request's own
   // response; nextResponse skips exactly that, and only that - the same
-  // hazard this file's "six-tool mint rule" test documents and guards
+  // hazard this file's "run-only mint rule" test documents and guards
   // against on its own chained reads.
   const incapableBody = (await nextResponse(server)) as {
     error?: unknown;
@@ -635,19 +635,19 @@ test("modern handshake: a tools/call whose own request envelope declares Tasks s
 });
 
 // ---------------------------------------------------------------------------
-// The six-tool mint rule, on the MODERN wire: run() mints, and
-// status/output/tail/kill/list each stay plain - regardless of Tasks
-// capability being declared on THEIR OWN request too. src/server.ts's
+// The seven-tool mint rule, on the MODERN wire: run() mints, and
+// status/output/tail/kill/list/follow each stay plain - regardless of
+// Tasks capability being declared on THEIR OWN request too. src/server.ts's
 // own tools/call handler branches on `request.params.name === "run"`
 // before any capability read even happens, so this is a structural
-// guarantee independent of era - but test/tasks.test.ts's own six-tool
+// guarantee independent of era - but test/tasks.test.ts's own seven-tool
 // mint rule proof exercises only the legacy (InMemoryTransport/SDK
 // Client) wire. This is the real-stdio modern-wire counterpart, on the
 // SAME connection where run() has just genuinely minted, so a capable
 // connection is not itself sufficient to make any OTHER tool mint.
 // ---------------------------------------------------------------------------
 
-test("modern handshake: six-tool mint rule on the real wire - run() mints while status/output/tail/kill/list each stay plain, even with Tasks capability declared on their OWN request too, on the SAME connection where run() just minted", async (t) => {
+test("modern handshake: seven-tool mint rule on the real wire - run() mints while status/output/tail/kill/list/follow each stay plain, even with Tasks capability declared on their OWN request too, on the SAME connection where run() just minted", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
   // explicit server.child.kill() below (a thrown assertion, in particular -
@@ -706,6 +706,12 @@ test("modern handshake: six-tool mint rule on the real wire - run() mints while 
     { name: "tail", arguments: { job_id: jobId } },
     { name: "kill", arguments: { job_id: jobId } },
     { name: "list", arguments: {} },
+    // By this point the job (a bare `true`, exiting near-instantly) has
+    // long since gone terminal - the earlier status/output/tail/kill/list
+    // round trips already guarantee that - so this resolves through
+    // follow's own immediate-return path. The bounded timeout_ms is a
+    // safety margin only, never something this test relies on hitting.
+    { name: "follow", arguments: { job_id: jobId, timeout_ms: 2000 } },
   ];
 
   let nextId = 3;
@@ -719,7 +725,7 @@ test("modern handshake: six-tool mint rule on the real wire - run() mints while 
       params: withModernEnvelope(
         { name: call.name, arguments: call.arguments },
         // Tasks capability declared on THIS request too - proving the
-        // six-tool mint rule is a per-tool-name guarantee, not merely
+        // seven-tool mint rule is a per-tool-name guarantee, not merely
         // "the earlier request in this test happened not to declare it."
         { extensions: { [TASKS_EXTENSION_URI]: {} } }
       ),
@@ -773,7 +779,7 @@ test("modern handshake: six-tool mint rule on the real wire - run() mints while 
 // raw JSON-RPC. Also settles the second of the two capability paths this
 // codebase has, on the real wire rather than by reading source alone -
 // `tools/call`'s own `run` branch reads a per-request Tasks-capability
-// declaration before minting (the six-tool-mint-rule test above, and
+// declaration before minting (the run-only-mint-rule test above, and
 // test/tasks.test.ts's legacy-era proof); src/server.ts registers
 // tasks/get, tasks/update, and tasks/cancel with NO such check at all
 // (confirmed directly by reading server.ts's own `server.setRequestHandler`
@@ -816,7 +822,7 @@ test("modern wire: tasks/get and tasks/cancel are UNROUTABLE on the 2026-07-28 e
   assert.ok((discoverLine.parsed as DiscoverResultBody).result, "discover must succeed first");
 
   // Mint a real task first - WITH capability declared, since minting
-  // itself IS gated (see the six-tool-mint-rule test above). A real taskId
+  // itself IS gated (see the run-only-mint-rule test above). A real taskId
   // must exist for the calls below to target, even though - as this test
   // itself proves - that target is never reached for two of the three
   // methods on this era.

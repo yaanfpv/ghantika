@@ -29,8 +29,9 @@ import { waitForFile } from "./harness.ts";
  * A schema-invalid tool call always returns a tool-execution error result
  * (`isError: true`, never a thrown JSON-RPC error) - the only difference
  * across cases is the message. This asserts that shape for every one
- * of the six tools directly against their exported handlers, at the unit
- * level (the real end-to-end proof lives in test/e2e-server.test.ts).
+ * of the six legacy tool handlers this file imports directly, at the unit
+ * level (the real end-to-end proof lives in test/e2e-server.test.ts;
+ * `follow` has its own dedicated coverage in test/follow.test.ts).
  */
 function assertToolError(result: CallToolResult, expectedSubstring: string): void {
   assert.equal(
@@ -228,8 +229,9 @@ for (const { mod, name } of jobIdTools) {
 // job_id" behavior is real, unknown-job not-found, tested thoroughly in
 // test/output-tail.test.ts), and kill is fully implemented as well
 // (its own real-behavior tests, including the external pgrep process-group
-// proof, live in test/kill.test.ts) - none of the six tools are left
-// returning the old "not implemented yet" stub message.
+// proof, live in test/kill.test.ts) - none of the six legacy tool handlers
+// this file imports are left returning the old "not implemented yet" stub
+// message (follow was never one of them - it shipped already implemented).
 
 // --- schema-handler agreement: the ADVERTISED inputSchema itself agrees
 // with what the handler already enforces - proving schema and handler are consistent,
