@@ -503,3 +503,149 @@ test("the transport-wake subscriber fires AT MOST ONCE per task - a duplicate ma
     );
   });
 });
+
+// =============================================================================
+// 6. Capability-gate fix: startTransportWakeOnTerminal must NOT be gated by
+//    isCapableConnection - it subscribes on the real job run() already
+//    created, never on the minted task-shaped response, and Codex (this
+//    layer's own target client) never declares Tasks-extension capability
+//    (README's own measured claim: "Neither host advertises the extension
+//    at handshake in the first place"). Before this fix, `if
+//    (!isCapableConnection) return result;` at the top of
+//    maybeAugmentRunResult made this branch structurally unreachable with
+//    isCapableConnection false - every test above (all written before this
+//    fix) passes `true`. These four prove the boundary directly: #1 shows
+//    the mechanism now genuinely fires for a non-capable connection with
+//    the gate ON (the fix working); #2 shows today's default deployment
+//    (gate OFF) is unaffected by a non-capable connection now reaching this
+//    code (the "zero observable behavior change today" claim, evidenced
+//    rather than asserted); #3 and #4 show the two capability-gated
+//    siblings and the minted-vs-passthrough response shape are unchanged
+//    on both sides of the isCapableConnection boundary - this fix moves
+//    only the transport-wake registration, nothing else.
+// =============================================================================
+
+test("gate ON + resolution 'resolved' + isCapableConnection FALSE - wake() still fires, where the branch was previously unreachable with isCapableConnection false at all", async (t) => {
+  await withWakeTransportEnabled("1", async () => {
+    t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", available);
+    const wakeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", delivers("codex-app-server-goal"));
+
+    const job = createNonTerminalJob("non-capable-gate-on-resolved");
+    const target: WakeTarget = "thread-non-capable-target";
+    const resolution: WakeTargetResolution = { state: "resolved", target };
+    maybeAugmentRunResult(makeRunResult(job.job_id), false, noopNotifier, resolution);
+
+    jobStore.markExited(job.job_id, 0, null);
+    await settle();
+
+    assert.equal(
+      wakeA.mock.callCount(),
+      1,
+      `isCapableConnection=false must not block the transport wake once the gate is on and the target resolved - got ${wakeA.mock.callCount()} wake() calls`
+    );
+    const [calledTarget] = wakeA.mock.calls[0]!.arguments;
+    assert.equal(calledTarget, target);
+  });
+});
+
+test('gate OFF (default) + resolution "resolved" + isCapableConnection FALSE - the subscription now reaches this codepath but STILL makes zero transport calls, proving no observable behavior changes in today\'s default deployment', async (t) => {
+  const probeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", unreachableProbe);
+  const wakeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", unreachableWake);
+  const probeB = t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unreachableProbe);
+  const wakeB = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", unreachableWake);
+
+  const job = createNonTerminalJob("non-capable-gate-off-resolved");
+  const target: WakeTarget = "thread-non-capable-gate-off-target";
+  const resolution: WakeTargetResolution = { state: "resolved", target };
+  // No withWakeTransportEnabled wrapper - this deliberately runs under
+  // whatever the process env already has GHANTIKA_WAKE_TRANSPORT_ENABLED
+  // set to, which in every real deployment and in this test run (nothing
+  // in this file's own module scope sets it globally) is unset - the
+  // exact "every real deployment today" state this test's own name claims.
+  assert.equal(
+    process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED,
+    undefined,
+    "sanity: this test must run with the gate genuinely unset, not merely assume it"
+  );
+  maybeAugmentRunResult(makeRunResult(job.job_id), false, noopNotifier, resolution);
+
+  jobStore.markExited(job.job_id, 0, null);
+  await settle();
+
+  assert.equal(probeA.mock.callCount(), 0, "gate OFF must still make zero probe() calls");
+  assert.equal(wakeA.mock.callCount(), 0, "gate OFF must still make zero wake() calls");
+  assert.equal(probeB.mock.callCount(), 0);
+  assert.equal(wakeB.mock.callCount(), 0);
+});
+
+test("regression guard: isCapableConnection FALSE never starts startTaskWatch/startTaskStatusNotifier - notifier is never invoked, even with a resolved transport target and the gate on", async (t) => {
+  await withWakeTransportEnabled("1", async () => {
+    t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", available);
+    t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", delivers("codex-app-server-goal"));
+
+    const job = createNonTerminalJob("non-capable-notifier-guard");
+    const resolution: WakeTargetResolution = {
+      state: "resolved",
+      target: "thread-notifier-guard-target",
+    };
+    let notifierCalls = 0;
+    const countingNotifier: TaskWakeNotifier = () => {
+      notifierCalls += 1;
+    };
+    maybeAugmentRunResult(makeRunResult(job.job_id), false, countingNotifier, resolution);
+
+    jobStore.markExited(job.job_id, 0, null);
+    await settle();
+
+    assert.equal(
+      notifierCalls,
+      0,
+      "a non-capable connection must never receive startTaskWatch's output-delta notification or startTaskStatusNotifier's notifications/tasks status notification - only the out-of-band transport wake may fire for it"
+    );
+  });
+});
+
+test("regression guard: the capable path is byte-for-byte unchanged - isCapableConnection TRUE still starts all three mechanisms and still returns the minted CreateTaskResult shape, never the raw passthrough result", async (t) => {
+  await withWakeTransportEnabled("1", async () => {
+    t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", available);
+    const wakeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", delivers("codex-app-server-goal"));
+
+    const job = createNonTerminalJob("capable-unchanged");
+    const resolution: WakeTargetResolution = {
+      state: "resolved",
+      target: "thread-capable-unchanged-target",
+    };
+    let notifierCalls = 0;
+    const countingNotifier: TaskWakeNotifier = () => {
+      notifierCalls += 1;
+    };
+    const rawResult = makeRunResult(job.job_id);
+    const minted = maybeAugmentRunResult(rawResult, true, countingNotifier, resolution);
+
+    // The minted shape is returned immediately, before the job ever goes
+    // terminal - `buildCreateTaskResult` reads the record's PRE-terminal
+    // state, matching every other test in this file's own established
+    // shape assertions (see the AC9 tests above, which read
+    // `minted.structuredContent` the same way).
+    assert.notEqual(
+      minted,
+      rawResult,
+      "a capable connection must still get the minted CreateTaskResult object, never the raw passthrough result"
+    );
+    assert.equal((minted as unknown as { resultType?: string }).resultType, "task");
+
+    jobStore.markExited(job.job_id, 0, null);
+    await settle();
+
+    assert.equal(
+      wakeA.mock.callCount(),
+      1,
+      "the transport wake must still fire for a capable connection exactly as before this fix"
+    );
+    assert.equal(
+      notifierCalls > 0,
+      true,
+      "a capable connection must still receive at least one notifier call (startTaskWatch's output-delta wake fires on markExited too, ahead of/alongside startTaskStatusNotifier's own notification) - the two capability-gated siblings are unchanged by this fix"
+    );
+  });
+});

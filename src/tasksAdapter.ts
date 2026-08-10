@@ -1373,20 +1373,28 @@ function buildTransportWakePayload(taskId: string, record: JobRecord): string {
 }
 
 /**
- * Starts the transport-layer wake for a freshly-minted task - called only
- * from `maybeAugmentRunResult`, alongside (never instead of)
- * `startTaskWatch`/`startTaskStatusNotifier`, and under the identical
- * guard: only when the backing job is not ALREADY terminal at mint time (a
- * job with no further transition ahead of it has nothing left to wake
- * about). A SEPARATE `jobStore.onJobTerminal` subscription from both
- * siblings' own - the same independence reasoning `startTaskStatusNotifier`'s
- * own docs give for why it is separate from `startTaskWatch`: a firehose
- * auto-stop of the output-delta watch, or any future change to either
- * sibling, must never also silence this one, and vice versa. Fires AT MOST
- * ONCE per task, exactly like `startTaskStatusNotifier` - `jobStore.
- * onJobTerminal` itself guarantees the single-fire property (see that
- * method's own docs), this function does not need to track its own
- * "already fired" state.
+ * Starts the transport-layer wake for a still-live job - called only from
+ * `maybeAugmentRunResult`, alongside (never instead of)
+ * `startTaskWatch`/`startTaskStatusNotifier`, and sharing exactly ONE guard
+ * with them: only when the backing job is not ALREADY terminal at mint time
+ * (a job with no further transition ahead of it has nothing left to wake
+ * about). It does NOT share their other guard: `startTaskWatch` and
+ * `startTaskStatusNotifier` run only on a Tasks-capable connection, because
+ * both push an MCP notification down THAT connection. This function never
+ * does - it subscribes on `jobId`, a real job `run()` already created
+ * whether or not this connection is Tasks-capable, and its own delivery
+ * (`selectAndWake`, below) is out-of-band, addressed by `wakeTargetResolution`
+ * rather than by anything this connection negotiated. So `isCapableConnection`
+ * is simply not an input to this function - a non-capable connection's job
+ * is exactly as valid a subject as a capable one's. A SEPARATE
+ * `jobStore.onJobTerminal` subscription from both siblings' own - the same
+ * independence reasoning `startTaskStatusNotifier`'s own docs give for why
+ * it is separate from `startTaskWatch`: a firehose auto-stop of the
+ * output-delta watch, or any future change to either sibling, must never
+ * also silence this one, and vice versa. Fires AT MOST ONCE per task,
+ * exactly like `startTaskStatusNotifier` - `jobStore.onJobTerminal` itself
+ * guarantees the single-fire property (see that method's own docs), this
+ * function does not need to track its own "already fired" state.
  *
  * `isTransportWakeEnabled()` is checked FIRST, before `resolution.state` is
  * even read - so with the env var unset (every real deployment today) this
@@ -1570,14 +1578,25 @@ function extractJobId(result: CallToolResult): string | undefined {
  * INDEPENDENT subscriptions - see `startTaskStatusNotifier`'s own docs for
  * why a firehose-triggered stop of the first can never silence the second,
  * and `startTransportWakeOnTerminal`'s own docs for the identical reasoning
- * applied to the third. `notifier` is always passed by `server.ts`
- * regardless of capability - it is simply never invoked when this function
- * returns early above, so passing it unconditionally costs nothing;
- * `wakeTargetResolution` is likewise always passed (`server.ts` resolves it
- * unconditionally on the `run` branch, in every era - see that file's own
- * wiring), and `startTransportWakeOnTerminal`'s own internal gate
+ * applied to the third.
+ *
+ * The three do NOT all share the same capability gate. `startTaskWatch` and
+ * `startTaskStatusNotifier` run only when `isCapableConnection` - both push
+ * an MCP notification down this connection, which only makes sense for a
+ * connection that negotiated the extension. `startTransportWakeOnTerminal`
+ * runs regardless: it subscribes on `jobId`, a real job this call's own
+ * `run()` already created whether or not this connection is Tasks-capable,
+ * and its delivery is out-of-band (see that function's own docs) - this
+ * connection's negotiated capability is simply not an input to it.
+ * `notifier` is always passed by `server.ts` regardless of capability - it
+ * is simply never invoked on a non-capable connection, so passing it
+ * unconditionally costs nothing; `wakeTargetResolution` is likewise always
+ * passed (`server.ts` resolves it unconditionally on the `run` branch, in
+ * every era - see that file's own wiring), and
+ * `startTransportWakeOnTerminal`'s own internal gate
  * (`isTransportWakeEnabled`) is what keeps it a real no-op everywhere this
- * story does not explicitly enable it.
+ * story does not explicitly enable it - on every connection, capable or
+ * not.
  */
 export function maybeAugmentRunResult(
   result: CallToolResult,
@@ -1585,18 +1604,28 @@ export function maybeAugmentRunResult(
   notifier: TaskWakeNotifier,
   wakeTargetResolution: WakeTargetResolution
 ): CallToolResult {
-  if (!isCapableConnection) return result;
   const jobId = extractJobId(result);
   if (jobId === undefined) return result;
   const record = jobStore.get(jobId);
   if (record === undefined) return result; // defensive only - run() always creates the record before returning
 
   if (!isTerminalJobState(record.state)) {
-    startTaskWatch(jobId, notifier);
-    startTaskStatusNotifier(jobId, notifier);
+    // startTransportWakeOnTerminal runs regardless of isCapableConnection - it
+    // subscribes on the real JOB this run() call already created, never on the
+    // minted TASK shape below, so a non-capable connection's job is exactly as
+    // valid a subject as a capable one's. Its own preconditions
+    // (isTransportWakeEnabled, wakeTargetResolution.state === "resolved") are
+    // the only gates that legitimately apply; Tasks-extension capability is a
+    // fact about this connection's MCP notifications, and this mechanism never
+    // sends one - see its own doc comment.
     startTransportWakeOnTerminal(jobId, wakeTargetResolution);
+    if (isCapableConnection) {
+      startTaskWatch(jobId, notifier);
+      startTaskStatusNotifier(jobId, notifier);
+    }
   }
 
+  if (!isCapableConnection) return result;
   const minted = buildCreateTaskResult(record);
   return minted as unknown as CallToolResult;
 }
