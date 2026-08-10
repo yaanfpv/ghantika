@@ -141,11 +141,11 @@ function rejectsAsync(message: string): () => Promise<WakeResult> {
 }
 
 // =============================================================================
-// 1. AC17, the load-bearing one: "absent" AND "malformed" never call
-//    selectAndWake - asserted against real spies, never reasoned about.
+// "absent" AND "malformed" never call selectAndWake - asserted against
+// real spies, never reasoned about.
 // =============================================================================
 
-test("AC17: with the gate ON, resolution 'absent' never calls selectAndWake - the real transports' probe()/wake() are never invoked", async (t) => {
+test("with the gate ON, resolution 'absent' never calls selectAndWake - the real transports' probe()/wake() are never invoked", async (t) => {
   await withWakeTransportEnabled("1", async () => {
     const probeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", unreachableProbe);
     const wakeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", unreachableWake);
@@ -182,7 +182,7 @@ test("AC17: with the gate ON, resolution 'absent' never calls selectAndWake - th
   });
 });
 
-test("AC17: with the gate ON, resolution 'malformed' never calls selectAndWake either - logged via console.error (the loud half of AC8), but still zero transport calls", async (t) => {
+test("with the gate ON, resolution 'malformed' never calls selectAndWake either - logged via console.error, but still zero transport calls", async (t) => {
   await withWakeTransportEnabled("1", async () => {
     const probeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", unreachableProbe);
     const wakeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", unreachableWake);
@@ -329,14 +329,13 @@ test("gate ON + resolution 'resolved': the first real transport's wake() is call
 });
 
 // =============================================================================
-// 4. AC9: a selectAndWake result other than "delivered" (refused /
-//    unavailable / a thrown rejection) never propagates into the
-//    tool-call response - the minted CreateTaskResult from
-//    maybeAugmentRunResult is unaffected either way, and the failure is
-//    logged rather than thrown.
+// A selectAndWake result other than "delivered" (refused / unavailable /
+// a thrown rejection) never propagates into the tool-call response - the
+// minted CreateTaskResult from maybeAugmentRunResult is unaffected either
+// way, and the failure is logged rather than thrown.
 // =============================================================================
 
-test("AC9: a 'refused' selectAndWake outcome never propagates into the already-minted CallToolResult - the poll floor stays authoritative", async (t) => {
+test("a 'refused' selectAndWake outcome never propagates into the already-minted CallToolResult - the poll floor stays authoritative", async (t) => {
   await withWakeTransportEnabled("1", async () => {
     t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", available);
     t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", refuses("codex-app-server-goal"));
@@ -364,7 +363,7 @@ test("AC9: a 'refused' selectAndWake outcome never propagates into the already-m
   });
 });
 
-test("AC9: an 'unavailable' selectAndWake outcome never propagates into the already-minted CallToolResult", async (t) => {
+test("an 'unavailable' selectAndWake outcome never propagates into the already-minted CallToolResult", async (t) => {
   await withWakeTransportEnabled("1", async () => {
     t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", available);
     t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", reportsUnavailable("codex-app-server-goal"));
@@ -392,7 +391,7 @@ test("AC9: an 'unavailable' selectAndWake outcome never propagates into the alre
   });
 });
 
-test("AC9: selectAndWake itself rejecting (a transport throwing/rejecting all the way out) never propagates into the already-minted CallToolResult, and never crashes the process - caught by this adapter's own .catch", async (t) => {
+test("selectAndWake itself rejecting (a transport throwing/rejecting all the way out) never propagates into the already-minted CallToolResult, and never crashes the process - caught by this adapter's own .catch", async (t) => {
   await withWakeTransportEnabled("1", async () => {
     t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", available);
     t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", rejectsAsync("connection reset"));
@@ -667,8 +666,8 @@ test("regression guard: the capable path is byte-for-byte unchanged - isCapableC
     // The minted shape is returned immediately, before the job ever goes
     // terminal - `buildCreateTaskResult` reads the record's PRE-terminal
     // state, matching every other test in this file's own established
-    // shape assertions (see the AC9 tests above, which read
-    // `minted.structuredContent` the same way).
+    // shape assertions (see the selectAndWake-outcome-propagation tests
+    // above, which read `minted.structuredContent` the same way).
     assert.notEqual(
       minted,
       rawResult,

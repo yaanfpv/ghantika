@@ -1651,24 +1651,18 @@ test(
 // ---------------------------------------------------------------------------
 // Wake-target metadata hand-off - `threadId` is handler material, never
 // envelope material (see `src/server.ts`'s own doc comment at its
-// `resolveWakeTarget` call site), so it can only be proven by a real
-// modern `_meta` object carrying both a reserved envelope key and the
-// non-reserved `threadId` together, exactly as a real client would send
-// them - `withModernEnvelope` above cannot express this (it replaces
-// `_meta` wholesale with just the two reserved keys), so these two tests
-// build the request's `_meta` by hand instead. Both drive a `sleep 0.1`-
-// equivalent short job to a real terminal transition and read the
-// resulting diagnostic off the real spawned process's own stderr - proof
-// against the real server-to-resolver hand-off, which
-// `test/wake-transport-wiring.test.ts`'s hand-constructed
-// `WakeTargetResolution` values cannot reach.
+// `resolveWakeTarget` call site). `withModernEnvelope` above cannot
+// express a request carrying both a reserved envelope key and the
+// non-reserved `threadId` together (it replaces `_meta` wholesale with
+// just the two reserved keys), so these two tests build the request's
+// `_meta` by hand instead. Both drive a short job to a real terminal
+// transition and read the resulting diagnostic off the real spawned
+// process's own stderr.
 // ---------------------------------------------------------------------------
 
 /**
- * Polls `server.stderrText()` for `substring` up to `attempts * 100`ms,
- * matching this file's own established retry-loop idiom (see the
- * `tasks/cancel` polling loop above) rather than a bespoke helper. The
- * malformed-threadId diagnostic below is written synchronously inside
+ * Polls `server.stderrText()` for `substring` up to `attempts * 100`ms.
+ * The malformed-threadId diagnostic below is written synchronously inside
  * `fireJobTerminal`'s own dispatch (before any `selectAndWake` promise even
  * exists), but the resolved-threadId diagnostic is written from inside an
  * un-awaited `.then()/.catch()` continuation - genuinely asynchronous
@@ -1680,10 +1674,9 @@ test(
  * specifically: `AppServerGoalWakeTransport.probe()` spawns a real,
  * throwaway `codex app-server` subprocess and speaks a real handshake to
  * it (see that transport's own doc comment) - genuine subprocess and IPC
- * latency, not a fixed in-process computation, and measured live on this
- * repo's own shared host to occasionally exceed 2s under concurrent load
- * from other processes on the same machine. The malformed case still
- * resolves in its first iteration or two regardless of this ceiling.
+ * latency, not a fixed in-process computation, that can exceed 2s under
+ * host contention. The malformed case still resolves in its first
+ * iteration or two regardless of this ceiling.
  */
 async function pollStderrFor(server: SpawnedServer, substring: string): Promise<boolean> {
   for (let attempt = 0; attempt < 150; attempt += 1) {
@@ -1693,7 +1686,7 @@ async function pollStderrFor(server: SpawnedServer, substring: string): Promise<
   return false;
 }
 
-test("wake-target hand-off, malformed: a real modern tools/call whose own request _meta carries threadId:'' alongside the required envelope keys logs the malformed-target skip diagnostic once the job reaches terminal - proving the resolver saw the caller's actual threadId, not the envelope's reserved keys", async (t) => {
+test("wake-target hand-off, malformed: a real modern tools/call whose own request _meta carries threadId:'' alongside the required envelope keys logs the malformed-target skip diagnostic once the job reaches terminal", async (t) => {
   const originalGate = process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED;
   process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED = "1";
   const server = tracked();
@@ -1740,7 +1733,7 @@ test("wake-target hand-off, malformed: a real modern tools/call whose own reques
   );
 });
 
-test("wake-target hand-off, resolved: a real modern tools/call whose own request _meta carries a real non-empty threadId alongside the required envelope keys reaches selectAndWake (an attempted-wake diagnostic, not silence) once the job reaches terminal - proving a genuine target resolves through the real server-to-adapter path, not only through a hand-built WakeTargetResolution", async (t) => {
+test("wake-target hand-off, resolved: a real modern tools/call whose own request _meta carries a real non-empty threadId alongside the required envelope keys reaches selectAndWake (an attempted-wake diagnostic, not silence) once the job reaches terminal", async (t) => {
   const originalGate = process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED;
   process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED = "1";
   const server = tracked();
@@ -1779,25 +1772,22 @@ test("wake-target hand-off, resolved: a real modern tools/call whose own request
 
   // Which of the three non-"delivered" outcomes (refused/unavailable/threw
   // - `startTransportWakeOnTerminal`'s own WakeResult union, see its doc
-  // comment) a real environment produces is NOT fixed: on a CI runner with
+  // comment) a real environment produces is not fixed: on a runner with
   // neither a real Codex app-server nor a real ChatGPT desktop IPC socket,
-  // both DEFAULT_TRANSPORTS probes report unavailable. On a dev machine
-  // that happens to have a real `codex app-server` reachable (measured
-  // live on this repo's own shared host, mid-development of this test),
-  // the app-server responds and REFUSES this non-UUID-shaped threadId
-  // instead - a real protocol-level validation error from a real transport,
-  // not a probe failure. Both are "an attempt reached selectAndWake";
-  // neither is "delivered" (this test asserts none of that requires a real
-  // Codex/Desktop session actually receiving a wake). What matters, and
-  // what distinguishes this from the sibling malformed test above, is that
-  // SOME attempted-wake diagnostic fires at all: that only happens when
-  // resolveWakeTarget answered "resolved", never "absent" - so its
-  // presence is direct evidence the real server passed this request's own
-  // threadId through to the resolver, not the envelope's reserved keys.
+  // both DEFAULT_TRANSPORTS probes report unavailable. A host with a real
+  // `codex app-server` reachable can instead have the app-server respond
+  // and refuse this non-UUID-shaped threadId - a real protocol-level
+  // validation error from a real transport, not a probe failure. Both are
+  // "an attempt reached selectAndWake"; neither is "delivered" - this test
+  // asserts only that request metadata reaches a gated wake attempt, never
+  // that a real recipient session is actually resumed. What distinguishes
+  // this from the sibling malformed test above is that some attempted-wake
+  // diagnostic fires at all: that only happens when resolveWakeTarget
+  // answered "resolved", never "absent".
   const found = await pollStderrFor(server, `transport wake `);
   assert.ok(
     found,
-    `expected some attempted-wake diagnostic on stderr (proving the resolver saw "resolved", not "absent") once the job terminalized; got stderr: ${server.stderrText()}`
+    `expected some attempted-wake diagnostic on stderr once the job terminalized; got stderr: ${server.stderrText()}`
   );
   const stderrText = server.stderrText();
   assert.match(

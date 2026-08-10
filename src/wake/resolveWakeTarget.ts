@@ -26,13 +26,12 @@
  *
  * This is a pure extraction function, not an authentication one: it never
  * validates `threadId`'s shape beyond "present and a non-empty string"
- * (not a UUID-format check, not a length check), since imposing a
- * stricter format than the measured wire evidence actually constrains
- * would be inventing a rule with no evidence behind it. It never falls
- * back to anything else (an env var, a config guess, a correlation
- * heuristic) when a target cannot be extracted - a caller holding
- * anything other than `"resolved"` has definitively not been given a
- * target and must not construct one from another source.
+ * (not a UUID-format check, not a length check), since a stricter check
+ * would risk rejecting a legitimate value on no stated authority. It
+ * never falls back to anything else (an env var, a config guess, a
+ * correlation heuristic) when a target cannot be extracted - a caller
+ * holding anything other than `"resolved"` has definitively not been
+ * given a target and must not construct one from another source.
  */
 import type { WakeTarget } from "./wakeTransport.js";
 

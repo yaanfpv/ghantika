@@ -1329,24 +1329,23 @@ function startTaskStatusNotifier(taskId: string, notifier: TaskWakeNotifier): vo
 }
 
 // ---------------------------------------------------------------------------
-// The transport-layer wake - genuinely resuming an idle AGENT SESSION on
-// the host machine (a Codex thread, a backgrounded Claude Code turn) via
-// `src/wake/selectTransport.ts`'s `selectAndWake`, rather than pushing an
-// MCP notification down THIS connection the way both mechanisms above do
-// (see `src/wake/wakeTransport.ts`'s own header for that same distinction,
-// stated from the transport side). This section wires that layer
-// REACHABLE and CALLABLE - closing the gap `resolveWakeTarget.ts` already
-// closed on the resolution side - while keeping it entirely INERT in every
-// real deployment today: `isTransportWakeEnabled` is the one gate every
-// path below passes through before a single transport call can happen.
+// The transport-layer wake - a mechanism intended to eventually resume an
+// idle AGENT SESSION on the host machine (a Codex thread, a backgrounded
+// Claude Code turn) via `src/wake/selectTransport.ts`'s `selectAndWake`,
+// rather than pushing an MCP notification down THIS connection the way
+// both mechanisms above do (see `src/wake/wakeTransport.ts`'s own header
+// for that same distinction, stated from the transport side). This
+// section wires that layer so a resolved target can reach a gated wake
+// attempt, while keeping it entirely INERT in every real deployment
+// today: `isTransportWakeEnabled` is the one gate every path below passes
+// through before a single transport call can happen.
 //
-// The PUBLIC surface shape of the opt-in (a `run` parameter, a separate
-// arming call, something else) is a deliberately separate, still-open
-// design decision - not settled here. So this is deliberately an
-// internal, undocumented, test-reachable toggle only, never a tool-schema
-// field, a documented flag, or anything a real client can discover or set
-// through the wire protocol. Follows this codebase's own house pattern
-// for exactly that shape - see `src/process.ts`'s
+// The public, client-facing shape of how an agent would eventually opt
+// into this is not decided here. So this is deliberately an internal
+// server-process environment variable only, never a tool-schema field, a
+// documented flag, or anything an MCP client can discover or set through
+// the wire protocol. Follows this codebase's own house pattern for
+// exactly that shape - see `src/process.ts`'s
 // `GHANTIKA_TEST_DEGRADE_PROC_READ`.
 // ---------------------------------------------------------------------------
 
@@ -1369,14 +1368,12 @@ function isTransportWakeEnabled(): boolean {
  * payload has no way to know which protocol era the RECIPIENT session is
  * actually running (it travels out-of-band through a real transport, not
  * back down the connection this job's own request arrived on), and
- * `tasks/get` is UNROUTABLE on the modern 2026-07-28 era (see
- * `test/modern-handshake.test.ts`'s own header doc: the installed SDK's
- * base dispatch refuses it before this codebase's own handler is ever
- * reached, a fact independent of any capability this codebase controls).
- * `status`/`output`/`tail` are the plain poll floor and work unconditionally
- * on every era this codebase serves, so they are the only instruction this
- * payload can make without risking sending a real recipient into a method
- * their own connection may not even be able to route.
+ * `tasks/get` is unroutable on the modern 2026-07-28 era regardless of any
+ * capability this codebase controls. `status`/`output`/`tail` are the
+ * plain poll floor and work unconditionally on every era this codebase
+ * serves, so they are the only instruction this payload can make without
+ * risking sending a real recipient into a method their own connection may
+ * not even be able to route.
  */
 function buildTransportWakePayload(taskId: string, record: JobRecord): string {
   return `ghantika job ${taskId} reached ${record.state} - use status/output/tail to read the result`;
