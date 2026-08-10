@@ -2960,7 +2960,21 @@ export class JobStore {
    */
   setKillConfirmation(jobId: string, confirmed: boolean): void {
     const record = this.jobs.get(jobId);
-    if (!record || !isTerminalJobState(record.state)) return;
+    if (!record || !isTerminalJobState(record.state)) {
+      // TEMPORARY diagnostic - names the exact moment a hypothesized race
+      // would drop this write: the reap already resolved with a real
+      // confirmation, but the record has not transitioned to a terminal
+      // state yet, so this call is a silent no-op and the value is lost.
+      // Remove before any fix ships - see this file's own
+      // hasReapEnteredDiagnostic and test/tasks.test.ts's
+      // pollUntilKillConfirmed breadcrumb for the matching removals.
+      console.error(
+        `[kill-confirmed-guard-diag] setKillConfirmation(${jobId}, ${confirmed}) REFUSED - record ${
+          record === undefined ? "missing" : `state=${record.state}`
+        }, not terminal, write dropped`
+      );
+      return;
+    }
     record.kill_confirmed = confirmed;
   }
 
