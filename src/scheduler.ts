@@ -300,8 +300,9 @@ export interface RetainedJobSummary {
  * reclamation once `retentionMs` ELAPSES since `ended_at`, OR once the
  * `maxRetainedJobs` cap is exceeded (oldest-`ended_at` first), WHICHEVER
  * FIRST - purely time + cap, never gated on whether/how a caller has read
- * the job (no ack operation, no 7th tool; see `src/jobStore.ts`'s own docs
- * on why reading via `output`/`tail` never resets this clock).
+ * the job (no ack/read-receipt operation exists - not `output`/`tail`,
+ * and not `follow`'s own wait either; see `src/jobStore.ts`'s own docs
+ * on why reading via `output`/`tail`/`follow` never resets this clock).
  *
  * This function is a pure decision, evaluated against whatever `now` its
  * caller supplies - it does not itself run on any schedule. How promptly
