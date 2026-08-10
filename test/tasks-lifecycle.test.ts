@@ -958,26 +958,28 @@ test("a sustained firehose rate rate-limits wakes and auto-stops ONLY the notifi
       );
 
       // The watch's own onJobTerminal subscription must already be gone at
-      // this point too - not merely inert, genuinely unsubscribed. A prior
-      // version left it registered until the job's own eventual TTL purge,
-      // since its callback's own "if (stopped) return" guard made it inert
-      // without ever removing it from jobStore. The count this asserts has
-      // grown twice since this test was first written (0 -> 1 -> 2), each
-      // time because a genuinely SEPARATE, independent `onJobTerminal`
-      // subscriber joined the same guard block in
-      // `maybeAugmentRunResult` - never because this regression itself
-      // weakened. First a `notifications/tasks` per-transition status
-      // notifier (startTaskStatusNotifier, see its own docs) took the count
-      // from 0 to 1; then the transport-layer wake subscriber
-      // (startTransportWakeOnTerminal, see its own docs - gated OFF by
-      // default via GHANTIKA_WAKE_TRANSPORT_ENABLED, but its SUBSCRIPTION
-      // is unconditional, exactly like its two siblings') took it from 1 to
-      // 2. Both must still be live here, since the job has not reached its
-      // real terminal transition yet - only the OTHER watch auto-stopped.
-      // The regression this test still guards is unchanged: if
-      // startTaskWatch's own listener were ever left registered instead of
-      // genuinely unsubscribed, this count would read 3 (the leaked one
-      // plus both siblings' own live ones), not 2.
+      // this point too - not merely inert, genuinely unsubscribed. A
+      // callback that merely goes inert via its own "if (stopped) return"
+      // guard, without ever calling its own unsubscribe, would stay
+      // registered until the job's eventual TTL purge; this assertion
+      // would not catch that as a leak by itself, since inert and
+      // unregistered look identical to any caller that never inspects the
+      // listener count directly.
+      //
+      // The count this asserts is 2: two genuinely SEPARATE, independent
+      // `onJobTerminal` subscribers share the same guard block in
+      // `maybeAugmentRunResult` alongside the watch under test here - the
+      // `notifications/tasks` per-transition status notifier
+      // (startTaskStatusNotifier, see its own docs) and the
+      // transport-layer wake subscriber (startTransportWakeOnTerminal, see
+      // its own docs - gated OFF by default via
+      // GHANTIKA_WAKE_TRANSPORT_ENABLED, but its SUBSCRIPTION is
+      // unconditional). Both must still be live here, since the job has
+      // not reached its real terminal transition yet - only the OTHER
+      // watch auto-stopped. If startTaskWatch's own listener were ever
+      // left registered instead of genuinely unsubscribed, this count
+      // would read 3 (the leaked one plus both siblings' own live ones),
+      // not 2.
       assert.equal(
         jobStore.getJobTerminalListenerCount(jobId),
         2,

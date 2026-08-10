@@ -1329,24 +1329,22 @@ function startTaskStatusNotifier(taskId: string, notifier: TaskWakeNotifier): vo
 }
 
 // ---------------------------------------------------------------------------
-// The transport-layer wake - a mechanism intended to eventually resume an
-// idle AGENT SESSION on the host machine (a Codex thread, a backgrounded
+// The transport-layer wake - a mechanism for eventually resuming an idle
+// AGENT SESSION on the host machine (a Codex thread, a backgrounded
 // Claude Code turn) via `src/wake/selectTransport.ts`'s `selectAndWake`,
 // rather than pushing an MCP notification down THIS connection the way
 // both mechanisms above do (see `src/wake/wakeTransport.ts`'s own header
 // for that same distinction, stated from the transport side). This
 // section wires that layer so a resolved target can reach a gated wake
-// attempt, while keeping it entirely INERT in every real deployment
-// today: `isTransportWakeEnabled` is the one gate every path below passes
-// through before a single transport call can happen.
+// attempt. `isTransportWakeEnabled` is the one gate every path below
+// passes through before a single transport call can happen, and it
+// defaults to off.
 //
-// The public, client-facing shape of how an agent would eventually opt
-// into this is not decided here. So this is deliberately an internal
-// server-process environment variable only, never a tool-schema field, a
-// documented flag, or anything an MCP client can discover or set through
-// the wire protocol. Follows this codebase's own house pattern for
-// exactly that shape - see `src/process.ts`'s
-// `GHANTIKA_TEST_DEGRADE_PROC_READ`.
+// This is deliberately an internal server-process environment variable
+// only, never a tool-schema field, a documented flag, or anything an MCP
+// client can discover or set through the wire protocol. Follows this
+// codebase's own house pattern for exactly that shape - see
+// `src/process.ts`'s `GHANTIKA_TEST_DEGRADE_PROC_READ`.
 // ---------------------------------------------------------------------------
 
 const WAKE_TRANSPORT_ENABLED_ENV = "GHANTIKA_WAKE_TRANSPORT_ENABLED";
@@ -1404,14 +1402,11 @@ function buildTransportWakePayload(taskId: string, record: JobRecord): string {
  * function does not need to track its own "already fired" state.
  *
  * `isTransportWakeEnabled()` is checked FIRST, before `resolution.state` is
- * even read - so with the env var unset (every real deployment today) this
- * subscription still gets CREATED (proving the wiring is genuinely
- * reachable), but its callback is a guaranteed no-op the instant it runs:
- * zero calls to `selectAndWake`, and therefore zero calls to any
- * transport's `probe()`/`wake()`. The gate is INTERNAL and UNDOCUMENTED -
- * see this section's own header comment for why (the public opt-in shape
- * is a deliberately separate, still-open design decision, not something
- * this file decides or hints at).
+ * even read - so this subscription is always created, regardless of the
+ * env var's value, and its callback is a guaranteed no-op whenever the
+ * gate is off: zero calls to `selectAndWake`, and therefore zero calls to
+ * any transport's `probe()`/`wake()`. The gate is INTERNAL and
+ * UNDOCUMENTED - see this section's own header comment for why.
  *
  * Fail-closed on every resolution state OTHER than `"resolved"`, whether
  * the gate is on or off: `"absent"` is Claude Code's ordinary, expected
@@ -1437,15 +1432,13 @@ function buildTransportWakePayload(taskId: string, record: JobRecord): string {
 function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetResolution): void {
   const unsubscribeTerminal = jobStore.onJobTerminal(taskId, () => {
     // Called first, unconditionally, before any of this callback's own
-    // early returns - `onJobTerminal` fires this at most once per task
-    // already, but `fireJobTerminal` never removes a fired listener from
-    // its own Set (see that method's own docs), so without this the
-    // closure - and, for a resolved target, the target-resolution data it
-    // captured - stays registered for the job's whole remaining life,
-    // until an unrelated `deleteJob` eventually clears it. Same class of
-    // leak `stopWatch`'s own `unsubscribeTerminal` call above already
-    // fixed for its sibling subscription; matching it here closes it for
-    // this one too.
+    // early returns - `onJobTerminal` fires this at most once per task,
+    // but `fireJobTerminal` never removes a fired listener from its own
+    // Set on its own (see that method's own docs), so this closure - and,
+    // for a resolved target, the target-resolution data it captured -
+    // must unsubscribe itself to avoid staying registered for the job's
+    // whole remaining life. Matches `stopWatch`'s own `unsubscribeTerminal`
+    // call above, which does the same for its sibling subscription.
     unsubscribeTerminal();
 
     if (!isTransportWakeEnabled()) return;

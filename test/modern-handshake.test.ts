@@ -1,32 +1,26 @@
 /**
  * Real end-to-end coverage for ghantika serving the 2026-07-28 revision's
  * `server/discover` opening exchange over stdio, via
- * `@modelcontextprotocol/server/stdio`'s `serveStdio`, without regressing
- * the legacy `initialize` handshake, the initialize-gate security
- * control, the `-32700` parse-error reply, or shutdown's real job-reap -
- * all four of which `test/e2e-server.test.ts` and
- * `test/shutdown.test.ts` already re-prove unmodified against the real
- * `dist/index.js` process (now built on `serveStdio` - see
- * `src/server.ts`'s `runServer()`), since neither file's own tests were
- * touched by this change and every one of them still passes against the
- * real spawned server.
+ * `@modelcontextprotocol/server/stdio`'s `serveStdio`, alongside the
+ * legacy `initialize` handshake, the initialize-gate security control,
+ * the `-32700` parse-error reply, and shutdown's real job-reap - all four
+ * of which `test/e2e-server.test.ts` and `test/shutdown.test.ts` already
+ * exercise directly against the real `dist/index.js` process (built on
+ * `serveStdio` - see `src/server.ts`'s `runServer()`), and pass.
  *
  * This file covers what those two files structurally cannot: the modern
  * opening exchange itself (`server/discover` succeeding, the
- * probe-then-fallback per-instance-state proof), the three registered task
- * methods (`tasks/get`/`tasks/update`/`tasks/cancel`) exercised over real
- * JSON-RPC on both eras rather than only ever minting a handle -
- * previously untested, so the extension had only ever been proven to MINT,
- * never to RESOLVE. Driving that resolution over the real modern wire
- * surfaced a genuine, measured installed-SDK fact rather than confirming
- * the naive expectation: `tasks/get` and `tasks/cancel` are UNROUTABLE on
- * the 2026-07-28 era, full stop, because the installed SDK's own base
- * dispatch recognizes both as belonging to the deprecated 2025-11-25
- * vocabulary and refuses them before this codebase's own handler is ever
- * reached; `tasks/update`, which that vocabulary never defined, is
- * unaffected and reaches this codebase's own handler normally on both
- * eras. See the task-method tests below, and `src/server.ts`'s own doc
- * comment at its three `tasks/*` registrations, for the full grounding.
+ * probe-then-fallback per-instance-state proof), and the three registered
+ * task methods (`tasks/get`/`tasks/update`/`tasks/cancel`) exercised over
+ * real JSON-RPC on both eras rather than only ever minting a handle.
+ * `tasks/get` and `tasks/cancel` are UNROUTABLE on the 2026-07-28 era,
+ * full stop, because the installed SDK's own base dispatch recognizes
+ * both as belonging to the deprecated 2025-11-25 vocabulary and refuses
+ * them before this codebase's own handler is ever reached; `tasks/update`,
+ * which that vocabulary never defined, is unaffected and reaches this
+ * codebase's own handler normally on both eras. See the task-method tests
+ * below, and `src/server.ts`'s own doc comment at its three `tasks/*`
+ * registrations, for the full grounding.
  * Also three negative controls - a comparison server
  * (`test/fixtures/negative-control-server.ts`) built in three variants,
  * each of which removes exactly one of the three guarantees `src/server.ts`
@@ -80,15 +74,12 @@ process.on("exit", () => {
  * JSON-RPC 2.0 - skipping over any NOTIFICATION (a `method` with no `id`
  * at all) seen along the way.
  *
- * Needed because this change adds `notifications/tasks` (see
- * `src/tasksAdapter.ts`'s own `startTaskStatusNotifier` docs): a
- * genuinely UNCONDITIONAL per-transition notification that now fires on
- * every Tasks-capable-minted task's own terminal transition, regardless
- * of whether the job ever produced any output at all. The pre-existing
- * output-delta wake could never interleave with a `["true"]`-style mint in
- * this file's own tests, since a job with zero output never fires it - but
- * `notifications/tasks` fires on ANY terminal transition, so a fast-exiting
- * command's own terminal notification can now land on the real wire in
+ * `notifications/tasks` (see `src/tasksAdapter.ts`'s own
+ * `startTaskStatusNotifier` docs) is a genuinely UNCONDITIONAL
+ * per-transition notification that fires on every Tasks-capable-minted
+ * task's own terminal transition, regardless of whether the job ever
+ * produced any output at all - including a fast-exiting command with zero
+ * output, so its terminal notification can land on the real wire in
  * between two otherwise-sequential request/response pairs a raw harness
  * reads one at a time. A test that mints a Tasks-capable task and then
  * chains several further requests against the SAME connection reads
@@ -128,12 +119,12 @@ interface DiscoverResultBody {
 test("server/discover over the real wire returns a successful result advertising the 2026-07-28 revision and the tools capability", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below (a thrown assertion, in particular -
-  // exactly this gap once let one assertion failure
-  // present as a 180-second whole-suite idle-watchdog hang instead of a
-  // fast, named failure). A backstop only: server.child.killed is already
-  // true by the time this runs on every normal green pass, since the
-  // explicit kill below fires first in the test's own synchronous flow.
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
   t.after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   });
@@ -167,12 +158,12 @@ test("server/discover over the real wire returns a successful result advertising
 test("regression check, modern side: the legacy initialize handshake is completely unaffected by a connection that never sends server/discover at all - reruns the exact legacy assertion e2e-server.test.ts already covers, here for direct side-by-side proof both eras are served by the SAME real binary", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below (a thrown assertion, in particular -
-  // exactly this gap once let one assertion failure
-  // present as a 180-second whole-suite idle-watchdog hang instead of a
-  // fast, named failure). A backstop only: server.child.killed is already
-  // true by the time this runs on every normal green pass, since the
-  // explicit kill below fires first in the test's own synchronous flow.
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
   t.after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   });
@@ -196,12 +187,12 @@ test("regression check, modern side: the legacy initialize handshake is complete
 test("legacy handshake, under serveStdio: tools/call sent before the initialize/initialized handshake completes is STILL rejected, proving the gate observers correctly chained onto serveStdio's own StdioConnectionChannel proxy rather than the raw wire transport", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below (a thrown assertion, in particular -
-  // exactly this gap once let one assertion failure
-  // present as a 180-second whole-suite idle-watchdog hang instead of a
-  // fast, named failure). A backstop only: server.child.killed is already
-  // true by the time this runs on every normal green pass, since the
-  // explicit kill below fires first in the test's own synchronous flow.
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
   t.after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   });
@@ -229,12 +220,12 @@ test("legacy handshake, under serveStdio: tools/call sent before the initialize/
 test("legacy handshake, under serveStdio: a real initialize + notifications/initialized still opens the gate normally - the observer chaining does not break the legitimate handshake either", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below (a thrown assertion, in particular -
-  // exactly this gap once let one assertion failure
-  // present as a 180-second whole-suite idle-watchdog hang instead of a
-  // fast, named failure). A backstop only: server.child.killed is already
-  // true by the time this runs on every normal green pass, since the
-  // explicit kill below fires first in the test's own synchronous flow.
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
   t.after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   });
@@ -264,12 +255,12 @@ test("legacy handshake, under serveStdio: a real initialize + notifications/init
 test("modern handshake: tools/call immediately after a successful server/discover succeeds - the modern era's own trust anchor (serveStdio's pre-connect setNegotiatedProtocolVersion) opens the gate with no initialize/initialized exchange, which this era has none of", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below (a thrown assertion, in particular -
-  // exactly this gap once let one assertion failure
-  // present as a 180-second whole-suite idle-watchdog hang instead of a
-  // fast, named failure). A backstop only: server.child.killed is already
-  // true by the time this runs on every normal green pass, since the
-  // explicit kill below fires first in the test's own synchronous flow.
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
   t.after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   });
@@ -320,12 +311,12 @@ test("modern handshake: tools/call immediately after a successful server/discove
 test("modern handshake: a tools/call whose OWN request envelope declares io.modelcontextprotocol/tasks mints a real Task result whose taskId is a real, present string, on the RAW wire shape - no structuredContent at all, resultType:'task' genuinely present (this raw stdio harness reads bytes directly, with no @modelcontextprotocol/client decode/strip involved, unlike test/tasks.test.ts's own InMemoryTransport-based proof, which has to build its own wire tap precisely because the SDK Client strips resultType before a caller ever sees it)", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below (a thrown assertion, in particular -
-  // exactly this gap once let one assertion failure
-  // present as a 180-second whole-suite idle-watchdog hang instead of a
-  // fast, named failure). A backstop only: server.child.killed is already
-  // true by the time this runs on every normal green pass, since the
-  // explicit kill below fires first in the test's own synchronous flow.
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
   t.after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   });
@@ -411,12 +402,12 @@ test("modern handshake: a tools/call whose OWN request envelope declares io.mode
 test("modern handshake: on the SAME connection, a tools/call whose OWN request envelope declares NO capabilities gets the plain poll floor, never a minted Task - proving the negotiation above is genuinely per-request, not cached at the connection level", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below (a thrown assertion, in particular -
-  // exactly this gap once let one assertion failure
-  // present as a 180-second whole-suite idle-watchdog hang instead of a
-  // fast, named failure). A backstop only: server.child.killed is already
-  // true by the time this runs on every normal green pass, since the
-  // explicit kill below fires first in the test's own synchronous flow.
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
   t.after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   });
@@ -515,12 +506,12 @@ test("modern handshake: on the SAME connection, a tools/call whose OWN request e
 test("modern handshake: a tools/call whose own request envelope declares ONLY the SDK-deprecated capabilities.tasks shape (never extensions/experimental) still gets the plain poll floor, not the extension - the modern era's own per-request envelope read, not the legacy connection-level one", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below (a thrown assertion, in particular -
-  // exactly this gap once let one assertion failure
-  // present as a 180-second whole-suite idle-watchdog hang instead of a
-  // fast, named failure). A backstop only: server.child.killed is already
-  // true by the time this runs on every normal green pass, since the
-  // explicit kill below fires first in the test's own synchronous flow.
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
   t.after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   });
@@ -581,12 +572,12 @@ test("modern handshake: a tools/call whose own request envelope declares ONLY th
 test("modern handshake: a tools/call whose own request envelope declares Tasks support ONLY under the older experimental bag (never extensions) still gets the plain poll floor, not the extension", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below (a thrown assertion, in particular -
-  // exactly this gap once let one assertion failure
-  // present as a 180-second whole-suite idle-watchdog hang instead of a
-  // fast, named failure). A backstop only: server.child.killed is already
-  // true by the time this runs on every normal green pass, since the
-  // explicit kill below fires first in the test's own synchronous flow.
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
   t.after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   });
@@ -650,12 +641,12 @@ test("modern handshake: a tools/call whose own request envelope declares Tasks s
 test("modern handshake: seven-tool mint rule on the real wire - run() mints while status/output/tail/kill/list/follow each stay plain, even with Tasks capability declared on their OWN request too, on the SAME connection where run() just minted", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below (a thrown assertion, in particular -
-  // exactly this gap once let one assertion failure
-  // present as a 180-second whole-suite idle-watchdog hang instead of a
-  // fast, named failure). A backstop only: server.child.killed is already
-  // true by the time this runs on every normal green pass, since the
-  // explicit kill below fires first in the test's own synchronous flow.
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
   t.after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   });
@@ -773,47 +764,43 @@ test("modern handshake: seven-tool mint rule on the real wire - run() mints whil
 
 // ---------------------------------------------------------------------------
 // The three registered task methods (tasks/get, tasks/update, tasks/cancel)
-// on the real modern wire - previously exercised only by MINTING a handle
-// (the test above, and every legacy-era test in test/tasks.test.ts /
-// test/tasks-lifecycle.test.ts), never by RESOLVING one over this era's own
-// raw JSON-RPC. Also settles the second of the two capability paths this
-// codebase has, on the real wire rather than by reading source alone -
-// `tools/call`'s own `run` branch reads a per-request Tasks-capability
-// declaration before minting (the run-only-mint-rule test above, and
-// test/tasks.test.ts's legacy-era proof); src/server.ts registers
-// tasks/get, tasks/update, and tasks/cancel with NO such check at all
-// (confirmed directly by reading server.ts's own `server.setRequestHandler`
-// calls for the three, which take only a params schema, never a capability
-// read) - BUT driving that claim over the real modern wire surfaces a
-// SEPARATE, more fundamental fact this AC's own premise did not anticipate:
-// `tasks/get` and `tasks/cancel` are UNROUTABLE on the 2026-07-28 era
-// through this connection's own request dispatch, regardless of
-// capability, because the installed SDK's own base `Protocol` class
-// recognizes both as belonging to the deprecated 2025-11-25 vocabulary and
-// refuses them with -32601 "Method not found" BEFORE this codebase's own
-// registered handler is ever consulted (see server.ts's own doc comment at
-// its three `tasks/*` registrations for the full grounding, including the
-// exact installed-SDK mechanism). `tasks/update` has no legacy-era
-// precedent at all, so it is recognized as a spec method by NEITHER era's
-// codec, is never caught by that guard, and reaches this codebase's own
-// handler normally on both eras - which is what actually lets this test
-// demonstrate capability-independence in execution, on the real modern
-// wire, for the one method the wire itself does not block. `tasks/get`'s
-// and `tasks/cancel`'s own capability-independence is demonstrated on the
-// legacy era instead (below), and by the in-process suites this AC's own
-// premise cited (test/tasks.test.ts, test/tasks-lifecycle.test.ts), which
-// exercise both fully.
+// on the real modern wire, exercised by RESOLVING a handle over this era's
+// own raw JSON-RPC rather than only ever minting one. Also settles the
+// second of the two capability paths this codebase has, on the real wire
+// rather than by reading source alone - `tools/call`'s own `run` branch
+// reads a per-request Tasks-capability declaration before minting (the
+// run-only-mint-rule test above, and test/tasks.test.ts's legacy-era
+// proof); src/server.ts registers tasks/get, tasks/update, and
+// tasks/cancel with NO such check at all (confirmed directly by reading
+// server.ts's own `server.setRequestHandler` calls for the three, which
+// take only a params schema, never a capability read). `tasks/get` and
+// `tasks/cancel` are UNROUTABLE on the 2026-07-28 era through this
+// connection's own request dispatch, regardless of capability, because
+// the installed SDK's own base `Protocol` class recognizes both as
+// belonging to the deprecated 2025-11-25 vocabulary and refuses them with
+// -32601 "Method not found" BEFORE this codebase's own registered handler
+// is ever consulted (see server.ts's own doc comment at its three
+// `tasks/*` registrations for the full grounding, including the exact
+// installed-SDK mechanism). `tasks/update` has no legacy-era precedent at
+// all, so it is recognized as a spec method by NEITHER era's codec, is
+// never caught by that guard, and reaches this codebase's own handler
+// normally on both eras - the one method whose capability-independence
+// this file can demonstrate on the real modern wire, since the wire
+// itself does not block it. `tasks/get`'s and `tasks/cancel`'s own
+// capability-independence is demonstrated on the legacy era instead
+// (below), and by the in-process suites (test/tasks.test.ts,
+// test/tasks-lifecycle.test.ts), which exercise both fully.
 // ---------------------------------------------------------------------------
 
-test("modern wire: tasks/get and tasks/cancel are UNROUTABLE on the 2026-07-28 era - a real, measured installed-SDK dispatch fact (the base Protocol class's own era-registry check), never a Tasks-capability gate this codebase applies, proven by the SAME outcome with and without capability declared", async (t) => {
+test("modern wire: tasks/get and tasks/cancel are UNROUTABLE on the 2026-07-28 era - the installed SDK's own base Protocol class refuses both before this codebase's handler runs, regardless of Tasks-capability, with the SAME outcome declared or not", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below (a thrown assertion, in particular -
-  // exactly this gap once let one assertion failure
-  // present as a 180-second whole-suite idle-watchdog hang instead of a
-  // fast, named failure). A backstop only: server.child.killed is already
-  // true by the time this runs on every normal green pass, since the
-  // explicit kill below fires first in the test's own synchronous flow.
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
   t.after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   });
@@ -893,12 +880,12 @@ test("modern wire: tasks/get and tasks/cancel are UNROUTABLE on the 2026-07-28 e
 test("modern wire: tasks/update - the one task method the legacy vocabulary never defined - reaches this codebase's own handler normally on the modern era, and succeeds with NO Tasks capability declared on its own request, proving the second capability path is genuinely gate-free for the one method the wire itself does not block", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below (a thrown assertion, in particular -
-  // exactly this gap once let one assertion failure
-  // present as a 180-second whole-suite idle-watchdog hang instead of a
-  // fast, named failure). A backstop only: server.child.killed is already
-  // true by the time this runs on every normal green pass, since the
-  // explicit kill below fires first in the test's own synchronous flow.
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
   t.after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   });
@@ -979,15 +966,15 @@ test("modern wire: tasks/update - the one task method the legacy vocabulary neve
   server.child.kill("SIGKILL");
 });
 
-test("legacy wire: tasks/get, tasks/update, and tasks/cancel all succeed with NO Tasks capability declared on their own connection - the legacy era's own capability model is connection-level (see resolveRunClientCapabilities's own docs), and the three task methods are unaffected by it either way since none of them reads capability at all; also confirms the real kill-and-reap effect on a still-running task, and closes the AC's own dual-capability-path premise for tasks/get and tasks/cancel where the modern wire itself cannot", async (t) => {
+test("legacy wire: tasks/get, tasks/update, and tasks/cancel all succeed with NO Tasks capability declared on their own connection - the legacy era's own capability model is connection-level (see resolveRunClientCapabilities's own docs), and the three task methods are unaffected by it either way since none of them reads capability at all; also confirms the real kill-and-reap effect on a still-running task, and demonstrates tasks/get's and tasks/cancel's own capability-independence directly, since the modern wire's own dispatch refusal prevents observing it there", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below (a thrown assertion, in particular -
-  // exactly this gap once let one assertion failure
-  // present as a 180-second whole-suite idle-watchdog hang instead of a
-  // fast, named failure). A backstop only: server.child.killed is already
-  // true by the time this runs on every normal green pass, since the
-  // explicit kill below fires first in the test's own synchronous flow.
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
   t.after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   });
@@ -1080,12 +1067,12 @@ test("legacy wire: tasks/get, tasks/update, and tasks/cancel all succeed with NO
 test("an unknown taskId on tasks/get, tasks/update, and tasks/cancel each fail closed with -32602 on the legacy era, matching the released spec's shared error code for both an unknown and an expired-and-purged id (the modern era cannot exercise tasks/get/tasks/cancel at all - see the unroutable-methods test above - so this is legacy-only, deliberately, rather than parameterized across both eras)", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below (a thrown assertion, in particular -
-  // exactly this gap once let one assertion failure
-  // present as a 180-second whole-suite idle-watchdog hang instead of a
-  // fast, named failure). A backstop only: server.child.killed is already
-  // true by the time this runs on every normal green pass, since the
-  // explicit kill below fires first in the test's own synchronous flow.
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
   t.after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   });
@@ -1125,12 +1112,12 @@ test("an unknown taskId on tasks/get, tasks/update, and tasks/cancel each fail c
 test("probe (server/discover) then fallback (initialize): the fallback instance's gate is genuinely fresh, requiring its OWN complete handshake, with no state leaking across the discard", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below (a thrown assertion, in particular -
-  // exactly this gap once let one assertion failure
-  // present as a 180-second whole-suite idle-watchdog hang instead of a
-  // fast, named failure). A backstop only: server.child.killed is already
-  // true by the time this runs on every normal green pass, since the
-  // explicit kill below fires first in the test's own synchronous flow.
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
   t.after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   });
@@ -1229,12 +1216,12 @@ test("probe (server/discover) then fallback (initialize): the fallback instance'
 test("modern context: a malformed line arriving AFTER a successful server/discover still gets -32700, and the modern connection survives to serve the next request correctly", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below (a thrown assertion, in particular -
-  // exactly this gap once let one assertion failure
-  // present as a 180-second whole-suite idle-watchdog hang instead of a
-  // fast, named failure). A backstop only: server.child.killed is already
-  // true by the time this runs on every normal green pass, since the
-  // explicit kill below fires first in the test's own synchronous flow.
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
   t.after(() => {
     if (!server.child.killed) server.child.kill("SIGKILL");
   });
