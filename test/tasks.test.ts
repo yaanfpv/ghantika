@@ -368,15 +368,27 @@ async function pollUntilKillConfirmed(
 ): Promise<Record<string, unknown>> {
   const breadcrumbIntervalMs = 5000;
   let lastBreadcrumbAt = Date.now();
+  let iteration = 0;
   for (;;) {
+    iteration += 1;
     const result = await client.callTool({ name: "kill", arguments: { job_id: jobId } });
     const last = runResultStructured(result);
     if (last.kill_confirmed !== undefined) {
       return last;
     }
     if (Date.now() - lastBreadcrumbAt >= breadcrumbIntervalMs) {
+      // TEMPORARY diagnostic - names which branch of reapProcessGroupOnce
+      // THIS iteration's own kill() call actually took, rather than only
+      // that kill_confirmed is still undefined. Remove before any fix
+      // ships - see jobStore.hasReapEnteredDiagnostic's own doc comment
+      // for the matching removal.
+      const hasChild = jobStore.getChildHandle(jobId) !== undefined;
+      const reapAttempted = jobStore.hasReapBeenAttempted(jobId);
+      const reapEntered = jobStore.hasReapEnteredDiagnostic(jobId);
       console.error(
-        `still waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(last)}`
+        `still waiting for kill_confirmed to settle for job ${jobId}, iteration ${iteration}, ` +
+          `hasChild=${hasChild}, reapEntered=${reapEntered}, reapAttempted=${reapAttempted}, ` +
+          `last saw: ${JSON.stringify(last)}`
       );
       lastBreadcrumbAt = Date.now();
     }
