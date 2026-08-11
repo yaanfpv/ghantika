@@ -2984,15 +2984,27 @@ export class JobStore {
    * Returns whether the write actually landed (`true`) or was refused
    * because the record no longer exists (`false`). Callers that also
    * track the one-time reap-attempt flag (`markReapAttempted`) check this
-   * before consuming it - not because a vanished record leaves anything
-   * to retry (it does not: a deleted job id can never be looked up again
-   * by any later call, so consuming the flag against it has no observable
-   * consequence either way), but because the SAME guard also has to keep
-   * working for the ordinary case this whole write-landed check exists
-   * for: an UNCONFIRMED outcome on a record that still exists, where
-   * leaving the flag unset is what lets a genuinely later `kill()` call
-   * re-consult the reap - see that method's own call-site docs for which
-   * of the two this actually is in each case.
+   * before consuming it, and the check does TWO different jobs depending
+   * on why it failed - conflating them was the original bug:
+   *
+   * `confirmed: false, wrote: true` - the record still exists and the
+   * reap genuinely could not confirm. This is the GENUINE RETRY case:
+   * leaving the flag unset is what lets a later `kill()` call reach this
+   * job's terminal record and re-consult the reap (existence-only, never
+   * a second signal - see that method's own "RETRY SAFETY" docs).
+   *
+   * `confirmed: true, wrote: false` - the record was deleted out from
+   * under a confirmed write (the only production path today is a lazy
+   * TTL purge racing an in-flight reap's own `await`). There is no
+   * record left to retry against. This is STALE-BOOKKEEPING CLEANUP:
+   * `markReapAttempted` has no existence check of its own, so calling it
+   * anyway would add this job id to the reap-attempted set with no
+   * corresponding record - `hasReapBeenAttempted` reading `true` for an
+   * id `get` can no longer find. Skipping the mark keeps that invariant
+   * intact.
+   *
+   * See that method's own call-site docs for which of the two applies at
+   * each site.
    */
   setKillConfirmation(jobId: string, confirmed: boolean): boolean {
     const record = this.jobs.get(jobId);
@@ -3251,13 +3263,13 @@ export class JobStore {
       const confirmed = await existenceOnlyReaper(handle.pid);
       // Only consume the one reap-attempt flag once the write it is
       // supposed to correspond to actually landed - see
-      // `setKillConfirmation`'s own docs for why a genuine confirmation
-      // can still fail to write (the record was deleted out from under
-      // this call). That specific case has no retry to protect - a
-      // deleted job id can never be looked up again - so the guard's real
-      // value here is for the ordinary `confirmed === false` outcome
-      // instead, where the record persists and a later call genuinely
-      // can re-consult this method.
+      // `setKillConfirmation`'s own docs for the two distinct reasons
+      // this can fail: an unconfirmed outcome on a record that still
+      // exists (the genuine retry case this method's own "RETRY SAFETY"
+      // docs cover), or a confirmed outcome whose record was deleted out
+      // from under this call (stale-bookkeeping cleanup - there is no
+      // record left to retry, but marking anyway would still add this
+      // job id to the reap-attempted set with nothing behind it).
       const wrote = this.setKillConfirmation(jobId, confirmed);
       if (confirmed && wrote) {
         this.markReapAttempted(jobId);

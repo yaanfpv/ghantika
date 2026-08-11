@@ -622,11 +622,14 @@ export async function handler(args: Record<string, unknown> | undefined): Promis
     //
     // A CONFIRMED outcome whose write did not land means the record
     // itself is gone (`setKillConfirmation` only ever refuses for that
-    // reason) - no follow-up `kill()` call can ever look this job id up
-    // again, so there is no retry to protect in this branch. Leaving the
-    // flag unset here only avoids stamping a stale entry against an id
-    // nothing will ever query again; it is a correctness nicety, not a
-    // self-heal.
+    // reason - the only production path today is the lazy TTL purge
+    // racing this same await). There is no retry to protect in this
+    // branch, but the guard is not a no-op either: `markReapAttempted`
+    // has no existence check of its own, so calling it here anyway would
+    // add this job id to the reap-attempted set with no record left
+    // behind it - `hasReapBeenAttempted` reading `true` for an id `get`
+    // can no longer find. This is STALE-BOOKKEEPING CLEANUP, a real
+    // invariant, not a retry protection.
     jobStore.markReapAttempted(jobId);
   }
   jobStore.setIdentityConfirmation(jobId, gate.identityConfirmed);

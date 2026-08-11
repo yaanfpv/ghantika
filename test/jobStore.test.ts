@@ -624,7 +624,7 @@ test(
 );
 
 test(
-  "reapProcessGroupOnce only consumes the reap-attempt flag once setKillConfirmation's write actually lands - a confirmed reaper outcome whose write is lost (the record vanished) leaves the flag correctly unset, not falsely marked",
+  "reapProcessGroupOnce's write-landed guard is stale-bookkeeping cleanup, not retry protection - a confirmed reaper outcome whose record vanished mid-flight must not recreate a reap-attempt entry with nothing behind it",
   {
     skip:
       process.platform === "win32"
@@ -636,11 +636,11 @@ test(
     // describe (a write that cannot land because the record is gone) by
     // deleting the job from inside the injected reaper - proving the
     // conditional-on-write-landing fix directly, rather than only via the
-    // timing window the real race depends on. Note what this DOES and
-    // does NOT prove: the deleted job id can never be looked up again by
-    // any later call, so there is no retry for this specific scenario to
-    // protect - what this proves is narrower, that the flag is not
-    // falsely consumed on a write that never landed.
+    // timing window the real race depends on. What this proves: not a
+    // retry (a deleted job id can never be looked up again, so there is
+    // no retry here to protect) but that `markReapAttempted` - which has
+    // no existence check of its own - does not add a reap-attempted
+    // entry for a job id `get` can no longer find.
     const store = new JobStore();
     const record = store.createJob({ argv: ["true"], cwd: "/tmp", env: {}, isShell: false });
     const child = spawnManaged(
