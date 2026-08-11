@@ -153,8 +153,12 @@
  * process table) and records the honest result as the job's
  * `kill_confirmed` field: `true` once zero surviving process-group members
  * were actually observed within the bound, `false` if the bound elapsed
- * without confirming - NEVER silently claimed `true` when it wasn't, and
- * NEVER present at all until the job actually reaches a terminal state.
+ * without confirming - NEVER silently claimed `true` when it wasn't. The
+ * write is NOT gated on, and never waits for, the record's own terminal
+ * transition - it can land before, after, or interleaved with it, since
+ * the two are independent (see jobStore.ts's own `kill_confirmed` field
+ * doc for the full contract, including the separate never-spawned case
+ * this handler's own external check never runs for at all).
  * On the DEFAULT path (no `signal` argument, or an explicit `SIGTERM`)
  * this runs strictly AFTER, and never gates, the job's own synchronous
  * `killed` state transition (see the "Idempotency and races" section
