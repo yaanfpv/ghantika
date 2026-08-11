@@ -2,34 +2,44 @@
 /**
  * Guards the `src/wake/` boundary: `WAKE_PUBLIC_FILES` names the exact,
  * small set of files under `src/wake/` whose exports may be imported from
- * outside `src/wake/` itself - today, `wakeTransport.ts` (the shared,
- * type-only contract every transport and the selector implement against)
- * and `selectTransport.ts` (the ordered-selection function a real caller
- * actually invokes to request a wake). Two public doors, not one: the
- * selector has to import both concrete transports to do its job, which no
- * single-file design can satisfy without either breaking
- * `wakeTransport.ts`'s own zero-runtime contract or exposing a transport's
- * internals directly. Every OTHER file that comes to live in `src/wake/`
- * (today: `appServerTransport.ts`, `desktopIpcTransport.ts`; tomorrow, any
- * further transport) is "its own module" in that sense, and its symbols
- * may appear only inside `src/wake/`, inside a `test/wake-*.test.ts` file
- * written to exercise it directly, or inside a `test/fixtures/wake-*.ts`
- * fixture one of those test files spawns as a real, separate OS process
- * (see "Disclosed scope boundary" below for the one, already-real, case of
- * this).
+ * outside `src/wake/` itself - `wakeTransport.ts` (the shared, type-only
+ * contract every transport and the selector implement against),
+ * `selectTransport.ts` (the ordered-selection function a real caller
+ * actually invokes to request a wake), and `resolveWakeTarget.ts` (the pure
+ * function that resolves a `WakeTarget` from an incoming `tools/call`
+ * request's own `_meta`, without ever fabricating one). Three public
+ * doors, not one: the selector has to import both concrete transports to
+ * do its job, which no single-file design can satisfy without either
+ * breaking `wakeTransport.ts`'s own zero-runtime contract or exposing a
+ * transport's internals directly; `resolveWakeTarget.ts` is admitted as a
+ * genuine THIRD door because `src/server.ts` needs to call it directly, at
+ * the same `tools/call` `run`-branch call site that already reads the
+ * request's own capability declaration, to resolve the wake target BEFORE
+ * handing it to `src/tasksAdapter.ts` - the same bar `selectTransport.ts`
+ * itself had to clear (a caller genuinely outside the `src/wake/` family
+ * needing to reach it directly, not merely a convenience). Every OTHER file
+ * that comes to live in `src/wake/` (today: `appServerTransport.ts`,
+ * `desktopIpcTransport.ts`; tomorrow, any further transport) is "its own
+ * module" in that sense, and its symbols may appear only inside
+ * `src/wake/`, inside a `test/wake-*.test.ts` file written to exercise it
+ * directly, or inside a `test/fixtures/wake-*.ts` fixture one of those test
+ * files spawns as a real, separate OS process (see "Disclosed scope
+ * boundary" below for the one, already-real, case of this).
  *
  * Two transports are built now (`appServerTransport.ts`,
  * `desktopIpcTransport.ts`), plus the selector that orders between them
  * (`selectTransport.ts`) - but nothing outside `src/wake/` imports either
  * concrete transport directly yet, so this check still has nothing to
- * flag in the real tree today. It exists anyway, real and running, so the
- * moment a transport-specific file (rather than one of the two admitted
- * public doors) gets imported from outside the family, it is caught the
- * instant it lands, rather than relying on every future PR remembering
- * the boundary by hand. Same shape and same shared AST toolkit as
- * `scripts/check-module-boundaries.mjs`'s sibling-import scan, inverted: that
- * guard stops `src/tools/*.ts` files reaching each other, this one stops
- * everything ELSE reaching INTO `src/wake/`'s non-public files.
+ * flag on THAT pair in the real tree today; `resolveWakeTarget.ts` IS now
+ * imported from outside the family (`src/server.ts`), which is exactly the
+ * admitted case above, not a violation. It exists anyway, real and
+ * running, so the moment a transport-specific file (rather than one of the
+ * three admitted public doors) gets imported from outside the family, it
+ * is caught the instant it lands, rather than relying on every future PR
+ * remembering the boundary by hand. Same shape and same shared AST toolkit
+ * as `scripts/check-module-boundaries.mjs`'s sibling-import scan, inverted:
+ * that guard stops `src/tools/*.ts` files reaching each other, this one
+ * stops everything ELSE reaching INTO `src/wake/`'s non-public files.
  *
  * Two checks, both run by `checkWakeTransportBoundaries`:
  *
@@ -96,7 +106,11 @@ const WAKE_SUBDIR = "wake";
  * second (or later) public door that needs to be reachable from outside
  * the family, the same bar `selectTransport.ts` had to clear.
  */
-export const WAKE_PUBLIC_FILES = new Set(["wakeTransport.ts", "selectTransport.ts"]);
+export const WAKE_PUBLIC_FILES = new Set([
+  "wakeTransport.ts",
+  "selectTransport.ts",
+  "resolveWakeTarget.ts",
+]);
 
 /**
  * `realpathSync`, falling back to `path.resolve(absPath)` when the path
