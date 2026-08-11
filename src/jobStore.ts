@@ -217,8 +217,8 @@ export interface JobRecord {
    * without needing a third value here.
    *
    * Set via `setKillConfirmation`, which writes as soon as its own
-   * `confirmed` argument is known - a real, current, external observation
-   * at the moment of the call, never a value carried forward - and does
+   * `confirmed` argument is known - reflecting whichever of the two cases
+   * above produced it, never a value carried forward - and does
    * NOT wait for, or gate, the record's own `state` reaching terminal; the
    * two typically settle within the same synchronous window (both are
    * consequences of the same real process-group event) but neither is
@@ -2962,11 +2962,13 @@ export class JobStore {
    * ("did an external check confirm the job's process group holds zero
    * members, or is that trivially true because it never had one") never
    * depended on the record's own `state` in the first place, and every
-   * caller of this method already derives `confirmed` from a genuine,
-   * current, external observation at the moment of the call - never a
-   * value carried forward from an earlier point in time - so gating the
-   * write on `state` having already caught up could only ever DROP an
-   * honest, already-true observation, never protect against a false one.
+   * caller of this method already knows `confirmed` at the moment of the
+   * call - a genuine, current external observation for the ordinary case,
+   * or the vacuous `true` a never-spawned job settles by construction (see
+   * `JobRecord.kill_confirmed`'s own docs) - never a value carried forward
+   * from an earlier point in time - so gating the write on `state` having
+   * already caught up could only ever DROP an honest, already-true
+   * observation, never protect against a false one.
    *
    * An earlier version of this method required the record to already be
    * terminal before it would write at all. That guard was removed after a

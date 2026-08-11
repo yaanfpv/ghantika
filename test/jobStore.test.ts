@@ -325,8 +325,8 @@ test("setKillConfirmation records true/false regardless of the job's own state, 
   // The terminal-state guard this method used to carry was removed after a
   // real, confirmed race was found between the eager reap at process exit
   // and the record's own stdio-close-gated terminal transition - see this
-  // method's own docs. Every real caller already derives `confirmed` from
-  // a genuine, current external observation, so a non-terminal record here
+  // method's own docs. A caller with a genuine external check already knows
+  // `confirmed` at the moment of the call, so a non-terminal record here
   // is not evidence the observation is wrong; it only means the record's
   // own bookkeeping has not caught up yet.
   const runningRecord = store.createJob({ argv: ["echo"], cwd: "/tmp", env: {}, isShell: false });
