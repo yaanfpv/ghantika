@@ -2561,6 +2561,10 @@ export class JobStore {
       const record = this.jobs.get(entry.jobId);
       if (record) record.queue_position = undefined;
       this.markKilled(entry.jobId, "queue-drained-at-shutdown");
+      // Same settling as the queue-cancellation path in src/tools/kill.ts:
+      // a job drained here never spawned a process group, so there is
+      // nothing left to confirm and the invariant settles it now.
+      this.setKillConfirmation(entry.jobId, true);
     }
   }
 
