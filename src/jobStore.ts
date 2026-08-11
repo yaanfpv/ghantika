@@ -3045,16 +3045,6 @@ export class JobStore {
     return this.reapEntered.has(jobId);
   }
 
-  // TEMPORARY diagnostic - exposes hasReapEntered to the test file's own
-  // breadcrumb, so an intermittent CI hang on a naturally-exited job can
-  // name which branch of reapProcessGroupOnce it's actually taking on a
-  // given poll iteration, rather than only that kill_confirmed is still
-  // undefined. Remove before any fix ships - see
-  // pollUntilKillConfirmed's own matching removal in test/tasks.test.ts.
-  hasReapEnteredDiagnostic(jobId: string): boolean {
-    return this.hasReapEntered(jobId);
-  }
-
   /** See `reapEntered`'s own class-level docs. */
   private markReapEntered(jobId: string): void {
     this.reapEntered.add(jobId);

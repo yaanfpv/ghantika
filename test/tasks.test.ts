@@ -377,17 +377,11 @@ async function pollUntilKillConfirmed(
       return last;
     }
     if (Date.now() - lastBreadcrumbAt >= breadcrumbIntervalMs) {
-      // TEMPORARY diagnostic - names which branch of reapProcessGroupOnce
-      // THIS iteration's own kill() call actually took, rather than only
-      // that kill_confirmed is still undefined. Remove before any fix
-      // ships - see jobStore.hasReapEnteredDiagnostic's own doc comment
-      // for the matching removal.
       const hasChild = jobStore.getChildHandle(jobId) !== undefined;
       const reapAttempted = jobStore.hasReapBeenAttempted(jobId);
-      const reapEntered = jobStore.hasReapEnteredDiagnostic(jobId);
       console.error(
         `still waiting for kill_confirmed to settle for job ${jobId}, iteration ${iteration}, ` +
-          `hasChild=${hasChild}, reapEntered=${reapEntered}, reapAttempted=${reapAttempted}, ` +
+          `hasChild=${hasChild}, reapAttempted=${reapAttempted}, ` +
           `last saw: ${JSON.stringify(last)}`
       );
       lastBreadcrumbAt = Date.now();
