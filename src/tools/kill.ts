@@ -603,19 +603,30 @@ export async function handler(args: Record<string, unknown> | undefined): Promis
     // header comment above for why marking moved off the front of the
     // call instead of running unconditionally beforehand, and see
     // `setKillConfirmation`'s own docs for why the write can fail to land
-    // even on a confirmed outcome. Either an UNCONFIRMED outcome (including
-    // the combined-degraded refused-escalation cell) or a confirmed one
-    // whose write did not land leaves this flag UNSET, so a follow-up
-    // `kill()` call reaching this job's already-terminal record finds
-    // `hasReapBeenAttempted` still `false` and genuinely re-consults
-    // `reapProcessGroupOnce` - rather than finding its one attempt already
-    // spent on a call that never actually recorded a reap outcome. That
-    // re-consultation NEVER signals again, though - see
-    // `reapProcessGroupOnce`'s own "RETRY SAFETY" docs: it can confirm the
-    // group is now gone, but a group that still reads alive stays a
-    // permanently disclosed unconfirmed residual instead of receiving a
-    // second signal this codebase can no longer confirm targets the same
-    // process group it originally spawned.
+    // even on a confirmed outcome. This flag stays UNSET for two distinct
+    // reasons with two distinct consequences - not one, and only the
+    // first is a retry:
+    //
+    // An UNCONFIRMED outcome (including the combined-degraded
+    // refused-escalation cell) leaves the record itself untouched and
+    // reachable, so a follow-up `kill()` call finds `hasReapBeenAttempted`
+    // still `false` and genuinely re-consults `reapProcessGroupOnce` -
+    // rather than finding its one attempt already spent on a call that
+    // never actually recorded a reap outcome. That re-consultation NEVER
+    // signals again, though - see `reapProcessGroupOnce`'s own "RETRY
+    // SAFETY" docs: it can confirm the group is now gone, but a group
+    // that still reads alive stays a permanently disclosed unconfirmed
+    // residual instead of receiving a second signal this codebase can no
+    // longer confirm targets the same process group it originally
+    // spawned.
+    //
+    // A CONFIRMED outcome whose write did not land means the record
+    // itself is gone (`setKillConfirmation` only ever refuses for that
+    // reason) - no follow-up `kill()` call can ever look this job id up
+    // again, so there is no retry to protect in this branch. Leaving the
+    // flag unset here only avoids stamping a stale entry against an id
+    // nothing will ever query again; it is a correctness nicety, not a
+    // self-heal.
     jobStore.markReapAttempted(jobId);
   }
   jobStore.setIdentityConfirmation(jobId, gate.identityConfirmed);

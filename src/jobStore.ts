@@ -2984,8 +2984,15 @@ export class JobStore {
    * Returns whether the write actually landed (`true`) or was refused
    * because the record no longer exists (`false`). Callers that also
    * track the one-time reap-attempt flag (`markReapAttempted`) check this
-   * before consuming it, so a write that never landed can never poison a
-   * later, genuine retry - see that method's own call-site docs.
+   * before consuming it - not because a vanished record leaves anything
+   * to retry (it does not: a deleted job id can never be looked up again
+   * by any later call, so consuming the flag against it has no observable
+   * consequence either way), but because the SAME guard also has to keep
+   * working for the ordinary case this whole write-landed check exists
+   * for: an UNCONFIRMED outcome on a record that still exists, where
+   * leaving the flag unset is what lets a genuinely later `kill()` call
+   * re-consult the reap - see that method's own call-site docs for which
+   * of the two this actually is in each case.
    */
   setKillConfirmation(jobId: string, confirmed: boolean): boolean {
     const record = this.jobs.get(jobId);
@@ -3246,8 +3253,11 @@ export class JobStore {
       // supposed to correspond to actually landed - see
       // `setKillConfirmation`'s own docs for why a genuine confirmation
       // can still fail to write (the record was deleted out from under
-      // this call), and why marking attempted anyway would strand
-      // `kill_confirmed` at `undefined` with no path left to retry it.
+      // this call). That specific case has no retry to protect - a
+      // deleted job id can never be looked up again - so the guard's real
+      // value here is for the ordinary `confirmed === false` outcome
+      // instead, where the record persists and a later call genuinely
+      // can re-consult this method.
       const wrote = this.setKillConfirmation(jobId, confirmed);
       if (confirmed && wrote) {
         this.markReapAttempted(jobId);
