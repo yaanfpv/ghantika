@@ -90,10 +90,14 @@
  * six - including `follow`, the newest - stay plain), so the plain poll
  * floor (status/output/tail on a job_id) is reachable on every
  * connection, capable or not, exactly as it was before this capability
- * existed. `maybeAugmentRunResult` is a pure pass-through unless the
- * connection is capable AND a real job_id can be read back out of the
- * plain result it was just handed - never inventing a handle from
- * nothing, never mutating jobStore itself.
+ * existed. `maybeAugmentRunResult`'s RESPONSE SHAPE is a pure
+ * pass-through unless the connection is capable AND a real job_id can be
+ * read back out of the plain result it was just handed - never
+ * inventing a handle from nothing. It does register a real jobStore side
+ * effect regardless of capability: a terminal-transition listener for
+ * the transport-layer wake (see `startTransportWakeOnTerminal`'s own
+ * docs), whose callback is a no-op unless `GHANTIKA_WAKE_TRANSPORT_ENABLED`
+ * is set.
  *
  * ## taskId == job_id, one handle namespace
  *
@@ -188,6 +192,16 @@ import {
 // `scripts/check-module-boundaries.mjs`'s sibling-import guard forbids -
 // see that script's own header for the exact, narrower scope of that rule).
 import * as killTool from "./tools/kill.js";
+// `resolveWakeTarget.ts` and `selectTransport.ts` are two of
+// `scripts/check-wake-transport-boundaries.mjs`'s own admitted public doors
+// into `src/wake/` (the third and second respectively - see that script's
+// own header for the full boundary design). This file never reaches into a
+// concrete transport (`appServerTransport.ts`/`desktopIpcTransport.ts`)
+// directly - `selectAndWake` and `DEFAULT_TRANSPORTS` are the only surface
+// this adapter needs, exactly as `src/server.ts` never needs anything
+// Tasks-shaped from this file beyond what it explicitly exports.
+import type { WakeTargetResolution } from "./wake/resolveWakeTarget.js";
+import { DEFAULT_TRANSPORTS, selectAndWake } from "./wake/selectTransport.js";
 
 // ---------------------------------------------------------------------------
 // The extension identity and the vendored, digest-verified schema
@@ -1319,6 +1333,159 @@ function startTaskStatusNotifier(taskId: string, notifier: TaskWakeNotifier): vo
 }
 
 // ---------------------------------------------------------------------------
+// The transport-layer wake - a mechanism for eventually resuming an idle
+// AGENT SESSION on the host machine (a Codex thread, a backgrounded
+// Claude Code turn) via `src/wake/selectTransport.ts`'s `selectAndWake`,
+// rather than pushing an MCP notification down THIS connection the way
+// both mechanisms above do (see `src/wake/wakeTransport.ts`'s own header
+// for that same distinction, stated from the transport side). This
+// section wires that layer so a resolved target can reach a gated wake
+// attempt. `isTransportWakeEnabled` is the one gate every path below
+// passes through before a single transport call can happen, and it
+// defaults to off.
+//
+// This is deliberately an internal server-process environment variable
+// only, never a tool-schema field, a documented flag, or anything an MCP
+// client can discover or set through the wire protocol. Follows this
+// codebase's own house pattern for exactly that shape - see
+// `src/process.ts`'s `GHANTIKA_TEST_DEGRADE_PROC_READ`.
+// ---------------------------------------------------------------------------
+
+const WAKE_TRANSPORT_ENABLED_ENV = "GHANTIKA_WAKE_TRANSPORT_ENABLED";
+
+/** True only when the internal reachability toggle is set to the exact string `"1"` - never a truthy/falsy env-var check, matching this file's own `isRunningUnderClaudeCode`-style (in `selectTransport.ts`) exact-match convention. Read fresh on every call rather than cached at module load, so a test can flip it between calls within one process. */
+function isTransportWakeEnabled(): boolean {
+  return process.env[WAKE_TRANSPORT_ENABLED_ENV] === "1";
+}
+
+/**
+ * A short, factual string for a transport's `wake()` payload - never a
+ * "creative" wake message, matching this file's own house register for
+ * `buildDetailedTaskResult`/`buildWakeParams`: names the fact (the task id,
+ * the exact terminal `JobState` it reached) and the concrete next step (the
+ * poll floor), nothing about what happens next beyond what is literally
+ * true.
+ *
+ * Names only `status`/`output`/`tail`, deliberately never `tasks/get` - this
+ * payload has no way to know which protocol era the RECIPIENT session is
+ * actually running (it travels out-of-band through a real transport, not
+ * back down the connection this job's own request arrived on), and
+ * `tasks/get` is unroutable on the modern 2026-07-28 era regardless of any
+ * capability this codebase controls. `status`/`output`/`tail` are the
+ * plain poll floor and work unconditionally on every era this codebase
+ * serves, so they are the only instruction this payload can make without
+ * risking sending a real recipient into a method their own connection may
+ * not even be able to route.
+ */
+function buildTransportWakePayload(taskId: string, record: JobRecord): string {
+  return `ghantika job ${taskId} reached ${record.state} - use status/output/tail to read the result`;
+}
+
+/**
+ * Starts the transport-layer wake for a still-live job - called only from
+ * `maybeAugmentRunResult`, alongside (never instead of)
+ * `startTaskWatch`/`startTaskStatusNotifier`, and sharing exactly ONE guard
+ * with them: only when the backing job is not ALREADY terminal at mint time
+ * (a job with no further transition ahead of it has nothing left to wake
+ * about). It does NOT share their other guard: `startTaskWatch` and
+ * `startTaskStatusNotifier` run only on a Tasks-capable connection, because
+ * both push an MCP notification down THAT connection. This function never
+ * does - it subscribes on `jobId`, a real job `run()` already created
+ * whether or not this connection is Tasks-capable, and its own delivery
+ * (`selectAndWake`, below) is out-of-band, addressed by `wakeTargetResolution`
+ * rather than by anything this connection negotiated. So `isCapableConnection`
+ * is simply not an input to this function - a non-capable connection's job
+ * is exactly as valid a subject as a capable one's. A SEPARATE
+ * `jobStore.onJobTerminal` subscription from both siblings' own - the same
+ * independence reasoning `startTaskStatusNotifier`'s own docs give for why
+ * it is separate from `startTaskWatch`: a firehose auto-stop of the
+ * output-delta watch, or any future change to either sibling, must never
+ * also silence this one, and vice versa. Fires AT MOST ONCE per task,
+ * exactly like `startTaskStatusNotifier` - `jobStore.onJobTerminal` itself
+ * guarantees the single-fire property (see that method's own docs), this
+ * function does not need to track its own "already fired" state.
+ *
+ * `isTransportWakeEnabled()` is checked FIRST, before `resolution.state` is
+ * even read - so this subscription is always created, regardless of the
+ * env var's value, and its callback is a guaranteed no-op whenever the
+ * gate is off: zero calls to `selectAndWake`, and therefore zero calls to
+ * any transport's `probe()`/`wake()`. The gate is INTERNAL and
+ * UNDOCUMENTED - see this section's own header comment for why.
+ *
+ * Fail-closed on every resolution state OTHER than `"resolved"`, whether
+ * the gate is on or off: `"absent"` (see `resolveWakeTarget.ts`'s own
+ * doc comment for what makes a request resolve that way) stays entirely
+ * silent - nothing to log, nothing attempted. `"malformed"` is logged (a
+ * wrong target must be loud, never silently swallowed - matching
+ * `sendTaskNotification`'s own `console.error` catch-pattern style) but
+ * STILL makes zero calls to `selectAndWake` - a malformed `threadId` must
+ * never reach anywhere near a real transport. Only `"resolved"`, with the
+ * gate on, ever calls `selectAndWake`.
+ *
+ * The whole path is fire-and-forget, exactly like `sendTaskNotification`
+ * already is: `selectAndWake`'s own promise is `.then`/`.catch`-handled
+ * inline, never `await`ed - this callback itself is synchronous and
+ * returns without waiting on any transport call - and nothing here can
+ * ever affect `maybeAugmentRunResult`'s own return value or throw into the
+ * `tools/call` response path that triggered it. A wake failure (a
+ * non-`"delivered"` outcome, or a thrown/rejected `selectAndWake` call
+ * itself) is a `console.error` line, nothing more - the poll floor
+ * (`tasks/get`/`status`/`output`/`tail`) stays authoritative regardless of
+ * whether this ever fires or what it finds when it does.
+ */
+function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetResolution): void {
+  const unsubscribeTerminal = jobStore.onJobTerminal(taskId, () => {
+    // Called first, unconditionally, before any of this callback's own
+    // early returns - `onJobTerminal` fires this at most once per task,
+    // but `fireJobTerminal` never removes a fired listener from its own
+    // Set on its own (see that method's own docs), so this closure - and,
+    // for a resolved target, the target-resolution data it captured -
+    // must unsubscribe itself to avoid staying registered for the job's
+    // whole remaining life. Matches `stopWatch`'s own `unsubscribeTerminal`
+    // call above, which does the same for its sibling subscription.
+    unsubscribeTerminal();
+
+    if (!isTransportWakeEnabled()) return;
+
+    if (resolution.state === "absent") return; // no target resolved - silent, nothing to log, nothing attempted
+
+    if (resolution.state === "malformed") {
+      // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- taskId is this codebase's own randomUUID(), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
+      console.error(
+        `[ghantika] transport wake skipped for task ${taskId}: wake target ${resolution.reason}`
+      );
+      return; // a malformed threadId must never reach selectAndWake, gate on or off
+    }
+
+    // resolution.state === "resolved" from here - the ONLY branch that ever
+    // calls selectAndWake.
+    const record = jobStore.get(taskId);
+    // Defensive only - see startTaskStatusNotifier's own identical comment:
+    // this listener runs as part of the SAME synchronous fireJobTerminal
+    // dispatch that just wrote the terminal state, so a genuinely undefined
+    // read here would mean the record was deleted in between, which no
+    // code path in this codebase does.
+    if (record === undefined) return;
+
+    selectAndWake(DEFAULT_TRANSPORTS, resolution.target, buildTransportWakePayload(taskId, record))
+      .then((wakeResult) => {
+        if (wakeResult.outcome !== "delivered") {
+          console.error(
+            // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- wakeResult.outcome is this codebase's own WakeResult union ("refused" | "unavailable"), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
+            `[ghantika] transport wake ${wakeResult.outcome} for task`,
+            taskId,
+            "-",
+            wakeResult.detail
+          );
+        }
+      })
+      .catch((error: unknown) => {
+        console.error("[ghantika] transport wake threw for task", taskId, error);
+      });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Minting - the run-only mint rule: ONLY run(), ONLY on a capable
 // connection, and ONLY by wrapping a job_id this call itself just produced
 // (never inventing a handle for a job this call didn't create)
@@ -1347,8 +1514,12 @@ function extractJobId(result: CallToolResult): string | undefined {
  * never trusted blindly) or replaces it ENTIRELY with the minted
  * `CreateTaskResult` for the SAME job the plain result already named.
  * Never mints for any job other than the one `result` itself is about,
- * and never touches `jobStore` beyond the SAME kind of read `getTask`
- * performs.
+ * and the RETURNED RESULT itself never touches `jobStore` beyond the
+ * SAME kind of read `getTask` performs. This function's own side
+ * effect - a terminal-transition listener registered via
+ * `startTransportWakeOnTerminal` (see its own docs) - is a real
+ * `jobStore` write made unconditionally, independent of what gets
+ * returned.
  *
  * REPLACES, never augments alongside, `content`/`structuredContent` - this
  * was an explicitly flagged open question before this adapter was built
@@ -1410,39 +1581,71 @@ function extractJobId(result: CallToolResult): string | undefined {
  * a benign default and make the real problem (an SDK gap) harder to see,
  * not easier.
  *
- * Also starts BOTH of this file's own notification mechanisms for that
- * SAME job, through `notifier` - but only when the backing job is not
- * ALREADY terminal at mint time (a job that started already-failed, e.g.
- * a bad cwd caught before ever spawning, has no "life" left to notify
- * about; see `src/jobStore.ts`'s `createFailedJob`): the pre-existing
- * output-driven wake watch (`startTaskWatch`, ghantika's own
- * `GHANTIKA_OUTPUT_WAKE_METHOD`, unconditional, non-spec, an accelerator
- * on top of the poll floor), and the released spec's own per-transition
- * `notifications/tasks` status notification (`startTaskStatusNotifier`,
- * see that function's own docs for the full field-by-field grounding
- * against the released contract). The two are deliberately INDEPENDENT
- * subscriptions - see `startTaskStatusNotifier`'s own docs for why a
- * firehose-triggered stop of the first can never silence the second.
+ * Also starts ALL THREE of this file's own notification/wake mechanisms for
+ * that SAME job, but only when the backing job is not ALREADY terminal at
+ * mint time (a job that started already-failed, e.g. a bad cwd caught
+ * before ever spawning, has no "life" left to notify about; see
+ * `src/jobStore.ts`'s `createFailedJob`): the pre-existing output-driven
+ * wake watch (`startTaskWatch`, ghantika's own `GHANTIKA_OUTPUT_WAKE_METHOD`,
+ * unconditional, non-spec, an accelerator on top of the poll floor, through
+ * `notifier`), the released spec's own per-transition `notifications/tasks`
+ * status notification (`startTaskStatusNotifier`, see that function's own
+ * docs for the full field-by-field grounding against the released
+ * contract, also through `notifier`), and the transport-layer wake
+ * (`startTransportWakeOnTerminal`, see that function's own docs - through
+ * `wakeTargetResolution`, never `notifier`, since it never sends an MCP
+ * notification down this connection at all). All three are deliberately
+ * INDEPENDENT subscriptions - see `startTaskStatusNotifier`'s own docs for
+ * why a firehose-triggered stop of the first can never silence the second,
+ * and `startTransportWakeOnTerminal`'s own docs for the identical reasoning
+ * applied to the third.
+ *
+ * The three do NOT all share the same capability gate. `startTaskWatch` and
+ * `startTaskStatusNotifier` run only when `isCapableConnection` - both push
+ * an MCP notification down this connection, which only makes sense for a
+ * connection that negotiated the extension. `startTransportWakeOnTerminal`
+ * runs regardless: it subscribes on `jobId`, a real job this call's own
+ * `run()` already created whether or not this connection is Tasks-capable,
+ * and its delivery is out-of-band (see that function's own docs) - this
+ * connection's negotiated capability is simply not an input to it.
  * `notifier` is always passed by `server.ts` regardless of capability - it
- * is simply never invoked when this function returns early above, so
- * passing it unconditionally costs nothing.
+ * is simply never invoked on a non-capable connection, so passing it
+ * unconditionally costs nothing; `wakeTargetResolution` is likewise always
+ * passed (`server.ts` resolves it unconditionally on the `run` branch, in
+ * every era - see that file's own wiring), and
+ * `startTransportWakeOnTerminal`'s own internal gate
+ * (`isTransportWakeEnabled`) is what keeps it a real no-op everywhere this
+ * story does not explicitly enable it - on every connection, capable or
+ * not.
  */
 export function maybeAugmentRunResult(
   result: CallToolResult,
   isCapableConnection: boolean,
-  notifier: TaskWakeNotifier
+  notifier: TaskWakeNotifier,
+  wakeTargetResolution: WakeTargetResolution
 ): CallToolResult {
-  if (!isCapableConnection) return result;
   const jobId = extractJobId(result);
   if (jobId === undefined) return result;
   const record = jobStore.get(jobId);
   if (record === undefined) return result; // defensive only - run() always creates the record before returning
 
   if (!isTerminalJobState(record.state)) {
-    startTaskWatch(jobId, notifier);
-    startTaskStatusNotifier(jobId, notifier);
+    // startTransportWakeOnTerminal runs regardless of isCapableConnection - it
+    // subscribes on the real JOB this run() call already created, never on the
+    // minted TASK shape below, so a non-capable connection's job is exactly as
+    // valid a subject as a capable one's. Its own preconditions
+    // (isTransportWakeEnabled, wakeTargetResolution.state === "resolved") are
+    // the only gates that legitimately apply; Tasks-extension capability is a
+    // fact about this connection's MCP notifications, and this mechanism never
+    // sends one - see its own doc comment.
+    startTransportWakeOnTerminal(jobId, wakeTargetResolution);
+    if (isCapableConnection) {
+      startTaskWatch(jobId, notifier);
+      startTaskStatusNotifier(jobId, notifier);
+    }
   }
 
+  if (!isCapableConnection) return result;
   const minted = buildCreateTaskResult(record);
   return minted as unknown as CallToolResult;
 }

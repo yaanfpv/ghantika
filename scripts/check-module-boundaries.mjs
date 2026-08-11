@@ -4,10 +4,10 @@
  * named in FROZEN_MODULES below (`server.ts`, `registry.ts`, `jobStore.ts`,
  * `process.ts`, `policy.ts`, `scheduler.ts`, `tasksAdapter.ts`, the seven
  * `tools/*.ts` handler files, `wake/wakeTransport.ts`,
- * `wake/appServerTransport.ts`, `wake/desktopIpcTransport.ts`, and
- * `wake/selectTransport.ts`), no more, no fewer - `src/index.ts` is
- * (`package.json`'s `"main"`/`"types"`), not one of the seven-tool
- * architecture's internal modules.
+ * `wake/appServerTransport.ts`, `wake/desktopIpcTransport.ts`,
+ * `wake/resolveWakeTarget.ts`, and `wake/selectTransport.ts`), no more, no
+ * fewer - `src/index.ts` is (`package.json`'s `"main"`/`"types"`), not one
+ * of the seven-tool architecture's internal modules.
  *
  * `wake/wakeTransport.ts` is admitted here the same way
  * `tasksAdapter.ts` was: this check governs WHICH FILES may exist, not a
@@ -63,6 +63,28 @@
  * call rather than reading a module-level array, specifically so nothing
  * about a single invocation's transport list can leak into, or be
  * mistaken for, persistent module state.
+ *
+ * `wake/resolveWakeTarget.ts` is admitted the same way: a single pure
+ * function (`resolveWakeTarget`) that reads an incoming `tools/call`
+ * request's raw `_meta` object and resolves a `WakeTarget` from it, or an
+ * explicit "absent"/"malformed" signal when none is extractable - it
+ * never fabricates one, and it never falls back to anything else when one
+ * can't be extracted. It holds no state of its own anywhere: no
+ * module-scope declaration, no constructed Map/Set/Array/Object beyond
+ * the plain three-shape discriminated-union object it builds and returns
+ * fresh on every call, so it passes the persistent-state scan below on
+ * its own merits, the same as every other admitted module, needing no
+ * exclusion. It imports only `WakeTarget` from `wakeTransport.ts`'s own
+ * type-only contract - the same shared door `selectTransport.ts` and
+ * every transport already import from - so this file adds a new caller
+ * of the shared contract, never a new dependency edge into anything else
+ * in `src/wake/`. `server.ts` is now its own caller too, reading the
+ * handler-visible non-reserved request `_meta` (`ctx.mcpReq._meta`, never
+ * `ctx.mcpReq.envelope` - see that call site's own doc comment for why)
+ * and passing the result to `tasksAdapter.ts`'s `maybeAugmentRunResult` -
+ * neither of those callers gives this file any state or mutable
+ * dependency of its own; the admission reasoning above (a pure function,
+ * no module-scope state) is unaffected by who calls it.
  *
  * Three checks, matching this repo's established guard style (see
  * scripts/check-npm-ci-usage.mjs): pure, exported functions that operate
@@ -162,6 +184,7 @@ export const FROZEN_MODULES = [
   "tools/tail.ts",
   "wake/appServerTransport.ts",
   "wake/desktopIpcTransport.ts",
+  "wake/resolveWakeTarget.ts",
   "wake/selectTransport.ts",
   "wake/wakeTransport.ts",
 ];
