@@ -50,9 +50,12 @@
  * that released contract** - not against a pre-finalization
  * guess. `schema/tasks-extension.schema.json` pins the spec's own generated
  * schema, measured directly (not summarized) against
- * `modelcontextprotocol/ext-tasks`; every result shape, status vocabulary,
- * and request/response shape below is checked against it in
- * `test/tasks.test.ts`. The one thing this adapter still deliberately
+ * `modelcontextprotocol/ext-tasks`; the result shapes, status vocabulary,
+ * and request/response shapes below are checked against it in
+ * `test/tasks.test.ts`, most of them (`createTaskResult`, `emittedAckResult`)
+ * against real emitted output - `tasks/get`'s response is currently checked
+ * only against a hand-written literal, not genuine adapter output. The one
+ * thing this adapter still deliberately
  * narrows from the full spec: `TASK_STATUSES` emits four of the spec's five
  * `taskStatus` values (never `input_required` - see that constant's own
  * docs for why), and `tasks/list`/`tasks/result` stay unregistered (the
