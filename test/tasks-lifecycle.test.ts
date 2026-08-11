@@ -59,7 +59,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { mock, test } from "node:test";
+import { before, mock, test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/client";
 import { InMemoryTransport } from "@modelcontextprotocol/server";
@@ -83,6 +83,12 @@ import {
   WATCH_STOP_REASON_FIREHOSE,
   getTask,
 } from "../dist/tasksAdapter.js";
+
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// Every test in this file mints a real job through the real `run` tool -
+// see test/helpers/requireSpawnPolicy.ts for what this checks and why.
+before(requireSpawnPolicy);
 
 // ---------------------------------------------------------------------------
 // Harness - mirrors test/tasks.test.ts's own startPair/tasksRequest/mintJob

@@ -3,7 +3,18 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { before, test } from "node:test";
+
+// Only the "Optional per-job execution deadline" section far below spawns a
+// real job through the real `run` tool's handler (`runTool.handler`,
+// imported locally there) - see test/helpers/requireSpawnPolicy.ts for what
+// this checks and why. Registered here, near the file's other top-level
+// setup, rather than next to that import: a top-level `before()` covers
+// every test in this file regardless of where in the file it is declared
+// (node:test collects the whole top-level suite before running its hooks),
+// so this is file-wide scope stated where a reader looks for it first.
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+before(requireSpawnPolicy);
 
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
 // import comment for why.

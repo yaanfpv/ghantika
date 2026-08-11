@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { after, test } from "node:test";
+import { after, before, test } from "node:test";
 
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
 // import comment for why.
@@ -18,6 +18,12 @@ import * as runTool from "../dist/tools/run.js";
 // Explicit ".ts" extension - see test/e2e-server.test.ts's import comment
 // for why spawnServer.ts is imported this way.
 import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/spawnServer.ts";
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// Every test in this file spawns a real job through the real `run` tool,
+// either in-process or via a real spawned server subprocess - see
+// test/helpers/requireSpawnPolicy.ts for what this checks and why.
+before(requireSpawnPolicy);
 
 // ---------------------------------------------------------------------------
 // Small local helpers

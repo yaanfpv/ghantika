@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 // Real client, real in-process transport, real server - the end-to-end
@@ -42,6 +42,12 @@ import {
 import { isProcessAlive, spawnManaged } from "../dist/process.js";
 import { createServer } from "../dist/server.js";
 import * as runTool from "../dist/tools/run.js";
+
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// Many tests in this file spawn a real job through the real `run` tool -
+// see test/helpers/requireSpawnPolicy.ts for what this checks and why.
+before(requireSpawnPolicy);
 
 // ---------------------------------------------------------------------------
 // JobStore: basic registration

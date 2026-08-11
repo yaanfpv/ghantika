@@ -57,7 +57,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
-import { after, test } from "node:test";
+import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
@@ -87,6 +87,12 @@ import {
 // comment for why spawnServer.ts (no relative imports of its own) is
 // loaded this way, unlike the dist/ imports above.
 import { type SpawnedServer, spawnServer } from "./helpers/spawnServer.ts";
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// The real fswatch job below (and any other real spawn in this file) goes
+// through the real `run` tool - see test/helpers/requireSpawnPolicy.ts for
+// what this checks and why.
+before(requireSpawnPolicy);
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const TEST_MAILBOX_ROOT = path.join(REPO_ROOT, "local", "dogfood", "test-mailbox");

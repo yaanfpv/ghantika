@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { before, test } from "node:test";
 import type { TestContext } from "node:test";
 
 // See test/e2e-server.test.ts's import comment for why this is ".ts", not ".js".
@@ -11,6 +11,12 @@ import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/sp
 // The shared marker-file poll and its pgid predicate - one implementation
 // for every suite that observes a job's real filesystem side effects.
 import { parsesAsPgid, waitForFile } from "./harness.ts";
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// Every test in this file spawns a real server subprocess and runs real
+// jobs through it - see test/helpers/requireSpawnPolicy.ts for what this
+// checks and why.
+before(requireSpawnPolicy);
 
 // Real client, real IN-PROCESS transport, real server - only the one test
 // below (the identity-mismatch fail-closed proof) needs this, rather than a

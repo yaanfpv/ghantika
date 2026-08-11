@@ -15,7 +15,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { before, test } from "node:test";
 
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
 // import comment for why.
@@ -37,6 +37,11 @@ import { runStrandedRetryScenario, waitForStdout } from "./helpers/killScenarios
 // Bounded retry absorbing the real fork-visibility race a test's own
 // immediate capture-then-assert can hit - see this helper's own header.
 import { retryBirthIdentityCapture } from "./helpers/birthIdentityRetry.ts";
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// Every test in this file spawns a real job through the real `run` tool -
+// see test/helpers/requireSpawnPolicy.ts for what this checks and why.
+before(requireSpawnPolicy);
 
 // Not shared via import from test/kill.test.ts (see the header comment
 // above for why) - duplicated here verbatim rather than moved, since

@@ -27,7 +27,7 @@
  * platform-gated at all.
  */
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { before, test } from "node:test";
 
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
 // import comment for why.
@@ -36,6 +36,15 @@ import * as killTool from "../dist/tools/kill.js";
 import * as listTool from "../dist/tools/list.js";
 import * as runTool from "../dist/tools/run.js";
 import * as statusTool from "../dist/tools/status.js";
+
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// The end-to-end tests in this file spawn a real job through the real `run`
+// tool's handler - see test/helpers/requireSpawnPolicy.ts for what this
+// checks and why. The pure unit tests against buildBirthIdentityProjection
+// never spawn and would pass without it, but a file-level guard is simpler
+// and more predictable than a per-test one - see that helper's own header.
+before(requireSpawnPolicy);
 
 const POSIX_ONLY_SKIP =
   process.platform === "win32"

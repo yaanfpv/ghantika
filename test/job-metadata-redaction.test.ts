@@ -30,13 +30,20 @@
  */
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { before, test } from "node:test";
 
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
 // import comment for why.
 import { isTerminalJobState, jobStore, type JobState } from "../dist/jobStore.js";
 import * as outputTool from "../dist/tools/output.js";
 import * as runTool from "../dist/tools/run.js";
+
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// Every test in this file spawns a real job through the real `run` tool's
+// handler - see test/helpers/requireSpawnPolicy.ts for what this checks and
+// why.
+before(requireSpawnPolicy);
 
 function structuredOf(result: {
   structuredContent?: Record<string, unknown>;

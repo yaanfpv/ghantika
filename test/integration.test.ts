@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { after, test } from "node:test";
+import { after, before, test } from "node:test";
 
 import {
   DESCENDANTS_PER_JOB,
@@ -36,6 +36,11 @@ import {
   waitForFile,
   waitForPgrepGroupMembers,
 } from "./harness.ts";
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// Every test in this file spawns real jobs through real server subprocesses
+// - see test/helpers/requireSpawnPolicy.ts for what this checks and why.
+before(requireSpawnPolicy);
 
 // The three tests below build real, multi-descendant process trees via
 // startNoisyJobs and confirm them with a real external `pgrep -g <pgid>`

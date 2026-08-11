@@ -32,7 +32,7 @@
  */
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
-import { test } from "node:test";
+import { before, test } from "node:test";
 
 import {
   type SpawnedServer,
@@ -44,8 +44,14 @@ import {
   spawnServer,
   withModernEnvelope,
 } from "./helpers/spawnServer.ts";
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 import { isProcessAlive } from "../dist/process.js";
 import { TASKS_CAPABILITY_DESCRIPTOR, TASKS_EXTENSION_URI } from "../dist/tasksAdapter.js";
+
+// Every test in this file spawns a real server subprocess and runs real
+// jobs through it - see test/helpers/requireSpawnPolicy.ts for what this
+// checks and why.
+before(requireSpawnPolicy);
 
 const NEGATIVE_CONTROL_FIXTURE = fileURLToPath(
   new URL("./fixtures/negative-control-server.ts", import.meta.url)

@@ -25,7 +25,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { before, test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/client";
 import { InMemoryTransport } from "@modelcontextprotocol/server";
@@ -48,6 +48,12 @@ import * as listTool from "../dist/tools/list.js";
 import * as outputTool from "../dist/tools/output.js";
 import * as runTool from "../dist/tools/run.js";
 import * as statusTool from "../dist/tools/status.js";
+
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// Every test in this file spawns a real job through the real `run` tool -
+// see test/helpers/requireSpawnPolicy.ts for what this checks and why.
+before(requireSpawnPolicy);
 
 // ---------------------------------------------------------------------------
 // Small local helpers

@@ -38,7 +38,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { before, test } from "node:test";
 
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
 // import comment for why.
@@ -49,6 +49,12 @@ import * as runTool from "../dist/tools/run.js";
 // Bounded retry absorbing the real fork-visibility race a test's own
 // immediate capture-then-assert can hit - see this helper's own header.
 import { retryBirthIdentityCapture } from "./helpers/birthIdentityRetry.ts";
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// Every test in this file spawns a real job through the real `run` tool's
+// handler - see test/helpers/requireSpawnPolicy.ts for what this checks and
+// why.
+before(requireSpawnPolicy);
 
 const POSIX_ONLY_SKIP =
   process.platform === "win32"

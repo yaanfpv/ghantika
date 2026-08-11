@@ -67,7 +67,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { test } from "node:test";
+import { before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { Client } from "@modelcontextprotocol/client";
@@ -88,8 +88,14 @@ import {
   taskIdParamsSchema,
 } from "../dist/tasksAdapter.js";
 
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SCHEMA_PATH = path.join(REPO_ROOT, "schema", "tasks-extension.schema.json");
+
+// Every test in this file mints a real job through the real `run` tool -
+// see test/helpers/requireSpawnPolicy.ts for what this checks and why.
+before(requireSpawnPolicy);
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -325,6 +331,45 @@ async function pollUntilTerminal(
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error(`job ${jobId} never reached a terminal state within ${maxAttempts} polls`);
+}
+
+/**
+ * Asserts a task's own `status` field against `expected`, and on mismatch
+ * enriches the failure with the BACKING JOB's own `diagnostic` (see
+ * `src/jobStore.ts`'s `JobDiagnostic`) when one is present - a task snapshot
+ * from `tasks/get` never carries that field itself (`GhantikaResultExtras`,
+ * the shape behind a task's `result`/`error`, has no such member - see
+ * `src/tasksAdapter.ts`), so a plain `assert.equal` on `status` alone
+ * discards the one piece of information that would explain an unexpected
+ * `"failed"`: a spawn denied by the command policy gate reads identically to
+ * any other unrelated state mismatch unless something goes and looks.
+ *
+ * The extra `status` tool call only happens on an actual mismatch (never on
+ * the passing path), and its result is folded into `assert.equal`'s own
+ * message rather than replacing the assertion - the real expected/actual
+ * values still print exactly as they always did.
+ */
+async function assertTaskStatus(
+  client: Client,
+  jobId: string,
+  actual: unknown,
+  expected: string,
+  message: string
+): Promise<void> {
+  if (actual === expected) return;
+  let diagnosticNote = "";
+  try {
+    const statusResult = runResultStructured(
+      await client.callTool({ name: "status", arguments: { job_id: jobId } })
+    );
+    if (statusResult.diagnostic) {
+      diagnosticNote = ` (job diagnostic: ${JSON.stringify(statusResult.diagnostic)})`;
+    }
+  } catch {
+    // Best effort only - fall through to the plain assertion below even if
+    // this extra status read itself fails for some unrelated reason.
+  }
+  assert.equal(actual, expected, `${message}${diagnosticNote}`);
 }
 
 /**
@@ -1836,7 +1881,13 @@ test("tasks/update on a LIVE (working) task returns the fixed emittedAckResult o
     await new Promise((resolve) => setTimeout(resolve, 30)); // let it actually start running
 
     const before = await tasksRequest(pair.client, "tasks/get", taskId);
-    assert.equal(before.status, "working");
+    await assertTaskStatus(
+      pair.client,
+      taskId,
+      before.status,
+      "working",
+      "expected the task to still be working"
+    );
 
     await tasksRequest(pair.client, "tasks/update", taskId);
     const raw = pair.wireTap.latestResultFor("tasks/update");
@@ -1869,7 +1920,13 @@ test("tasks/update and tasks/cancel are each IDEMPOTENT on a TERMINAL task - bot
     await pollUntilTerminal(pair.client, taskId);
 
     const firstGet = await tasksRequest(pair.client, "tasks/get", taskId);
-    assert.equal(firstGet.status, "completed");
+    await assertTaskStatus(
+      pair.client,
+      taskId,
+      firstGet.status,
+      "completed",
+      "expected the task to have completed"
+    );
 
     await tasksRequest(pair.client, "tasks/update", taskId);
     const firstUpdateRaw = pair.wireTap.latestResultFor("tasks/update");

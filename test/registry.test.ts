@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { before, test } from "node:test";
 
 import { ProtocolError } from "@modelcontextprotocol/server";
 
@@ -11,6 +11,13 @@ import { ProtocolError } from "@modelcontextprotocol/server";
 // produces something Node can actually load end-to-end. `npm test` runs
 // `npm run build` first for exactly this reason (see package.json).
 import { TOOL_NAMES, dispatchToolCall, listToolDefinitions } from "../dist/registry.js";
+
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// see test/helpers/requireSpawnPolicy.ts for what this checks and why: the
+// "mutation control" test below dispatches "run" for real through the same
+// ambient-policy gate every other spawning test file in this suite guards.
+before(requireSpawnPolicy);
 
 const EXPECTED_TOOL_NAMES = ["run", "status", "list", "output", "tail", "kill", "follow"];
 

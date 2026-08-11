@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { after, test } from "node:test";
+import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 // Explicit ".ts" extension (not the NodeNext-style ".js" src/ uses): this
@@ -16,6 +16,12 @@ import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/sp
 // observes a job's real filesystem side effects (see its own docs for why
 // it waits on content rather than on the file existing).
 import { parsesAsJsonObject, waitForFile } from "./harness.ts";
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// Every test in this file spawns a real `dist/index.js` server subprocess
+// and runs real jobs through it - see test/helpers/requireSpawnPolicy.ts for
+// what this checks and why.
+before(requireSpawnPolicy);
 
 /**
  * The real end-to-end proof: a real spawned `dist/index.js` process, real

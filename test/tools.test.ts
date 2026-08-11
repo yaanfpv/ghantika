@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { before, test } from "node:test";
 
 import type { CallToolResult } from "@modelcontextprotocol/server";
 // The SDK's own AJV-based schema validator (the schema-handler-agreement
@@ -24,6 +24,15 @@ import * as tailTool from "../dist/tools/tail.js";
 // ".js" - the shared marker-file poll waits for CONTENT, never for mere
 // existence, so a follow-up read never races the write.
 import { waitForFile } from "./harness.ts";
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// Several tests below spawn a real job through the real `run` tool's
+// handler - see test/helpers/requireSpawnPolicy.ts for what this checks and
+// why. This is independent of the one test further down that scopes its
+// OWN extra policy entry for a freshly-generated fixture path: this hook
+// only checks the AMBIENT value at file-load time, well before that test's
+// own scoped mutation ever runs.
+before(requireSpawnPolicy);
 
 /**
  * A schema-invalid tool call always returns a tool-execution error result
