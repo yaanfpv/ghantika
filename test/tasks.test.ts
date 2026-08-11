@@ -1996,9 +1996,11 @@ test("seven-tool mint rule: on a capable connection, run() mints a handle while 
     // "both streams already ended" FAST PATH can mark `state` "exited"
     // with NO dependency on that reap promise at all, so a plain
     // `pollUntilTerminal` can observe a terminal `state` before the reap's
-    // own `JobStore.setKillConfirmation` write (itself gated on the job
-    // already being terminal - see that setter's own doc comment) has
-    // landed. Poll via `pollUntilKillConfirmed` (established by commit
+    // own `JobStore.setKillConfirmation` write - real, asynchronous
+    // event-loop scheduling latency with no ordering guarantee against
+    // that read, never gated on the job's own state (see that setter's
+    // own doc comment for why it no longer requires the record already
+    // be terminal) - has landed. Poll via `pollUntilKillConfirmed` (established by commit
     // c12b111 for exactly this class, just triggered there by an explicit
     // `kill()` call instead of the natural-exit eager reap) exactly like
     // this test's own second job does below.

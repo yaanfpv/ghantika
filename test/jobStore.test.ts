@@ -109,7 +109,7 @@ test("createFailedJob registers an already-terminal failed job with a spawn-erro
   assert.equal(record.ended_at, record.started_at);
 });
 
-test("reapProcessGroupOnce on a never-spawned (createFailedJob) job returns no-child AND sets kill_confirmed true - vacuously, since it never had a process group to check", async () => {
+test("createFailedJob settles kill_confirmed true IMMEDIATELY, before any reap attempt - a never-spawned job's process group trivially holds zero members, so there is nothing to wait on a later kill() call to observe", () => {
   const store = new JobStore();
   const record = store.createFailedJob({
     argv: ["/no/such/binary"],
@@ -121,15 +121,27 @@ test("reapProcessGroupOnce on a never-spawned (createFailedJob) job returns no-c
 
   assert.equal(
     store.get(record.job_id)!.kill_confirmed,
-    undefined,
-    "unset before any reap attempt"
+    true,
+    "settled true as part of createFailedJob itself, distinguishable from the degraded false via diagnostic/state, never left undefined for a poller to wait on forever"
   );
+});
+
+test("reapProcessGroupOnce on a never-spawned (createFailedJob) job returns no-child AND reads kill_confirmed true, whether from createFailedJob's own immediate settling or its own no-child branch's unconditional (re-)write of the same true value - a later reap call is consistent with, never a precondition for, that settled value", async () => {
+  const store = new JobStore();
+  const record = store.createFailedJob({
+    argv: ["/no/such/binary"],
+    cwd: "/tmp",
+    env: {},
+    isShell: false,
+    diagnosticMessage: "command not found or not executable",
+  });
+
   const outcome = await store.reapProcessGroupOnce(record.job_id);
   assert.deepEqual(outcome, { kind: "no-child" });
   assert.equal(
     store.get(record.job_id)!.kill_confirmed,
     true,
-    "a never-spawned job's group trivially holds zero members - true by construction, distinguishable from the degraded false via diagnostic/state, never left undefined for a poller to wait on forever"
+    "true both before and after this call - createFailedJob already settled it, and this branch's own unconditional write lands the identical value"
   );
 });
 

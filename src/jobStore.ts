@@ -205,13 +205,16 @@ export interface JobRecord {
    * TWO DISJOINT REASONS this reads `true`, and a caller that only cares
    * whether it is safe to treat the job as settled does not need to tell
    * them apart: (1) the ordinary case - a real external check actually
-   * observed zero survivors; (2) a job created via `createFailedJob`
-   * (invalid cwd, unresolvable executable, or a policy denial - see its
-   * own docs) never had a process group to check in the first place, so
-   * this is written `true` vacuously, with NO external check ever run.
-   * `diagnostic` (always populated for a `createFailedJob` job) and
-   * `state: "failed"` together tell a caller that DOES care which reason
-   * applied, without needing a third value here.
+   * observed zero survivors; (2) a job that never spawned a process group
+   * in the first place, so this is written `true` vacuously, with NO
+   * external check ever run - either a SYNC preflight rejection via
+   * `createFailedJob` (invalid cwd, unresolvable executable, or a policy
+   * denial - see its own docs), settled as part of that call, or an ASYNC
+   * spawn failure past those checks via `markSpawnFailed` (see its own
+   * docs), settled as part of that job's terminal transition. `diagnostic`
+   * (always populated for either never-spawned route) and `state:
+   * "failed"` together tell a caller that DOES care which reason applied,
+   * without needing a third value here.
    *
    * Set via `setKillConfirmation`, which writes as soon as its own
    * `confirmed` argument is known - a real, current, external observation
@@ -1909,6 +1912,15 @@ export class JobStore {
       is_shell: input.isShell,
     };
     this.jobs.set(record.job_id, record);
+    // A job that never reached child_process.spawn never had a process
+    // group to begin with - its membership is trivially empty, the exact
+    // fact kill_confirmed exists to report, so this settles it immediately
+    // rather than leaving it unset until some later, unrelated kill() call
+    // happens to observe the same zero-member group. setKillConfirmation
+    // cannot fail here (the record was just inserted above), but its
+    // return value is intentionally unchecked - there is no retry path to
+    // gate on it the way markReapAttempted's caller does.
+    this.setKillConfirmation(record.job_id, true);
     // Same shared-counter construction as createJob above, even though a
     // failed-to-spawn job will realistically never produce any output -
     // keeping both constructors identical means there is no separate,
@@ -2789,6 +2801,14 @@ export class JobStore {
     // Same instant as ended_at - a terminal transition IS a real,
     // observable state change. See JobRecord.last_updated_at's own docs.
     record.last_updated_at = now;
+    // Same reasoning as createFailedJob's own identical call: an async
+    // spawn failure this deep means child_process.spawn itself never
+    // produced a real OS process, so no process group was ever created -
+    // see run.ts's beginSpawn onError callback, whose own comment states
+    // this directly ("no real child was ever attached"). Set before
+    // fireJobTerminal so any subscriber reacting to this same terminal
+    // transition observes the settled value, never the unset one.
+    this.setKillConfirmation(jobId, true);
     this.clearDeadlineTimer(jobId);
     this.fireJobTerminal(jobId);
   }
@@ -3177,11 +3197,13 @@ export class JobStore {
     }
     const handle = this.getChildHandle(jobId);
     if (handle === undefined) {
-      // A job that never had a child attached (`createFailedJob` - invalid
-      // cwd, unresolvable executable, or a policy denial; `attachChild` is
-      // this store's only writer to `children`, called unconditionally on
-      // every successful spawn, so no-child here means never spawned, not
-      // merely already reaped) never had a process group to check, so this
+      // A job that never had a child attached - either a SYNC preflight
+      // rejection via `createFailedJob` (invalid cwd, unresolvable
+      // executable, or a policy denial) or an ASYNC spawn failure past
+      // those checks via `markSpawnFailed`; `attachChild` is this store's
+      // only writer to `children`, called unconditionally on every
+      // successful spawn, so no-child here means never spawned via EITHER
+      // route, not merely already reaped - never had a process group to check, so this
       // is `true` by construction - see `JobRecord.kill_confirmed`'s own
       // docs for the two disjoint reasons this field reads `true`. No
       // external check ever runs for this case; the write is still made so

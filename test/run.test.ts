@@ -143,22 +143,23 @@ async function waitForBirthIdentity(jobId: string): Promise<void> {
  * fire-and-forget `jobStore.reapProcessGroupOnce` call at the child's own
  * OS-level exit that `test/tasks.test.ts`'s own "run-only mint rule" test
  * (both its exited-naturally AND its explicitly-killed job) is exposed to.
- * `JobStore.setKillConfirmation`/`.setIdentityConfirmation` (see their own
- * doc comments in `src/jobStore.ts`) each only ever WRITE once the job's
- * own record has ALREADY transitioned to a terminal state - a transition
- * this eager reap does not itself perform, but whose OWN observation
- * (`jobStore.reapProcessGroupOnce`'s "already gone" fast path, and this
- * codebase's own external `isProcessGroupAlive` check that feeds it) can
- * genuinely race ahead of the SEPARATE, asynchronous OS-level
- * child-process `exit` notification that `beginSpawn`'s `onExit` callback
- * (and, through it, `jobStore.markKilled`/`markExited`) depends on - two
- * independent observers of the same real process death, with no ordering
- * guarantee between them. `kill.ts`'s own explicit write can therefore
- * reach `setKillConfirmation`'s terminal-state guard before that guard's
- * own precondition has landed, silently no-opping the write for THIS
- * call's own response even though the call as a whole still succeeds.
- * Retrying (never re-signaling, see above) gives that transition time to
- * land and the write a real second chance.
+ * `JobStore.setKillConfirmation` (see its own doc comments in
+ * `src/jobStore.ts`) writes as soon as its own `confirmed` argument is
+ * known, never gated on or waiting for the record's own `state` reaching
+ * terminal - a real, external race was found and fixed here (see that
+ * method's own docs for the full history: an earlier version of this
+ * method DID require the record to already be terminal, and that guard
+ * silently dropped a genuine confirmation whenever the eager reap's own
+ * observation raced ahead of the record's SEPARATE terminal transition,
+ * permanently, since the reap-once tracking had already consumed its one
+ * attempt). What still makes retrying necessary even with that guard gone
+ * is a DIFFERENT, un-fixable fact: the confirmation write itself is real,
+ * asynchronous event-loop scheduling latency with no ordering guarantee
+ * against when a caller's own `kill()` response is captured - a single
+ * unconditional read right after the FIRST `kill()` call can still
+ * legitimately observe `undefined` if the confirmation simply has not
+ * landed yet by that instant. Retrying (never re-signaling, see above)
+ * gives that write time to land.
  *
  * This loop carries NO wall-clock deadline and never throws on elapsed
  * time. Every job here goes through the same fire-and-forget eager reap
@@ -353,13 +354,15 @@ test(
     // Poll (never a single unconditional read of the first kill() call's
     // own response) until `kill_confirmed` has actually settled - see
     // `pollUntilKillConfirmed`'s own docs above for why this job, spawned
-    // through the real `run()`/`beginSpawn`, is exposed to the same
-    // eager-reap-vs-terminal-transition race `test/tasks.test.ts`'s
-    // "run-only mint rule" test guards against. `identity_confirmed` is
-    // read from that SAME settled response, never the original,
-    // potentially-unsettled `killResult` - it shares the identical
-    // terminal-state-gated write (`JobStore.setIdentityConfirmation`) that
-    // makes `kill_confirmed` racy here.
+    // through the real `run()`/`beginSpawn`, needs the retry regardless of
+    // the eager-reap-vs-terminal-transition history that doc explains.
+    // `identity_confirmed` is read from that SAME settled response, never
+    // the original, potentially-unsettled `killResult` - not because it
+    // shares `kill_confirmed`'s own reason for being racy (asynchronous
+    // settling with no ordering guarantee against the read), but because
+    // `JobStore.setIdentityConfirmation` carries its OWN, still-live
+    // terminal-state gate (see its own doc comments) that could just as
+    // easily make it read `undefined` on the original, unpolled response.
     const confirmedKillResult = await pollUntilKillConfirmed(jobId);
     assert.equal(confirmedKillResult.state, "killed");
     assert.equal(
@@ -448,9 +451,10 @@ test(
     // EVIDENCED SKIP (no `pollUntilKillConfirmed` here, unlike the sibling
     // test above): this test checks `identity_confirmed` alone -
     // `kill_confirmed` is never read here at all. `JobStore.
-    // setIdentityConfirmation` shares `setKillConfirmation`'s identical
-    // terminal-state guard (see both setters' own doc comments in
-    // `src/jobStore.ts`), and for THIS scenario - a genuinely alive target
+    // setIdentityConfirmation` STILL carries the terminal-state guard
+    // `setKillConfirmation` no longer does (see both setters' own doc
+    // comments in `src/jobStore.ts` for why the two diverge), and for
+    // THIS scenario - a genuinely alive target
     // (`sleep 5`) signaled by the default terminating path, whose
     // `onSignaled` callback calls `jobStore.markKilled` SYNCHRONOUSLY,
     // immediately after the send, well before this same handler's later,
