@@ -13,9 +13,10 @@
  * `.thread_id`; the top-level, spec-shaped `threadId` is read instead of
  * that vendor field, since it is the less vendor-specific of the two.
  *
- * Claude Code's own `_meta` shape (`{claudecode/toolUseId,
- * progressToken}`) carries no `threadId` at all; this function reads
- * that as the ordinary `"absent"` case rather than an error.
+ * Any handler-visible metadata object lacking `threadId` resolves to the
+ * `"absent"` case rather than an error - a fact about this resolver,
+ * true regardless of which client sent the request, needing no claim
+ * about any particular client's shape.
  *
  * Three states, matching `src/tools/status.ts`'s own
  * `PublicBirthIdentityProjection` pattern - narrowing on `state` alone

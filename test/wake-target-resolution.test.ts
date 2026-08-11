@@ -116,9 +116,9 @@ test("a caller falls back cleanly to the poll floor for every non-resolved shape
   }
 });
 
-// --- a realistic negative control against a real, different client's own measured shape ---
+// --- a negative control against a hand-authored literal shaped like a metadata object carrying no threadId ---
 
-test('a real Claude Code _meta shape ({"claudecode/toolUseId", progressToken}) resolves to "absent" - correctly read as "nothing here" rather than misreading one of its fields as a thread id', () => {
+test('a metadata object shaped like {"claudecode/toolUseId", progressToken} - no threadId field at all - resolves to "absent", correctly read as "nothing here" rather than misreading one of its fields as a thread id', () => {
   const result = resolveWakeTarget({ "claudecode/toolUseId": "abc", progressToken: 1 });
   assert.deepEqual(result, { state: "absent" });
 });

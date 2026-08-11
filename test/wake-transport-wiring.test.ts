@@ -484,14 +484,17 @@ test("the transport-wake subscriber fires AT MOST ONCE per task - a duplicate ma
 // =============================================================================
 // 6. startTransportWakeOnTerminal is NOT gated by isCapableConnection - it
 //    subscribes on the real job run() already created, never on the
-//    minted task-shaped response, and Codex (this layer's own target
-//    client) never declares Tasks-extension capability (README: "Neither
-//    host advertises the extension at handshake in the first place").
-//    These four exercise the isCapableConnection FALSE side of that
-//    boundary directly: #1 shows the mechanism fires for a non-capable
-//    connection with the gate ON; #2 shows today's default deployment
-//    (gate OFF) makes zero transport calls regardless of capability; #3
-//    and #4 show the two capability-gated siblings and the
+//    minted task-shaped response. The README records, narrowly, that
+//    neither of the two tested hosts (Claude Code 2.1.220, Codex CLI
+//    0.144.0-alpha.4) advertised the extension at handshake - evidence
+//    about those tested versions, not a permanent property of either
+//    client, and the README itself says so ("Read this as evidence
+//    about today's hosts, not about the mechanism"). These four exercise
+//    the isCapableConnection FALSE side of that boundary directly: #1
+//    shows the mechanism fires for a non-capable connection with the
+//    gate ON; #2 shows the default (gate OFF) code path, as run in this
+//    test process, makes zero transport calls regardless of capability;
+//    #3 and #4 show the two capability-gated siblings and the
 //    minted-vs-passthrough response shape behave identically on both
 //    sides of the isCapableConnection boundary - only the transport-wake
 //    registration itself is independent of it.
@@ -533,7 +536,7 @@ test("gate ON + resolution 'resolved' + isCapableConnection FALSE - wake() fires
   });
 });
 
-test('gate OFF (default) + resolution "resolved" + isCapableConnection FALSE - the subscription now reaches this codepath but STILL makes zero transport calls, proving no observable behavior changes in today\'s default deployment', async (t) => {
+test('gate OFF (the default code path) + resolution "resolved" + isCapableConnection FALSE - the subscription now reaches this codepath but STILL makes zero transport calls, proving no observable behavior changes on the default code path', async (t) => {
   const probeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", unreachableProbe);
   const wakeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", unreachableWake);
   const probeB = t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unreachableProbe);
@@ -543,10 +546,12 @@ test('gate OFF (default) + resolution "resolved" + isCapableConnection FALSE - t
   const target: WakeTarget = "thread-non-capable-gate-off-target";
   const resolution: WakeTargetResolution = { state: "resolved", target };
   // No withWakeTransportEnabled wrapper - this deliberately runs under
-  // whatever the process env already has GHANTIKA_WAKE_TRANSPORT_ENABLED
-  // set to, which in every real deployment and in this test run (nothing
-  // in this file's own module scope sets it globally) is unset - the
-  // exact "every real deployment today" state this test's own name claims.
+  // whatever this test process's own env already has
+  // GHANTIKA_WAKE_TRANSPORT_ENABLED set to, which is unset here (nothing
+  // in this file's own module scope sets it globally). This establishes
+  // only that THIS process's default is unset, not any claim about every
+  // real deployment; `src/tasksAdapter.ts` expressly permits an operator
+  // to set the variable to `"1"`.
   assert.equal(
     process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED,
     undefined,
