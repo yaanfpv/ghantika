@@ -1553,8 +1553,8 @@ test(
     // explicit server.child.kill("SIGTERM") below - a real live "sleep 60"
     // backing job is spawned well before that signal, so a thrown setup
     // assertion here would otherwise leave both the server AND that live
-    // process group behind. See test/modern-handshake.test.ts's
-    // the guaranteed-cleanup fix in test/modern-handshake.test.ts for the
+    // process group behind. See the guaranteed-cleanup fix in
+    // test/modern-handshake.test.ts for the
     // full rationale.
     t.after(() => {
       if (!server.child.killed) server.child.kill("SIGKILL");

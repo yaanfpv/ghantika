@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { after, before, test } from "node:test";
+import { after, before, describe, test } from "node:test";
 
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
 // import comment for why.
@@ -20,10 +20,17 @@ import * as runTool from "../dist/tools/run.js";
 import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/spawnServer.ts";
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 
-// Every test in this file spawns a real job through the real `run` tool,
-// either in-process or via a real spawned server subprocess - see
-// test/helpers/requireSpawnPolicy.ts for what this checks and why.
-before(requireSpawnPolicy);
+// Only the "non-blocking snapshot consistency, HARDENED" test (Tier 2.5)
+// and the `run`-driven end-to-end tests in Tier 3 below spawn a real job
+// through the real `run` tool - see test/helpers/requireSpawnPolicy.ts for
+// what this checks and why. Every other test in this file builds a
+// synthetic job directly via makeJobWithRawOutput() or a hand-built
+// snapshot and never touches policy at all, so the guard is scoped
+// locally to just those two sections' own describe() blocks below,
+// instead of running once file-wide: node:test scopes a describe()-level
+// before() hook to only the tests nested inside that describe(), so a
+// missing or invalid policy fails ONLY the tests that genuinely spawn a
+// real job, leaving every synthetic-job test in this file unaffected.
 
 // ---------------------------------------------------------------------------
 // Small local helpers
@@ -1331,136 +1338,142 @@ test("output()/tail() real handler bodies: a stream genuinely empty at reclaim t
 // without any per-call SLA or seq-integrity check within a response.
 // =============================================================================
 
-test(
-  "non-blocking snapshot consistency, HARDENED: real PGID-alive assertions bracketing both output() and tail(), a per-call deadline, and full seq-integrity checks within every response - never a torn/corrupted/out-of-order event",
-  {
-    skip:
-      process.platform === "win32"
-        ? "exercises a real POSIX pgrep oracle, no win32 equivalent path here"
-        : false,
-  },
-  async () => {
-    const runResult = runTool.handler({
-      command: [
-        "node",
-        "-e",
-        "let i = 0; const t = setInterval(() => { if (i >= 4000) { clearInterval(t); return; } console.log('payload-' + 'x'.repeat(40) + '-' + i); i++; }, 0)",
-      ],
-    });
-    assert.notEqual(runResult.isError, true);
-    const jobId = (runResult.structuredContent as Record<string, unknown>).job_id as string;
-    const handle = jobStore.getChildHandle(jobId);
-    assert.notEqual(handle, undefined, "expected a real attached child for this in-process job");
-    const pgid = handle!.pid;
+// The one test in this tier spawns a real job via runTool.handler(), so
+// the policy guard is scoped to just this describe() block.
+describe("Tier 2.5: real concurrent-write stress", () => {
+  before(requireSpawnPolicy);
 
-    try {
-      // Bracket #1: confirm the writer is a REAL, alive process group
-      // before ever trusting that the reads below are genuinely concurrent
-      // with it, not silently racing an already-dead job.
-      assert.ok(
-        pgrepGroupMembers(pgid).length > 0,
-        "the writer's process group must be alive before the concurrent-read loop starts"
-      );
+  test(
+    "non-blocking snapshot consistency, HARDENED: real PGID-alive assertions bracketing both output() and tail(), a per-call deadline, and full seq-integrity checks within every response - never a torn/corrupted/out-of-order event",
+    {
+      skip:
+        process.platform === "win32"
+          ? "exercises a real POSIX pgrep oracle, no win32 equivalent path here"
+          : false,
+    },
+    async () => {
+      const runResult = runTool.handler({
+        command: [
+          "node",
+          "-e",
+          "let i = 0; const t = setInterval(() => { if (i >= 4000) { clearInterval(t); return; } console.log('payload-' + 'x'.repeat(40) + '-' + i); i++; }, 0)",
+        ],
+      });
+      assert.notEqual(runResult.isError, true);
+      const jobId = (runResult.structuredContent as Record<string, unknown>).job_id as string;
+      const handle = jobStore.getChildHandle(jobId);
+      assert.notEqual(handle, undefined, "expected a real attached child for this in-process job");
+      const pgid = handle!.pid;
 
-      const CALL_DEADLINE_MS = 500;
-      function timedCall<T>(label: string, fn: () => T): T {
-        const startedAt = Date.now();
-        const result = fn();
-        const elapsed = Date.now() - startedAt;
+      try {
+        // Bracket #1: confirm the writer is a REAL, alive process group
+        // before ever trusting that the reads below are genuinely concurrent
+        // with it, not silently racing an already-dead job.
         assert.ok(
-          elapsed < CALL_DEADLINE_MS,
-          `${label} must resolve well under ${CALL_DEADLINE_MS}ms on its own (a per-call deadline, not just the aggregate loop budget) - took ${elapsed}ms`
+          pgrepGroupMembers(pgid).length > 0,
+          "the writer's process group must be alive before the concurrent-read loop starts"
         );
-        return result;
-      }
 
-      const lineShape = /^payload-x{40}-\d+$/;
-      let sawAtLeastOneEvent = false;
-      let sawAliveMidLoop = false;
-      const startedAt = Date.now();
-      // Hammer output()/tail() repeatedly WHILE the child is very likely
-      // still writing - every single response must be internally
-      // well-formed, and at least one read (bracket #2) must observe the
-      // writer's process group still alive, proving genuine concurrency.
-      // The handler calls themselves are synchronous, but the real child's
-      // stdout `data` events are delivered asynchronously by the event
-      // loop - a tight synchronous `while` loop with no `await` inside it
-      // never yields, which starves the event loop and means the child's
-      // output is NEVER actually read during the loop (proven empirically:
-      // without the yield below, this test always observes zero events).
-      // Yielding via `setImmediate` each iteration is what makes the reads
-      // genuinely concurrent with the writer's real, async I/O.
-      while (Date.now() - startedAt < 1500) {
-        const outputResult = timedCall("output()", () =>
-          outputTool.handler({ job_id: jobId, stream: "stdout" })
-        );
-        const tailResult = timedCall("tail()", () =>
-          tailTool.handler({ job_id: jobId, stream: "stdout", lines: 25 })
-        );
-        if (pgrepGroupMembers(pgid).length > 0) sawAliveMidLoop = true;
-
-        for (const result of [outputResult, tailResult]) {
-          assert.notEqual(
-            result.isError,
-            true,
-            "a snapshot read must never itself error under concurrent writes"
+        const CALL_DEADLINE_MS = 500;
+        function timedCall<T>(label: string, fn: () => T): T {
+          const startedAt = Date.now();
+          const result = fn();
+          const elapsed = Date.now() - startedAt;
+          assert.ok(
+            elapsed < CALL_DEADLINE_MS,
+            `${label} must resolve well under ${CALL_DEADLINE_MS}ms on its own (a per-call deadline, not just the aggregate loop budget) - took ${elapsed}ms`
           );
-          const events = (result.structuredContent?.events ?? []) as Array<{
-            seq?: number;
-            stream?: string;
-            text?: string;
-            partial?: boolean;
-          }>;
-          let previousSeq = -Infinity;
-          for (const event of events) {
-            sawAtLeastOneEvent = true;
-            assert.equal(typeof event.seq, "number", "every event must carry an integer seq");
-            assert.ok(Number.isInteger(event.seq), `seq must be an integer, got ${event.seq}`);
-            assert.ok(
-              event.seq! > previousSeq,
-              `seqs must be strictly ascending and unique within one response - got ${event.seq} after ${previousSeq}`
+          return result;
+        }
+
+        const lineShape = /^payload-x{40}-\d+$/;
+        let sawAtLeastOneEvent = false;
+        let sawAliveMidLoop = false;
+        const startedAt = Date.now();
+        // Hammer output()/tail() repeatedly WHILE the child is very likely
+        // still writing - every single response must be internally
+        // well-formed, and at least one read (bracket #2) must observe the
+        // writer's process group still alive, proving genuine concurrency.
+        // The handler calls themselves are synchronous, but the real child's
+        // stdout `data` events are delivered asynchronously by the event
+        // loop - a tight synchronous `while` loop with no `await` inside it
+        // never yields, which starves the event loop and means the child's
+        // output is NEVER actually read during the loop (proven empirically:
+        // without the yield below, this test always observes zero events).
+        // Yielding via `setImmediate` each iteration is what makes the reads
+        // genuinely concurrent with the writer's real, async I/O.
+        while (Date.now() - startedAt < 1500) {
+          const outputResult = timedCall("output()", () =>
+            outputTool.handler({ job_id: jobId, stream: "stdout" })
+          );
+          const tailResult = timedCall("tail()", () =>
+            tailTool.handler({ job_id: jobId, stream: "stdout", lines: 25 })
+          );
+          if (pgrepGroupMembers(pgid).length > 0) sawAliveMidLoop = true;
+
+          for (const result of [outputResult, tailResult]) {
+            assert.notEqual(
+              result.isError,
+              true,
+              "a snapshot read must never itself error under concurrent writes"
             );
-            previousSeq = event.seq!;
-            assert.equal(
-              event.stream,
-              "stdout",
-              "this read only ever selected stdout - no cross-stream leakage"
-            );
-            const text = event.text!;
-            // A torn/corrupted event would fail to match the exact
-            // repeated payload shape (e.g. half-old-content-half-new-
-            // content spliced together) UNLESS it's honestly flagged
-            // partial (a genuine still-open line, never a lie).
-            if (!lineShape.test(text)) {
-              assert.equal(
-                event.partial,
-                true,
-                `a malformed-looking line must be explicitly flagged partial, got: ${JSON.stringify(text)}`
+            const events = (result.structuredContent?.events ?? []) as Array<{
+              seq?: number;
+              stream?: string;
+              text?: string;
+              partial?: boolean;
+            }>;
+            let previousSeq = -Infinity;
+            for (const event of events) {
+              sawAtLeastOneEvent = true;
+              assert.equal(typeof event.seq, "number", "every event must carry an integer seq");
+              assert.ok(Number.isInteger(event.seq), `seq must be an integer, got ${event.seq}`);
+              assert.ok(
+                event.seq! > previousSeq,
+                `seqs must be strictly ascending and unique within one response - got ${event.seq} after ${previousSeq}`
               );
+              previousSeq = event.seq!;
+              assert.equal(
+                event.stream,
+                "stdout",
+                "this read only ever selected stdout - no cross-stream leakage"
+              );
+              const text = event.text!;
+              // A torn/corrupted event would fail to match the exact
+              // repeated payload shape (e.g. half-old-content-half-new-
+              // content spliced together) UNLESS it's honestly flagged
+              // partial (a genuine still-open line, never a lie).
+              if (!lineShape.test(text)) {
+                assert.equal(
+                  event.partial,
+                  true,
+                  `a malformed-looking line must be explicitly flagged partial, got: ${JSON.stringify(text)}`
+                );
+              }
             }
           }
+          // Yield to the event loop so the real child's async stdout `data`
+          // events actually get a chance to fire between reads.
+          await new Promise((resolve) => setImmediate(resolve));
         }
-        // Yield to the event loop so the real child's async stdout `data`
-        // events actually get a chance to fire between reads.
-        await new Promise((resolve) => setImmediate(resolve));
-      }
-      assert.ok(
-        sawAtLeastOneEvent,
-        "the stress loop must have actually observed real output at least once"
-      );
-      assert.ok(
-        sawAliveMidLoop,
-        "the writer's process group must have been observed alive at least once DURING the read loop - proving genuine concurrency, not reads against an already-finished job"
-      );
-    } finally {
-      try {
-        process.kill(-pgid, "SIGKILL"); // cleanup - a no-op (ESRCH) if it already exited naturally
-      } catch {
-        // already exited naturally - fine
+        assert.ok(
+          sawAtLeastOneEvent,
+          "the stress loop must have actually observed real output at least once"
+        );
+        assert.ok(
+          sawAliveMidLoop,
+          "the writer's process group must have been observed alive at least once DURING the read loop - proving genuine concurrency, not reads against an already-finished job"
+        );
+      } finally {
+        try {
+          process.kill(-pgid, "SIGKILL"); // cleanup - a no-op (ESRCH) if it already exited naturally
+        } catch {
+          // already exited naturally - fine
+        }
       }
     }
-  }
-);
+  );
+});
 
 // =============================================================================
 // Tier 3: real end-to-end proof - a real spawned dist/index.js process, real
@@ -1518,138 +1531,148 @@ test("e2e: tools/list advertises output/tail with their real (non-stub) schemas"
   server.child.kill("SIGKILL");
 });
 
-test("e2e: output()/tail() over the real wire, on a real spawned job producing known output", async () => {
-  const server = tracked();
-  await completeHandshake(server);
-  const runBody = await callTool(server, 901, "run", {
-    command: ["node", "-e", "console.log('one'); console.log('two'); console.log('three')"],
-  });
-  const jobId = runBody.result?.structuredContent?.job_id as string;
-  assert.equal(typeof jobId, "string");
+// The three tests below drive a real spawned command through the real
+// `run` tool over the wire, so the policy guard is scoped to just this
+// describe() block - "tools/list" above and the unknown-job_id test below
+// never call `run`, so neither one needs it.
+describe("Tier 3: run-driven end-to-end tests", () => {
+  before(requireSpawnPolicy);
 
-  // Poll output() until the real (fast, but genuinely async) child has
-  // written all three lines - this test is specifically about output()'s
-  // own event-delivery behavior, so it drives the poll through output()
-  // itself rather than a different tool's completion signal.
-  let events: Array<{ text: string }> = [];
-  const deadline = Date.now() + 5000;
-  while (events.length < 3 && Date.now() < deadline) {
-    const body = await callTool(server, 902, "output", { job_id: jobId, stream: "stdout" });
-    events = (body.result?.structuredContent?.events ?? []) as Array<{ text: string }>;
-    if (events.length < 3) await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  assert.deepEqual(
-    events.map((e) => e.text),
-    ["one", "two", "three"]
-  );
+  test("e2e: output()/tail() over the real wire, on a real spawned job producing known output", async () => {
+    const server = tracked();
+    await completeHandshake(server);
+    const runBody = await callTool(server, 901, "run", {
+      command: ["node", "-e", "console.log('one'); console.log('two'); console.log('three')"],
+    });
+    const jobId = runBody.result?.structuredContent?.job_id as string;
+    assert.equal(typeof jobId, "string");
 
-  const tailBody = await callTool(server, 903, "tail", {
-    job_id: jobId,
-    stream: "stdout",
-    lines: 2,
-  });
-  const tailEvents = (tailBody.result?.structuredContent?.events ?? []) as Array<{ text: string }>;
-  assert.deepEqual(
-    tailEvents.map((e) => e.text),
-    ["two", "three"]
-  );
-  server.child.kill("SIGKILL");
-});
+    // Poll output() until the real (fast, but genuinely async) child has
+    // written all three lines - this test is specifically about output()'s
+    // own event-delivery behavior, so it drives the poll through output()
+    // itself rather than a different tool's completion signal.
+    let events: Array<{ text: string }> = [];
+    const deadline = Date.now() + 5000;
+    while (events.length < 3 && Date.now() < deadline) {
+      const body = await callTool(server, 902, "output", { job_id: jobId, stream: "stdout" });
+      events = (body.result?.structuredContent?.events ?? []) as Array<{ text: string }>;
+      if (events.length < 3) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.deepEqual(
+      events.map((e) => e.text),
+      ["one", "two", "three"]
+    );
 
-test("e2e: a real spawned job with a genuinely partial final line (no trailing newline) - visible and flagged, both live and after the job terminates", async () => {
-  const server = tracked();
-  await completeHandshake(server);
-  const runBody = await callTool(server, 910, "run", {
-    command: ["node", "-e", "process.stdout.write('no newline at the very end')"],
-  });
-  const jobId = runBody.result?.structuredContent?.job_id as string;
-
-  let events: Array<{ text: string; partial?: boolean }> = [];
-  const deadline = Date.now() + 5000;
-  while (events.length < 1 && Date.now() < deadline) {
-    const body = await callTool(server, 911, "tail", {
+    const tailBody = await callTool(server, 903, "tail", {
       job_id: jobId,
       stream: "stdout",
-      lines: 10,
+      lines: 2,
     });
-    events = (body.result?.structuredContent?.events ?? []) as Array<{
+    const tailEvents = (tailBody.result?.structuredContent?.events ?? []) as Array<{
+      text: string;
+    }>;
+    assert.deepEqual(
+      tailEvents.map((e) => e.text),
+      ["two", "three"]
+    );
+    server.child.kill("SIGKILL");
+  });
+
+  test("e2e: a real spawned job with a genuinely partial final line (no trailing newline) - visible and flagged, both live and after the job terminates", async () => {
+    const server = tracked();
+    await completeHandshake(server);
+    const runBody = await callTool(server, 910, "run", {
+      command: ["node", "-e", "process.stdout.write('no newline at the very end')"],
+    });
+    const jobId = runBody.result?.structuredContent?.job_id as string;
+
+    let events: Array<{ text: string; partial?: boolean }> = [];
+    const deadline = Date.now() + 5000;
+    while (events.length < 1 && Date.now() < deadline) {
+      const body = await callTool(server, 911, "tail", {
+        job_id: jobId,
+        stream: "stdout",
+        lines: 10,
+      });
+      events = (body.result?.structuredContent?.events ?? []) as Array<{
+        text: string;
+        partial?: boolean;
+      }>;
+      if (events.length < 1) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(events.length, 1);
+    assert.equal(events[0]!.text, "no newline at the very end");
+    assert.equal(events[0]!.partial, true, "the partial final line must be flagged partial: true");
+
+    // Give the (already-fast, now surely exited) child extra margin, then
+    // re-read - this is the TERMINAL FLUSH proof: a read strictly after the
+    // process has ended must still return the complete buffer.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const postTerminalBody = await callTool(server, 912, "output", {
+      job_id: jobId,
+      stream: "stdout",
+    });
+    const postTerminalEvents = (postTerminalBody.result?.structuredContent?.events ?? []) as Array<{
       text: string;
       partial?: boolean;
     }>;
-    if (events.length < 1) await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  assert.equal(events.length, 1);
-  assert.equal(events[0]!.text, "no newline at the very end");
-  assert.equal(events[0]!.partial, true, "the partial final line must be flagged partial: true");
-
-  // Give the (already-fast, now surely exited) child extra margin, then
-  // re-read - this is the TERMINAL FLUSH proof: a read strictly after the
-  // process has ended must still return the complete buffer.
-  await new Promise((resolve) => setTimeout(resolve, 200));
-  const postTerminalBody = await callTool(server, 912, "output", {
-    job_id: jobId,
-    stream: "stdout",
+    assert.deepEqual(
+      postTerminalEvents.map((e) => e.text),
+      ["no newline at the very end"]
+    );
+    assert.equal(postTerminalEvents[0]!.partial, true);
+    server.child.kill("SIGKILL");
   });
-  const postTerminalEvents = (postTerminalBody.result?.structuredContent?.events ?? []) as Array<{
-    text: string;
-    partial?: boolean;
-  }>;
-  assert.deepEqual(
-    postTerminalEvents.map((e) => e.text),
-    ["no newline at the very end"]
-  );
-  assert.equal(postTerminalEvents[0]!.partial, true);
-  server.child.kill("SIGKILL");
-});
 
-test("e2e: a real spawned job that overflows the retention cap - truncated: true and a bounded drop-count disclosure, read over the real wire", async () => {
-  const server = tracked();
-  await completeHandshake(server);
-  // A real fast child that synchronously prints 10,050 lines - guaranteed
-  // to exceed MAX_BUFFER_LINES (10,000), forcing genuine eviction in the
-  // real jobStore singleton this server process owns.
-  const runBody = await callTool(server, 920, "run", {
-    command: ["node", "-e", "for (let i = 0; i < 10050; i++) console.log('overflow-line-' + i)"],
+  test("e2e: a real spawned job that overflows the retention cap - truncated: true and a bounded drop-count disclosure, read over the real wire", async () => {
+    const server = tracked();
+    await completeHandshake(server);
+    // A real fast child that synchronously prints 10,050 lines - guaranteed
+    // to exceed MAX_BUFFER_LINES (10,000), forcing genuine eviction in the
+    // real jobStore singleton this server process owns.
+    const runBody = await callTool(server, 920, "run", {
+      command: ["node", "-e", "for (let i = 0; i < 10050; i++) console.log('overflow-line-' + i)"],
+    });
+    const jobId = runBody.result?.structuredContent?.job_id as string;
+
+    // Poll until the real child has genuinely finished writing (detected via
+    // the buffer settling on truncated: true AND the newest retained line
+    // being the real last line printed).
+    let body: ToolCallBody | undefined;
+    let structured: Record<string, unknown> | undefined;
+    const deadline = Date.now() + 8000;
+    for (;;) {
+      body = await callTool(server, 921, "output", { job_id: jobId, stream: "stdout" });
+      structured = body.result?.structuredContent;
+      const events = (structured?.events ?? []) as Array<{ text: string }>;
+      const last = events[events.length - 1];
+      if (structured?.truncated === true && last?.text === "overflow-line-10049") break;
+      if (Date.now() > deadline)
+        throw new Error("timed out waiting for the real overflow child to finish");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    assert.equal(structured!.truncated, true);
+    assert.equal(typeof structured!.dropped, "number");
+    assert.ok((structured!.dropped as number) > 0, "some lines must have been genuinely dropped");
+    assert.equal(typeof structured!.droppedBeforeCursor, "number");
+    const events = structured!.events as Array<{ text: string }>;
+    assert.ok(events.length < 10050, "eviction must have genuinely dropped some lines");
+    assert.equal(
+      events[events.length - 1]!.text,
+      "overflow-line-10049",
+      "the newest line must always survive eviction"
+    );
+    assert.equal(
+      events.some((e) => e.text === "overflow-line-0"),
+      false,
+      "the oldest lines must have been genuinely evicted"
+    );
+    // Independently-verifiable identity, proven over the real wire: total
+    // lines produced (10,050) = dropped + currently-retained.
+    assert.equal((structured!.dropped as number) + events.length, 10050);
+    server.child.kill("SIGKILL");
   });
-  const jobId = runBody.result?.structuredContent?.job_id as string;
-
-  // Poll until the real child has genuinely finished writing (detected via
-  // the buffer settling on truncated: true AND the newest retained line
-  // being the real last line printed).
-  let body: ToolCallBody | undefined;
-  let structured: Record<string, unknown> | undefined;
-  const deadline = Date.now() + 8000;
-  for (;;) {
-    body = await callTool(server, 921, "output", { job_id: jobId, stream: "stdout" });
-    structured = body.result?.structuredContent;
-    const events = (structured?.events ?? []) as Array<{ text: string }>;
-    const last = events[events.length - 1];
-    if (structured?.truncated === true && last?.text === "overflow-line-10049") break;
-    if (Date.now() > deadline)
-      throw new Error("timed out waiting for the real overflow child to finish");
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-
-  assert.equal(structured!.truncated, true);
-  assert.equal(typeof structured!.dropped, "number");
-  assert.ok((structured!.dropped as number) > 0, "some lines must have been genuinely dropped");
-  assert.equal(typeof structured!.droppedBeforeCursor, "number");
-  const events = structured!.events as Array<{ text: string }>;
-  assert.ok(events.length < 10050, "eviction must have genuinely dropped some lines");
-  assert.equal(
-    events[events.length - 1]!.text,
-    "overflow-line-10049",
-    "the newest line must always survive eviction"
-  );
-  assert.equal(
-    events.some((e) => e.text === "overflow-line-0"),
-    false,
-    "the oldest lines must have been genuinely evicted"
-  );
-  // Independently-verifiable identity, proven over the real wire: total
-  // lines produced (10,050) = dropped + currently-retained.
-  assert.equal((structured!.dropped as number) + events.length, 10050);
-  server.child.kill("SIGKILL");
 });
 
 test("e2e: output/tail over the wire on an unknown job_id is a typed not-found tool error, not a JSON-RPC protocol error and never a fabricated snapshot", async () => {

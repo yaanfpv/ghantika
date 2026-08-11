@@ -19,7 +19,7 @@ This builds the project and then runs the whole suite through `scripts/run-tests
 
 ghantika's command-execution policy (`src/policy.ts`) is default-deny: with no policy file configured, every attempt to spawn a command is refused. A large share of this suite's own tests spawn real commands to prove real behavior, so they need a policy file that allows the small set of ordinary binaries the fixtures use (`node`, `true`, `sleep`, and so on). `scripts/run-tests.mjs` points `GHANTIKA_POLICY_FILE` at `test/fixtures/policy-allow.json` for exactly this reason, and every test file it spawns inherits that setting.
 
-If you bypass `scripts/run-tests.mjs` and invoke `node --test` directly on a file, that variable is never set. Every spawning test in that file will then fail immediately with the command denied - not because anything is broken, but because the policy gate is doing exactly what it's designed to do with no policy configured. Left alone, that shows up as a plain, confusing assertion failure (something like "expected completed, got failed") with nothing pointing at the real cause. Most of the test files that spawn real commands guard against this: they check the variable once, early, and fail with a message naming the actual reason and what to do about it, rather than letting every affected test fail its own way. If you hit that guard's message, you're running tests the unsupported way - see below for the supported one.
+If you bypass `scripts/run-tests.mjs` and invoke `node --test` directly on a file, that variable is never set, and the policy gate is then doing exactly what it's designed to do with no policy configured: every spawn attempt is denied. Most spawning tests read the denial as a plain, confusing assertion failure (something like "expected completed, got failed") with nothing pointing at the real cause - but a test whose assertion only checks that the tool call resolved, rather than what it resolved to, can instead pass silently against the denied result it never meant to accept, giving no signal at all. Most of the test files that spawn real commands guard against this: they check the variable once, early, and fail with a message naming the actual reason and what to do about it, rather than letting every affected test fail its own confusing or silent way. If you hit that guard's message, you're running tests the unsupported way - see below for the supported one.
 
 ### Running a single test
 
@@ -31,7 +31,13 @@ If you bypass `scripts/run-tests.mjs` and invoke `node --test` directly on a fil
       --test-name-pattern="the pattern from the test's own title" \
       test/tasks.test.ts
 
-This is honest about what it does and doesn't give you: it bypasses `scripts/run-tests.mjs`'s own extras (the discovered-file floor, skip-discipline enforcement, JUnit output, the configurable idle/wall timeouts), but it does not bypass the policy requirement above, which is why it works at all for a file that spawns real commands. A handful of test files manage their own policy value per test (`test/policy.test.ts`, which tests the policy gate itself) and don't need the variable set ambiently; for everything else, set it as shown.
+This is honest about what it does and doesn't give you: it bypasses `scripts/run-tests.mjs`'s own extras (the discovered-file floor, skip-discipline enforcement, JUnit output, the configurable idle/wall timeouts), but it does not bypass the policy requirement above, which is why it works at all for a file whose spawning tests need it. Three distinct cases are worth naming separately, since they are different properties and easy to conflate:
+
+- `test/policy.test.ts` manages its own policy value per test, deliberately, to exercise the gate's own absent/malformed/narrow-policy behavior directly - it needs no guard because that is the whole point of the file.
+- `test/process-slow-paths.test.ts` spawns via the low-level `spawnManaged` primitive directly rather than going through the `run` tool's handler, so it never reaches the policy gate at all - it needs no guard because the gate is simply not in its path.
+- `test/tools.test.ts` is guarded normally like any other spawning file, but one test inside it temporarily scopes a fixture-specific policy override on top of the ambient baseline (restored in a `finally` block afterward) - this is a single test managing an additional, narrower policy value, not a reason the file is unguarded.
+
+For everything else, set the variable as shown.
 
 Before running a single test this way, make sure `dist/` is up to date (`npm run build`) - the test files import the built output, not `src/` directly, so a stale or missing build produces its own, unrelated failures.
 

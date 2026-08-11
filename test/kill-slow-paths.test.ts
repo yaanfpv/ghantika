@@ -15,7 +15,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { before, test } from "node:test";
+import { before, describe, test } from "node:test";
 
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
 // import comment for why.
@@ -38,10 +38,6 @@ import { runStrandedRetryScenario, waitForStdout } from "./helpers/killScenarios
 // immediate capture-then-assert can hit - see this helper's own header.
 import { retryBirthIdentityCapture } from "./helpers/birthIdentityRetry.ts";
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
-
-// Every test in this file spawns a real job through the real `run` tool -
-// see test/helpers/requireSpawnPolicy.ts for what this checks and why.
-before(requireSpawnPolicy);
 
 // Not shared via import from test/kill.test.ts (see the header comment
 // above for why) - duplicated here verbatim rather than moved, since
@@ -538,152 +534,164 @@ test(
   }
 );
 
-test(
-  "a caller-supplied signal that never gets externally confirmed leaves the job NON-TERMINAL, with kill_confirmed/identity_confirmed genuinely ABSENT on the real wire (both content and structuredContent) - never present as false - and the job stays reachable for a follow-up kill",
-  {
-    skip:
-      process.platform === "win32"
-        ? "sends a real SIGSTOP and reads real pgrep output, POSIX-only"
-        : false,
-  },
-  async (t) => {
-    const server = tracked();
-    // Guaranteed cleanup for any path that never reaches this test's own
-    // explicit server.child.kill() below - see test/modern-handshake.test.ts's
-    // the guaranteed-cleanup fix in test/modern-handshake.test.ts for the
-    // full rationale (a thrown assertion here would
-    // otherwise leave a live server referenced only by the module-scope
-    // `spawned` array, which keeps the whole test-runner process's event
-    // loop non-empty and can prevent this file's own process.on("exit")
-    // backstop from ever firing). A backstop only: server.child.killed is
-    // already true by the time this runs on every normal green pass.
-    t.after(() => {
-      if (!server.child.killed) server.child.kill("SIGKILL");
-    });
-    await completeHandshake(server);
+// This is the caller-supplied-signal test (the one that drives a real
+// spawned server over the wire) - the only test in this file that spawns
+// a real job through the real `run` tool - see
+// test/helpers/requireSpawnPolicy.ts for what this checks and why. Scoped
+// to just this describe block rather than the whole file: every other
+// test in this file spawns via a direct `spawnManaged` call instead,
+// which never reaches the `run` tool's policy gate at all, so a
+// file-level guard would fail them without any of them ever needing it.
+describe("kill: caller-supplied signal over the real wire (spawns through the real `run` tool)", () => {
+  before(requireSpawnPolicy);
 
-    const dir = makeTempDir("ghantika-kill-e2e-");
-    const marker = path.join(dir, "pgid.txt");
-    // `exec` replaces the shell process image with `sleep` itself, so
-    // there is exactly one real, tracked process to reason about (no
-    // separate shell process lingering behind it).
-    const shellCommand = `echo $$ > '${marker}'; exec sleep 30`;
+  test(
+    "a caller-supplied signal that never gets externally confirmed leaves the job NON-TERMINAL, with kill_confirmed/identity_confirmed genuinely ABSENT on the real wire (both content and structuredContent) - never present as false - and the job stays reachable for a follow-up kill",
+    {
+      skip:
+        process.platform === "win32"
+          ? "sends a real SIGSTOP and reads real pgrep output, POSIX-only"
+          : false,
+    },
+    async (t) => {
+      const server = tracked();
+      // Guaranteed cleanup for any path that never reaches this test's own
+      // explicit server.child.kill() below - see the guaranteed-cleanup fix
+      // in test/modern-handshake.test.ts for the
+      // full rationale (a thrown assertion here would
+      // otherwise leave a live server referenced only by the module-scope
+      // `spawned` array, which keeps the whole test-runner process's event
+      // loop non-empty and can prevent this file's own process.on("exit")
+      // backstop from ever firing). A backstop only: server.child.killed is
+      // already true by the time this runs on every normal green pass.
+      t.after(() => {
+        if (!server.child.killed) server.child.kill("SIGKILL");
+      });
+      await completeHandshake(server);
 
-    server.send({
-      jsonrpc: "2.0",
-      id: 540,
-      method: "tools/call",
-      params: { name: "run", arguments: { command: shellCommand, shell: true } },
-    });
-    const runLine = await server.nextLine();
-    const runBody = runLine.parsed as RunResponseBody;
-    assert.equal(runBody.error, undefined);
-    assert.notEqual(
-      runBody.result?.isError,
-      true,
-      `run() must succeed: ${JSON.stringify(runBody)}`
-    );
-    const jobId = runBody.result?.structuredContent?.job_id as string;
-    assert.equal(typeof jobId, "string");
+      const dir = makeTempDir("ghantika-kill-e2e-");
+      const marker = path.join(dir, "pgid.txt");
+      // `exec` replaces the shell process image with `sleep` itself, so
+      // there is exactly one real, tracked process to reason about (no
+      // separate shell process lingering behind it).
+      const shellCommand = `echo $$ > '${marker}'; exec sleep 30`;
 
-    const pgidText = await waitForFile(marker, { until: parsesAsPgid });
-    const pgid = Number(pgidText.trim());
-    assert.ok(
-      Number.isInteger(pgid) && pgid > 0,
-      `expected a real numeric pgid from the marker file, got: ${JSON.stringify(pgidText)}`
-    );
+      server.send({
+        jsonrpc: "2.0",
+        id: 540,
+        method: "tools/call",
+        params: { name: "run", arguments: { command: shellCommand, shell: true } },
+      });
+      const runLine = await server.nextLine();
+      const runBody = runLine.parsed as RunResponseBody;
+      assert.equal(runBody.error, undefined);
+      assert.notEqual(
+        runBody.result?.isError,
+        true,
+        `run() must succeed: ${JSON.stringify(runBody)}`
+      );
+      const jobId = runBody.result?.structuredContent?.job_id as string;
+      assert.equal(typeof jobId, "string");
 
-    const beforeMembers = await waitForPgrepGroupMembers(
-      pgid,
-      (members) => members.length >= 1,
-      3000
-    );
-    assert.ok(
-      beforeMembers.length >= 1,
-      `expected the real sleep process alive before kill, pgrep saw: ${JSON.stringify(beforeMembers)}`
-    );
+      const pgidText = await waitForFile(marker, { until: parsesAsPgid });
+      const pgid = Number(pgidText.trim());
+      assert.ok(
+        Number.isInteger(pgid) && pgid > 0,
+        `expected a real numeric pgid from the marker file, got: ${JSON.stringify(pgidText)}`
+      );
 
-    server.send({
-      jsonrpc: "2.0",
-      id: 541,
-      method: "tools/call",
-      params: { name: "kill", arguments: { job_id: jobId, signal: "SIGSTOP" } },
-    });
-    const killLine = await server.nextLine(8000);
-    const killBody = killLine.parsed as RunResponseBody;
-    assert.equal(killBody.error, undefined);
-    assert.notEqual(
-      killBody.result?.isError,
-      true,
-      `kill(SIGSTOP) must succeed: ${JSON.stringify(killBody)}`
-    );
+      const beforeMembers = await waitForPgrepGroupMembers(
+        pgid,
+        (members) => members.length >= 1,
+        3000
+      );
+      assert.ok(
+        beforeMembers.length >= 1,
+        `expected the real sleep process alive before kill, pgrep saw: ${JSON.stringify(beforeMembers)}`
+      );
 
-    // THE proof: SIGSTOP pauses, never ends, the process - the job must
-    // stay non-terminal, and BOTH confirmation fields must be genuinely
-    // ABSENT (never present-as-false) on both real wire surfaces.
-    assert.notEqual(
-      killBody.result?.structuredContent?.state,
-      "killed",
-      `SIGSTOP must never falsely mark the job killed, got: ${JSON.stringify(killBody.result?.structuredContent)}`
-    );
-    assertFieldsAbsent(
-      killBody.result?.structuredContent ?? {},
-      ["kill_confirmed", "identity_confirmed"],
-      "the real wire's structuredContent for an unconfirmed non-default signal"
-    );
-    const contentProjection = parseContentProjection(killBody);
-    assertFieldsAbsent(
-      contentProjection,
-      ["kill_confirmed", "identity_confirmed"],
-      "the real wire's content[0].text JSON for an unconfirmed non-default signal"
-    );
+      server.send({
+        jsonrpc: "2.0",
+        id: 541,
+        method: "tools/call",
+        params: { name: "kill", arguments: { job_id: jobId, signal: "SIGSTOP" } },
+      });
+      const killLine = await server.nextLine(8000);
+      const killBody = killLine.parsed as RunResponseBody;
+      assert.equal(killBody.error, undefined);
+      assert.notEqual(
+        killBody.result?.isError,
+        true,
+        `kill(SIGSTOP) must succeed: ${JSON.stringify(killBody)}`
+      );
 
-    // The real process-group member must still genuinely be alive
-    // (stopped, not reaped) - a real, independent pgrep, never our own
-    // bookkeeping.
-    const afterStopMembers = await waitForPgrepGroupMembers(
-      pgid,
-      (members) => members.length >= 1,
-      500
-    );
-    assert.ok(
-      afterStopMembers.length >= 1,
-      `expected the real process to still be alive (stopped) after SIGSTOP, pgrep saw: ${JSON.stringify(afterStopMembers)}`
-    );
+      // THE proof: SIGSTOP pauses, never ends, the process - the job must
+      // stay non-terminal, and BOTH confirmation fields must be genuinely
+      // ABSENT (never present-as-false) on both real wire surfaces.
+      assert.notEqual(
+        killBody.result?.structuredContent?.state,
+        "killed",
+        `SIGSTOP must never falsely mark the job killed, got: ${JSON.stringify(killBody.result?.structuredContent)}`
+      );
+      assertFieldsAbsent(
+        killBody.result?.structuredContent ?? {},
+        ["kill_confirmed", "identity_confirmed"],
+        "the real wire's structuredContent for an unconfirmed non-default signal"
+      );
+      const contentProjection = parseContentProjection(killBody);
+      assertFieldsAbsent(
+        contentProjection,
+        ["kill_confirmed", "identity_confirmed"],
+        "the real wire's content[0].text JSON for an unconfirmed non-default signal"
+      );
 
-    // THE follow-up proof: because the job was correctly left
-    // non-terminal, a follow-up kill() (default signal) must still reach
-    // and actually reap the previously-stopped process - permanently
-    // stranding it (the pre-fix bug) would make this a no-op instead.
-    server.send({
-      jsonrpc: "2.0",
-      id: 542,
-      method: "tools/call",
-      params: { name: "kill", arguments: { job_id: jobId } },
-    });
-    const followUpLine = await server.nextLine(8000);
-    const followUpBody = followUpLine.parsed as RunResponseBody;
-    assert.notEqual(
-      followUpBody.result?.isError,
-      true,
-      `expected the follow-up kill to succeed: ${JSON.stringify(followUpBody)}`
-    );
-    assert.equal(followUpBody.result?.structuredContent?.state, "killed");
+      // The real process-group member must still genuinely be alive
+      // (stopped, not reaped) - a real, independent pgrep, never our own
+      // bookkeeping.
+      const afterStopMembers = await waitForPgrepGroupMembers(
+        pgid,
+        (members) => members.length >= 1,
+        500
+      );
+      assert.ok(
+        afterStopMembers.length >= 1,
+        `expected the real process to still be alive (stopped) after SIGSTOP, pgrep saw: ${JSON.stringify(afterStopMembers)}`
+      );
 
-    const afterFollowUp = await waitForPgrepGroupMembers(
-      pgid,
-      (members) => members.length === 0,
-      3000
-    );
-    assert.deepEqual(
-      afterFollowUp,
-      [],
-      `expected the previously-stopped process to actually be reaped by the follow-up kill, pgrep still saw: ${JSON.stringify(afterFollowUp)}`
-    );
+      // THE follow-up proof: because the job was correctly left
+      // non-terminal, a follow-up kill() (default signal) must still reach
+      // and actually reap the previously-stopped process - permanently
+      // stranding it (the pre-fix bug) would make this a no-op instead.
+      server.send({
+        jsonrpc: "2.0",
+        id: 542,
+        method: "tools/call",
+        params: { name: "kill", arguments: { job_id: jobId } },
+      });
+      const followUpLine = await server.nextLine(8000);
+      const followUpBody = followUpLine.parsed as RunResponseBody;
+      assert.notEqual(
+        followUpBody.result?.isError,
+        true,
+        `expected the follow-up kill to succeed: ${JSON.stringify(followUpBody)}`
+      );
+      assert.equal(followUpBody.result?.structuredContent?.state, "killed");
 
-    server.child.kill("SIGKILL");
-  }
-);
+      const afterFollowUp = await waitForPgrepGroupMembers(
+        pgid,
+        (members) => members.length === 0,
+        3000
+      );
+      assert.deepEqual(
+        afterFollowUp,
+        [],
+        `expected the previously-stopped process to actually be reaped by the follow-up kill, pgrep still saw: ${JSON.stringify(afterFollowUp)}`
+      );
+
+      server.child.kill("SIGKILL");
+    }
+  );
+});
 
 // --- THE COMBINED DEGRADED CELL, at the real handler/wire level ---
 

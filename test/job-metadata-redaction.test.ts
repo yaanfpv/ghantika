@@ -40,9 +40,11 @@ import * as runTool from "../dist/tools/run.js";
 
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 
-// Every test in this file spawns a real job through the real `run` tool's
-// handler - see test/helpers/requireSpawnPolicy.ts for what this checks and
-// why.
+// Every test in this file but the "mutation control" test below spawns a
+// real job through the real `run` tool's handler - see
+// test/helpers/requireSpawnPolicy.ts for what this checks and why. The
+// "mutation control" test checks an assertion's discriminating power
+// against a local mutant object and never calls `run`.
 before(requireSpawnPolicy);
 
 function structuredOf(result: {

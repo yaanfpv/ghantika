@@ -52,8 +52,10 @@ import { retryBirthIdentityCapture } from "./helpers/birthIdentityRetry.ts";
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 
 // Every test in this file spawns a real job through the real `run` tool's
-// handler - see test/helpers/requireSpawnPolicy.ts for what this checks and
-// why.
+// handler, except the Windows-only assertion below - see
+// test/helpers/requireSpawnPolicy.ts for what this checks and why. That one
+// test only runs on win32 and never spawns: it calls
+// captureBirthIdentityPosix directly on this test process's own pid.
 before(requireSpawnPolicy);
 
 const POSIX_ONLY_SKIP =

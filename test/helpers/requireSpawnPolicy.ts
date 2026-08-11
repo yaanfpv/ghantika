@@ -4,11 +4,15 @@
  * so - whether via a real MCP client/server pair over `InMemoryTransport`,
  * a real spawned `dist/index.js` subprocess (see `./spawnServer.ts`), or a
  * direct in-process call to `src/tools/run.ts`'s own `handler`.
- * `test/policy.test.ts` is the one exception: it also spawns real commands
- * through that same `handler`, but manages its own `GHANTIKA_POLICY_FILE`
- * value per test (see CONTRIBUTING.md) to exercise the gate's own
- * absent/malformed/narrow-policy behavior directly, so it stays unguarded
- * rather than call this helper. Every ordinary path ends up inside
+ * `test/policy.test.ts` is the one exception AMONG FILES THAT USE THIS
+ * PATH: it also spawns real commands through that same `handler`, but
+ * manages its own `GHANTIKA_POLICY_FILE` value per test (see
+ * CONTRIBUTING.md) to exercise the gate's own absent/malformed/narrow-policy
+ * behavior directly, so it stays unguarded rather than call this helper.
+ * `test/process-slow-paths.test.ts` is a separate, unrelated case: it calls
+ * `spawnManaged` directly rather than going through this tool's `handler`
+ * at all, so it never reaches the policy gate below and needs no preflight
+ * of its own (see CONTRIBUTING.md). Every ordinary path ends up inside
  * `src/policy.ts`'s
  * `decideRunPolicy`/`decideShellPolicy`, and that gate is default-deny: with
  * no `GHANTIKA_POLICY_FILE` configured, every spawn attempt is denied and

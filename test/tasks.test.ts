@@ -67,7 +67,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { before, test } from "node:test";
+import { before, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { Client } from "@modelcontextprotocol/client";
@@ -93,9 +93,19 @@ import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SCHEMA_PATH = path.join(REPO_ROOT, "schema", "tasks-extension.schema.json");
 
-// Every test in this file mints a real job through the real `run` tool -
-// see test/helpers/requireSpawnPolicy.ts for what this checks and why.
-before(requireSpawnPolicy);
+// The following sections' tests mint a real job through the real `run`
+// tool - see test/helpers/requireSpawnPolicy.ts for what this checks and
+// why. The schema-validation controls, the capability-negotiation checks
+// that never call run() (initialize-negotiation, the live registry
+// set-equality introspection, and TASK_STATUSES-vs-schema), the taskId
+// tests that only exercise an unknown/empty id, and the completeness
+// sweep mint no job of their own - so requireSpawnPolicy is scoped via a
+// local before() inside a describe() around only the tests that actually
+// spawn (below), rather than run file-wide: node:test fails EVERY test in
+// a file when a top-level before() hook throws, which would fail even the
+// pure tests above (and the ones interleaved below) that never touch
+// policy or spawn anything at all, the moment GHANTIKA_POLICY_FILE is
+// unset.
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -983,413 +993,425 @@ test("the advertised io.modelcontextprotocol/tasks capability descriptor is exac
   }
 });
 
-// ---------------------------------------------------------------------------
-// A client that declares ONLY the SDK-deprecated
-// `capabilities.tasks` shape (never `extensions`/`experimental`) must still
-// not reach the extension - `isConnectionTasksCapable` has never read that
-// field, so this is unchanged behavior; asserted directly here so it cannot
-// regress.
-// ---------------------------------------------------------------------------
+describe("spawning tests: connection capability and mint mechanics", () => {
+  before(requireSpawnPolicy);
 
-test("a client declaring ONLY the SDK-deprecated capabilities.tasks shape (no extensions/experimental bag at all) still gets the plain poll floor, not the extension", async () => {
-  pairCounter += 1;
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const instance = createServer(serverTransport);
-  await instance.server.connect(instance.transport);
+  // ---------------------------------------------------------------------------
+  // A client that declares ONLY the SDK-deprecated
+  // `capabilities.tasks` shape (never `extensions`/`experimental`) must still
+  // not reach the extension - `isConnectionTasksCapable` has never read that
+  // field, so this is unchanged behavior; asserted directly here so it cannot
+  // regress.
+  // ---------------------------------------------------------------------------
 
-  const client = new Client(
-    { name: `ghantika-tasks-test-client-${pairCounter}`, version: "0.0.0" },
-    // The SDK-deprecated shape: a bare `tasks` key, never `extensions` or
-    // `experimental` - the two bags `isConnectionTasksCapable` actually
-    // reads (see src/tasksAdapter.ts's own `hasTasksExtensionKey`).
-    { capabilities: { tasks: {} } as Record<string, unknown> }
-  );
-  await client.connect(clientTransport);
+  test("a client declaring ONLY the SDK-deprecated capabilities.tasks shape (no extensions/experimental bag at all) still gets the plain poll floor, not the extension", async () => {
+    pairCounter += 1;
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const instance = createServer(serverTransport);
+    await instance.server.connect(instance.transport);
 
-  try {
-    const structured = await runJob(client, { label: "deprecated-tasks-shape" });
-    assert.equal(
-      structured.taskId,
-      undefined,
-      `a capabilities.tasks-only declaration must never mint a Task result, got: ${JSON.stringify(structured)}`
+    const client = new Client(
+      { name: `ghantika-tasks-test-client-${pairCounter}`, version: "0.0.0" },
+      // The SDK-deprecated shape: a bare `tasks` key, never `extensions` or
+      // `experimental` - the two bags `isConnectionTasksCapable` actually
+      // reads (see src/tasksAdapter.ts's own `hasTasksExtensionKey`).
+      { capabilities: { tasks: {} } as Record<string, unknown> }
     );
-    assert.equal(
-      typeof structured.job_id,
-      "string",
-      "the plain poll floor (a bare job_id) must still be returned"
-    );
-  } finally {
-    await instance.shutdown("tasks.test.ts deprecated-capabilities-shape regression complete");
-  }
-});
+    await client.connect(clientTransport);
 
-// ---------------------------------------------------------------------------
-// Capability negotiation matches the finalized extension contract exactly,
-// which designates `extensions` as the sole bag - a client declaring Tasks
-// support only under the older, free-form `experimental` bag must not be
-// recognized as capable. `extensions` and `capabilities.tasks` are already
-// proven not to leak into each other above; `experimental` is the third bag
-// capability negotiation deliberately never reads.
-// ---------------------------------------------------------------------------
-
-test("a client declaring Tasks support ONLY under the older experimental bag (never extensions) still gets the plain poll floor, not the extension", async () => {
-  pairCounter += 1;
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const instance = createServer(serverTransport);
-  await instance.server.connect(instance.transport);
-
-  const client = new Client(
-    { name: `ghantika-tasks-test-client-${pairCounter}`, version: "0.0.0" },
-    {
-      capabilities: {
-        experimental: { [TASKS_EXTENSION_URI]: {} },
-      } as Record<string, unknown>,
-    }
-  );
-  await client.connect(clientTransport);
-
-  try {
-    const structured = await runJob(client, { label: "experimental-bag-only" });
-    assert.equal(
-      structured.taskId,
-      undefined,
-      `an experimental-bag-only declaration must never mint a Task result, got: ${JSON.stringify(structured)}`
-    );
-    assert.equal(
-      typeof structured.job_id,
-      "string",
-      "the plain poll floor (a bare job_id) must still be returned"
-    );
-  } finally {
-    await instance.shutdown("tasks.test.ts experimental-bag-only regression complete");
-  }
-});
-
-// ---------------------------------------------------------------------------
-// The run-only mint rule: run() mints unsolicited on a capable connection,
-// with no per-request opt-in field involved at all
-// ---------------------------------------------------------------------------
-
-test("a Tasks-advertised connection gets an unsolicited server-minted task handle on a bare run() call - no opt-in field anywhere in the request", async () => {
-  const pair = await startPair(true);
-  try {
-    const minted = await mintJob(pair.client, { label: "mint-unsolicited" });
-    assert.equal(typeof minted.taskId, "string");
-    assert.equal(minted.status, "working");
-    assert.equal(
-      minted.job_id,
-      undefined,
-      "the plain {job_id} shape must not also appear on a minted result"
-    );
-  } finally {
-    await pair.close();
-  }
-});
-
-test("on a capable connection, run() mints a CreateTaskResult even though the call carries no request-level capability/task field whatsoever - minting depends only on the connection", async () => {
-  const pair = await startPair(true);
-  try {
-    // Deliberately no `task`, no `_meta`, no capability-shaped argument of
-    // any kind beyond what `run` already accepts - proving the mint
-    // decision reads nothing from the individual request.
-    const minted = await mintJob(pair.client, { command: ["true"], label: "no-opt-in-field" });
-    assert.equal(typeof minted.taskId, "string");
-  } finally {
-    await pair.close();
-  }
-});
-
-// ---------------------------------------------------------------------------
-// The minted result's REAL wire shape (via the wire tap, resultType
-// included) validates against the pinned, digest-verified schema, and the
-// one disclosed SDK content-injection artifact is bounded exactly
-// ---------------------------------------------------------------------------
-
-test("the minted result's RAW wire shape - resultType included, the disclosed content:[] SDK artifact stripped - validates against the real, digest-verified vendored createTaskResult schema", async () => {
-  const pair = await startPair(true);
-  try {
-    await mintJob(pair.client, { label: "schema-validate" });
-    const raw = pair.wireTap.latestResultFor("tools/call");
-    assert.ok(raw, "expected a captured raw tools/call result");
-    assert.equal(raw!.resultType, "task", "the wire-level resultType discriminator must be 'task'");
-    const stripped = stripDisclosedContentArtifact(raw!);
-    const schema = loadSchema();
-    const problems = validatesAgainst(schema, "createTaskResult", stripped);
-    assert.deepEqual(
-      problems,
-      [],
-      `minted result (post content-artifact strip) failed schema validation: ${JSON.stringify(problems)}`
-    );
-  } finally {
-    await pair.close();
-  }
-});
-
-test("the minted result's RAW wire shape carries EXACTLY one key beyond what buildCreateTaskResult constructs - the disclosed content:[] artifact - never structuredContent, never an unbounded extra field set", async () => {
-  const pair = await startPair(true);
-  try {
-    await mintJob(pair.client, { label: "artifact-bound" });
-    const raw = pair.wireTap.latestResultFor("tools/call");
-    assert.ok(raw);
-    assert.equal(
-      raw!.structuredContent,
-      undefined,
-      "a minted result must never carry structuredContent"
-    );
-    const keys = Object.keys(raw!).sort();
-    const expectedTaskKeys = [
-      "taskId",
-      "status",
-      "createdAt",
-      "lastUpdatedAt",
-      "ttlMs",
-      "pollIntervalMs",
-      "resultType",
-    ];
-    const extraKeys = keys.filter((k) => !expectedTaskKeys.includes(k));
-    assert.deepEqual(
-      extraKeys,
-      ["content"],
-      `expected the ONLY key beyond the real CreateTaskResult fields to be the disclosed "content" artifact, got extra keys: ${JSON.stringify(extraKeys)}`
-    );
-  } finally {
-    await pair.close();
-  }
-});
-
-// ---------------------------------------------------------------------------
-// A non-capable connection is byte-stable with the plain {job_id} shape -
-// no CreateTaskResult ever appears
-// ---------------------------------------------------------------------------
-
-test("a non-capable connection's run() returns the plain job projection - a genuine deep-equality check of the COMPLETE real plain PublicJobProjection response across BOTH structuredContent and content, key set AND field values (started_at format-checked AND bracketed against a real wall-clock window this test itself observed around the run() call, so a stable-but-wrong ISO value cannot survive), not just presence/absence of a few named fields", async () => {
-  const pair = await startPair(false);
-  try {
-    // Not `runJob` here, deliberately - that helper (see `runResultStructured`
-    // above) discards `CallToolResult.content` entirely and returns only
-    // `structuredContent`, which is exactly the gap previously demonstrated
-    // for this test: a mutant changing ONLY `content` (leaving
-    // `structuredContent` untouched) still passed. The raw `CallToolResult`
-    // is kept here so both halves of the real tool result can be checked.
-    const beforeRunMs = Date.now();
-    const result = await pair.client.callTool({
-      name: "run",
-      arguments: { command: ["true"], label: "plain-poll-floor" },
-    });
-    const afterRunMs = Date.now();
-    assert.notEqual((result as { isError?: boolean }).isError, true);
-    const structured = runResultStructured(result);
-    assert.equal(typeof structured.job_id, "string");
-    assert.equal(
-      structured.taskId,
-      undefined,
-      "a non-capable connection must never see a minted taskId field"
-    );
-
-    // The COMPLETE key set the real PublicJobProjection shape carries -
-    // see src/jobStore.ts's own toPublicProjection, which always writes
-    // all twelve fields (the six optional ones included, EXPLICITLY as
-    // `undefined` when a job hasn't reached that point yet - verified
-    // empirically here rather than assumed: InMemoryTransport passes the
-    // structured content through without an actual JSON.stringify pass,
-    // so an `undefined`-valued own property survives as a present key,
-    // unlike what a real JSON-serialized wire would show).
-    assert.deepEqual(
-      Object.keys(structured).sort(),
-      [
-        "command_summary",
-        "counts",
-        "diagnostic",
-        "ended_at",
-        "escalation_refused_reason",
-        "exit_code",
-        "identity_capture",
-        "identity_confirmed",
-        "job_id",
-        "kill_confirmed",
-        "label",
-        "queue_position",
-        "signal",
-        "started_at",
-        "state",
-      ].sort(),
-      `expected the plain projection's key set to deep-equal the real plain job-projection shape exactly, got: ${JSON.stringify(Object.keys(structured).sort())}`
-    );
-    assert.equal(
-      structured.state,
-      "starting",
-      "a freshly-started job's synchronous projection must be exactly 'starting'"
-    );
-    for (const key of [
-      "ended_at",
-      "exit_code",
-      "signal",
-      "diagnostic",
-      "queue_position",
-      "kill_confirmed",
-      "identity_confirmed",
-      "escalation_refused_reason",
-    ]) {
-      assert.equal(
-        structured[key],
-        undefined,
-        `expected "${key}" to be unset on a freshly-started job, got ${JSON.stringify(structured[key])}`
-      );
-    }
-    assert.equal(
-      structured.identity_capture,
-      "pending",
-      `expected a freshly-started job's identity_capture to be "pending" at this synchronous instant, got ${JSON.stringify(structured.identity_capture)}`
-    );
-
-    assert.equal(
-      structured.label,
-      "plain-poll-floor",
-      "expected the real label supplied to run(), not a placeholder"
-    );
-    assert.equal(
-      structured.command_summary,
-      "true",
-      'expected the real argv[0] basename of the default ["true"] command, not a placeholder'
-    );
-    assert.match(
-      structured.started_at as string,
-      ISO_TIMESTAMP_PATTERN,
-      `expected started_at to be a real ISO-8601 millisecond timestamp (Date#toISOString() shape), got ${JSON.stringify(structured.started_at)}`
-    );
-    const structuredStartedAtMs = Date.parse(structured.started_at as string);
-    assert.ok(
-      structuredStartedAtMs >= beforeRunMs && structuredStartedAtMs <= afterRunMs,
-      `expected started_at (${JSON.stringify(structured.started_at)}) to fall inside the real wall-clock bracket [${beforeRunMs}, ${afterRunMs}] this test captured around the actual run() call - a stable-but-wrong ISO-shaped value would fall outside it`
-    );
-    assert.deepEqual(
-      structured.counts,
-      { stdout_lines: 0, stdout_bytes: 0, stderr_lines: 0, stderr_bytes: 0 },
-      `expected the real, freshly-started zero counts by full value, not just the right key set - got ${JSON.stringify(structured.counts)}`
-    );
-
-    const contentBlocks = (result as CallToolResult).content;
-    assert.ok(
-      Array.isArray(contentBlocks) && contentBlocks.length === 1,
-      `expected exactly one content block, got ${JSON.stringify(contentBlocks)}`
-    );
-    const [contentBlock] = contentBlocks;
-    assert.equal(
-      (contentBlock as { type?: string }).type,
-      "text",
-      `expected the content block's type to be "text", got ${JSON.stringify(contentBlock)}`
-    );
-    const contentText = (contentBlock as { text?: unknown }).text;
-    assert.equal(typeof contentText, "string", "expected the content block's text to be a string");
-
-    let parsedContent: unknown;
     try {
-      parsedContent = JSON.parse(contentText as string);
-    } catch (error) {
-      throw new Error(
-        `expected content[0].text to be valid, parseable JSON - src/tools/run.ts's own toolSuccess builds it via JSON.stringify(projection, null, 2) - got ${JSON.stringify(contentText)}`,
-        { cause: error }
+      const structured = await runJob(client, { label: "deprecated-tasks-shape" });
+      assert.equal(
+        structured.taskId,
+        undefined,
+        `a capabilities.tasks-only declaration must never mint a Task result, got: ${JSON.stringify(structured)}`
       );
-    }
-    const parsedContentRecord = parsedContent as Record<string, unknown>;
-
-    assert.deepEqual(
-      Object.keys(parsedContentRecord).sort(),
-      ["command_summary", "counts", "identity_capture", "job_id", "label", "started_at", "state"],
-      `expected content's real JSON-serialized key set to be exactly the DEFINED PublicJobProjection fields (JSON.stringify drops undefined optional fields), got: ${JSON.stringify(Object.keys(parsedContentRecord).sort())}`
-    );
-
-    assert.deepEqual(
-      parsedContentRecord,
-      JSON.parse(JSON.stringify(structured)),
-      `expected content's parsed JSON to agree with structuredContent on every field it carries - got content=${JSON.stringify(parsedContentRecord)} vs structuredContent=${JSON.stringify(structured)}`
-    );
-
-    assert.equal(parsedContentRecord.job_id, structured.job_id);
-    assert.equal(parsedContentRecord.state, "starting");
-    assert.equal(parsedContentRecord.label, "plain-poll-floor");
-    assert.equal(parsedContentRecord.command_summary, "true");
-    assert.match(
-      parsedContentRecord.started_at as string,
-      ISO_TIMESTAMP_PATTERN,
-      `expected content's started_at to be a real ISO-8601 millisecond timestamp, got ${JSON.stringify(parsedContentRecord.started_at)}`
-    );
-    const contentStartedAtMs = Date.parse(parsedContentRecord.started_at as string);
-    assert.ok(
-      contentStartedAtMs >= beforeRunMs && contentStartedAtMs <= afterRunMs,
-      `expected content's started_at (${JSON.stringify(parsedContentRecord.started_at)}) to fall inside the real wall-clock bracket [${beforeRunMs}, ${afterRunMs}] this test captured around the actual run() call - a stable-but-wrong ISO-shaped value would fall outside it`
-    );
-    assert.deepEqual(
-      parsedContentRecord.counts,
-      { stdout_lines: 0, stdout_bytes: 0, stderr_lines: 0, stderr_bytes: 0 },
-      `expected content's counts to deep-equal the real, freshly-started zero counts, got ${JSON.stringify(parsedContentRecord.counts)}`
-    );
-  } finally {
-    await pair.close();
-  }
-});
-
-// ---------------------------------------------------------------------------
-// N mints produce N distinct, high-entropy (v4 UUID) taskIds
-// ---------------------------------------------------------------------------
-
-test("N mints on a capable connection produce N distinct, high-entropy v4-UUID-format taskIds", async () => {
-  const pair = await startPair(true);
-  try {
-    const N = 12;
-    const taskIds: string[] = [];
-    for (let i = 0; i < N; i += 1) {
-      const minted = await mintJob(pair.client, { label: `entropy-${i}` });
-      taskIds.push(minted.taskId as string);
-    }
-    assert.equal(new Set(taskIds).size, N, "every minted taskId must be distinct");
-    for (const id of taskIds) {
-      assert.ok(UUID_V4_PATTERN.test(id), `taskId "${id}" is not a v4-UUID-shaped string`);
-    }
-  } finally {
-    await pair.close();
-  }
-});
-
-// ---------------------------------------------------------------------------
-// The registered task method set deep-equals exactly {tasks/get,
-// tasks/update, tasks/cancel} - set-equality, no legacy result/list surface,
-// no seventh tool
-// ---------------------------------------------------------------------------
-
-test("the registered task method set is exactly {tasks/get, tasks/update, tasks/cancel} - no tasks/list, no tasks/result, no seventh method", async () => {
-  const pair = await startPair(true);
-  try {
-    const minted = await mintJob(pair.client, { label: "method-set-fixture" });
-    const taskId = minted.taskId as string;
-
-    // tasks/get must succeed and name this exact task.
-    const getResult = await tasksRequest(pair.client, "tasks/get", taskId);
-    assert.equal(getResult.taskId, taskId);
-
-    // tasks/update and tasks/cancel must succeed too (their client-decoded
-    // shape is an empty object post resultType-strip - see this file's
-    // header - so "succeeds without throwing" is what this loop checks for
-    // them; their exact ack shape is proven via the wire tap elsewhere).
-    await tasksRequest(pair.client, "tasks/update", taskId);
-    await tasksRequest(pair.client, "tasks/cancel", taskId);
-
-    // The legacy surface must NOT exist - a real JSON-RPC method-not-found
-    // error (-32601), not a well-formed response of any shape.
-    for (const method of ["tasks/list", "tasks/result"]) {
-      await assert.rejects(
-        () => pair.client.request({ method, params: {} }, passthroughResultSchema()),
-        (error: unknown) => {
-          const message = String((error as { message?: unknown })?.message ?? error);
-          return /-32601|not found|unknown method/i.test(message);
-        },
-        `expected ${method} to be unregistered (method not found)`
+      assert.equal(
+        typeof structured.job_id,
+        "string",
+        "the plain poll floor (a bare job_id) must still be returned"
       );
+    } finally {
+      await instance.shutdown("tasks.test.ts deprecated-capabilities-shape regression complete");
     }
-  } finally {
-    await pair.close();
-  }
-});
+  });
+
+  // ---------------------------------------------------------------------------
+  // Capability negotiation matches the finalized extension contract exactly,
+  // which designates `extensions` as the sole bag - a client declaring Tasks
+  // support only under the older, free-form `experimental` bag must not be
+  // recognized as capable. `extensions` and `capabilities.tasks` are already
+  // proven not to leak into each other above; `experimental` is the third bag
+  // capability negotiation deliberately never reads.
+  // ---------------------------------------------------------------------------
+
+  test("a client declaring Tasks support ONLY under the older experimental bag (never extensions) still gets the plain poll floor, not the extension", async () => {
+    pairCounter += 1;
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const instance = createServer(serverTransport);
+    await instance.server.connect(instance.transport);
+
+    const client = new Client(
+      { name: `ghantika-tasks-test-client-${pairCounter}`, version: "0.0.0" },
+      {
+        capabilities: {
+          experimental: { [TASKS_EXTENSION_URI]: {} },
+        } as Record<string, unknown>,
+      }
+    );
+    await client.connect(clientTransport);
+
+    try {
+      const structured = await runJob(client, { label: "experimental-bag-only" });
+      assert.equal(
+        structured.taskId,
+        undefined,
+        `an experimental-bag-only declaration must never mint a Task result, got: ${JSON.stringify(structured)}`
+      );
+      assert.equal(
+        typeof structured.job_id,
+        "string",
+        "the plain poll floor (a bare job_id) must still be returned"
+      );
+    } finally {
+      await instance.shutdown("tasks.test.ts experimental-bag-only regression complete");
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // The run-only mint rule: run() mints unsolicited on a capable connection,
+  // with no per-request opt-in field involved at all
+  // ---------------------------------------------------------------------------
+
+  test("a Tasks-advertised connection gets an unsolicited server-minted task handle on a bare run() call - no opt-in field anywhere in the request", async () => {
+    const pair = await startPair(true);
+    try {
+      const minted = await mintJob(pair.client, { label: "mint-unsolicited" });
+      assert.equal(typeof minted.taskId, "string");
+      assert.equal(minted.status, "working");
+      assert.equal(
+        minted.job_id,
+        undefined,
+        "the plain {job_id} shape must not also appear on a minted result"
+      );
+    } finally {
+      await pair.close();
+    }
+  });
+
+  test("on a capable connection, run() mints a CreateTaskResult even though the call carries no request-level capability/task field whatsoever - minting depends only on the connection", async () => {
+    const pair = await startPair(true);
+    try {
+      // Deliberately no `task`, no `_meta`, no capability-shaped argument of
+      // any kind beyond what `run` already accepts - proving the mint
+      // decision reads nothing from the individual request.
+      const minted = await mintJob(pair.client, { command: ["true"], label: "no-opt-in-field" });
+      assert.equal(typeof minted.taskId, "string");
+    } finally {
+      await pair.close();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // The minted result's REAL wire shape (via the wire tap, resultType
+  // included) validates against the pinned, digest-verified schema, and the
+  // one disclosed SDK content-injection artifact is bounded exactly
+  // ---------------------------------------------------------------------------
+
+  test("the minted result's RAW wire shape - resultType included, the disclosed content:[] SDK artifact stripped - validates against the real, digest-verified vendored createTaskResult schema", async () => {
+    const pair = await startPair(true);
+    try {
+      await mintJob(pair.client, { label: "schema-validate" });
+      const raw = pair.wireTap.latestResultFor("tools/call");
+      assert.ok(raw, "expected a captured raw tools/call result");
+      assert.equal(
+        raw!.resultType,
+        "task",
+        "the wire-level resultType discriminator must be 'task'"
+      );
+      const stripped = stripDisclosedContentArtifact(raw!);
+      const schema = loadSchema();
+      const problems = validatesAgainst(schema, "createTaskResult", stripped);
+      assert.deepEqual(
+        problems,
+        [],
+        `minted result (post content-artifact strip) failed schema validation: ${JSON.stringify(problems)}`
+      );
+    } finally {
+      await pair.close();
+    }
+  });
+
+  test("the minted result's RAW wire shape carries EXACTLY one key beyond what buildCreateTaskResult constructs - the disclosed content:[] artifact - never structuredContent, never an unbounded extra field set", async () => {
+    const pair = await startPair(true);
+    try {
+      await mintJob(pair.client, { label: "artifact-bound" });
+      const raw = pair.wireTap.latestResultFor("tools/call");
+      assert.ok(raw);
+      assert.equal(
+        raw!.structuredContent,
+        undefined,
+        "a minted result must never carry structuredContent"
+      );
+      const keys = Object.keys(raw!).sort();
+      const expectedTaskKeys = [
+        "taskId",
+        "status",
+        "createdAt",
+        "lastUpdatedAt",
+        "ttlMs",
+        "pollIntervalMs",
+        "resultType",
+      ];
+      const extraKeys = keys.filter((k) => !expectedTaskKeys.includes(k));
+      assert.deepEqual(
+        extraKeys,
+        ["content"],
+        `expected the ONLY key beyond the real CreateTaskResult fields to be the disclosed "content" artifact, got extra keys: ${JSON.stringify(extraKeys)}`
+      );
+    } finally {
+      await pair.close();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // A non-capable connection is byte-stable with the plain {job_id} shape -
+  // no CreateTaskResult ever appears
+  // ---------------------------------------------------------------------------
+
+  test("a non-capable connection's run() returns the plain job projection - a genuine deep-equality check of the COMPLETE real plain PublicJobProjection response across BOTH structuredContent and content, key set AND field values (started_at format-checked AND bracketed against a real wall-clock window this test itself observed around the run() call, so a stable-but-wrong ISO value cannot survive), not just presence/absence of a few named fields", async () => {
+    const pair = await startPair(false);
+    try {
+      // Not `runJob` here, deliberately - that helper (see `runResultStructured`
+      // above) discards `CallToolResult.content` entirely and returns only
+      // `structuredContent`, which is exactly the gap previously demonstrated
+      // for this test: a mutant changing ONLY `content` (leaving
+      // `structuredContent` untouched) still passed. The raw `CallToolResult`
+      // is kept here so both halves of the real tool result can be checked.
+      const beforeRunMs = Date.now();
+      const result = await pair.client.callTool({
+        name: "run",
+        arguments: { command: ["true"], label: "plain-poll-floor" },
+      });
+      const afterRunMs = Date.now();
+      assert.notEqual((result as { isError?: boolean }).isError, true);
+      const structured = runResultStructured(result);
+      assert.equal(typeof structured.job_id, "string");
+      assert.equal(
+        structured.taskId,
+        undefined,
+        "a non-capable connection must never see a minted taskId field"
+      );
+
+      // The COMPLETE key set the real PublicJobProjection shape carries -
+      // see src/jobStore.ts's own toPublicProjection, which always writes
+      // all twelve fields (the six optional ones included, EXPLICITLY as
+      // `undefined` when a job hasn't reached that point yet - verified
+      // empirically here rather than assumed: InMemoryTransport passes the
+      // structured content through without an actual JSON.stringify pass,
+      // so an `undefined`-valued own property survives as a present key,
+      // unlike what a real JSON-serialized wire would show).
+      assert.deepEqual(
+        Object.keys(structured).sort(),
+        [
+          "command_summary",
+          "counts",
+          "diagnostic",
+          "ended_at",
+          "escalation_refused_reason",
+          "exit_code",
+          "identity_capture",
+          "identity_confirmed",
+          "job_id",
+          "kill_confirmed",
+          "label",
+          "queue_position",
+          "signal",
+          "started_at",
+          "state",
+        ].sort(),
+        `expected the plain projection's key set to deep-equal the real plain job-projection shape exactly, got: ${JSON.stringify(Object.keys(structured).sort())}`
+      );
+      assert.equal(
+        structured.state,
+        "starting",
+        "a freshly-started job's synchronous projection must be exactly 'starting'"
+      );
+      for (const key of [
+        "ended_at",
+        "exit_code",
+        "signal",
+        "diagnostic",
+        "queue_position",
+        "kill_confirmed",
+        "identity_confirmed",
+        "escalation_refused_reason",
+      ]) {
+        assert.equal(
+          structured[key],
+          undefined,
+          `expected "${key}" to be unset on a freshly-started job, got ${JSON.stringify(structured[key])}`
+        );
+      }
+      assert.equal(
+        structured.identity_capture,
+        "pending",
+        `expected a freshly-started job's identity_capture to be "pending" at this synchronous instant, got ${JSON.stringify(structured.identity_capture)}`
+      );
+
+      assert.equal(
+        structured.label,
+        "plain-poll-floor",
+        "expected the real label supplied to run(), not a placeholder"
+      );
+      assert.equal(
+        structured.command_summary,
+        "true",
+        'expected the real argv[0] basename of the default ["true"] command, not a placeholder'
+      );
+      assert.match(
+        structured.started_at as string,
+        ISO_TIMESTAMP_PATTERN,
+        `expected started_at to be a real ISO-8601 millisecond timestamp (Date#toISOString() shape), got ${JSON.stringify(structured.started_at)}`
+      );
+      const structuredStartedAtMs = Date.parse(structured.started_at as string);
+      assert.ok(
+        structuredStartedAtMs >= beforeRunMs && structuredStartedAtMs <= afterRunMs,
+        `expected started_at (${JSON.stringify(structured.started_at)}) to fall inside the real wall-clock bracket [${beforeRunMs}, ${afterRunMs}] this test captured around the actual run() call - a stable-but-wrong ISO-shaped value would fall outside it`
+      );
+      assert.deepEqual(
+        structured.counts,
+        { stdout_lines: 0, stdout_bytes: 0, stderr_lines: 0, stderr_bytes: 0 },
+        `expected the real, freshly-started zero counts by full value, not just the right key set - got ${JSON.stringify(structured.counts)}`
+      );
+
+      const contentBlocks = (result as CallToolResult).content;
+      assert.ok(
+        Array.isArray(contentBlocks) && contentBlocks.length === 1,
+        `expected exactly one content block, got ${JSON.stringify(contentBlocks)}`
+      );
+      const [contentBlock] = contentBlocks;
+      assert.equal(
+        (contentBlock as { type?: string }).type,
+        "text",
+        `expected the content block's type to be "text", got ${JSON.stringify(contentBlock)}`
+      );
+      const contentText = (contentBlock as { text?: unknown }).text;
+      assert.equal(
+        typeof contentText,
+        "string",
+        "expected the content block's text to be a string"
+      );
+
+      let parsedContent: unknown;
+      try {
+        parsedContent = JSON.parse(contentText as string);
+      } catch (error) {
+        throw new Error(
+          `expected content[0].text to be valid, parseable JSON - src/tools/run.ts's own toolSuccess builds it via JSON.stringify(projection, null, 2) - got ${JSON.stringify(contentText)}`,
+          { cause: error }
+        );
+      }
+      const parsedContentRecord = parsedContent as Record<string, unknown>;
+
+      assert.deepEqual(
+        Object.keys(parsedContentRecord).sort(),
+        ["command_summary", "counts", "identity_capture", "job_id", "label", "started_at", "state"],
+        `expected content's real JSON-serialized key set to be exactly the DEFINED PublicJobProjection fields (JSON.stringify drops undefined optional fields), got: ${JSON.stringify(Object.keys(parsedContentRecord).sort())}`
+      );
+
+      assert.deepEqual(
+        parsedContentRecord,
+        JSON.parse(JSON.stringify(structured)),
+        `expected content's parsed JSON to agree with structuredContent on every field it carries - got content=${JSON.stringify(parsedContentRecord)} vs structuredContent=${JSON.stringify(structured)}`
+      );
+
+      assert.equal(parsedContentRecord.job_id, structured.job_id);
+      assert.equal(parsedContentRecord.state, "starting");
+      assert.equal(parsedContentRecord.label, "plain-poll-floor");
+      assert.equal(parsedContentRecord.command_summary, "true");
+      assert.match(
+        parsedContentRecord.started_at as string,
+        ISO_TIMESTAMP_PATTERN,
+        `expected content's started_at to be a real ISO-8601 millisecond timestamp, got ${JSON.stringify(parsedContentRecord.started_at)}`
+      );
+      const contentStartedAtMs = Date.parse(parsedContentRecord.started_at as string);
+      assert.ok(
+        contentStartedAtMs >= beforeRunMs && contentStartedAtMs <= afterRunMs,
+        `expected content's started_at (${JSON.stringify(parsedContentRecord.started_at)}) to fall inside the real wall-clock bracket [${beforeRunMs}, ${afterRunMs}] this test captured around the actual run() call - a stable-but-wrong ISO-shaped value would fall outside it`
+      );
+      assert.deepEqual(
+        parsedContentRecord.counts,
+        { stdout_lines: 0, stdout_bytes: 0, stderr_lines: 0, stderr_bytes: 0 },
+        `expected content's counts to deep-equal the real, freshly-started zero counts, got ${JSON.stringify(parsedContentRecord.counts)}`
+      );
+    } finally {
+      await pair.close();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // N mints produce N distinct, high-entropy (v4 UUID) taskIds
+  // ---------------------------------------------------------------------------
+
+  test("N mints on a capable connection produce N distinct, high-entropy v4-UUID-format taskIds", async () => {
+    const pair = await startPair(true);
+    try {
+      const N = 12;
+      const taskIds: string[] = [];
+      for (let i = 0; i < N; i += 1) {
+        const minted = await mintJob(pair.client, { label: `entropy-${i}` });
+        taskIds.push(minted.taskId as string);
+      }
+      assert.equal(new Set(taskIds).size, N, "every minted taskId must be distinct");
+      for (const id of taskIds) {
+        assert.ok(UUID_V4_PATTERN.test(id), `taskId "${id}" is not a v4-UUID-shaped string`);
+      }
+    } finally {
+      await pair.close();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // The registered task method set deep-equals exactly {tasks/get,
+  // tasks/update, tasks/cancel} - set-equality, no legacy result/list surface,
+  // no seventh tool
+  // ---------------------------------------------------------------------------
+
+  test("the registered task method set is exactly {tasks/get, tasks/update, tasks/cancel} - no tasks/list, no tasks/result, no seventh method", async () => {
+    const pair = await startPair(true);
+    try {
+      const minted = await mintJob(pair.client, { label: "method-set-fixture" });
+      const taskId = minted.taskId as string;
+
+      // tasks/get must succeed and name this exact task.
+      const getResult = await tasksRequest(pair.client, "tasks/get", taskId);
+      assert.equal(getResult.taskId, taskId);
+
+      // tasks/update and tasks/cancel must succeed too (their client-decoded
+      // shape is an empty object post resultType-strip - see this file's
+      // header - so "succeeds without throwing" is what this loop checks for
+      // them; their exact ack shape is proven via the wire tap elsewhere).
+      await tasksRequest(pair.client, "tasks/update", taskId);
+      await tasksRequest(pair.client, "tasks/cancel", taskId);
+
+      // The legacy surface must NOT exist - a real JSON-RPC method-not-found
+      // error (-32601), not a well-formed response of any shape.
+      for (const method of ["tasks/list", "tasks/result"]) {
+        await assert.rejects(
+          () => pair.client.request({ method, params: {} }, passthroughResultSchema()),
+          (error: unknown) => {
+            const message = String((error as { message?: unknown })?.message ?? error);
+            return /-32601|not found|unknown method/i.test(message);
+          },
+          `expected ${method} to be unregistered (method not found)`
+        );
+      }
+    } finally {
+      await pair.close();
+    }
+  });
+}); // end describe("spawning tests: connection capability and mint mechanics")
 
 test("the registered task/* method set is a genuine SET-EQUALITY over the server's OWN real registration mechanism, not merely '3 named methods answer and 2 named methods 404' - a REAL seventh handler injected into the live registry is caught, which the presence/absence check above cannot see since it never enumerates the registry at all", async () => {
   const [, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -1491,50 +1513,54 @@ test("TASK_STATUSES is a SUBSET of the vendored schema's own taskStatus enum (ne
   }
 });
 
-// ---------------------------------------------------------------------------
-// tasks/get(taskId) resolves via the identity mapping to the SAME job
-// status()/output() already reports, live, including after the job reaches
-// a real terminal state (real exit code, real output - never a canned
-// 'working')
-// ---------------------------------------------------------------------------
+describe("spawning tests: tasks/get identity mapping against the real job", () => {
+  before(requireSpawnPolicy);
 
-test("tasks/get(taskId) resolves to the SAME job status()/output() reports - not just a matching taskId, but genuine cross-field agreement with the real status(), including createdAt/lastUpdatedAt agreement with the real job record", async () => {
-  const pair = await startPair(true);
-  try {
-    const minted = await mintJob(pair.client, { label: "identity-mapping" });
-    const taskId = minted.taskId as string;
+  // ---------------------------------------------------------------------------
+  // tasks/get(taskId) resolves via the identity mapping to the SAME job
+  // status()/output() already reports, live, including after the job reaches
+  // a real terminal state (real exit code, real output - never a canned
+  // 'working')
+  // ---------------------------------------------------------------------------
 
-    const statusResult = runResultStructured(
-      await pair.client.callTool({ name: "status", arguments: { job_id: taskId } })
-    );
-    assert.equal(statusResult.job_id, taskId, "taskId must equal the real job_id");
+  test("tasks/get(taskId) resolves to the SAME job status()/output() reports - not just a matching taskId, but genuine cross-field agreement with the real status(), including createdAt/lastUpdatedAt agreement with the real job record", async () => {
+    const pair = await startPair(true);
+    try {
+      const minted = await mintJob(pair.client, { label: "identity-mapping" });
+      const taskId = minted.taskId as string;
 
-    const taskGet = await tasksRequest(pair.client, "tasks/get", taskId);
-    assert.equal(taskGet.taskId, taskId);
+      const statusResult = runResultStructured(
+        await pair.client.callTool({ name: "status", arguments: { job_id: taskId } })
+      );
+      assert.equal(statusResult.job_id, taskId, "taskId must equal the real job_id");
 
-    const expectedTaskStatus: Record<string, string> = {
-      starting: "working",
-      running: "working",
-      exited: "completed",
-      failed: "failed",
-      killed: "cancelled",
-    };
-    const jobState = statusResult.state as string;
-    assert.equal(
-      taskGet.status,
-      expectedTaskStatus[jobState],
-      `expected tasks/get's status to map from status()'s real state "${jobState}" via the documented mapping, got ${JSON.stringify(taskGet.status)}`
-    );
-    assert.equal(
-      taskGet.createdAt,
-      statusResult.started_at,
-      "tasks/get's createdAt must equal status()'s real started_at - the same underlying job record"
-    );
-    assert.match(taskGet.lastUpdatedAt as string, ISO_TIMESTAMP_PATTERN);
-  } finally {
-    await pair.close();
-  }
-});
+      const taskGet = await tasksRequest(pair.client, "tasks/get", taskId);
+      assert.equal(taskGet.taskId, taskId);
+
+      const expectedTaskStatus: Record<string, string> = {
+        starting: "working",
+        running: "working",
+        exited: "completed",
+        failed: "failed",
+        killed: "cancelled",
+      };
+      const jobState = statusResult.state as string;
+      assert.equal(
+        taskGet.status,
+        expectedTaskStatus[jobState],
+        `expected tasks/get's status to map from status()'s real state "${jobState}" via the documented mapping, got ${JSON.stringify(taskGet.status)}`
+      );
+      assert.equal(
+        taskGet.createdAt,
+        statusResult.started_at,
+        "tasks/get's createdAt must equal status()'s real started_at - the same underlying job record"
+      );
+      assert.match(taskGet.lastUpdatedAt as string, ISO_TIMESTAMP_PATTERN);
+    } finally {
+      await pair.close();
+    }
+  });
+}); // end describe("spawning tests: tasks/get identity mapping against the real job")
 
 // ---------------------------------------------------------------------------
 // An unresolvable taskId THROWS the fixed task_not_found JSON-RPC error
@@ -1581,373 +1607,377 @@ test("an EMPTY-STRING taskId is REJECTED at the request-validation boundary on a
   }
 });
 
-test("tasks/update accepts (and structurally ignores) an inputResponses param, matching the released spec's own {taskId, inputResponses} request shape - ghantika never has a pending input_required step, so the value itself is never interpreted, but the request-validation boundary must not reject the field's mere presence", async () => {
-  const pair = await startPair(true);
-  try {
-    const minted = await mintJob(pair.client, { label: "input-responses-accepted" });
-    const taskId = minted.taskId as string;
-    // Should resolve without throwing, whatever shape inputResponses takes -
-    // it is accepted-but-unread (see tasksAdapter.ts's own updateTask docs).
-    await tasksUpdateRequestWithInputResponses(pair.client, taskId, {});
-    await tasksUpdateRequestWithInputResponses(pair.client, taskId, {
-      someKey: "someElicitResponse",
-    });
-    const raw = pair.wireTap.latestResultFor("tasks/update");
-    assert.deepEqual(
-      raw,
-      { resultType: "complete" },
-      "the ack shape must be unaffected by inputResponses' content"
-    );
-  } finally {
-    await pair.close();
-  }
-});
+describe("spawning tests: task lifecycle, ack/idempotency, and state mapping", () => {
+  before(requireSpawnPolicy);
 
-test("after the backing job reaches a REAL terminal state (known exit code, known output), tasks/get(taskId) reflects that real state under result.exitCode/result.output - never a canned 'working' decoupled from the job, and never top-level exitCode/output (the released spec nests them under the status-specific result/error container)", async () => {
-  const pair = await startPair(true);
-  try {
-    const minted = await mintJob(pair.client, {
-      command: [
-        process.execPath,
-        "-e",
-        "process.stdout.write('hello-from-task'); process.exitCode = 7;",
-      ],
-      label: "terminal-reflection",
-    });
-    const taskId = minted.taskId as string;
+  test("tasks/update accepts (and structurally ignores) an inputResponses param, matching the released spec's own {taskId, inputResponses} request shape - ghantika never has a pending input_required step, so the value itself is never interpreted, but the request-validation boundary must not reject the field's mere presence", async () => {
+    const pair = await startPair(true);
+    try {
+      const minted = await mintJob(pair.client, { label: "input-responses-accepted" });
+      const taskId = minted.taskId as string;
+      // Should resolve without throwing, whatever shape inputResponses takes -
+      // it is accepted-but-unread (see tasksAdapter.ts's own updateTask docs).
+      await tasksUpdateRequestWithInputResponses(pair.client, taskId, {});
+      await tasksUpdateRequestWithInputResponses(pair.client, taskId, {
+        someKey: "someElicitResponse",
+      });
+      const raw = pair.wireTap.latestResultFor("tasks/update");
+      assert.deepEqual(
+        raw,
+        { resultType: "complete" },
+        "the ack shape must be unaffected by inputResponses' content"
+      );
+    } finally {
+      await pair.close();
+    }
+  });
 
-    await pollUntilTerminal(pair.client, taskId);
+  test("after the backing job reaches a REAL terminal state (known exit code, known output), tasks/get(taskId) reflects that real state under result.exitCode/result.output - never a canned 'working' decoupled from the job, and never top-level exitCode/output (the released spec nests them under the status-specific result/error container)", async () => {
+    const pair = await startPair(true);
+    try {
+      const minted = await mintJob(pair.client, {
+        command: [
+          process.execPath,
+          "-e",
+          "process.stdout.write('hello-from-task'); process.exitCode = 7;",
+        ],
+        label: "terminal-reflection",
+      });
+      const taskId = minted.taskId as string;
 
-    const taskGet = await tasksRequest(pair.client, "tasks/get", taskId);
-    assert.equal(
-      taskGet.status,
-      "completed",
-      `expected a completed task, got status ${JSON.stringify(taskGet.status)}`
-    );
-    assert.equal(
-      taskGet.exitCode,
-      undefined,
-      "exitCode must never be top-level on the released contract"
-    );
-    assert.equal(
-      taskGet.output,
-      undefined,
-      "output must never be top-level on the released contract"
-    );
-    const result = taskGet.result as Record<string, unknown> | undefined;
-    assert.ok(result, "expected a real result container on a completed task");
-    assert.equal(
-      result!.exitCode,
-      7,
-      "the real exit code must be reflected under result.exitCode, not a canned value"
-    );
-    const output = result!.output as Record<string, number> | undefined;
-    assert.ok(output, "expected real output counts under result.output on a terminal task");
-    // A `> 0` threshold, not `pollUntilCountsSettled`'s exact-value shape:
-    // `stdout_bytes` (`JobStore`'s `bytesEverReceived`) is bumped
-    // synchronously on every raw chunk ARRIVAL (`appendChunkToBuffer`),
-    // independent of the stream ending or `finalizeStream` ever running -
-    // unlike `stdout_lines` (`linesEverMaterialized`), which specifically
-    // needs a trailing-newline-less final fragment to be FLUSHED at stream
-    // end. This job's write happens well before its process exits, so the
-    // byte has already arrived (and been counted) long before
-    // `pollUntilTerminal` above could observe a terminal state at all -
-    // a value written synchronously and safe to sample once, just via
-    // chunk-arrival timing rather than the state transition itself.
-    assert.ok(
-      output!.stdout_bytes > 0,
-      `expected non-zero stdout_bytes reflecting real output, got ${JSON.stringify(output)}`
-    );
-    // ttlMs is a real, exposed, non-null number for a terminal task -
-    // never the still-working null.
-    assert.equal(
-      taskGet.ttlMs,
-      TASK_TTL_MS,
-      "expected the real, exposed TASK_TTL_MS on a terminal task"
-    );
-  } finally {
-    await pair.close();
-  }
-});
+      await pollUntilTerminal(pair.client, taskId);
 
-test("a job that never spawns (spawn-error class) maps to task status 'failed' with the diagnostic nested under error, distinct from a completed task whose command happened to exit non-zero", async () => {
-  const pair = await startPair(true);
-  try {
-    const minted = await mintJob(pair.client, {
-      command: ["this-command-definitely-does-not-exist-ghantika-tasks-test"],
-      label: "spawn-failure-mapping",
-    });
-    const taskId = minted.taskId as string;
-    await pollUntilTerminal(pair.client, taskId);
+      const taskGet = await tasksRequest(pair.client, "tasks/get", taskId);
+      assert.equal(
+        taskGet.status,
+        "completed",
+        `expected a completed task, got status ${JSON.stringify(taskGet.status)}`
+      );
+      assert.equal(
+        taskGet.exitCode,
+        undefined,
+        "exitCode must never be top-level on the released contract"
+      );
+      assert.equal(
+        taskGet.output,
+        undefined,
+        "output must never be top-level on the released contract"
+      );
+      const result = taskGet.result as Record<string, unknown> | undefined;
+      assert.ok(result, "expected a real result container on a completed task");
+      assert.equal(
+        result!.exitCode,
+        7,
+        "the real exit code must be reflected under result.exitCode, not a canned value"
+      );
+      const output = result!.output as Record<string, number> | undefined;
+      assert.ok(output, "expected real output counts under result.output on a terminal task");
+      // A `> 0` threshold, not `pollUntilCountsSettled`'s exact-value shape:
+      // `stdout_bytes` (`JobStore`'s `bytesEverReceived`) is bumped
+      // synchronously on every raw chunk ARRIVAL (`appendChunkToBuffer`),
+      // independent of the stream ending or `finalizeStream` ever running -
+      // unlike `stdout_lines` (`linesEverMaterialized`), which specifically
+      // needs a trailing-newline-less final fragment to be FLUSHED at stream
+      // end. This job's write happens well before its process exits, so the
+      // byte has already arrived (and been counted) long before
+      // `pollUntilTerminal` above could observe a terminal state at all -
+      // a value written synchronously and safe to sample once, just via
+      // chunk-arrival timing rather than the state transition itself.
+      assert.ok(
+        output!.stdout_bytes > 0,
+        `expected non-zero stdout_bytes reflecting real output, got ${JSON.stringify(output)}`
+      );
+      // ttlMs is a real, exposed, non-null number for a terminal task -
+      // never the still-working null.
+      assert.equal(
+        taskGet.ttlMs,
+        TASK_TTL_MS,
+        "expected the real, exposed TASK_TTL_MS on a terminal task"
+      );
+    } finally {
+      await pair.close();
+    }
+  });
 
-    const taskGet = await tasksRequest(pair.client, "tasks/get", taskId);
-    assert.equal(taskGet.status, "failed");
-    assert.ok(taskGet.error, "expected a real error container on a failed task");
-    assert.equal(taskGet.result, undefined, "a failed task must never carry a result container");
-  } finally {
-    await pair.close();
-  }
-});
+  test("a job that never spawns (spawn-error class) maps to task status 'failed' with the diagnostic nested under error, distinct from a completed task whose command happened to exit non-zero", async () => {
+    const pair = await startPair(true);
+    try {
+      const minted = await mintJob(pair.client, {
+        command: ["this-command-definitely-does-not-exist-ghantika-tasks-test"],
+        label: "spawn-failure-mapping",
+      });
+      const taskId = minted.taskId as string;
+      await pollUntilTerminal(pair.client, taskId);
 
-test("a killed job maps to task status 'cancelled', with no result/error container at all - the spec's own CancelledTask shape", async () => {
-  const pair = await startPair(true);
-  try {
-    const minted = await mintJob(pair.client, {
-      command: [process.execPath, "-e", "setTimeout(() => {}, 60000);"],
-      label: "kill-mapping",
-    });
-    const taskId = minted.taskId as string;
+      const taskGet = await tasksRequest(pair.client, "tasks/get", taskId);
+      assert.equal(taskGet.status, "failed");
+      assert.ok(taskGet.error, "expected a real error container on a failed task");
+      assert.equal(taskGet.result, undefined, "a failed task must never carry a result container");
+    } finally {
+      await pair.close();
+    }
+  });
 
-    // Give the process a moment to actually spawn before killing it.
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await pair.client.callTool({ name: "kill", arguments: { job_id: taskId } });
-    await pollUntilTerminal(pair.client, taskId);
+  test("a killed job maps to task status 'cancelled', with no result/error container at all - the spec's own CancelledTask shape", async () => {
+    const pair = await startPair(true);
+    try {
+      const minted = await mintJob(pair.client, {
+        command: [process.execPath, "-e", "setTimeout(() => {}, 60000);"],
+        label: "kill-mapping",
+      });
+      const taskId = minted.taskId as string;
 
-    const taskGet = await tasksRequest(pair.client, "tasks/get", taskId);
-    assert.equal(taskGet.status, "cancelled");
-    assert.equal(taskGet.result, undefined);
-    assert.equal(taskGet.error, undefined);
-  } finally {
-    await pair.close();
-  }
-});
+      // Give the process a moment to actually spawn before killing it.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await pair.client.callTool({ name: "kill", arguments: { job_id: taskId } });
+      await pollUntilTerminal(pair.client, taskId);
 
-// ---------------------------------------------------------------------------
-// lastUpdatedAt: starts equal to createdAt, advances on real output arrival
-// and on the terminal transition - the src/jobStore.ts half of this contract
-// ---------------------------------------------------------------------------
+      const taskGet = await tasksRequest(pair.client, "tasks/get", taskId);
+      assert.equal(taskGet.status, "cancelled");
+      assert.equal(taskGet.result, undefined);
+      assert.equal(taskGet.error, undefined);
+    } finally {
+      await pair.close();
+    }
+  });
 
-test("a freshly-minted task's lastUpdatedAt equals its createdAt - no state change has happened yet", async () => {
-  const pair = await startPair(true);
-  try {
-    const minted = await mintJob(pair.client, {
-      command: [process.execPath, "-e", "setTimeout(() => {}, 60000);"],
-      label: "last-updated-fresh",
-    });
-    assert.equal(minted.lastUpdatedAt, minted.createdAt);
-    await pair.client.callTool({ name: "kill", arguments: { job_id: minted.taskId as string } });
-  } finally {
-    await pair.close();
-  }
-});
+  // ---------------------------------------------------------------------------
+  // lastUpdatedAt: starts equal to createdAt, advances on real output arrival
+  // and on the terminal transition - the src/jobStore.ts half of this contract
+  // ---------------------------------------------------------------------------
 
-test("lastUpdatedAt advances past createdAt once the job produces real output and reaches its terminal instant - proving jobStore.ts's touch runs on output-arrival regardless of whether a watch is subscribed (a legacy-era connection here never starts a watch at all) and on every terminal transition", async () => {
-  const pair = await startPair(true);
-  try {
-    const minted = await mintJob(pair.client, {
-      command: [
-        process.execPath,
-        "-e",
-        "process.stdout.write('line-1\\n'); setTimeout(() => { process.exitCode = 0; }, 30);",
-      ],
-      label: "last-updated-advances",
-    });
-    const taskId = minted.taskId as string;
-    const createdAtMs = Date.parse(minted.createdAt as string);
+  test("a freshly-minted task's lastUpdatedAt equals its createdAt - no state change has happened yet", async () => {
+    const pair = await startPair(true);
+    try {
+      const minted = await mintJob(pair.client, {
+        command: [process.execPath, "-e", "setTimeout(() => {}, 60000);"],
+        label: "last-updated-fresh",
+      });
+      assert.equal(minted.lastUpdatedAt, minted.createdAt);
+      await pair.client.callTool({ name: "kill", arguments: { job_id: minted.taskId as string } });
+    } finally {
+      await pair.close();
+    }
+  });
 
-    await pollUntilTerminal(pair.client, taskId);
-    const taskGet = await tasksRequest(pair.client, "tasks/get", taskId);
-    const lastUpdatedAtMs = Date.parse(taskGet.lastUpdatedAt as string);
-    assert.ok(
-      lastUpdatedAtMs > createdAtMs,
-      `expected lastUpdatedAt (${taskGet.lastUpdatedAt}) to have advanced past createdAt (${minted.createdAt}) once output arrived and the job terminated`
-    );
-  } finally {
-    await pair.close();
-  }
-});
+  test("lastUpdatedAt advances past createdAt once the job produces real output and reaches its terminal instant - proving jobStore.ts's touch runs on output-arrival regardless of whether a watch is subscribed (a legacy-era connection here never starts a watch at all) and on every terminal transition", async () => {
+    const pair = await startPair(true);
+    try {
+      const minted = await mintJob(pair.client, {
+        command: [
+          process.execPath,
+          "-e",
+          "process.stdout.write('line-1\\n'); setTimeout(() => { process.exitCode = 0; }, 30);",
+        ],
+        label: "last-updated-advances",
+      });
+      const taskId = minted.taskId as string;
+      const createdAtMs = Date.parse(minted.createdAt as string);
 
-// ---------------------------------------------------------------------------
-// statusMessage / watchStopped: this adapter's own new construction logic
-// for a pre-recorded watch-stop annotation, poked directly via the shared
-// jobStore singleton (in-process, same module registry - see
-// src/server.ts's own header doc on why this is possible without a real
-// firehose) rather than driving 5000 lines/sec for real - the firehose
-// TRIGGER itself (startTaskWatch/checkFirehose) is explicitly OUT of scope
-// here (see tasksAdapter.ts's own section header), but the
-// RENDERING of an already-recorded watch-stop into statusMessage/result/
-// error is new code and is tested here directly.
-// ---------------------------------------------------------------------------
+      await pollUntilTerminal(pair.client, taskId);
+      const taskGet = await tasksRequest(pair.client, "tasks/get", taskId);
+      const lastUpdatedAtMs = Date.parse(taskGet.lastUpdatedAt as string);
+      assert.ok(
+        lastUpdatedAtMs > createdAtMs,
+        `expected lastUpdatedAt (${taskGet.lastUpdatedAt}) to have advanced past createdAt (${minted.createdAt}) once output arrived and the job terminated`
+      );
+    } finally {
+      await pair.close();
+    }
+  });
 
-test("a pre-terminal watch-stop annotation renders as text into statusMessage on a still-working task - the spec-legal, otherwise-unused field this adapter's ONE use of it targets", async () => {
-  const pair = await startPair(true);
-  try {
-    const minted = await mintJob(pair.client, {
-      command: [process.execPath, "-e", "setTimeout(() => {}, 60000);"],
-      label: "watch-stop-pre-terminal",
-    });
-    const taskId = minted.taskId as string;
-    jobStore.recordOutputWatchStopped(taskId, "firehose", "2026-01-01T00:00:00.000Z");
+  // ---------------------------------------------------------------------------
+  // statusMessage / watchStopped: this adapter's own new construction logic
+  // for a pre-recorded watch-stop annotation, poked directly via the shared
+  // jobStore singleton (in-process, same module registry - see
+  // src/server.ts's own header doc on why this is possible without a real
+  // firehose) rather than driving 5000 lines/sec for real - the firehose
+  // TRIGGER itself (startTaskWatch/checkFirehose) is explicitly OUT of scope
+  // here (see tasksAdapter.ts's own section header), but the
+  // RENDERING of an already-recorded watch-stop into statusMessage/result/
+  // error is new code and is tested here directly.
+  // ---------------------------------------------------------------------------
 
-    const taskGet = await tasksRequest(pair.client, "tasks/get", taskId);
-    assert.equal(taskGet.status, "working");
-    assert.equal(
-      taskGet.statusMessage,
-      "output watch auto-stopped (firehose) at 2026-01-01T00:00:00.000Z"
-    );
+  test("a pre-terminal watch-stop annotation renders as text into statusMessage on a still-working task - the spec-legal, otherwise-unused field this adapter's ONE use of it targets", async () => {
+    const pair = await startPair(true);
+    try {
+      const minted = await mintJob(pair.client, {
+        command: [process.execPath, "-e", "setTimeout(() => {}, 60000);"],
+        label: "watch-stop-pre-terminal",
+      });
+      const taskId = minted.taskId as string;
+      jobStore.recordOutputWatchStopped(taskId, "firehose", "2026-01-01T00:00:00.000Z");
 
-    await pair.client.callTool({ name: "kill", arguments: { job_id: taskId } });
-  } finally {
-    await pair.close();
-  }
-});
+      const taskGet = await tasksRequest(pair.client, "tasks/get", taskId);
+      assert.equal(taskGet.status, "working");
+      assert.equal(
+        taskGet.statusMessage,
+        "output watch auto-stopped (firehose) at 2026-01-01T00:00:00.000Z"
+      );
 
-test("the SAME watch-stop fact renders STRUCTURALLY, under result.watchStopped, once the task reaches a terminal state - never as statusMessage text on a terminal task", async () => {
-  const pair = await startPair(true);
-  try {
-    const minted = await mintJob(pair.client, { label: "watch-stop-terminal" });
-    const taskId = minted.taskId as string;
-    await pollUntilTerminal(pair.client, taskId);
-    jobStore.recordOutputWatchStopped(taskId, "firehose", "2026-01-01T00:00:00.000Z");
+      await pair.client.callTool({ name: "kill", arguments: { job_id: taskId } });
+    } finally {
+      await pair.close();
+    }
+  });
 
-    const taskGet = await tasksRequest(pair.client, "tasks/get", taskId);
-    assert.equal(taskGet.status, "completed");
-    assert.equal(
-      taskGet.statusMessage,
-      undefined,
-      "a terminal task must never carry the pre-terminal statusMessage rendering"
-    );
-    const result = taskGet.result as Record<string, unknown>;
-    assert.deepEqual(result.watchStopped, {
-      reason: "firehose",
-      stoppedAt: "2026-01-01T00:00:00.000Z",
-    });
-  } finally {
-    await pair.close();
-  }
-});
+  test("the SAME watch-stop fact renders STRUCTURALLY, under result.watchStopped, once the task reaches a terminal state - never as statusMessage text on a terminal task", async () => {
+    const pair = await startPair(true);
+    try {
+      const minted = await mintJob(pair.client, { label: "watch-stop-terminal" });
+      const taskId = minted.taskId as string;
+      await pollUntilTerminal(pair.client, taskId);
+      jobStore.recordOutputWatchStopped(taskId, "firehose", "2026-01-01T00:00:00.000Z");
 
-// ---------------------------------------------------------------------------
-// On a capable connection, the backing job stays pollable via the PLAIN
-// status/output surface on the mapped job_id after an unsolicited handle is
-// minted - the handle augments the poll floor, it never replaces it
-// ---------------------------------------------------------------------------
+      const taskGet = await tasksRequest(pair.client, "tasks/get", taskId);
+      assert.equal(taskGet.status, "completed");
+      assert.equal(
+        taskGet.statusMessage,
+        undefined,
+        "a terminal task must never carry the pre-terminal statusMessage rendering"
+      );
+      const result = taskGet.result as Record<string, unknown>;
+      assert.deepEqual(result.watchStopped, {
+        reason: "firehose",
+        stoppedAt: "2026-01-01T00:00:00.000Z",
+      });
+    } finally {
+      await pair.close();
+    }
+  });
 
-test("on a capable connection, status/output/tail on the mapped job_id keep working normally after a handle is minted - the plain poll floor is never replaced", async () => {
-  const pair = await startPair(true);
-  try {
-    const minted = await mintJob(pair.client, {
-      command: [process.execPath, "-e", "process.stdout.write('poll-floor-line\\n');"],
-      label: "poll-floor-still-reachable",
-    });
-    const taskId = minted.taskId as string;
+  // ---------------------------------------------------------------------------
+  // On a capable connection, the backing job stays pollable via the PLAIN
+  // status/output surface on the mapped job_id after an unsolicited handle is
+  // minted - the handle augments the poll floor, it never replaces it
+  // ---------------------------------------------------------------------------
 
-    const statusResult = runResultStructured(
-      await pair.client.callTool({ name: "status", arguments: { job_id: taskId } })
-    );
-    assert.equal(statusResult.job_id, taskId);
+  test("on a capable connection, status/output/tail on the mapped job_id keep working normally after a handle is minted - the plain poll floor is never replaced", async () => {
+    const pair = await startPair(true);
+    try {
+      const minted = await mintJob(pair.client, {
+        command: [process.execPath, "-e", "process.stdout.write('poll-floor-line\\n');"],
+        label: "poll-floor-still-reachable",
+      });
+      const taskId = minted.taskId as string;
 
-    const outputResult = (await pair.client.callTool({
-      name: "output",
-      arguments: { job_id: taskId },
-    })) as { isError?: boolean };
-    assert.notEqual(
-      outputResult.isError,
-      true,
-      "the plain output tool must still work on a minted job_id"
-    );
+      const statusResult = runResultStructured(
+        await pair.client.callTool({ name: "status", arguments: { job_id: taskId } })
+      );
+      assert.equal(statusResult.job_id, taskId);
 
-    const tailResult = (await pair.client.callTool({
-      name: "tail",
-      arguments: { job_id: taskId, n: 5 },
-    })) as { isError?: boolean };
-    assert.notEqual(
-      tailResult.isError,
-      true,
-      "the plain tail tool must still work on a minted job_id"
-    );
-  } finally {
-    await pair.close();
-  }
-});
+      const outputResult = (await pair.client.callTool({
+        name: "output",
+        arguments: { job_id: taskId },
+      })) as { isError?: boolean };
+      assert.notEqual(
+        outputResult.isError,
+        true,
+        "the plain output tool must still work on a minted job_id"
+      );
 
-// ---------------------------------------------------------------------------
-// tasks/update's own interim contract, on the released spec: a fixed,
-// empty ack (resultType: "complete") that mutates NOTHING observable -
-// asserted via the wire tap, since the client-decoded value strips
-// resultType and leaves nothing else to look at. tasks/cancel shares the
-// SAME fixed ack shape now, but is covered by its own idempotency test
-// below since it ALSO has a real side effect the first time it runs.
-// ---------------------------------------------------------------------------
+      const tailResult = (await pair.client.callTool({
+        name: "tail",
+        arguments: { job_id: taskId, n: 5 },
+      })) as { isError?: boolean };
+      assert.notEqual(
+        tailResult.isError,
+        true,
+        "the plain tail tool must still work on a minted job_id"
+      );
+    } finally {
+      await pair.close();
+    }
+  });
 
-test("tasks/update on a LIVE (working) task returns the fixed emittedAckResult on the wire and mutates NOTHING observable - proven by a full-object deep-equality of tasks/get before and after", async () => {
-  const pair = await startPair(true);
-  try {
-    const minted = await mintJob(pair.client, {
-      command: [process.execPath, "-e", "setTimeout(() => {}, 60000);"],
-      label: "live-interim-contract",
-    });
-    const taskId = minted.taskId as string;
-    await new Promise((resolve) => setTimeout(resolve, 30)); // let it actually start running
+  // ---------------------------------------------------------------------------
+  // tasks/update's own interim contract, on the released spec: a fixed,
+  // empty ack (resultType: "complete") that mutates NOTHING observable -
+  // asserted via the wire tap, since the client-decoded value strips
+  // resultType and leaves nothing else to look at. tasks/cancel shares the
+  // SAME fixed ack shape now, but is covered by its own idempotency test
+  // below since it ALSO has a real side effect the first time it runs.
+  // ---------------------------------------------------------------------------
 
-    const before = await tasksRequest(pair.client, "tasks/get", taskId);
-    await assertTaskStatus(
-      pair.client,
-      taskId,
-      before.status,
-      "working",
-      "expected the task to still be working"
-    );
+  test("tasks/update on a LIVE (working) task returns the fixed emittedAckResult on the wire and mutates NOTHING observable - proven by a full-object deep-equality of tasks/get before and after", async () => {
+    const pair = await startPair(true);
+    try {
+      const minted = await mintJob(pair.client, {
+        command: [process.execPath, "-e", "setTimeout(() => {}, 60000);"],
+        label: "live-interim-contract",
+      });
+      const taskId = minted.taskId as string;
+      await new Promise((resolve) => setTimeout(resolve, 30)); // let it actually start running
 
-    await tasksRequest(pair.client, "tasks/update", taskId);
-    const raw = pair.wireTap.latestResultFor("tasks/update");
-    assert.deepEqual(raw, { resultType: "complete" });
-    const schema = loadSchema();
-    assert.deepEqual(validatesAgainst(schema, "emittedAckResult", raw), []);
+      const before = await tasksRequest(pair.client, "tasks/get", taskId);
+      await assertTaskStatus(
+        pair.client,
+        taskId,
+        before.status,
+        "working",
+        "expected the task to still be working"
+      );
 
-    const after = await tasksRequest(pair.client, "tasks/get", taskId);
-    assert.deepEqual(
-      after,
-      before,
-      "tasks/update must not have altered the observable job state in ANY field"
-    );
+      await tasksRequest(pair.client, "tasks/update", taskId);
+      const raw = pair.wireTap.latestResultFor("tasks/update");
+      assert.deepEqual(raw, { resultType: "complete" });
+      const schema = loadSchema();
+      assert.deepEqual(validatesAgainst(schema, "emittedAckResult", raw), []);
 
-    // Clean up the still-live background process.
-    await pair.client.callTool({ name: "kill", arguments: { job_id: taskId } });
-  } finally {
-    await pair.close();
-  }
-});
+      const after = await tasksRequest(pair.client, "tasks/get", taskId);
+      assert.deepEqual(
+        after,
+        before,
+        "tasks/update must not have altered the observable job state in ANY field"
+      );
 
-test("tasks/update and tasks/cancel are each IDEMPOTENT on a TERMINAL task - both return the identical fixed ack every time, and repeated calls never alter the real tasks/get snapshot", async () => {
-  const pair = await startPair(true);
-  try {
-    const minted = await mintJob(pair.client, {
-      command: [process.execPath, "-e", "process.exitCode = 0;"],
-      label: "terminal-interim-contract",
-    });
-    const taskId = minted.taskId as string;
-    await pollUntilTerminal(pair.client, taskId);
+      // Clean up the still-live background process.
+      await pair.client.callTool({ name: "kill", arguments: { job_id: taskId } });
+    } finally {
+      await pair.close();
+    }
+  });
 
-    const firstGet = await tasksRequest(pair.client, "tasks/get", taskId);
-    await assertTaskStatus(
-      pair.client,
-      taskId,
-      firstGet.status,
-      "completed",
-      "expected the task to have completed"
-    );
+  test("tasks/update and tasks/cancel are each IDEMPOTENT on a TERMINAL task - both return the identical fixed ack every time, and repeated calls never alter the real tasks/get snapshot", async () => {
+    const pair = await startPair(true);
+    try {
+      const minted = await mintJob(pair.client, {
+        command: [process.execPath, "-e", "process.exitCode = 0;"],
+        label: "terminal-interim-contract",
+      });
+      const taskId = minted.taskId as string;
+      await pollUntilTerminal(pair.client, taskId);
 
-    await tasksRequest(pair.client, "tasks/update", taskId);
-    const firstUpdateRaw = pair.wireTap.latestResultFor("tasks/update");
-    await tasksRequest(pair.client, "tasks/update", taskId);
-    const secondUpdateRaw = pair.wireTap.latestResultFor("tasks/update");
-    assert.deepEqual(firstUpdateRaw, secondUpdateRaw);
-    assert.deepEqual(firstUpdateRaw, { resultType: "complete" });
+      const firstGet = await tasksRequest(pair.client, "tasks/get", taskId);
+      await assertTaskStatus(
+        pair.client,
+        taskId,
+        firstGet.status,
+        "completed",
+        "expected the task to have completed"
+      );
 
-    await tasksRequest(pair.client, "tasks/cancel", taskId);
-    const firstCancelRaw = pair.wireTap.latestResultFor("tasks/cancel");
-    await tasksRequest(pair.client, "tasks/cancel", taskId);
-    const secondCancelRaw = pair.wireTap.latestResultFor("tasks/cancel");
-    assert.deepEqual(firstCancelRaw, secondCancelRaw);
-    assert.deepEqual(firstCancelRaw, { resultType: "complete" });
+      await tasksRequest(pair.client, "tasks/update", taskId);
+      const firstUpdateRaw = pair.wireTap.latestResultFor("tasks/update");
+      await tasksRequest(pair.client, "tasks/update", taskId);
+      const secondUpdateRaw = pair.wireTap.latestResultFor("tasks/update");
+      assert.deepEqual(firstUpdateRaw, secondUpdateRaw);
+      assert.deepEqual(firstUpdateRaw, { resultType: "complete" });
 
-    const finalGet = await tasksRequest(pair.client, "tasks/get", taskId);
-    assert.deepEqual(finalGet, firstGet, "neither method may have altered the terminal snapshot");
-  } finally {
-    await pair.close();
-  }
-});
+      await tasksRequest(pair.client, "tasks/cancel", taskId);
+      const firstCancelRaw = pair.wireTap.latestResultFor("tasks/cancel");
+      await tasksRequest(pair.client, "tasks/cancel", taskId);
+      const secondCancelRaw = pair.wireTap.latestResultFor("tasks/cancel");
+      assert.deepEqual(firstCancelRaw, secondCancelRaw);
+      assert.deepEqual(firstCancelRaw, { resultType: "complete" });
+
+      const finalGet = await tasksRequest(pair.client, "tasks/get", taskId);
+      assert.deepEqual(finalGet, firstGet, "neither method may have altered the terminal snapshot");
+    } finally {
+      await pair.close();
+    }
+  });
+}); // end describe("spawning tests: task lifecycle, ack/idempotency, and state mapping")
 
 test("on an UNKNOWN taskId, tasks/get, tasks/update, and tasks/cancel all THROW the IDENTICAL fixed task_not_found error - never an arbitrary/varying shape, and never a value the pre-story tagged-success contract would have returned", async () => {
   const pair = await startPair(true);
@@ -1991,419 +2021,432 @@ function carriesNoHandleTellTale(body: unknown): boolean {
   return HANDLE_TELL_TALE_FIELDS.every((field) => !serialized.includes(`"${field}"`));
 }
 
-test("seven-tool mint rule: on a capable connection, run() mints a handle while status/output/tail/kill/list/follow each return their PLAIN response with no handle minted - status/kill (both real PublicJobProjection shapes) are checked by full key-set AND VALUE deep-equality against the real plain job-projection shape, list/output/tail are checked by a genuine whole-object comparison against their real, complete values, and follow (called against this same, already-terminal job) is checked for the same absence of any minted-handle field", async () => {
-  const pair = await startPair(true);
-  try {
-    const beforeFirstJobMs = Date.now();
-    const minted = await mintJob(pair.client, {
-      command: [process.execPath, "-e", "process.stdout.write('x');"],
-      label: "seven-tool-mint-rule",
-    });
-    const taskId = minted.taskId as string;
-    assert.equal(typeof minted.taskId, "string", "run() must mint on a capable connection");
+describe("spawning tests: seven-tool mint rule (run mints, every other tool stays plain)", () => {
+  before(requireSpawnPolicy);
 
-    await pollUntilTerminal(pair.client, taskId);
+  test("seven-tool mint rule: on a capable connection, run() mints a handle while status/output/tail/kill/list/follow each return their PLAIN response with no handle minted - status/kill (both real PublicJobProjection shapes) are checked by full key-set AND VALUE deep-equality against the real plain job-projection shape, list/output/tail are checked by a genuine whole-object comparison against their real, complete values, and follow (called against this same, already-terminal job) is checked for the same absence of any minted-handle field", async () => {
+    const pair = await startPair(true);
+    try {
+      const beforeFirstJobMs = Date.now();
+      const minted = await mintJob(pair.client, {
+        command: [process.execPath, "-e", "process.stdout.write('x');"],
+        label: "seven-tool-mint-rule",
+      });
+      const taskId = minted.taskId as string;
+      assert.equal(typeof minted.taskId, "string", "run() must mint on a capable connection");
 
-    const PUBLIC_JOB_PROJECTION_KEYS = [
-      "command_summary",
-      "counts",
-      "diagnostic",
-      "ended_at",
-      "exit_code",
-      "escalation_refused_reason",
-      "identity_capture",
-      "identity_confirmed",
-      "job_id",
-      "kill_confirmed",
-      "label",
-      "queue_position",
-      "signal",
-      "started_at",
-      "state",
-    ].sort();
+      await pollUntilTerminal(pair.client, taskId);
 
-    // status's own response carries two ADDITIVE fields no other tool's
-    // response does - `pid`/`birth_identity` (see
-    // `src/tools/status.ts`'s `StatusProjection`) - so it gets its own key
-    // set, layered on top of the shared PublicJobProjection one, rather
-    // than widening PUBLIC_JOB_PROJECTION_KEYS itself: kill's own
-    // assertion below still checks against the UNCHANGED shared set,
-    // which is what actually proves status gained fields kill did not.
-    const STATUS_PROJECTION_KEYS = [...PUBLIC_JOB_PROJECTION_KEYS, "pid", "birth_identity"].sort();
+      const PUBLIC_JOB_PROJECTION_KEYS = [
+        "command_summary",
+        "counts",
+        "diagnostic",
+        "ended_at",
+        "exit_code",
+        "escalation_refused_reason",
+        "identity_capture",
+        "identity_confirmed",
+        "job_id",
+        "kill_confirmed",
+        "label",
+        "queue_position",
+        "signal",
+        "started_at",
+        "state",
+      ].sort();
 
-    // TWO further async-materialized fields the deep-equal below pins to an
-    // exact value, neither of which `pollUntilTerminal` above ever waited
-    // on (it only watches `state`) - a SIBLING of this same test's own
-    // `kill_confirmed` fix a little further down (the SECOND job's
-    // `kill_confirmed`), found here by sweeping this test by the general
-    // shape of the race rather than by the specific `stdout_lines` field
-    // name PR #88's measured failure happened to name.
-    //
-    // `kill_confirmed`: this job was never explicitly killed - it exits on
-    // its own - so its `kill_confirmed` is populated ENTIRELY by
-    // `src/tools/run.ts`'s `beginSpawn`'s own eager, fire-and-forget
-    // `jobStore.reapProcessGroupOnce` call at the child's OS-level exit,
-    // never awaited by any client-facing call. `createTerminalMarkGate`'s
-    // "both streams already ended" FAST PATH can mark `state` "exited"
-    // with NO dependency on that reap promise at all, so a plain
-    // `pollUntilTerminal` can observe a terminal `state` before the reap's
-    // own `JobStore.setKillConfirmation` write (itself gated on the job
-    // already being terminal - see that setter's own doc comment) has
-    // landed. Poll via `pollUntilKillConfirmed` (established by commit
-    // c12b111 for exactly this class, just triggered there by an explicit
-    // `kill()` call instead of the natural-exit eager reap) exactly like
-    // this test's own second job does below.
-    //
-    // `counts`: see `pollUntilCountsSettled`'s own docs immediately above
-    // for the full mechanism - this is the exact failure PR #88 measured
-    // (actual `stdout_lines` value 0, expected 1).
-    //
-    // Order matters only in that both must settle before `statusResult` is
-    // captured for the deep-equal below; `pollUntilCountsSettled`'s own
-    // status() reads happen strictly after `pollUntilKillConfirmed`
-    // resolves, so its returned snapshot reflects both settled fields at
-    // once.
-    await pollUntilKillConfirmed(pair.client, taskId);
-    const statusResult = await pollUntilCountsSettled(pair.client, taskId);
-    const afterFirstJobMs = Date.now();
-    assert.equal(statusResult.job_id, taskId);
-    assert.deepEqual(
-      Object.keys(statusResult).sort(),
-      STATUS_PROJECTION_KEYS,
-      `expected status's response to deep-equal STATUS_PROJECTION_KEYS exactly (no minted field, no dropped field, and including status's own additive pid/birth_identity fields), got: ${JSON.stringify(Object.keys(statusResult).sort())}`
-    );
+      // status's own response carries two ADDITIVE fields no other tool's
+      // response does - `pid`/`birth_identity` (see
+      // `src/tools/status.ts`'s `StatusProjection`) - so it gets its own key
+      // set, layered on top of the shared PublicJobProjection one, rather
+      // than widening PUBLIC_JOB_PROJECTION_KEYS itself: kill's own
+      // assertion below still checks against the UNCHANGED shared set,
+      // which is what actually proves status gained fields kill did not.
+      const STATUS_PROJECTION_KEYS = [
+        ...PUBLIC_JOB_PROJECTION_KEYS,
+        "pid",
+        "birth_identity",
+      ].sort();
 
-    assert.ok(
-      Date.parse(statusResult.ended_at as string) >= Date.parse(statusResult.started_at as string),
-      `expected status's ended_at (${JSON.stringify(statusResult.ended_at)}) to be at or after started_at (${JSON.stringify(statusResult.started_at)})`
-    );
-    const statusStartedAtMs = Date.parse(statusResult.started_at as string);
-    const statusEndedAtMs = Date.parse(statusResult.ended_at as string);
-    assert.ok(
-      statusStartedAtMs >= beforeFirstJobMs && statusStartedAtMs <= afterFirstJobMs,
-      `expected status's started_at (${JSON.stringify(statusResult.started_at)}) to fall inside the real wall-clock bracket [${beforeFirstJobMs}, ${afterFirstJobMs}] this test captured around the job's actual run`
-    );
-    assert.ok(
-      statusEndedAtMs >= beforeFirstJobMs && statusEndedAtMs <= afterFirstJobMs,
-      `expected status's ended_at (${JSON.stringify(statusResult.ended_at)}) to fall inside the real wall-clock bracket [${beforeFirstJobMs}, ${afterFirstJobMs}] this test captured around the job's actual run`
-    );
-    assert.ok(
-      ["pending", "captured", "unavailable"].includes(statusResult.identity_capture as string),
-      `expected status's identity_capture to be one of pending/captured/unavailable, got: ${JSON.stringify(statusResult.identity_capture)}`
-    );
+      // TWO further async-materialized fields the deep-equal below pins to an
+      // exact value, neither of which `pollUntilTerminal` above ever waited
+      // on (it only watches `state`) - a SIBLING of this same test's own
+      // `kill_confirmed` fix a little further down (the SECOND job's
+      // `kill_confirmed`), found here by sweeping this test by the general
+      // shape of the race rather than by the specific `stdout_lines` field
+      // name PR #88's measured failure happened to name.
+      //
+      // `kill_confirmed`: this job was never explicitly killed - it exits on
+      // its own - so its `kill_confirmed` is populated ENTIRELY by
+      // `src/tools/run.ts`'s `beginSpawn`'s own eager, fire-and-forget
+      // `jobStore.reapProcessGroupOnce` call at the child's OS-level exit,
+      // never awaited by any client-facing call. `createTerminalMarkGate`'s
+      // "both streams already ended" FAST PATH can mark `state` "exited"
+      // with NO dependency on that reap promise at all, so a plain
+      // `pollUntilTerminal` can observe a terminal `state` before the reap's
+      // own `JobStore.setKillConfirmation` write (itself gated on the job
+      // already being terminal - see that setter's own doc comment) has
+      // landed. Poll via `pollUntilKillConfirmed` (established by commit
+      // c12b111 for exactly this class, just triggered there by an explicit
+      // `kill()` call instead of the natural-exit eager reap) exactly like
+      // this test's own second job does below.
+      //
+      // `counts`: see `pollUntilCountsSettled`'s own docs immediately above
+      // for the full mechanism - this is the exact failure PR #88 measured
+      // (actual `stdout_lines` value 0, expected 1).
+      //
+      // Order matters only in that both must settle before `statusResult` is
+      // captured for the deep-equal below; `pollUntilCountsSettled`'s own
+      // status() reads happen strictly after `pollUntilKillConfirmed`
+      // resolves, so its returned snapshot reflects both settled fields at
+      // once.
+      await pollUntilKillConfirmed(pair.client, taskId);
+      const statusResult = await pollUntilCountsSettled(pair.client, taskId);
+      const afterFirstJobMs = Date.now();
+      assert.equal(statusResult.job_id, taskId);
+      assert.deepEqual(
+        Object.keys(statusResult).sort(),
+        STATUS_PROJECTION_KEYS,
+        `expected status's response to deep-equal STATUS_PROJECTION_KEYS exactly (no minted field, no dropped field, and including status's own additive pid/birth_identity fields), got: ${JSON.stringify(Object.keys(statusResult).sort())}`
+      );
 
-    // pid/birth_identity (see src/tools/status.ts's StatusProjection) are
-    // status-only additive fields, sourced from the same real tracked
-    // child jobStore.getChildHandle exposes - this job DID get a live
-    // child (a real `node` process), so both must be present. pid is
-    // checked as a real positive OS pid; birth_identity's exact settled
-    // shape races the same async capture identity_capture already names
-    // above (still "pending", or already "captured" with a real
-    // platform-tagged identity payload, or "unavailable" if the capture
-    // genuinely failed) - checked for STRUCTURAL validity here (never a
-    // stray/malformed shape, and never a "captured" state missing its
-    // identity payload or a non-captured state carrying one), then both
-    // are excluded from the exact-literal comparison below for the same
-    // reason identity_capture is: genuinely outside this test's control.
-    assert.equal(
-      typeof statusResult.pid,
-      "number",
-      `expected status's pid to be a real number, got: ${JSON.stringify(statusResult.pid)}`
-    );
-    assert.ok(
-      (statusResult.pid as number) > 0,
-      `expected status's pid to be a positive OS pid, got: ${JSON.stringify(statusResult.pid)}`
-    );
-    const birthIdentity = statusResult.birth_identity as { state?: string; identity?: unknown };
-    assert.ok(
-      typeof birthIdentity === "object" &&
-        birthIdentity !== null &&
-        ["pending", "captured", "unavailable"].includes(birthIdentity.state as string),
-      `expected status's birth_identity.state to be one of pending/captured/unavailable, got: ${JSON.stringify(statusResult.birth_identity)}`
-    );
-    assert.equal(
-      "identity" in birthIdentity,
-      birthIdentity.state === "captured",
-      `expected birth_identity to carry an "identity" payload if and only if its state is "captured" - never a "pending"/"unavailable" state carrying one, and never a "captured" state missing one - got: ${JSON.stringify(statusResult.birth_identity)}`
-    );
-    if (birthIdentity.state === "captured") {
-      const identity = birthIdentity.identity as { platform?: string };
       assert.ok(
-        identity.platform === "linux-starttime-ticks" || identity.platform === "posix-elapsed",
-        `expected a captured birth_identity's platform to be linux-starttime-ticks or posix-elapsed, got: ${JSON.stringify(identity)}`
+        Date.parse(statusResult.ended_at as string) >=
+          Date.parse(statusResult.started_at as string),
+        `expected status's ended_at (${JSON.stringify(statusResult.ended_at)}) to be at or after started_at (${JSON.stringify(statusResult.started_at)})`
       );
-    }
+      const statusStartedAtMs = Date.parse(statusResult.started_at as string);
+      const statusEndedAtMs = Date.parse(statusResult.ended_at as string);
+      assert.ok(
+        statusStartedAtMs >= beforeFirstJobMs && statusStartedAtMs <= afterFirstJobMs,
+        `expected status's started_at (${JSON.stringify(statusResult.started_at)}) to fall inside the real wall-clock bracket [${beforeFirstJobMs}, ${afterFirstJobMs}] this test captured around the job's actual run`
+      );
+      assert.ok(
+        statusEndedAtMs >= beforeFirstJobMs && statusEndedAtMs <= afterFirstJobMs,
+        `expected status's ended_at (${JSON.stringify(statusResult.ended_at)}) to fall inside the real wall-clock bracket [${beforeFirstJobMs}, ${afterFirstJobMs}] this test captured around the job's actual run`
+      );
+      assert.ok(
+        ["pending", "captured", "unavailable"].includes(statusResult.identity_capture as string),
+        `expected status's identity_capture to be one of pending/captured/unavailable, got: ${JSON.stringify(statusResult.identity_capture)}`
+      );
 
-    const statusWithoutIdentityCapture = { ...statusResult };
-    delete statusWithoutIdentityCapture.identity_capture;
-    delete statusWithoutIdentityCapture.pid;
-    delete statusWithoutIdentityCapture.birth_identity;
-    assert.deepEqual(
-      withTimestampFieldsChecked(statusWithoutIdentityCapture, ["started_at", "ended_at"]),
-      {
-        job_id: taskId,
-        state: "exited",
-        exit_code: 0,
-        signal: undefined,
-        diagnostic: undefined,
-        queue_position: undefined,
-        command_summary: path.basename(process.execPath),
-        label: "seven-tool-mint-rule",
-        counts: { stdout_lines: 1, stdout_bytes: 1, stderr_lines: 0, stderr_bytes: 0 },
-        kill_confirmed: true,
-        identity_confirmed: undefined,
-        escalation_refused_reason: undefined,
-      },
-      `expected status's response to deep-equal its real, complete values, not just the right key set - got: ${JSON.stringify(statusResult)}`
-    );
+      // pid/birth_identity (see src/tools/status.ts's StatusProjection) are
+      // status-only additive fields, sourced from the same real tracked
+      // child jobStore.getChildHandle exposes - this job DID get a live
+      // child (a real `node` process), so both must be present. pid is
+      // checked as a real positive OS pid; birth_identity's exact settled
+      // shape races the same async capture identity_capture already names
+      // above (still "pending", or already "captured" with a real
+      // platform-tagged identity payload, or "unavailable" if the capture
+      // genuinely failed) - checked for STRUCTURAL validity here (never a
+      // stray/malformed shape, and never a "captured" state missing its
+      // identity payload or a non-captured state carrying one), then both
+      // are excluded from the exact-literal comparison below for the same
+      // reason identity_capture is: genuinely outside this test's control.
+      assert.equal(
+        typeof statusResult.pid,
+        "number",
+        `expected status's pid to be a real number, got: ${JSON.stringify(statusResult.pid)}`
+      );
+      assert.ok(
+        (statusResult.pid as number) > 0,
+        `expected status's pid to be a positive OS pid, got: ${JSON.stringify(statusResult.pid)}`
+      );
+      const birthIdentity = statusResult.birth_identity as { state?: string; identity?: unknown };
+      assert.ok(
+        typeof birthIdentity === "object" &&
+          birthIdentity !== null &&
+          ["pending", "captured", "unavailable"].includes(birthIdentity.state as string),
+        `expected status's birth_identity.state to be one of pending/captured/unavailable, got: ${JSON.stringify(statusResult.birth_identity)}`
+      );
+      assert.equal(
+        "identity" in birthIdentity,
+        birthIdentity.state === "captured",
+        `expected birth_identity to carry an "identity" payload if and only if its state is "captured" - never a "pending"/"unavailable" state carrying one, and never a "captured" state missing one - got: ${JSON.stringify(statusResult.birth_identity)}`
+      );
+      if (birthIdentity.state === "captured") {
+        const identity = birthIdentity.identity as { platform?: string };
+        assert.ok(
+          identity.platform === "linux-starttime-ticks" || identity.platform === "posix-elapsed",
+          `expected a captured birth_identity's platform to be linux-starttime-ticks or posix-elapsed, got: ${JSON.stringify(identity)}`
+        );
+      }
 
-    const listResult = runResultStructured(
-      await pair.client.callTool({ name: "list", arguments: {} })
-    );
-    assert.deepEqual(
-      Object.keys(listResult).sort(),
-      ["concurrency_cap", "jobs"],
-      `expected list's response to deep-equal the real {jobs, concurrency_cap} key set exactly, got: ${JSON.stringify(Object.keys(listResult).sort())}`
-    );
-    const listedJobs = listResult.jobs as unknown[];
-    assert.ok(
-      Array.isArray(listedJobs),
-      `expected list's jobs field to be an array, got: ${JSON.stringify(listResult.jobs)}`
-    );
-    assert.ok(
-      carriesNoHandleTellTale(listedJobs),
-      `list's response must carry NONE of ${JSON.stringify(HANDLE_TELL_TALE_FIELDS)} anywhere, got: ${JSON.stringify(listedJobs)}`
-    );
-    const listedEntry = (listedJobs as Array<Record<string, unknown>>).find(
-      (job) => job.job_id === taskId
-    );
-    assert.ok(
-      listedEntry,
-      `expected list to include the minted, now-terminal job ${taskId}, got: ${JSON.stringify(listedJobs)}`
-    );
-    assert.deepEqual(
-      listedEntry,
-      {
-        job_id: taskId,
-        label: "seven-tool-mint-rule",
-        state: "exited",
-        started_at: statusResult.started_at,
-        queue_position: undefined,
-      },
-      `expected list's entry for the minted job to deep-equal its real, complete values - got: ${JSON.stringify(listedEntry)}`
-    );
+      const statusWithoutIdentityCapture = { ...statusResult };
+      delete statusWithoutIdentityCapture.identity_capture;
+      delete statusWithoutIdentityCapture.pid;
+      delete statusWithoutIdentityCapture.birth_identity;
+      assert.deepEqual(
+        withTimestampFieldsChecked(statusWithoutIdentityCapture, ["started_at", "ended_at"]),
+        {
+          job_id: taskId,
+          state: "exited",
+          exit_code: 0,
+          signal: undefined,
+          diagnostic: undefined,
+          queue_position: undefined,
+          command_summary: path.basename(process.execPath),
+          label: "seven-tool-mint-rule",
+          counts: { stdout_lines: 1, stdout_bytes: 1, stderr_lines: 0, stderr_bytes: 0 },
+          kill_confirmed: true,
+          identity_confirmed: undefined,
+          escalation_refused_reason: undefined,
+        },
+        `expected status's response to deep-equal its real, complete values, not just the right key set - got: ${JSON.stringify(statusResult)}`
+      );
 
-    const outputResult = runResultStructured(
-      await pair.client.callTool({ name: "output", arguments: { job_id: taskId } })
-    );
-    assert.ok(
-      carriesNoHandleTellTale(outputResult),
-      `output's response must carry NONE of ${JSON.stringify(HANDLE_TELL_TALE_FIELDS)} anywhere, got: ${JSON.stringify(outputResult)}`
-    );
-    assert.deepEqual(
-      outputResult,
-      { events: [{ seq: 1, stream: "stdout", text: "x", partial: true }], next_cursor: 1 },
-      `expected output's response to deep-equal its real, complete values exactly - got: ${JSON.stringify(outputResult)}`
-    );
+      const listResult = runResultStructured(
+        await pair.client.callTool({ name: "list", arguments: {} })
+      );
+      assert.deepEqual(
+        Object.keys(listResult).sort(),
+        ["concurrency_cap", "jobs"],
+        `expected list's response to deep-equal the real {jobs, concurrency_cap} key set exactly, got: ${JSON.stringify(Object.keys(listResult).sort())}`
+      );
+      const listedJobs = listResult.jobs as unknown[];
+      assert.ok(
+        Array.isArray(listedJobs),
+        `expected list's jobs field to be an array, got: ${JSON.stringify(listResult.jobs)}`
+      );
+      assert.ok(
+        carriesNoHandleTellTale(listedJobs),
+        `list's response must carry NONE of ${JSON.stringify(HANDLE_TELL_TALE_FIELDS)} anywhere, got: ${JSON.stringify(listedJobs)}`
+      );
+      const listedEntry = (listedJobs as Array<Record<string, unknown>>).find(
+        (job) => job.job_id === taskId
+      );
+      assert.ok(
+        listedEntry,
+        `expected list to include the minted, now-terminal job ${taskId}, got: ${JSON.stringify(listedJobs)}`
+      );
+      assert.deepEqual(
+        listedEntry,
+        {
+          job_id: taskId,
+          label: "seven-tool-mint-rule",
+          state: "exited",
+          started_at: statusResult.started_at,
+          queue_position: undefined,
+        },
+        `expected list's entry for the minted job to deep-equal its real, complete values - got: ${JSON.stringify(listedEntry)}`
+      );
 
-    const tailResult = runResultStructured(
-      await pair.client.callTool({ name: "tail", arguments: { job_id: taskId, n: 1 } })
-    );
-    assert.ok(
-      carriesNoHandleTellTale(tailResult),
-      `tail's response must carry NONE of ${JSON.stringify(HANDLE_TELL_TALE_FIELDS)} anywhere, got: ${JSON.stringify(tailResult)}`
-    );
-    assert.deepEqual(
-      tailResult,
-      outputResult,
-      `expected tail's response to deep-equal output's real response exactly for this single-line, now-terminal job - got: ${JSON.stringify(tailResult)}`
-    );
+      const outputResult = runResultStructured(
+        await pair.client.callTool({ name: "output", arguments: { job_id: taskId } })
+      );
+      assert.ok(
+        carriesNoHandleTellTale(outputResult),
+        `output's response must carry NONE of ${JSON.stringify(HANDLE_TELL_TALE_FIELDS)} anywhere, got: ${JSON.stringify(outputResult)}`
+      );
+      assert.deepEqual(
+        outputResult,
+        { events: [{ seq: 1, stream: "stdout", text: "x", partial: true }], next_cursor: 1 },
+        `expected output's response to deep-equal its real, complete values exactly - got: ${JSON.stringify(outputResult)}`
+      );
 
-    // follow, the seventh tool: on this same capable connection, against
-    // this same already-terminal job, it must stay exactly as plain as
-    // the other five - no minted handle, ever, regardless of capability
-    // (server.ts's tools/call dispatch only ever hands a result to the
-    // adapter when request.params.name === "run", so this is a structural
-    // guarantee, not merely an observed one). The job is already terminal,
-    // so this resolves via follow's own immediate-return path (no timer
-    // ever starts) rather than genuinely waiting out timeout_ms.
-    const followResult = runResultStructured(
-      await pair.client.callTool({
-        name: "follow",
-        arguments: { job_id: taskId, timeout_ms: 60_000 },
-      })
-    );
-    assert.ok(
-      carriesNoHandleTellTale(followResult),
-      `follow's response must carry NONE of ${JSON.stringify(HANDLE_TELL_TALE_FIELDS)} anywhere, got: ${JSON.stringify(followResult)}`
-    );
-    assert.equal(
-      followResult.reason,
-      "terminal",
-      `expected follow on this already-terminal job to return immediately via reason: "terminal" (never a 60s wait), got: ${JSON.stringify(followResult)}`
-    );
+      const tailResult = runResultStructured(
+        await pair.client.callTool({ name: "tail", arguments: { job_id: taskId, n: 1 } })
+      );
+      assert.ok(
+        carriesNoHandleTellTale(tailResult),
+        `tail's response must carry NONE of ${JSON.stringify(HANDLE_TELL_TALE_FIELDS)} anywhere, got: ${JSON.stringify(tailResult)}`
+      );
+      assert.deepEqual(
+        tailResult,
+        outputResult,
+        `expected tail's response to deep-equal output's real response exactly for this single-line, now-terminal job - got: ${JSON.stringify(tailResult)}`
+      );
 
-    const beforeSecondJobMs = Date.now();
-    const second = await mintJob(pair.client, {
-      command: [process.execPath, "-e", "setTimeout(() => {}, 60000);"],
-      label: "seven-tool-mint-rule-kill-target",
-    });
-    const secondTaskId = second.taskId as string;
-    await new Promise((resolve) => setTimeout(resolve, 50)); // let it actually start running
-    const killResult = runResultStructured(
-      await pair.client.callTool({ name: "kill", arguments: { job_id: secondTaskId } })
-    );
-    const afterKillMs = Date.now();
-    assert.deepEqual(
-      Object.keys(killResult).sort(),
-      PUBLIC_JOB_PROJECTION_KEYS,
-      `expected kill's response to deep-equal the real PublicJobProjection key set exactly, got: ${JSON.stringify(Object.keys(killResult).sort())}`
-    );
+      // follow, the seventh tool: on this same capable connection, against
+      // this same already-terminal job, it must stay exactly as plain as
+      // the other five - no minted handle, ever, regardless of capability
+      // (server.ts's tools/call dispatch only ever hands a result to the
+      // adapter when request.params.name === "run", so this is a structural
+      // guarantee, not merely an observed one). The job is already terminal,
+      // so this resolves via follow's own immediate-return path (no timer
+      // ever starts) rather than genuinely waiting out timeout_ms.
+      const followResult = runResultStructured(
+        await pair.client.callTool({
+          name: "follow",
+          arguments: { job_id: taskId, timeout_ms: 60_000 },
+        })
+      );
+      assert.ok(
+        carriesNoHandleTellTale(followResult),
+        `follow's response must carry NONE of ${JSON.stringify(HANDLE_TELL_TALE_FIELDS)} anywhere, got: ${JSON.stringify(followResult)}`
+      );
+      assert.equal(
+        followResult.reason,
+        "terminal",
+        `expected follow on this already-terminal job to return immediately via reason: "terminal" (never a 60s wait), got: ${JSON.stringify(followResult)}`
+      );
 
-    // The checks below read `killResult` - the FIRST, synchronously
-    // captured kill() response - directly, on purpose, never the later
-    // poll-settled one: `src/tools/kill.ts`'s own doc comment is explicit
-    // that the job's "killed" state (and, with it, started_at/ended_at,
-    // which are only ever touched by a real state transition) is reported
-    // SYNCHRONOUSLY, at kill-time, regardless of when the separate async
-    // `kill_confirmed`/`identity_confirmed` confirmation later lands. So
-    // this wall-clock bracket - captured around this FIRST call alone -
-    // stays the right one to check against even though the poll below can
-    // take real additional time afterward: nothing it does changes
-    // started_at/ended_at, only kill_confirmed.
-    assert.ok(
-      Date.parse(killResult.ended_at as string) >= Date.parse(killResult.started_at as string),
-      `expected kill's ended_at (${JSON.stringify(killResult.ended_at)}) to be at or after started_at (${JSON.stringify(killResult.started_at)})`
-    );
-    const killStartedAtMs = Date.parse(killResult.started_at as string);
-    const killEndedAtMs = Date.parse(killResult.ended_at as string);
-    assert.ok(
-      killStartedAtMs >= beforeSecondJobMs && killStartedAtMs <= afterKillMs,
-      `expected kill's started_at (${JSON.stringify(killResult.started_at)}) to fall inside the real wall-clock bracket [${beforeSecondJobMs}, ${afterKillMs}] this test captured around the killed job's actual run`
-    );
-    assert.ok(
-      killEndedAtMs >= beforeSecondJobMs && killEndedAtMs <= afterKillMs,
-      `expected kill's ended_at (${JSON.stringify(killResult.ended_at)}) to fall inside the real wall-clock bracket [${beforeSecondJobMs}, ${afterKillMs}] this test captured around the killed job's actual run`
-    );
-    // identity_confirmed/identity_capture are read from the same FIRST
-    // `killResult` too - this test has never observed these two flaking
-    // the way kill_confirmed does, and they are excluded from the final
-    // deep-equal below anyway (deleted before the comparison, exactly as
-    // before), so there is nothing riding on their exact settle timing
-    // here.
-    assert.equal(
-      typeof killResult.identity_confirmed,
-      "boolean",
-      `expected kill's identity_confirmed to be present as a boolean once terminal, got: ${JSON.stringify(killResult.identity_confirmed)}`
-    );
-    assert.ok(
-      ["pending", "captured", "unavailable"].includes(killResult.identity_capture as string),
-      `expected kill's identity_capture to be one of pending/captured/unavailable, got: ${JSON.stringify(killResult.identity_capture)}`
-    );
-
-    // THE FIX: `kill_confirmed` is written by an async confirmation
-    // callback inside kill's OWN implementation (see
-    // `pollUntilKillConfirmed`'s own doc comment above, and
-    // `src/tools/kill.ts`'s doc comment on the field itself) - the write
-    // can genuinely lag this call's own promise resolution by real
-    // event-loop scheduling latency, so `killResult.kill_confirmed` above
-    // can legitimately still read `undefined` on a loaded CI runner even
-    // though every OTHER field checked above is already final. Poll
-    // (via repeated, idempotent `kill` calls against the same job_id -
-    // never a second signal, see the poll helper's own docs) until it has
-    // actually settled, and use THAT settled response - never the
-    // original `killResult` - for the exact-value comparison below, which
-    // is the one assertion that actually depends on kill_confirmed's real
-    // value.
-    const confirmedKillResult = await pollUntilKillConfirmed(pair.client, secondTaskId);
-    const killResultWithoutIdentityFields = { ...confirmedKillResult };
-    delete killResultWithoutIdentityFields.identity_confirmed;
-    delete killResultWithoutIdentityFields.identity_capture;
-    // `counts` below needs no `pollUntilCountsSettled`-style wait, unlike
-    // the first job above: this job's own command
-    // (`setTimeout(() => {}, 60000)`) never writes a single byte to either
-    // stream for its whole life, so `linesEverMaterialized`/
-    // `bytesEverReceived` (see `pollUntilCountsSettled`'s own docs) start
-    // at their all-zero initial value and have nothing to ever
-    // materialize - there is no async output-arrival path in flight here
-    // for a poll to race, only the SIGTERM handling's own kill_confirmed
-    // gap this poll already covers.
-    assert.deepEqual(
-      withTimestampFieldsChecked(killResultWithoutIdentityFields, ["started_at", "ended_at"]),
-      {
-        job_id: secondTaskId,
-        state: "killed",
-        exit_code: undefined,
-        signal: "SIGTERM",
-        diagnostic: undefined,
-        queue_position: undefined,
-        command_summary: path.basename(process.execPath),
+      const beforeSecondJobMs = Date.now();
+      const second = await mintJob(pair.client, {
+        command: [process.execPath, "-e", "setTimeout(() => {}, 60000);"],
         label: "seven-tool-mint-rule-kill-target",
-        counts: { stdout_lines: 0, stdout_bytes: 0, stderr_lines: 0, stderr_bytes: 0 },
-        kill_confirmed: true,
-        escalation_refused_reason: undefined,
-      },
-      `expected kill's response to deep-equal its real, complete values, not just the right key set - got: ${JSON.stringify(confirmedKillResult)}`
-    );
-  } finally {
-    await pair.close();
-  }
-});
-
-// ---------------------------------------------------------------------------
-// A deterministic, simulated stand-in for verification against a real
-// Tasks-capable host - that verification needs an actual external client
-// and is not exercised here. A SIMULATED Tasks-capable client observes the
-// FULL negotiate -> unsolicited-handle -> tasks/get sequence, and this test
-// fails closed (throws) if any step in that sequence is skipped or silently
-// absent, so a hollow fixture could never masquerade as this proof.
-// ---------------------------------------------------------------------------
-
-test("simulated Tasks-capable host: negotiate -> unsolicited handle -> tasks/get poll, every step observed and none skippable", async () => {
-  const pair = await startPair(true);
-  try {
-    const serverCapabilities = pair.client.getServerCapabilities();
-    const negotiated = Boolean(serverCapabilities?.extensions?.[TASKS_EXTENSION_URI]);
-    if (!negotiated) {
-      throw new Error(
-        "simulated host: negotiation step failed - server never advertised the Tasks extension"
+      });
+      const secondTaskId = second.taskId as string;
+      await new Promise((resolve) => setTimeout(resolve, 50)); // let it actually start running
+      const killResult = runResultStructured(
+        await pair.client.callTool({ name: "kill", arguments: { job_id: secondTaskId } })
       );
-    }
-
-    const minted = await mintJob(pair.client, { label: "simulated-host-e2e" });
-    if (typeof minted.taskId !== "string") {
-      throw new Error(
-        `simulated host: unsolicited-handle step failed - expected a minted CreateTaskResult, got ${JSON.stringify(minted)}`
+      const afterKillMs = Date.now();
+      assert.deepEqual(
+        Object.keys(killResult).sort(),
+        PUBLIC_JOB_PROJECTION_KEYS,
+        `expected kill's response to deep-equal the real PublicJobProjection key set exactly, got: ${JSON.stringify(Object.keys(killResult).sort())}`
       );
-    }
-    const taskId = minted.taskId;
 
-    await pollUntilTerminal(pair.client, taskId);
-    const finalTask = await tasksRequest(pair.client, "tasks/get", taskId);
-    if (finalTask.status !== "completed") {
-      throw new Error(
-        `simulated host: tasks/get poll step failed - expected a completed task, got ${JSON.stringify(finalTask)}`
+      // The checks below read `killResult` - the FIRST, synchronously
+      // captured kill() response - directly, on purpose, never the later
+      // poll-settled one: `src/tools/kill.ts`'s own doc comment is explicit
+      // that the job's "killed" state (and, with it, started_at/ended_at,
+      // which are only ever touched by a real state transition) is reported
+      // SYNCHRONOUSLY, at kill-time, regardless of when the separate async
+      // `kill_confirmed`/`identity_confirmed` confirmation later lands. So
+      // this wall-clock bracket - captured around this FIRST call alone -
+      // stays the right one to check against even though the poll below can
+      // take real additional time afterward: nothing it does changes
+      // started_at/ended_at, only kill_confirmed.
+      assert.ok(
+        Date.parse(killResult.ended_at as string) >= Date.parse(killResult.started_at as string),
+        `expected kill's ended_at (${JSON.stringify(killResult.ended_at)}) to be at or after started_at (${JSON.stringify(killResult.started_at)})`
       );
+      const killStartedAtMs = Date.parse(killResult.started_at as string);
+      const killEndedAtMs = Date.parse(killResult.ended_at as string);
+      assert.ok(
+        killStartedAtMs >= beforeSecondJobMs && killStartedAtMs <= afterKillMs,
+        `expected kill's started_at (${JSON.stringify(killResult.started_at)}) to fall inside the real wall-clock bracket [${beforeSecondJobMs}, ${afterKillMs}] this test captured around the killed job's actual run`
+      );
+      assert.ok(
+        killEndedAtMs >= beforeSecondJobMs && killEndedAtMs <= afterKillMs,
+        `expected kill's ended_at (${JSON.stringify(killResult.ended_at)}) to fall inside the real wall-clock bracket [${beforeSecondJobMs}, ${afterKillMs}] this test captured around the killed job's actual run`
+      );
+      // identity_confirmed/identity_capture are read from the same FIRST
+      // `killResult` too - this test has never observed these two flaking
+      // the way kill_confirmed does, and they are excluded from the final
+      // deep-equal below anyway (deleted before the comparison, exactly as
+      // before), so there is nothing riding on their exact settle timing
+      // here.
+      assert.equal(
+        typeof killResult.identity_confirmed,
+        "boolean",
+        `expected kill's identity_confirmed to be present as a boolean once terminal, got: ${JSON.stringify(killResult.identity_confirmed)}`
+      );
+      assert.ok(
+        ["pending", "captured", "unavailable"].includes(killResult.identity_capture as string),
+        `expected kill's identity_capture to be one of pending/captured/unavailable, got: ${JSON.stringify(killResult.identity_capture)}`
+      );
+
+      // THE FIX: `kill_confirmed` is written by an async confirmation
+      // callback inside kill's OWN implementation (see
+      // `pollUntilKillConfirmed`'s own doc comment above, and
+      // `src/tools/kill.ts`'s doc comment on the field itself) - the write
+      // can genuinely lag this call's own promise resolution by real
+      // event-loop scheduling latency, so `killResult.kill_confirmed` above
+      // can legitimately still read `undefined` on a loaded CI runner even
+      // though every OTHER field checked above is already final. Poll
+      // (via repeated, idempotent `kill` calls against the same job_id -
+      // never a second signal, see the poll helper's own docs) until it has
+      // actually settled, and use THAT settled response - never the
+      // original `killResult` - for the exact-value comparison below, which
+      // is the one assertion that actually depends on kill_confirmed's real
+      // value.
+      const confirmedKillResult = await pollUntilKillConfirmed(pair.client, secondTaskId);
+      const killResultWithoutIdentityFields = { ...confirmedKillResult };
+      delete killResultWithoutIdentityFields.identity_confirmed;
+      delete killResultWithoutIdentityFields.identity_capture;
+      // `counts` below needs no `pollUntilCountsSettled`-style wait, unlike
+      // the first job above: this job's own command
+      // (`setTimeout(() => {}, 60000)`) never writes a single byte to either
+      // stream for its whole life, so `linesEverMaterialized`/
+      // `bytesEverReceived` (see `pollUntilCountsSettled`'s own docs) start
+      // at their all-zero initial value and have nothing to ever
+      // materialize - there is no async output-arrival path in flight here
+      // for a poll to race, only the SIGTERM handling's own kill_confirmed
+      // gap this poll already covers.
+      assert.deepEqual(
+        withTimestampFieldsChecked(killResultWithoutIdentityFields, ["started_at", "ended_at"]),
+        {
+          job_id: secondTaskId,
+          state: "killed",
+          exit_code: undefined,
+          signal: "SIGTERM",
+          diagnostic: undefined,
+          queue_position: undefined,
+          command_summary: path.basename(process.execPath),
+          label: "seven-tool-mint-rule-kill-target",
+          counts: { stdout_lines: 0, stdout_bytes: 0, stderr_lines: 0, stderr_bytes: 0 },
+          kill_confirmed: true,
+          escalation_refused_reason: undefined,
+        },
+        `expected kill's response to deep-equal its real, complete values, not just the right key set - got: ${JSON.stringify(confirmedKillResult)}`
+      );
+    } finally {
+      await pair.close();
     }
+  });
+}); // end describe("spawning tests: seven-tool mint rule (run mints, every other tool stays plain)")
 
-    assert.equal(negotiated, true);
-    assert.equal(typeof taskId, "string");
-    assert.equal(finalTask.status, "completed");
-  } finally {
-    await pair.close();
-  }
-});
+describe("spawning tests: simulated end-to-end host proof and the poll-interval hint", () => {
+  before(requireSpawnPolicy);
 
-test("the poll interval hint is a positive, stable constant on every minted/live result", async () => {
-  const pair = await startPair(true);
-  try {
-    const minted = await mintJob(pair.client, { label: "poll-interval-hint" });
-    assert.equal(minted.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS);
-    assert.ok((minted.pollIntervalMs as number) > 0);
-  } finally {
-    await pair.close();
-  }
-});
+  // ---------------------------------------------------------------------------
+  // A deterministic, simulated stand-in for verification against a real
+  // Tasks-capable host - that verification needs an actual external client
+  // and is not exercised here. A SIMULATED Tasks-capable client observes the
+  // FULL negotiate -> unsolicited-handle -> tasks/get sequence, and this test
+  // fails closed (throws) if any step in that sequence is skipped or silently
+  // absent, so a hollow fixture could never masquerade as this proof.
+  // ---------------------------------------------------------------------------
+
+  test("simulated Tasks-capable host: negotiate -> unsolicited handle -> tasks/get poll, every step observed and none skippable", async () => {
+    const pair = await startPair(true);
+    try {
+      const serverCapabilities = pair.client.getServerCapabilities();
+      const negotiated = Boolean(serverCapabilities?.extensions?.[TASKS_EXTENSION_URI]);
+      if (!negotiated) {
+        throw new Error(
+          "simulated host: negotiation step failed - server never advertised the Tasks extension"
+        );
+      }
+
+      const minted = await mintJob(pair.client, { label: "simulated-host-e2e" });
+      if (typeof minted.taskId !== "string") {
+        throw new Error(
+          `simulated host: unsolicited-handle step failed - expected a minted CreateTaskResult, got ${JSON.stringify(minted)}`
+        );
+      }
+      const taskId = minted.taskId;
+
+      await pollUntilTerminal(pair.client, taskId);
+      const finalTask = await tasksRequest(pair.client, "tasks/get", taskId);
+      if (finalTask.status !== "completed") {
+        throw new Error(
+          `simulated host: tasks/get poll step failed - expected a completed task, got ${JSON.stringify(finalTask)}`
+        );
+      }
+
+      assert.equal(negotiated, true);
+      assert.equal(typeof taskId, "string");
+      assert.equal(finalTask.status, "completed");
+    } finally {
+      await pair.close();
+    }
+  });
+
+  test("the poll interval hint is a positive, stable constant on every minted/live result", async () => {
+    const pair = await startPair(true);
+    try {
+      const minted = await mintJob(pair.client, { label: "poll-interval-hint" });
+      assert.equal(minted.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS);
+      assert.ok((minted.pollIntervalMs as number) > 0);
+    } finally {
+      await pair.close();
+    }
+  });
+}); // end describe("spawning tests: simulated end-to-end host proof and the poll-interval hint")
 
 // ---------------------------------------------------------------------------
 // A completeness sweep: every tracked behavioral commitment this capability

@@ -13,9 +13,12 @@ import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/sp
 import { parsesAsPgid, waitForFile } from "./harness.ts";
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 
-// Every test in this file spawns a real server subprocess and runs real
-// jobs through it - see test/helpers/requireSpawnPolicy.ts for what this
-// checks and why.
+// Most tests in this file spawn a real job through the real `run` tool -
+// via a real spawned server subprocess or an in-memory transport - see
+// test/helpers/requireSpawnPolicy.ts for what this checks and why. The
+// three plain-signal tests below (SIGTERM/SIGINT/stdin EOF reaching the
+// cleanup path) and the mutation control just after them spawn a process
+// but never dispatch `run`.
 before(requireSpawnPolicy);
 
 // Real client, real IN-PROCESS transport, real server - only the one test

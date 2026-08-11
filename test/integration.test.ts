@@ -38,8 +38,14 @@ import {
 } from "./harness.ts";
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 
-// Every test in this file spawns real jobs through real server subprocesses
-// - see test/helpers/requireSpawnPolicy.ts for what this checks and why.
+// Most tests in this file spawn a real job through the real `run` tool,
+// over the real MCP wire via a spawned server subprocess - see
+// test/helpers/requireSpawnPolicy.ts for what this checks and why. The
+// three "Windows mapping" tests at the end of this file spawn nothing:
+// two are pure source-text checks against src/tools/kill.ts and
+// src/server.ts, and the third exercises jobStore's own
+// platform-independent bookkeeping directly (imported from
+// dist/jobStore.js), never calling the `run` tool or a spawned server.
 before(requireSpawnPolicy);
 
 // The three tests below build real, multi-descendant process trees via

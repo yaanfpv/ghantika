@@ -86,8 +86,12 @@ import {
 
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 
-// Every test in this file mints a real job through the real `run` tool -
-// see test/helpers/requireSpawnPolicy.ts for what this checks and why.
+// Most tests in this file mint a real job through the real `run` tool -
+// see test/helpers/requireSpawnPolicy.ts for what this checks and why. The
+// TTL-stranded-slot test below, and the output-arrival seam's own low-
+// level mechanics tests (multi-line/split-chunk/stream-end/unsubscribe/
+// isolation), drive jobStore directly against a synthetic record instead -
+// no real backing process at all.
 before(requireSpawnPolicy);
 
 // ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { before, test } from "node:test";
+import { before, describe, test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/client";
 import { InMemoryTransport } from "@modelcontextprotocol/server";
@@ -51,9 +51,15 @@ import * as statusTool from "../dist/tools/status.js";
 
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 
-// Every test in this file spawns a real job through the real `run` tool -
-// see test/helpers/requireSpawnPolicy.ts for what this checks and why.
-before(requireSpawnPolicy);
+// The tests below that genuinely spawn a real job through the real `run`
+// tool's handler (or a real in-process server) are grouped into their own
+// `describe()` blocks, each scoped with its own local
+// `before(requireSpawnPolicy)` call - see test/helpers/requireSpawnPolicy.ts
+// for what this checks and why. The tests that drive a fresh `JobStore`
+// instance directly through `requestSlot`/`enqueueJob`/`releaseSlot`
+// exercise the pure admission/queue contract instead, and never spawn a
+// real process, so they stay outside any such `describe()` block,
+// unaffected by the guard.
 
 // ---------------------------------------------------------------------------
 // Small local helpers
@@ -193,99 +199,107 @@ test('loadConcurrencyConfigFromEnv falls back to the documented defaults when th
 // boundaries
 // ---------------------------------------------------------------------------
 
-test("run() rejects fail-fast, without blocking, once the concurrency cap and queue are both full - including the cap=0 and max-queue-depth=0 boundaries", async () => {
-  // A store with no explicit config uses the environment-sourced
-  // default, which must itself be >= 1 (never 0) - a freshly-started
-  // server can run something out of the box.
-  {
-    const store = new JobStore();
-    assert.deepEqual(store.requestSlot(), { kind: "admit" });
-  }
+describe("overflow: fail-fast rejection (real run() tool)", () => {
+  before(requireSpawnPolicy);
 
-  // The general overflow case with a normal (>= 1) cap and some real
-  // queue depth: admits up to the cap, queues up to the depth, rejects
-  // beyond that. `requestSlot()` alone only ever DECIDES - the queue's
-  // own length (what the NEXT decision actually sees) only changes once
-  // the caller follows up with `enqueueJob`, exactly as the real
-  // `run()` handler does - see `JobStore.requestSlot`'s own docs.
-  {
-    const store = new JobStore({ maxConcurrentJobs: 1, maxQueueDepth: 1 });
-    assert.deepEqual(store.requestSlot(), { kind: "admit" });
-    const queuedJob = store.createJob({ argv: ["b"], cwd: "/tmp", env: {}, isShell: false });
-    assert.deepEqual(store.requestSlot(), { kind: "queue" });
-    store.enqueueJob(queuedJob.job_id, () => {});
-    const rejected = store.requestSlot();
-    assert.equal(rejected.kind, "reject");
-    assert.equal((rejected as { reason: string }).reason, "queue-full");
-  }
+  test("run() rejects fail-fast, without blocking, once the concurrency cap and queue are both full - including the cap=0 and max-queue-depth=0 boundaries", async () => {
+    // A store with no explicit config uses the environment-sourced
+    // default, which must itself be >= 1 (never 0) - a freshly-started
+    // server can run something out of the box.
+    {
+      const store = new JobStore();
+      assert.deepEqual(store.requestSlot(), { kind: "admit" });
+    }
 
-  // Boundary: cap = 0 rejects EVERY job outright, even with a real
-  // queue depth configured - "no capacity at all" is permanent, never a
-  // transient "queue it and wait forever."
-  {
-    const store = new JobStore({ maxConcurrentJobs: 0, maxQueueDepth: 5 });
-    const rejected = store.requestSlot();
-    assert.equal(rejected.kind, "reject");
-    assert.equal((rejected as { reason: string }).reason, "no-capacity");
-    assert.equal(store.getQueueLength(), 0, "cap=0 must never queue anything, ever");
-  }
+    // The general overflow case with a normal (>= 1) cap and some real
+    // queue depth: admits up to the cap, queues up to the depth, rejects
+    // beyond that. `requestSlot()` alone only ever DECIDES - the queue's
+    // own length (what the NEXT decision actually sees) only changes once
+    // the caller follows up with `enqueueJob`, exactly as the real
+    // `run()` handler does - see `JobStore.requestSlot`'s own docs.
+    {
+      const store = new JobStore({ maxConcurrentJobs: 1, maxQueueDepth: 1 });
+      assert.deepEqual(store.requestSlot(), { kind: "admit" });
+      const queuedJob = store.createJob({ argv: ["b"], cwd: "/tmp", env: {}, isShell: false });
+      assert.deepEqual(store.requestSlot(), { kind: "queue" });
+      store.enqueueJob(queuedJob.job_id, () => {});
+      const rejected = store.requestSlot();
+      assert.equal(rejected.kind, "reject");
+      assert.equal((rejected as { reason: string }).reason, "queue-full");
+    }
 
-  // Boundary: max-queue-depth = 0 means no queue at all - a second
-  // concurrent arrival, while the cap's one slot is held, is rejected
-  // immediately, never queued.
-  {
-    const store = new JobStore({ maxConcurrentJobs: 1, maxQueueDepth: 0 });
-    assert.deepEqual(store.requestSlot(), { kind: "admit" });
-    const rejected = store.requestSlot();
-    assert.equal(rejected.kind, "reject");
-    assert.equal((rejected as { reason: string }).reason, "queue-full");
-    assert.equal(store.getQueueLength(), 0);
-  }
+    // Boundary: cap = 0 rejects EVERY job outright, even with a real
+    // queue depth configured - "no capacity at all" is permanent, never a
+    // transient "queue it and wait forever."
+    {
+      const store = new JobStore({ maxConcurrentJobs: 0, maxQueueDepth: 5 });
+      const rejected = store.requestSlot();
+      assert.equal(rejected.kind, "reject");
+      assert.equal((rejected as { reason: string }).reason, "no-capacity");
+      assert.equal(store.getQueueLength(), 0, "cap=0 must never queue anything, ever");
+    }
 
-  // The real run() tool, wired to the shared singleton: cap=1,
-  // max-queue-depth=0.
-  jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 0 });
-  let firstJobId: string | undefined;
-  try {
-    const beforeFirst = Date.now();
-    const first = runTool.handler({
-      command: ["sleep", "30"],
-      label: "concurrency-overflow-first-job",
-    });
-    const firstElapsed = Date.now() - beforeFirst;
-    assert.notEqual(first.isError, true);
-    const firstStructured = structured(first);
-    firstJobId = firstStructured.job_id as string;
-    assert.ok(["starting", "running"].includes(firstStructured.state as string));
-    assert.ok(firstElapsed < 1000, `run() must return instantly, took ${firstElapsed}ms`);
+    // Boundary: max-queue-depth = 0 means no queue at all - a second
+    // concurrent arrival, while the cap's one slot is held, is rejected
+    // immediately, never queued.
+    {
+      const store = new JobStore({ maxConcurrentJobs: 1, maxQueueDepth: 0 });
+      assert.deepEqual(store.requestSlot(), { kind: "admit" });
+      const rejected = store.requestSlot();
+      assert.equal(rejected.kind, "reject");
+      assert.equal((rejected as { reason: string }).reason, "queue-full");
+      assert.equal(store.getQueueLength(), 0);
+    }
 
-    const beforeSecond = Date.now();
-    const second = runTool.handler({
-      command: ["sleep", "30"],
-      label: "concurrency-overflow-second-job",
-    });
-    const secondElapsed = Date.now() - beforeSecond;
-    assert.equal(
-      second.isError,
-      true,
-      "cap full + max-queue-depth 0 must reject fail-fast, never queue or block"
-    );
-    assert.equal(structured(second).reason, "queue-full");
-    assert.equal(structured(second).job_id, undefined, "a rejected run() must never create a job");
-    assert.ok(
-      secondElapsed < 1000,
-      `a rejected run() must also return instantly, took ${secondElapsed}ms`
-    );
+    // The real run() tool, wired to the shared singleton: cap=1,
+    // max-queue-depth=0.
+    jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 0 });
+    let firstJobId: string | undefined;
+    try {
+      const beforeFirst = Date.now();
+      const first = runTool.handler({
+        command: ["sleep", "30"],
+        label: "concurrency-overflow-first-job",
+      });
+      const firstElapsed = Date.now() - beforeFirst;
+      assert.notEqual(first.isError, true);
+      const firstStructured = structured(first);
+      firstJobId = firstStructured.job_id as string;
+      assert.ok(["starting", "running"].includes(firstStructured.state as string));
+      assert.ok(firstElapsed < 1000, `run() must return instantly, took ${firstElapsed}ms`);
 
-    const jobs = structured(listTool.handler()).jobs as Array<Record<string, unknown>>;
-    assert.equal(
-      jobs.some((j) => j.label === "concurrency-overflow-second-job"),
-      false,
-      "a rejected run() must never appear in list()'s output"
-    );
-  } finally {
-    await cleanUpSharedJobs(firstJobId ? [firstJobId] : []);
-  }
+      const beforeSecond = Date.now();
+      const second = runTool.handler({
+        command: ["sleep", "30"],
+        label: "concurrency-overflow-second-job",
+      });
+      const secondElapsed = Date.now() - beforeSecond;
+      assert.equal(
+        second.isError,
+        true,
+        "cap full + max-queue-depth 0 must reject fail-fast, never queue or block"
+      );
+      assert.equal(structured(second).reason, "queue-full");
+      assert.equal(
+        structured(second).job_id,
+        undefined,
+        "a rejected run() must never create a job"
+      );
+      assert.ok(
+        secondElapsed < 1000,
+        `a rejected run() must also return instantly, took ${secondElapsed}ms`
+      );
+
+      const jobs = structured(listTool.handler()).jobs as Array<Record<string, unknown>>;
+      assert.equal(
+        jobs.some((j) => j.label === "concurrency-overflow-second-job"),
+        false,
+        "a rejected run() must never appear in list()'s output"
+      );
+    } finally {
+      await cleanUpSharedJobs(firstJobId ? [firstJobId] : []);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -359,128 +373,132 @@ test("FIFO admission with insertion-sequence tie-break; a dequeue spawn failure 
 // Exactly-once slot release tied to the awaited reap, and shutdown drain
 // ---------------------------------------------------------------------------
 
-test("a slot releases only after the finishing job's reap has been awaited to completion (a slow reap never releases early); shutdown kills queued jobs and drains the queue deterministically", async () => {
-  // --- Exactly-once release, tied to the awaited reap ---
-  {
-    const store = new JobStore({ maxConcurrentJobs: 1, maxQueueDepth: 1 });
-    const a = store.createJob({ argv: ["a"], cwd: "/tmp", env: {}, isShell: false });
-    assert.deepEqual(store.requestSlot(), { kind: "admit" });
-    const b = store.createJob({ argv: ["b"], cwd: "/tmp", env: {}, isShell: false });
-    assert.deepEqual(store.requestSlot(), { kind: "queue" });
-    let dequeued = false;
-    store.enqueueJob(b.job_id, () => {
-      dequeued = true;
-    });
+describe("exactly-once slot release / shutdown drain (real server)", () => {
+  before(requireSpawnPolicy);
 
-    let resolveReap: (decision: ReapReleaseDecision) => void = () => {};
-    const slowReap = new Promise<ReapReleaseDecision>((resolve) => {
-      resolveReap = resolve;
-    });
+  test("a slot releases only after the finishing job's reap has been awaited to completion (a slow reap never releases early); shutdown kills queued jobs and drains the queue deterministically", async () => {
+    // --- Exactly-once release, tied to the awaited reap ---
+    {
+      const store = new JobStore({ maxConcurrentJobs: 1, maxQueueDepth: 1 });
+      const a = store.createJob({ argv: ["a"], cwd: "/tmp", env: {}, isShell: false });
+      assert.deepEqual(store.requestSlot(), { kind: "admit" });
+      const b = store.createJob({ argv: ["b"], cwd: "/tmp", env: {}, isShell: false });
+      assert.deepEqual(store.requestSlot(), { kind: "queue" });
+      let dequeued = false;
+      store.enqueueJob(b.job_id, () => {
+        dequeued = true;
+      });
 
-    // Fire-and-forget, exactly like run.ts's own onExit wiring - never
-    // awaited by its own caller.
-    const releasePromise = store.releaseSlot(a.job_id, slowReap);
+      let resolveReap: (decision: ReapReleaseDecision) => void = () => {};
+      const slowReap = new Promise<ReapReleaseDecision>((resolve) => {
+        resolveReap = resolve;
+      });
 
-    // Give the event loop several real turns - a slow reap that has NOT
-    // resolved yet must NOT have released the slot early, however many
-    // turns pass.
-    for (let i = 0; i < 5; i += 1) {
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-    assert.equal(dequeued, false, "the slot must not release before its reap resolves");
-    assert.equal(store.getActiveSlotCount(), 1, "a's slot must still read as held");
-    assert.equal(store.get(b.job_id)!.queue_position, 1, "b must still be queued");
+      // Fire-and-forget, exactly like run.ts's own onExit wiring - never
+      // awaited by its own caller.
+      const releasePromise = store.releaseSlot(a.job_id, slowReap);
 
-    // Now let the reap actually finish, CONFIRMED - the release must
-    // complete exactly then.
-    resolveReap("confirmed");
-    await releasePromise;
-    assert.equal(dequeued, true, "the slot must release once its reap has genuinely resolved");
-    assert.equal(store.get(b.job_id)!.queue_position, undefined);
-    assert.equal(store.getActiveSlotCount(), 1, "b now holds the one and only slot");
-  }
+      // Give the event loop several real turns - a slow reap that has NOT
+      // resolved yet must NOT have released the slot early, however many
+      // turns pass.
+      for (let i = 0; i < 5; i += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.equal(dequeued, false, "the slot must not release before its reap resolves");
+      assert.equal(store.getActiveSlotCount(), 1, "a's slot must still read as held");
+      assert.equal(store.get(b.job_id)!.queue_position, 1, "b must still be queued");
 
-  // --- Shutdown kills queued jobs and drains the queue deterministically ---
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const instance = createServer(serverTransport);
-  await instance.server.connect(instance.transport);
-  const client = new Client({ name: "ghantika-concurrency-shutdown-test", version: "0.0.0" });
-  await client.connect(clientTransport);
-
-  jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 2 });
-  // Hoisted above the try - the finally block below needs it too, to clean
-  // up the concurrency slot shutdown's own live-job reap never releases
-  // (see that block's own docs).
-  let runningJobId: string | undefined;
-  try {
-    const running = (await client.callTool({
-      name: "run",
-      arguments: { command: ["sleep", "30"], label: "concurrency-shutdown-running-job" },
-    })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
-    assert.notEqual(running.isError, true);
-    runningJobId = running.structuredContent?.job_id as string;
-    assert.ok(["starting", "running"].includes(running.structuredContent?.state as string));
-
-    const queued = (await client.callTool({
-      name: "run",
-      arguments: { command: ["sleep", "30"], label: "concurrency-shutdown-queued-job" },
-    })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
-    assert.notEqual(queued.isError, true);
-    const queuedJobId = queued.structuredContent?.job_id as string;
-    assert.equal(queued.structuredContent?.state, "starting");
-    assert.equal(queued.structuredContent?.queue_position, 1);
-    assert.equal(jobStore.getQueueLength(), 1);
-
-    await client.close();
-    await instance.shutdown("test cleanup - concurrency queue drain");
-
-    const queuedAfterShutdown = jobStore.get(queuedJobId)!;
-    assert.equal(
-      queuedAfterShutdown.state,
-      "killed",
-      "a still-queued job must be killed on shutdown, never left in starting forever"
-    );
-    assert.equal(queuedAfterShutdown.queue_position, undefined);
-    assert.equal(jobStore.getQueueLength(), 0, "the queue must be fully drained after shutdown");
-    assert.notEqual(
-      jobStore.get(runningJobId),
-      undefined,
-      "the running job's own record is untouched by the queue drain"
-    );
-
-    // A second drain is a genuine no-op - deterministic, idempotent.
-    jobStore.drainQueueOnShutdown();
-    assert.equal(jobStore.getQueueLength(), 0);
-  } finally {
-    // src/server.ts's real shutdown reap kills a still-LIVE job's real
-    // process and marks its record terminal, but - unlike an ordinary
-    // kill() call - never releases its concurrency SLOT (a real
-    // production server always exits its whole process right after
-    // shutdown, so a leaked activeSlots count in a process about to die
-    // has no real consequence there; it only matters here, on the
-    // shared jobStore singleton every later test in this file reuses).
-    // A follow-up kill() call against the now-terminal record is the
-    // correct cleanup - src/tools/kill.ts's own late-recovery branch
-    // (kill.ts's own docs) sees the shutdown reap's already-attempted,
-    // already-confirmed outcome and calls releaseSlot for exactly this
-    // case, the same path a caller retrying kill() after a genuine
-    // stranding would take. Guarded on runningJobId actually having been
-    // assigned - the try block above could in principle throw before
-    // reaching that assignment.
-    if (runningJobId !== undefined) {
-      await killTool.handler({ job_id: runningJobId });
-      await waitUntil(() => jobStore.getActiveSlotCount() === 0);
+      // Now let the reap actually finish, CONFIRMED - the release must
+      // complete exactly then.
+      resolveReap("confirmed");
+      await releasePromise;
+      assert.equal(dequeued, true, "the slot must release once its reap has genuinely resolved");
+      assert.equal(store.get(b.job_id)!.queue_position, undefined);
+      assert.equal(store.getActiveSlotCount(), 1, "b now holds the one and only slot");
     }
 
-    // The real shutdown() call above closed the shared jobStore
-    // singleton's admission gate for good (JobStore.beginShutdown is
-    // permanent by design). Reopen it directly so the LATER tests in
-    // this file - which never construct a fresh createServer() of their
-    // own, the one place that gate is otherwise reset - can still
-    // exercise requestSlot() normally.
-    jobStore.clearShutdownGate();
-    jobStore.drainQueueOnShutdown();
-  }
+    // --- Shutdown kills queued jobs and drains the queue deterministically ---
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const instance = createServer(serverTransport);
+    await instance.server.connect(instance.transport);
+    const client = new Client({ name: "ghantika-concurrency-shutdown-test", version: "0.0.0" });
+    await client.connect(clientTransport);
+
+    jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 2 });
+    // Hoisted above the try - the finally block below needs it too, to clean
+    // up the concurrency slot shutdown's own live-job reap never releases
+    // (see that block's own docs).
+    let runningJobId: string | undefined;
+    try {
+      const running = (await client.callTool({
+        name: "run",
+        arguments: { command: ["sleep", "30"], label: "concurrency-shutdown-running-job" },
+      })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
+      assert.notEqual(running.isError, true);
+      runningJobId = running.structuredContent?.job_id as string;
+      assert.ok(["starting", "running"].includes(running.structuredContent?.state as string));
+
+      const queued = (await client.callTool({
+        name: "run",
+        arguments: { command: ["sleep", "30"], label: "concurrency-shutdown-queued-job" },
+      })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
+      assert.notEqual(queued.isError, true);
+      const queuedJobId = queued.structuredContent?.job_id as string;
+      assert.equal(queued.structuredContent?.state, "starting");
+      assert.equal(queued.structuredContent?.queue_position, 1);
+      assert.equal(jobStore.getQueueLength(), 1);
+
+      await client.close();
+      await instance.shutdown("test cleanup - concurrency queue drain");
+
+      const queuedAfterShutdown = jobStore.get(queuedJobId)!;
+      assert.equal(
+        queuedAfterShutdown.state,
+        "killed",
+        "a still-queued job must be killed on shutdown, never left in starting forever"
+      );
+      assert.equal(queuedAfterShutdown.queue_position, undefined);
+      assert.equal(jobStore.getQueueLength(), 0, "the queue must be fully drained after shutdown");
+      assert.notEqual(
+        jobStore.get(runningJobId),
+        undefined,
+        "the running job's own record is untouched by the queue drain"
+      );
+
+      // A second drain is a genuine no-op - deterministic, idempotent.
+      jobStore.drainQueueOnShutdown();
+      assert.equal(jobStore.getQueueLength(), 0);
+    } finally {
+      // src/server.ts's real shutdown reap kills a still-LIVE job's real
+      // process and marks its record terminal, but - unlike an ordinary
+      // kill() call - never releases its concurrency SLOT (a real
+      // production server always exits its whole process right after
+      // shutdown, so a leaked activeSlots count in a process about to die
+      // has no real consequence there; it only matters here, on the
+      // shared jobStore singleton every later test in this file reuses).
+      // A follow-up kill() call against the now-terminal record is the
+      // correct cleanup - src/tools/kill.ts's own late-recovery branch
+      // (kill.ts's own docs) sees the shutdown reap's already-attempted,
+      // already-confirmed outcome and calls releaseSlot for exactly this
+      // case, the same path a caller retrying kill() after a genuine
+      // stranding would take. Guarded on runningJobId actually having been
+      // assigned - the try block above could in principle throw before
+      // reaching that assignment.
+      if (runningJobId !== undefined) {
+        await killTool.handler({ job_id: runningJobId });
+        await waitUntil(() => jobStore.getActiveSlotCount() === 0);
+      }
+
+      // The real shutdown() call above closed the shared jobStore
+      // singleton's admission gate for good (JobStore.beginShutdown is
+      // permanent by design). Reopen it directly so the LATER tests in
+      // this file - which never construct a fresh createServer() of their
+      // own, the one place that gate is otherwise reset - can still
+      // exercise requestSlot() normally.
+      jobStore.clearShutdownGate();
+      jobStore.drainQueueOnShutdown();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -711,159 +729,170 @@ test("deleteJob reclaims a stranded job's strandedSlots entry as part of its own
 // all three outcomes; observable via status and list
 // ---------------------------------------------------------------------------
 
-test("queue_position is a field on the existing starting state (never a new enum state) on a job-state enum that stays closed at five values; run() returns instantly whether it admits immediately, queues, or rejects; queue_position is observable via status and list, the current cap via list", async () => {
-  assert.equal(ALL_JOB_STATES.length, 5, "queueing must never introduce a sixth job state");
-  assert.deepEqual(
-    [...ALL_JOB_STATES].sort(),
-    ["exited", "failed", "killed", "running", "starting"].sort()
-  );
+describe("queue_position observability via run()/status()/list() (real run() tool)", () => {
+  before(requireSpawnPolicy);
 
-  jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 1 });
-  let firstJobId: string | undefined;
-  try {
-    // Case 1: admits immediately.
-    const beforeFirst = Date.now();
-    const first = runTool.handler({
-      command: ["sleep", "30"],
-      label: "concurrency-cases-first-job",
-    });
-    const firstElapsed = Date.now() - beforeFirst;
-    assert.notEqual(first.isError, true);
-    const firstStructured = structured(first);
-    firstJobId = firstStructured.job_id as string;
-    assert.ok(["starting", "running"].includes(firstStructured.state as string));
-    assert.equal(
-      firstStructured.queue_position,
-      undefined,
-      "an immediately-admitted job is never queued"
-    );
-    assert.ok(
-      firstElapsed < 1000,
-      `immediate admission must return instantly, took ${firstElapsed}ms`
+  test("queue_position is a field on the existing starting state (never a new enum state) on a job-state enum that stays closed at five values; run() returns instantly whether it admits immediately, queues, or rejects; queue_position is observable via status and list, the current cap via list", async () => {
+    assert.equal(ALL_JOB_STATES.length, 5, "queueing must never introduce a sixth job state");
+    assert.deepEqual(
+      [...ALL_JOB_STATES].sort(),
+      ["exited", "failed", "killed", "running", "starting"].sort()
     );
 
-    // Case 2: queues (cap is full, queue depth allows it).
-    const beforeQueued = Date.now();
-    const queued = runTool.handler({
-      command: ["sleep", "30"],
-      label: "concurrency-cases-queued-job",
-    });
-    const queuedElapsed = Date.now() - beforeQueued;
-    assert.notEqual(queued.isError, true);
-    const queuedStructured = structured(queued);
-    const queuedJobId = queuedStructured.job_id as string;
-    assert.equal(
-      queuedStructured.state,
-      "starting",
-      "a queued job reports the EXISTING starting state - never a new enum value"
-    );
-    assert.equal(queuedStructured.queue_position, 1);
-    assert.ok(queuedElapsed < 1000, `queueing must return instantly, took ${queuedElapsed}ms`);
+    jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 1 });
+    let firstJobId: string | undefined;
+    try {
+      // Case 1: admits immediately.
+      const beforeFirst = Date.now();
+      const first = runTool.handler({
+        command: ["sleep", "30"],
+        label: "concurrency-cases-first-job",
+      });
+      const firstElapsed = Date.now() - beforeFirst;
+      assert.notEqual(first.isError, true);
+      const firstStructured = structured(first);
+      firstJobId = firstStructured.job_id as string;
+      assert.ok(["starting", "running"].includes(firstStructured.state as string));
+      assert.equal(
+        firstStructured.queue_position,
+        undefined,
+        "an immediately-admitted job is never queued"
+      );
+      assert.ok(
+        firstElapsed < 1000,
+        `immediate admission must return instantly, took ${firstElapsed}ms`
+      );
 
-    // Case 3: rejects (cap and queue are both now full).
-    const beforeRejected = Date.now();
-    const rejected = runTool.handler({
-      command: ["true"],
-      label: "concurrency-cases-rejected-job",
-    });
-    const rejectedElapsed = Date.now() - beforeRejected;
-    assert.equal(rejected.isError, true);
-    assert.ok(rejectedElapsed < 1000, `rejection must return instantly, took ${rejectedElapsed}ms`);
+      // Case 2: queues (cap is full, queue depth allows it).
+      const beforeQueued = Date.now();
+      const queued = runTool.handler({
+        command: ["sleep", "30"],
+        label: "concurrency-cases-queued-job",
+      });
+      const queuedElapsed = Date.now() - beforeQueued;
+      assert.notEqual(queued.isError, true);
+      const queuedStructured = structured(queued);
+      const queuedJobId = queuedStructured.job_id as string;
+      assert.equal(
+        queuedStructured.state,
+        "starting",
+        "a queued job reports the EXISTING starting state - never a new enum value"
+      );
+      assert.equal(queuedStructured.queue_position, 1);
+      assert.ok(queuedElapsed < 1000, `queueing must return instantly, took ${queuedElapsed}ms`);
 
-    // Observable via status().
-    const statusStructured = structured(statusTool.handler({ job_id: queuedJobId }));
-    assert.equal(statusStructured.queue_position, 1);
-    assert.equal(statusStructured.state, "starting");
+      // Case 3: rejects (cap and queue are both now full).
+      const beforeRejected = Date.now();
+      const rejected = runTool.handler({
+        command: ["true"],
+        label: "concurrency-cases-rejected-job",
+      });
+      const rejectedElapsed = Date.now() - beforeRejected;
+      assert.equal(rejected.isError, true);
+      assert.ok(
+        rejectedElapsed < 1000,
+        `rejection must return instantly, took ${rejectedElapsed}ms`
+      );
 
-    // Observable via list(): both the per-job queue_position and the
-    // server-wide concurrency cap.
-    const listStructured = structured(listTool.handler());
-    assert.equal(listStructured.concurrency_cap, 1);
-    const jobs = listStructured.jobs as Array<Record<string, unknown>>;
-    const listedQueued = jobs.find((j) => j.job_id === queuedJobId);
-    assert.ok(listedQueued, "the queued job must appear in list()'s output");
-    assert.equal(listedQueued?.queue_position, 1);
-    const listedFirst = jobs.find((j) => j.job_id === firstJobId);
-    assert.ok(listedFirst, "the running job must appear in list()'s output");
-    assert.equal(listedFirst?.queue_position, undefined);
-  } finally {
-    await cleanUpSharedJobs(firstJobId ? [firstJobId] : []);
-  }
+      // Observable via status().
+      const statusStructured = structured(statusTool.handler({ job_id: queuedJobId }));
+      assert.equal(statusStructured.queue_position, 1);
+      assert.equal(statusStructured.state, "starting");
+
+      // Observable via list(): both the per-job queue_position and the
+      // server-wide concurrency cap.
+      const listStructured = structured(listTool.handler());
+      assert.equal(listStructured.concurrency_cap, 1);
+      const jobs = listStructured.jobs as Array<Record<string, unknown>>;
+      const listedQueued = jobs.find((j) => j.job_id === queuedJobId);
+      assert.ok(listedQueued, "the queued job must appear in list()'s output");
+      assert.equal(listedQueued?.queue_position, 1);
+      const listedFirst = jobs.find((j) => j.job_id === firstJobId);
+      assert.ok(listedFirst, "the running job must appear in list()'s output");
+      assert.equal(listedFirst?.queue_position, undefined);
+    } finally {
+      await cleanUpSharedJobs(firstJobId ? [firstJobId] : []);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
 // kill() on a still-queued job
 // ---------------------------------------------------------------------------
 
-test("kill() on a still-queued job dequeues it, renumbers the survivors, settles it to killed, and it never actually spawns once its would-be slot frees", async () => {
-  jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 2 });
-  let activeJobId: string | undefined;
-  let firstQueuedId: string | undefined;
-  let secondQueuedId: string | undefined;
-  try {
-    const active = runTool.handler({ command: ["sleep", "30"], label: "kill-queued-active" });
-    assert.notEqual(active.isError, true);
-    activeJobId = structured(active).job_id as string;
+describe("kill() on a still-queued job (real run() tool)", () => {
+  before(requireSpawnPolicy);
 
-    const first = runTool.handler({ command: ["sleep", "30"], label: "kill-queued-first" });
-    assert.notEqual(first.isError, true);
-    firstQueuedId = structured(first).job_id as string;
-    assert.equal(structured(first).queue_position, 1);
+  test("kill() on a still-queued job dequeues it, renumbers the survivors, settles it to killed, and it never actually spawns once its would-be slot frees", async () => {
+    jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 2 });
+    let activeJobId: string | undefined;
+    let firstQueuedId: string | undefined;
+    let secondQueuedId: string | undefined;
+    try {
+      const active = runTool.handler({ command: ["sleep", "30"], label: "kill-queued-active" });
+      assert.notEqual(active.isError, true);
+      activeJobId = structured(active).job_id as string;
 
-    const second = runTool.handler({ command: ["sleep", "30"], label: "kill-queued-second" });
-    assert.notEqual(second.isError, true);
-    secondQueuedId = structured(second).job_id as string;
-    assert.equal(structured(second).queue_position, 2);
+      const first = runTool.handler({ command: ["sleep", "30"], label: "kill-queued-first" });
+      assert.notEqual(first.isError, true);
+      firstQueuedId = structured(first).job_id as string;
+      assert.equal(structured(first).queue_position, 1);
 
-    // Kill the FIRST queued job while it is still queued - this used to
-    // report "internal inconsistency" and leave it stranded in the
-    // queue.
-    const killResult = await killTool.handler({ job_id: firstQueuedId });
-    assert.notEqual(
-      killResult.isError,
-      true,
-      `kill() on a queued job must succeed, not report an internal inconsistency: ${JSON.stringify(killResult)}`
-    );
+      const second = runTool.handler({ command: ["sleep", "30"], label: "kill-queued-second" });
+      assert.notEqual(second.isError, true);
+      secondQueuedId = structured(second).job_id as string;
+      assert.equal(structured(second).queue_position, 2);
 
-    // It is removed from the queue, not merely marked terminal in place.
-    assert.equal(jobStore.getQueueLength(), 1);
-    const statusAfterKill = structured(statusTool.handler({ job_id: firstQueuedId }));
-    assert.equal(statusAfterKill.state, "killed");
-    assert.equal(statusAfterKill.queue_position, undefined);
+      // Kill the FIRST queued job while it is still queued - this used to
+      // report "internal inconsistency" and leave it stranded in the
+      // queue.
+      const killResult = await killTool.handler({ job_id: firstQueuedId });
+      assert.notEqual(
+        killResult.isError,
+        true,
+        `kill() on a queued job must succeed, not report an internal inconsistency: ${JSON.stringify(killResult)}`
+      );
 
-    // The survivor renumbers up from position 2 to position 1.
-    const survivorStatus = structured(statusTool.handler({ job_id: secondQueuedId }));
-    assert.equal(
-      survivorStatus.queue_position,
-      1,
-      "the remaining queued job must renumber up after the removal"
-    );
+      // It is removed from the queue, not merely marked terminal in place.
+      assert.equal(jobStore.getQueueLength(), 1);
+      const statusAfterKill = structured(statusTool.handler({ job_id: firstQueuedId }));
+      assert.equal(statusAfterKill.state, "killed");
+      assert.equal(statusAfterKill.queue_position, undefined);
 
-    const listedJobs = structured(listTool.handler()).jobs as Array<Record<string, unknown>>;
-    const listedKilled = listedJobs.find((j) => j.job_id === firstQueuedId);
-    assert.equal(listedKilled?.state, "killed");
-    assert.equal(listedKilled?.queue_position, undefined);
+      // The survivor renumbers up from position 2 to position 1.
+      const survivorStatus = structured(statusTool.handler({ job_id: secondQueuedId }));
+      assert.equal(
+        survivorStatus.queue_position,
+        1,
+        "the remaining queued job must renumber up after the removal"
+      );
 
-    // Free the active slot - the survivor, never the killed job, must
-    // be the one that actually gets a turn.
-    const killActive = await killTool.handler({ job_id: activeJobId });
-    assert.notEqual(killActive.isError, true);
-    await waitUntil(() => jobStore.getChildHandle(secondQueuedId!) !== undefined);
-    assert.equal(jobStore.get(secondQueuedId!)!.queue_position, undefined);
+      const listedJobs = structured(listTool.handler()).jobs as Array<Record<string, unknown>>;
+      const listedKilled = listedJobs.find((j) => j.job_id === firstQueuedId);
+      assert.equal(listedKilled?.state, "killed");
+      assert.equal(listedKilled?.queue_position, undefined);
 
-    // The job killed while queued never got a turn: no child was ever
-    // attached for it, and its state never left `killed`.
-    assert.equal(
-      jobStore.getChildHandle(firstQueuedId),
-      undefined,
-      "a job killed while queued must never spawn a real process"
-    );
-    assert.equal(jobStore.get(firstQueuedId)!.state, "killed");
-  } finally {
-    await cleanUpSharedJobs(
-      [activeJobId, firstQueuedId, secondQueuedId].filter((id): id is string => id !== undefined)
-    );
-  }
+      // Free the active slot - the survivor, never the killed job, must
+      // be the one that actually gets a turn.
+      const killActive = await killTool.handler({ job_id: activeJobId });
+      assert.notEqual(killActive.isError, true);
+      await waitUntil(() => jobStore.getChildHandle(secondQueuedId!) !== undefined);
+      assert.equal(jobStore.get(secondQueuedId!)!.queue_position, undefined);
+
+      // The job killed while queued never got a turn: no child was ever
+      // attached for it, and its state never left `killed`.
+      assert.equal(
+        jobStore.getChildHandle(firstQueuedId),
+        undefined,
+        "a job killed while queued must never spawn a real process"
+      );
+      assert.equal(jobStore.get(firstQueuedId)!.state, "killed");
+    } finally {
+      await cleanUpSharedJobs(
+        [activeJobId, firstQueuedId, secondQueuedId].filter((id): id is string => id !== undefined)
+      );
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -871,205 +900,211 @@ test("kill() on a still-queued job dequeues it, renumbers the survivors, settles
 // slot must never be able to release another job's reservation
 // ---------------------------------------------------------------------------
 
-test("kill() on a preflight-failed record that never held a concurrency slot must never release another job's reservation - covers invalid cwd, missing executable, and policy-denied", async () => {
-  jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 0 });
-  let ownerJobId: string | undefined;
-  try {
-    const owner = runTool.handler({ command: ["sleep", "30"], label: "unslotted-kill-owner" });
-    assert.notEqual(owner.isError, true);
-    ownerJobId = structured(owner).job_id as string;
-    assert.equal(jobStore.getActiveSlotCount(), 1, "the real owner holds the only slot");
+describe("releaseSlot ownership: unslotted preflight failures and double-cancel (real run() tool)", () => {
+  before(requireSpawnPolicy);
 
-    // "cat" resolves to a real executable but is not on the test policy
-    // allow-list (test/fixtures/policy-allow.json), so it is denied AFTER
-    // resolution - distinct from the missing-executable case below, which
-    // never resolves at all.
-    const preflightCases: Array<{ readonly name: string; readonly command: string[] }> = [
-      { name: "invalid cwd", command: ["sleep", "1"] },
-      {
-        name: "missing executable",
-        command: ["this-command-definitely-does-not-exist-ghantika-unslotted-kill"],
-      },
-      { name: "policy-denied", command: ["cat"] },
-    ];
+  test("kill() on a preflight-failed record that never held a concurrency slot must never release another job's reservation - covers invalid cwd, missing executable, and policy-denied", async () => {
+    jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 0 });
+    let ownerJobId: string | undefined;
+    try {
+      const owner = runTool.handler({ command: ["sleep", "30"], label: "unslotted-kill-owner" });
+      assert.notEqual(owner.isError, true);
+      ownerJobId = structured(owner).job_id as string;
+      assert.equal(jobStore.getActiveSlotCount(), 1, "the real owner holds the only slot");
 
-    for (const { name, command } of preflightCases) {
-      const args: Record<string, unknown> = { command, label: `unslotted-kill-${name}` };
-      if (name === "invalid cwd") args.cwd = "/this-dir-does-not-exist-ghantika-unslotted-kill";
+      // "cat" resolves to a real executable but is not on the test policy
+      // allow-list (test/fixtures/policy-allow.json), so it is denied AFTER
+      // resolution - distinct from the missing-executable case below, which
+      // never resolves at all.
+      const preflightCases: Array<{ readonly name: string; readonly command: string[] }> = [
+        { name: "invalid cwd", command: ["sleep", "1"] },
+        {
+          name: "missing executable",
+          command: ["this-command-definitely-does-not-exist-ghantika-unslotted-kill"],
+        },
+        { name: "policy-denied", command: ["cat"] },
+      ];
 
-      const failed = runTool.handler(args);
-      assert.notEqual(
-        failed.isError,
-        true,
-        `${name}: run() itself must still succeed with a terminal failed record`
-      );
-      const failedStructured = structured(failed);
-      assert.equal(
-        failedStructured.state,
-        "failed",
-        `${name}: must be a terminal preflight failure`
-      );
-      const failedJobId = failedStructured.job_id as string;
+      for (const { name, command } of preflightCases) {
+        const args: Record<string, unknown> = { command, label: `unslotted-kill-${name}` };
+        if (name === "invalid cwd") args.cwd = "/this-dir-does-not-exist-ghantika-unslotted-kill";
 
-      const killResult = await killTool.handler({ job_id: failedJobId });
-      assert.notEqual(
-        killResult.isError,
-        true,
-        `${name}: kill on an already-terminal record must be a no-op success`
-      );
+        const failed = runTool.handler(args);
+        assert.notEqual(
+          failed.isError,
+          true,
+          `${name}: run() itself must still succeed with a terminal failed record`
+        );
+        const failedStructured = structured(failed);
+        assert.equal(
+          failedStructured.state,
+          "failed",
+          `${name}: must be a terminal preflight failure`
+        );
+        const failedJobId = failedStructured.job_id as string;
+
+        const killResult = await killTool.handler({ job_id: failedJobId });
+        assert.notEqual(
+          killResult.isError,
+          true,
+          `${name}: kill on an already-terminal record must be a no-op success`
+        );
+
+        assert.equal(
+          jobStore.getActiveSlotCount(),
+          1,
+          `${name}: killing an unslotted preflight-failed record must NOT touch the real owner's reservation`
+        );
+
+        // Cap=1, depth=0: a subsequent valid run() must still be REJECTED,
+        // never admitted - the exact symptom the P1 produces when the
+        // counter is wrongly decremented by an unslotted job's kill.
+        const shouldReject = runTool.handler({
+          command: ["sleep", "1"],
+          label: `unslotted-kill-probe-${name}`,
+        });
+        assert.equal(
+          shouldReject.isError,
+          true,
+          `${name}: cap must still read full - a second real job must not be admitted`
+        );
+        assert.equal(structured(shouldReject).reason, "queue-full");
+      }
 
       assert.equal(
         jobStore.getActiveSlotCount(),
         1,
-        `${name}: killing an unslotted preflight-failed record must NOT touch the real owner's reservation`
+        "the real owner's slot is still the only one ever held, after all three preflight-failure classes"
       );
-
-      // Cap=1, depth=0: a subsequent valid run() must still be REJECTED,
-      // never admitted - the exact symptom the P1 produces when the
-      // counter is wrongly decremented by an unslotted job's kill.
-      const shouldReject = runTool.handler({
-        command: ["sleep", "1"],
-        label: `unslotted-kill-probe-${name}`,
-      });
+    } finally {
+      await cleanUpSharedJobs(ownerJobId ? [ownerJobId] : []);
       assert.equal(
-        shouldReject.isError,
-        true,
-        `${name}: cap must still read full - a second real job must not be admitted`
+        jobStore.getActiveSlotCount(),
+        0,
+        "cleanup released the real owner's slot exactly once"
       );
-      assert.equal(structured(shouldReject).reason, "queue-full");
     }
+  });
 
-    assert.equal(
-      jobStore.getActiveSlotCount(),
-      1,
-      "the real owner's slot is still the only one ever held, after all three preflight-failure classes"
-    );
-  } finally {
-    await cleanUpSharedJobs(ownerJobId ? [ownerJobId] : []);
-    assert.equal(
-      jobStore.getActiveSlotCount(),
-      0,
-      "cleanup released the real owner's slot exactly once"
-    );
-  }
-});
-
-test("double-cancelling a QUEUED (never-dequeued) job must never release a different job's reservation, across both real cancellation surfaces", async () => {
-  jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 1 });
-  let ownerJobId: string | undefined;
-  try {
-    const owner = runTool.handler({
-      command: ["sleep", "30"],
-      label: "queued-double-cancel-owner",
-    });
-    assert.notEqual(owner.isError, true);
-    ownerJobId = structured(owner).job_id as string;
-    assert.equal(jobStore.getActiveSlotCount(), 1, "the real owner holds the only slot");
-
-    // Both real entry points that can ever cancel a still-queued job -
-    // `kill.ts`'s own handler, and `tasksAdapter.cancelTask`, which
-    // delegates to that same handler internally (see its own docs) but is
-    // still a distinct, real caller worth exercising directly rather than
-    // trusting by construction.
-    const cancelSurfaces: Array<{
-      readonly name: string;
-      readonly cancel: (jobId: string) => Promise<{ isError?: boolean } | { error: unknown }>;
-    }> = [
-      { name: "kill", cancel: (jobId) => killTool.handler({ job_id: jobId }) },
-      { name: "tasks/cancel", cancel: (jobId) => tasksAdapter.cancelTask(jobId) },
-    ];
-
-    for (const { name, cancel } of cancelSurfaces) {
-      const queued = runTool.handler({
-        command: ["sleep", "1"],
-        label: `queued-double-cancel-${name.replace("/", "-")}`,
+  test("double-cancelling a QUEUED (never-dequeued) job must never release a different job's reservation, across both real cancellation surfaces", async () => {
+    jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 1 });
+    let ownerJobId: string | undefined;
+    try {
+      const owner = runTool.handler({
+        command: ["sleep", "30"],
+        label: "queued-double-cancel-owner",
       });
-      assert.notEqual(
-        queued.isError,
-        true,
-        `${name}: run() itself must still succeed with a queued record`
-      );
-      const queuedStructured = structured(queued);
-      assert.equal(
-        queuedStructured.queue_position,
-        1,
-        `${name}: cap is full - this job must queue, not run`
-      );
-      const queuedJobId = queuedStructured.job_id as string;
+      assert.notEqual(owner.isError, true);
+      ownerJobId = structured(owner).job_id as string;
+      assert.equal(jobStore.getActiveSlotCount(), 1, "the real owner holds the only slot");
 
-      const first = await cancel(queuedJobId);
-      assert.notEqual(
-        "isError" in first ? first.isError : undefined,
-        true,
-        `${name}: cancelling a still-queued job must succeed`
-      );
+      // Both real entry points that can ever cancel a still-queued job -
+      // `kill.ts`'s own handler, and `tasksAdapter.cancelTask`, which
+      // delegates to that same handler internally (see its own docs) but is
+      // still a distinct, real caller worth exercising directly rather than
+      // trusting by construction.
+      const cancelSurfaces: Array<{
+        readonly name: string;
+        readonly cancel: (jobId: string) => Promise<{ isError?: boolean } | { error: unknown }>;
+      }> = [
+        { name: "kill", cancel: (jobId) => killTool.handler({ job_id: jobId }) },
+        { name: "tasks/cancel", cancel: (jobId) => tasksAdapter.cancelTask(jobId) },
+      ];
+
+      for (const { name, cancel } of cancelSurfaces) {
+        const queued = runTool.handler({
+          command: ["sleep", "1"],
+          label: `queued-double-cancel-${name.replace("/", "-")}`,
+        });
+        assert.notEqual(
+          queued.isError,
+          true,
+          `${name}: run() itself must still succeed with a queued record`
+        );
+        const queuedStructured = structured(queued);
+        assert.equal(
+          queuedStructured.queue_position,
+          1,
+          `${name}: cap is full - this job must queue, not run`
+        );
+        const queuedJobId = queuedStructured.job_id as string;
+
+        const first = await cancel(queuedJobId);
+        assert.notEqual(
+          "isError" in first ? first.isError : undefined,
+          true,
+          `${name}: cancelling a still-queued job must succeed`
+        );
+        assert.equal(
+          jobStore.getActiveSlotCount(),
+          1,
+          `${name}: cancelling a QUEUED job must never touch the owner's slot`
+        );
+
+        // THE regression: a second cancellation of the SAME now-terminal
+        // record reaches the terminal late-recovery path, not the queue
+        // path - this is exactly where the old bug decremented a slot this
+        // job never held.
+        const second = await cancel(queuedJobId);
+        assert.notEqual(
+          "isError" in second ? second.isError : undefined,
+          true,
+          `${name}: a second cancellation of the now-terminal record must be a no-op success`
+        );
+        assert.equal(
+          jobStore.getActiveSlotCount(),
+          1,
+          `${name}: a SECOND cancellation of the same queued-then-cancelled job must still never free the owner's slot`
+        );
+
+        // The property a user would feel: with the queue now empty again,
+        // a probe job must be QUEUED behind the still-running owner, never
+        // admitted as a second live child under a cap of one. Checking
+        // `getActiveSlotCount()` immediately after creating it is the
+        // direct assertion - an admitted (rather than queued) probe would
+        // increment it to 2 right here, on the same synchronous call.
+        const probe = runTool.handler({
+          command: ["sleep", "1"],
+          label: `queued-double-cancel-probe-${name.replace("/", "-")}`,
+        });
+        assert.notEqual(
+          probe.isError,
+          true,
+          `${name}: the probe must still be accepted (queued), not rejected`
+        );
+        assert.equal(
+          structured(probe).queue_position,
+          1,
+          `${name}: the probe must be QUEUED behind the owner, never admitted directly - a cap-of-one breach reads as an immediate admission here`
+        );
+        assert.equal(
+          jobStore.getActiveSlotCount(),
+          1,
+          `${name}: creating the probe must not itself increment activeSlots - the owner's slot is still the only one held`
+        );
+
+        // Clear the probe out of the queue before the next surface's own
+        // pass reuses the one queue slot.
+        const probeCancelled = await killTool.handler({
+          job_id: structured(probe).job_id as string,
+        });
+        assert.notEqual(probeCancelled.isError, true);
+      }
+
       assert.equal(
         jobStore.getActiveSlotCount(),
         1,
-        `${name}: cancelling a QUEUED job must never touch the owner's slot`
+        "the real owner's slot is still the only one ever held, after both cancellation surfaces' double-cancel"
       );
-
-      // THE regression: a second cancellation of the SAME now-terminal
-      // record reaches the terminal late-recovery path, not the queue
-      // path - this is exactly where the old bug decremented a slot this
-      // job never held.
-      const second = await cancel(queuedJobId);
-      assert.notEqual(
-        "isError" in second ? second.isError : undefined,
-        true,
-        `${name}: a second cancellation of the now-terminal record must be a no-op success`
-      );
+    } finally {
+      await cleanUpSharedJobs(ownerJobId ? [ownerJobId] : []);
       assert.equal(
         jobStore.getActiveSlotCount(),
-        1,
-        `${name}: a SECOND cancellation of the same queued-then-cancelled job must still never free the owner's slot`
+        0,
+        "cleanup released the real owner's slot exactly once"
       );
-
-      // The property a user would feel: with the queue now empty again,
-      // a probe job must be QUEUED behind the still-running owner, never
-      // admitted as a second live child under a cap of one. Checking
-      // `getActiveSlotCount()` immediately after creating it is the
-      // direct assertion - an admitted (rather than queued) probe would
-      // increment it to 2 right here, on the same synchronous call.
-      const probe = runTool.handler({
-        command: ["sleep", "1"],
-        label: `queued-double-cancel-probe-${name.replace("/", "-")}`,
-      });
-      assert.notEqual(
-        probe.isError,
-        true,
-        `${name}: the probe must still be accepted (queued), not rejected`
-      );
-      assert.equal(
-        structured(probe).queue_position,
-        1,
-        `${name}: the probe must be QUEUED behind the owner, never admitted directly - a cap-of-one breach reads as an immediate admission here`
-      );
-      assert.equal(
-        jobStore.getActiveSlotCount(),
-        1,
-        `${name}: creating the probe must not itself increment activeSlots - the owner's slot is still the only one held`
-      );
-
-      // Clear the probe out of the queue before the next surface's own
-      // pass reuses the one queue slot.
-      const probeCancelled = await killTool.handler({ job_id: structured(probe).job_id as string });
-      assert.notEqual(probeCancelled.isError, true);
     }
-
-    assert.equal(
-      jobStore.getActiveSlotCount(),
-      1,
-      "the real owner's slot is still the only one ever held, after both cancellation surfaces' double-cancel"
-    );
-  } finally {
-    await cleanUpSharedJobs(ownerJobId ? [ownerJobId] : []);
-    assert.equal(
-      jobStore.getActiveSlotCount(),
-      0,
-      "cleanup released the real owner's slot exactly once"
-    );
-  }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1236,55 +1271,59 @@ test("deleteJob reclaims a job's slotReleased dedupe entry, so a long-running se
 // Shutdown admission race
 // ---------------------------------------------------------------------------
 
-test("shutdown gates new admissions the instant it begins: a run() call arriving while shutdown is still awaiting its own reap is rejected, never queued or spawned", async () => {
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const instance = createServer(serverTransport);
-  await instance.server.connect(instance.transport);
-  const client = new Client({ name: "ghantika-shutdown-admission-race-test", version: "0.0.0" });
-  await client.connect(clientTransport);
+describe("shutdown admission race (real server)", () => {
+  before(requireSpawnPolicy);
 
-  jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 1 });
-  try {
-    const holder = (await client.callTool({
-      name: "run",
-      arguments: { command: ["sleep", "30"], label: "shutdown-race-holder" },
-    })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
-    assert.notEqual(holder.isError, true);
+  test("shutdown gates new admissions the instant it begins: a run() call arriving while shutdown is still awaiting its own reap is rejected, never queued or spawned", async () => {
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const instance = createServer(serverTransport);
+    await instance.server.connect(instance.transport);
+    const client = new Client({ name: "ghantika-shutdown-admission-race-test", version: "0.0.0" });
+    await client.connect(clientTransport);
 
-    await client.close();
+    jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 1 });
+    try {
+      const holder = (await client.callTool({
+        name: "run",
+        arguments: { command: ["sleep", "30"], label: "shutdown-race-holder" },
+      })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
+      assert.notEqual(holder.isError, true);
 
-    // Do not await yet - the point is to land a run() call while
-    // shutdown is still in flight (specifically, while it's awaiting the
-    // live-job reap started inside performShutdown).
-    const shutdownPromise = instance.shutdown("test - admission race");
+      await client.close();
 
-    const late = runTool.handler({
-      command: ["sleep", "30"],
-      label: "shutdown-race-late-arrival",
-    });
-    assert.equal(
-      late.isError,
-      true,
-      "a run() call arriving once shutdown has begun must be rejected, never admitted or queued"
-    );
-    const lateStructured = structured(late);
-    assert.equal(lateStructured.reason, "shutting-down");
-    assert.equal(lateStructured.job_id, undefined, "a rejected run() must never create a job");
+      // Do not await yet - the point is to land a run() call while
+      // shutdown is still in flight (specifically, while it's awaiting the
+      // live-job reap started inside performShutdown).
+      const shutdownPromise = instance.shutdown("test - admission race");
 
-    await shutdownPromise;
+      const late = runTool.handler({
+        command: ["sleep", "30"],
+        label: "shutdown-race-late-arrival",
+      });
+      assert.equal(
+        late.isError,
+        true,
+        "a run() call arriving once shutdown has begun must be rejected, never admitted or queued"
+      );
+      const lateStructured = structured(late);
+      assert.equal(lateStructured.reason, "shutting-down");
+      assert.equal(lateStructured.job_id, undefined, "a rejected run() must never create a job");
 
-    // A genuinely rejected call never created a job at all - nothing to
-    // find, by any id, and nothing ever ran for it.
-    const jobs = jobStore.list();
-    assert.equal(
-      jobs.some((j) => j.label === "shutdown-race-late-arrival"),
-      false,
-      "a run() rejected for shutting-down must never appear as a tracked job"
-    );
-  } finally {
-    jobStore.clearShutdownGate();
-    jobStore.drainQueueOnShutdown();
-  }
+      await shutdownPromise;
+
+      // A genuinely rejected call never created a job at all - nothing to
+      // find, by any id, and nothing ever ran for it.
+      const jobs = jobStore.list();
+      assert.equal(
+        jobs.some((j) => j.label === "shutdown-race-late-arrival"),
+        false,
+        "a run() rejected for shutting-down must never appear as a tracked job"
+      );
+    } finally {
+      jobStore.clearShutdownGate();
+      jobStore.drainQueueOnShutdown();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1297,113 +1336,117 @@ test("shutdown gates new admissions the instant it begins: a run() call arriving
 // unverified claim in a doc comment.
 // ---------------------------------------------------------------------------
 
-test(
-  "DISCLOSED RESIDUAL, pinned by a real reproduction: a queued job's cwd is not re-validated at actual spawn time - swapping the checked directory for a symlink escaping the configured root WHILE the job is queued lets the real spawn land outside every configured root",
-  {
-    skip:
-      process.platform === "win32"
-        ? "symlink creation needs elevated privileges on win32 in CI"
-        : false,
-  },
-  async () => {
-    // A preceding test in this file may leave activeSlots/queue settling
-    // asynchronously (its own cleanup does not always wait for that, e.g.
-    // the shutdown-admission-race test just above only clears the
-    // shutdown gate) - establish a genuinely clean baseline here rather
-    // than assuming one, so this test's own cap=1/queue=1 admission
-    // decisions are never computed against leftover state from whatever
-    // ran immediately before it.
-    await waitUntil(() => jobStore.getActiveSlotCount() === 0 && jobStore.getQueueLength() === 0);
-    jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 1 });
-    const allowedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-toctou-root-"));
-    const checkedDir = path.join(allowedRoot, "job");
-    fs.mkdirSync(checkedDir);
-    const outsideTarget = fs.mkdtempSync(
-      path.join(os.tmpdir(), "ghantika-cwdroots-toctou-outside-")
-    );
-    const originalRoots = process.env[CWD_ROOTS_ENV_VAR];
-    let blockerJobId: string | undefined;
-    let queuedJobId: string | undefined;
-    try {
-      process.env[CWD_ROOTS_ENV_VAR] = allowedRoot;
+describe("GHANTIKA_CWD_ROOTS TOCTOU residual (real run() tool)", () => {
+  before(requireSpawnPolicy);
 
-      // Occupies the single slot so the job below is forced to queue. Its
-      // own cwd must ALSO pass the now-active root check (equal to the
-      // root itself is accepted) - otherwise it fails pre-flight, never
-      // reserves a slot at all, and the job below is admitted instantly
-      // instead of genuinely queuing.
-      const blocker = runTool.handler({
-        command: ["sleep", "30"],
-        cwd: allowedRoot,
-        label: "toctou-blocker",
-      });
-      assert.notEqual(blocker.isError, true);
-      const blockerStructured = structured(blocker);
-      blockerJobId = blockerStructured.job_id as string;
-      assert.ok(
-        ["starting", "running"].includes(blockerStructured.state as string),
-        `blocker must genuinely hold the concurrency slot, got: ${JSON.stringify(blockerStructured)}`
+  test(
+    "DISCLOSED RESIDUAL, pinned by a real reproduction: a queued job's cwd is not re-validated at actual spawn time - swapping the checked directory for a symlink escaping the configured root WHILE the job is queued lets the real spawn land outside every configured root",
+    {
+      skip:
+        process.platform === "win32"
+          ? "symlink creation needs elevated privileges on win32 in CI"
+          : false,
+    },
+    async () => {
+      // A preceding test in this file may leave activeSlots/queue settling
+      // asynchronously (its own cleanup does not always wait for that, e.g.
+      // the shutdown-admission-race test just above only clears the
+      // shutdown gate) - establish a genuinely clean baseline here rather
+      // than assuming one, so this test's own cap=1/queue=1 admission
+      // decisions are never computed against leftover state from whatever
+      // ran immediately before it.
+      await waitUntil(() => jobStore.getActiveSlotCount() === 0 && jobStore.getQueueLength() === 0);
+      jobStore.setConcurrencyConfig({ maxConcurrentJobs: 1, maxQueueDepth: 1 });
+      const allowedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-toctou-root-"));
+      const checkedDir = path.join(allowedRoot, "job");
+      fs.mkdirSync(checkedDir);
+      const outsideTarget = fs.mkdtempSync(
+        path.join(os.tmpdir(), "ghantika-cwdroots-toctou-outside-")
       );
+      const originalRoots = process.env[CWD_ROOTS_ENV_VAR];
+      let blockerJobId: string | undefined;
+      let queuedJobId: string | undefined;
+      try {
+        process.env[CWD_ROOTS_ENV_VAR] = allowedRoot;
 
-      // Validated NOW, while checkedDir is a real directory genuinely
-      // inside allowedRoot - exactly the check the fail-open fix above
-      // makes correct. It passes.
-      const queued = runTool.handler({
-        command: ["node", "-e", "process.stdout.write(process.cwd())"],
-        cwd: checkedDir,
-        label: "toctou-queued",
-      });
-      assert.notEqual(queued.isError, true);
-      const queuedStructured = structured(queued);
-      queuedJobId = queuedStructured.job_id as string;
-      assert.equal(queuedStructured.state, "starting");
-      assert.equal(queuedStructured.queue_position, 1, "must genuinely be queued, not admitted");
+        // Occupies the single slot so the job below is forced to queue. Its
+        // own cwd must ALSO pass the now-active root check (equal to the
+        // root itself is accepted) - otherwise it fails pre-flight, never
+        // reserves a slot at all, and the job below is admitted instantly
+        // instead of genuinely queuing.
+        const blocker = runTool.handler({
+          command: ["sleep", "30"],
+          cwd: allowedRoot,
+          label: "toctou-blocker",
+        });
+        assert.notEqual(blocker.isError, true);
+        const blockerStructured = structured(blocker);
+        blockerJobId = blockerStructured.job_id as string;
+        assert.ok(
+          ["starting", "running"].includes(blockerStructured.state as string),
+          `blocker must genuinely hold the concurrency slot, got: ${JSON.stringify(blockerStructured)}`
+        );
 
-      // The swap: remove the checked directory and put a symlink of the
-      // SAME name in its place, pointing OUTSIDE every configured root.
-      // The queued job's own already-validated string never sees this -
-      // it sits closed over, unconfirmed, for the rest of this job's
-      // queue residence.
-      fs.rmdirSync(checkedDir);
-      fs.symlinkSync(outsideTarget, checkedDir, "dir");
+        // Validated NOW, while checkedDir is a real directory genuinely
+        // inside allowedRoot - exactly the check the fail-open fix above
+        // makes correct. It passes.
+        const queued = runTool.handler({
+          command: ["node", "-e", "process.stdout.write(process.cwd())"],
+          cwd: checkedDir,
+          label: "toctou-queued",
+        });
+        assert.notEqual(queued.isError, true);
+        const queuedStructured = structured(queued);
+        queuedJobId = queuedStructured.job_id as string;
+        assert.equal(queuedStructured.state, "starting");
+        assert.equal(queuedStructured.queue_position, 1, "must genuinely be queued, not admitted");
 
-      // Release the blocker's slot so the queued job dequeues and its
-      // real spawn actually happens - now, against the swapped path.
-      await killTool.handler({ job_id: blockerJobId });
-      await waitUntil(() => isTerminalJobState(jobStore.get(queuedJobId!)!.state));
+        // The swap: remove the checked directory and put a symlink of the
+        // SAME name in its place, pointing OUTSIDE every configured root.
+        // The queued job's own already-validated string never sees this -
+        // it sits closed over, unconfirmed, for the rest of this job's
+        // queue residence.
+        fs.rmdirSync(checkedDir);
+        fs.symlinkSync(outsideTarget, checkedDir, "dir");
 
-      assert.equal(jobStore.get(queuedJobId)!.state, "exited");
-      const output = structured(outputTool.handler({ job_id: queuedJobId, stream: "stdout" }));
-      const events = output.events as Array<{ text: string }>;
-      const printedCwd = events.map((event) => event.text).join("");
-      // THE DISCLOSED ESCAPE ITSELF: the process that actually ran printed
-      // the OUTSIDE-root real path, not the allowed-root one it was
-      // validated against moments earlier - the swap won. This is exactly
-      // the residual src/process.ts's resolveCwd doc comment now
-      // discloses; if a future change closes this gap (e.g. revalidating
-      // at actual dequeue/spawn time), this assertion is the one that
-      // must then flip to prove the closure, not be deleted.
-      assert.equal(printedCwd, fs.realpathSync(outsideTarget));
-    } finally {
-      if (originalRoots === undefined) delete process.env[CWD_ROOTS_ENV_VAR];
-      else process.env[CWD_ROOTS_ENV_VAR] = originalRoots;
-      // Pass BOTH ids through cleanup rather than assuming the happy path
-      // already terminated them - an assertion above can throw at any
-      // point (including before the blocker is killed, or before the
-      // queued job reaches a terminal state), and in that case one or
-      // both real process groups are still alive when this block runs.
-      // killTool.handler is idempotent against an already-terminal job
-      // (a documented no-op with respect to its recorded state, though it
-      // may still attempt a real cleanup reap), so calling it on both ids
-      // unconditionally is always safe and is what actually guarantees
-      // the blocker's group - and the queued job's, if it ever spawned -
-      // is signaled and reaped rather than left running past this test.
-      // Filtered to only the ids that were actually assigned, since a
-      // throw before runTool.handler returns leaves that variable
-      // undefined.
-      await cleanUpSharedJobs(
-        [blockerJobId, queuedJobId].filter((id): id is string => id !== undefined)
-      );
+        // Release the blocker's slot so the queued job dequeues and its
+        // real spawn actually happens - now, against the swapped path.
+        await killTool.handler({ job_id: blockerJobId });
+        await waitUntil(() => isTerminalJobState(jobStore.get(queuedJobId!)!.state));
+
+        assert.equal(jobStore.get(queuedJobId)!.state, "exited");
+        const output = structured(outputTool.handler({ job_id: queuedJobId, stream: "stdout" }));
+        const events = output.events as Array<{ text: string }>;
+        const printedCwd = events.map((event) => event.text).join("");
+        // THE DISCLOSED ESCAPE ITSELF: the process that actually ran printed
+        // the OUTSIDE-root real path, not the allowed-root one it was
+        // validated against moments earlier - the swap won. This is exactly
+        // the residual src/process.ts's resolveCwd doc comment now
+        // discloses; if a future change closes this gap (e.g. revalidating
+        // at actual dequeue/spawn time), this assertion is the one that
+        // must then flip to prove the closure, not be deleted.
+        assert.equal(printedCwd, fs.realpathSync(outsideTarget));
+      } finally {
+        if (originalRoots === undefined) delete process.env[CWD_ROOTS_ENV_VAR];
+        else process.env[CWD_ROOTS_ENV_VAR] = originalRoots;
+        // Pass BOTH ids through cleanup rather than assuming the happy path
+        // already terminated them - an assertion above can throw at any
+        // point (including before the blocker is killed, or before the
+        // queued job reaches a terminal state), and in that case one or
+        // both real process groups are still alive when this block runs.
+        // killTool.handler is idempotent against an already-terminal job
+        // (a documented no-op with respect to its recorded state, though it
+        // may still attempt a real cleanup reap), so calling it on both ids
+        // unconditionally is always safe and is what actually guarantees
+        // the blocker's group - and the queued job's, if it ever spawned -
+        // is signaled and reaped rather than left running past this test.
+        // Filtered to only the ids that were actually assigned, since a
+        // throw before runTool.handler returns leaves that variable
+        // undefined.
+        await cleanUpSharedJobs(
+          [blockerJobId, queuedJobId].filter((id): id is string => id !== undefined)
+        );
+      }
     }
-  }
-);
+  );
+});
