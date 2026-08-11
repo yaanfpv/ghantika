@@ -19,11 +19,14 @@
  *     cardinality still matches the already-owned policy, and that
  *     `tasks/get` and `output`/`tail` stay two genuinely distinct surfaces.
  *   - the core regression guarantee - a frozen, checked-in golden
- *     (`test/fixtures/plain-poll-golden.json`, captured from a real
- *     spawned build of the commit right before the wake layer merged) that
- *     every plain-poll response must still match under canonical projection,
- *     whether or not the Tasks adapter is actively engaged elsewhere in the
- *     same process.
+ *     (`test/fixtures/plain-poll-golden.json`, covering all SEVEN plain
+ *     tools, captured from a real spawned build of the commit that has
+ *     `follow` merged but predates the wake-TRANSPORT-layer's own wiring
+ *     into `tasksAdapter.ts`/`server.ts` - see that golden's own
+ *     provenance comment, right above where it is loaded below, for the
+ *     exact commit and the reasoning) that every plain-poll response must
+ *     still match under canonical projection, whether or not the Tasks
+ *     adapter is actively engaged elsewhere in the same process.
  *   - the wake proof itself - a SIMULATED/mock capable client is
  *     genuinely woken through the real notification path, explicitly
  *     labeled as simulated (never claiming a real installed host's own
@@ -82,6 +85,10 @@ import {
   waitForFile,
   waitForPgrepGroupMembers,
 } from "./harness.ts";
+import {
+  canonicalizePlainPollResponse,
+  toCanonicalResultPair,
+} from "./helpers/plainPollCanonicalization.ts";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const GOLDEN_PATH = path.join(REPO_ROOT, "test", "fixtures", "plain-poll-golden.json");
@@ -966,18 +973,47 @@ test("notifications/tasks still fires on the real terminal transition even after
 });
 
 // =============================================================================
-// Strictly additive: canonicalized plain poll against a frozen golden.
-// The golden was captured from a REAL spawned build of the commit right
-// before the wake layer merged (f56dfd7), speaking real, raw JSON-RPC over
-// its real stdin/stdout to a plain (non-Tasks-capable) connection, running
-// the same six scenarios runPlainPollScenarios below runs and canonicalizing
-// them the same way canonicalizePlainPollResponse below does. The fixture
-// file itself is bare JSON with no header or provenance record of its own -
-// this comment is where that provenance lives, not an in-file header. It is
-// LOADED here, not regenerated from the currently-running server. The
-// comparison below is against this canonical projection, not literal wire
-// bytes - see the field-exclusion rationale below for exactly what it masks
-// and why.
+// Strictly additive: canonicalized plain poll against a frozen golden,
+// covering all SEVEN plain tools.
+//
+// The golden was REGENERATED (deliberately, via
+// scripts/capture-plain-poll-golden.mjs, a manual tool never run
+// automatically as part of the gate/CI - see that script's own header,
+// including its own required expected-base check that refuses to run
+// against the wrong checkout) from a real spawned build of commit
+// eed123fbd350d803b360ff1f509343ac3eb4b465 - the commit that capture run
+// both required as its expected base and recorded in its own printed
+// summary - speaking real, raw JSON-RPC over its real stdin/stdout to a
+// plain (non-Tasks-capable) connection, running the same seven scenarios
+// runPlainPollScenarios below runs and canonicalizing them the same way
+// canonicalizePlainPollResponse (test/helpers/plainPollCanonicalization.ts)
+// does - both the capture script and this file import that ONE shared
+// function, never two copies that could drift.
+//
+// That commit was chosen deliberately, not merely "whatever HEAD happened
+// to be": it has `follow` (src/tools/follow.ts, the 7th tool) already
+// merged, but predates the wake-TRANSPORT-layer's own wiring into
+// tasksAdapter.ts/server.ts (the open "wire the transport-layer wake
+// reachable and callable" work). Confirmed at that commit against this
+// repo's own source rather than assumed: neither tasksAdapter.ts nor
+// server.ts has a runtime import of, or call into, anything src/wake/*.ts
+// exports (WakeTarget/selectAndWake/the transport classes) - src/server.ts
+// does carry a comment naming wake/appServerTransport.ts and
+// wake/desktopIpcTransport.ts by path at that same commit, but a comment
+// is not wiring, and this claim is scoped to wiring specifically. So this
+// remains a genuine PRE-WAKE-TRANSPORT snapshot for all seven tools - the
+// same kind of frozen "before" baseline the original six-tool golden was,
+// just re-drawn at the boundary this story's own tool surface actually
+// needs, rather than a golden quietly re-baselined to whatever the code
+// happens to emit today (see this script's own header for why that
+// distinction matters and how the regeneration is proven non-vacuous).
+// The fixture file itself is bare
+// JSON with no header or provenance record of its own - this comment is
+// where that provenance lives, not an in-file header. It is LOADED here,
+// not regenerated from the currently-running server. The comparison below
+// is against this canonical projection, not literal wire bytes - see
+// canonicalizePlainPollResponse's own docs for exactly what it masks and
+// why.
 //
 // Each tool's golden entry carries BOTH `structuredContent` and a second
 // value captured from `content` - but that second value is only the
@@ -996,92 +1032,6 @@ test("notifications/tasks still fires on the real terminal transition even after
 // =============================================================================
 
 const golden = JSON.parse(readFileSync(GOLDEN_PATH, "utf8")) as Record<string, unknown>;
-
-// These four fields are real, pre-existing (unchanged by the wake-layer
-// story) process-GROUP confirmation fields whose PRESENCE, not just value,
-// is a genuine timing race independent of the wake layer entirely -
-// kill_confirmed/identity_confirmed depend on whether an async pgrep-based
-// reap has settled by the moment a response is read, identity_capture on
-// whether the async ps-based birth-identity capture has settled, and
-// escalation_refused_reason only ever appears on a SIGKILL-escalation
-// identity mismatch. Confirmed directly against src/jobStore.ts's own
-// `PublicJobProjection`/`toPublicProjection`: all four are declared OPTIONAL
-// and are passed through verbatim from a `JobRecord` field that is itself
-// only ever written once its own async, fire-and-forget confirmation
-// settles - and JSON serialization drops an unset optional field entirely
-// rather than carrying it as `null`. So a real, honest capture can
-// legitimately have any of these four present or fully absent depending on
-// nothing but timing, independent of any real bug. That is why these four
-// are EXCLUDED from the comparison below rather than masked to a stable
-// token the way job_id/started_at/ended_at/label are: masking replaces the
-// VALUE of a field that is always PRESENT, but forcing one of these four to
-// always compare as present (or always absent) would fabricate a
-// determinism the real wire protocol does not have - which would silently
-// paper over a genuine regression in their presence rather than prove
-// anything about it. None of the four is something this change's wake layer
-// could plausibly regress (already governed by test/kill.test.ts and
-// friends) - excluding them keeps this comparison scoped to the
-// wake-additivity property it exists to prove.
-const RACY_IN_PRESENCE_CONFIRMATION_FIELDS = new Set([
-  "kill_confirmed",
-  "identity_confirmed",
-  "identity_capture",
-  "escalation_refused_reason",
-]);
-
-/**
- * Masks volatile fields to the SAME stable placeholder tokens the golden
- * fixture was frozen with, and drops any key whose value is `undefined` -
- * real wire JSON serialization always drops these (which is how the golden
- * was captured), so this keeps the comparison correct regardless of
- * whether a given live call happens to travel over a real byte-serialized
- * transport or an in-process one that can leak an explicitly-undefined key
- * no real client would ever observe. `label` is masked too - it is a
- * caller-supplied literal input (not a server invariant), and this file's
- * own scenarios need a distinct, real label per run (so `list`'s own
- * single-entry isolation still holds when several scenarios share one
- * process) rather than reusing the golden's exact literal string. The four
- * `RACY_IN_PRESENCE_CONFIRMATION_FIELDS` are dropped (never given a
- * placeholder value) - see that constant's own docs for why deletion, not
- * masking, is the honest choice for a field whose real PRESENCE is racy,
- * not just its value.
- *
- * `pid` (status only - see `src/tools/status.ts`'s `StatusProjection`) is
- * a real, per-run OS process id, so it is masked to a stable placeholder
- * the same way `job_id` is - its PRESENCE is deterministic (set
- * synchronously by `run()` before this file's own `runJob` helper ever
- * returns), only its numeric value varies between runs. `birth_identity`
- * (same source file) is masked WHOLE, never recursed into: unlike `pid`
- * its real value can legitimately take one of several different SHAPES
- * depending purely on timing (still `"pending"`, or already `"captured"`
- * with a platform-tagged identity payload whose own fields - a raw
- * kernel tick count on Linux, a captured timestamp/elapsed-seconds pair
- * everywhere else - are themselves real and non-reproducible) - the same
- * underlying async birth-identity capture `identity_capture` already
- * names, just carrying the settled payload alongside the state instead of
- * a bare string. A single flat placeholder collapses every legitimate
- * outcome to one canonical token, exactly like the other masked fields,
- * without needing this file to also special-case `identity_capture`'s
- * PRESENCE-racing treatment for a field whose presence here is not racy.
- */
-function canonicalizePlainPollResponse(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalizePlainPollResponse);
-  if (value !== null && typeof value === "object") {
-    const out: Record<string, unknown> = {};
-    for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
-      if (v === undefined) continue;
-      if (RACY_IN_PRESENCE_CONFIRMATION_FIELDS.has(key)) continue;
-      if (key === "job_id") out[key] = "<JOB_ID>";
-      else if (key === "started_at" || key === "ended_at") out[key] = "<TIMESTAMP>";
-      else if (key === "label") out[key] = "<LABEL>";
-      else if (key === "pid") out[key] = "<PID>";
-      else if (key === "birth_identity") out[key] = "<BIRTH_IDENTITY>";
-      else out[key] = canonicalizePlainPollResponse(v);
-    }
-    return out;
-  }
-  return value;
-}
 
 /**
  * Compares `live` (after canonicalization) against `golden` via actual
@@ -1105,50 +1055,7 @@ function assertPlainPollByteIdentical(live: unknown, context: string): void {
   );
 }
 
-/**
- * Extracts BOTH halves of a real `CallToolResult` a golden comparison
- * needs: `structuredContent` as-is, and `content`'s own FIRST text block
- * independently re-parsed from its raw JSON string - never assumed equal
- * to `structuredContent` just because that is every handler's current
- * contract. A future regression that lets the two drift (a stale
- * `content` string a handler forgot to update alongside a real
- * `structuredContent` change, say) is exactly what capturing both
- * separately is for.
- *
- * The boundary this does NOT cover, stated explicitly rather than left
- * implied: only the first `content` block's parsed body is compared. The
- * array's own length and ordering, each block's `type`, any additional
- * blocks beyond the first, and every other `CallToolResult` envelope
- * field are outside what this - and therefore the additivity proof built
- * on it - actually establishes.
- */
-function toCanonicalResultPair(result: {
-  content?: Array<{ type: string; text?: string }>;
-  structuredContent?: unknown;
-}): { structuredContent: unknown; content: unknown } {
-  const text = result.content?.[0]?.text;
-  assert.equal(
-    typeof text,
-    "string",
-    `expected a text content block, got: ${JSON.stringify(result.content)}`
-  );
-  return {
-    structuredContent: result.structuredContent,
-    content: JSON.parse(text as string),
-  };
-}
-
-// `follow` (the 7th tool) is deliberately OUT OF SCOPE for this whole
-// file's golden comparison, on purpose, permanently: the golden was
-// captured from a real build of the commit right before the wake layer
-// merged (see GOLDEN_PATH's own doc comment above), and `follow` did not
-// exist at that commit - there is no frozen pre-wake value for it to
-// match, and inventing a synthetic one would make this golden describe a
-// tool surface that never actually existed at any point in this repo's
-// history. A tool added later earns its own coverage elsewhere
-// (test/follow.test.ts), never a manufactured entry here.
-
-/** Runs the same six deterministic scenarios the golden was captured from, against a PLAIN (non-Tasks-capable) client, and returns each tool's canonicalized {structuredContent, content} pair keyed by tool name. */
+/** Runs the same seven deterministic scenarios the golden was captured from, against a PLAIN (non-Tasks-capable) client, and returns each tool's canonicalized {structuredContent, content} pair keyed by tool name. */
 async function runPlainPollScenarios(
   client: Client,
   labelPrefix: string
@@ -1285,10 +1192,49 @@ async function runPlainPollScenarios(
     results.kill = toCanonicalResultPair(killResult);
   }
 
+  {
+    // `follow` (the 7th tool) - the only plain tool that does not resolve
+    // near-instantly, so it needs a scenario that genuinely EXERCISES the
+    // wait rather than one that would have returned the same way even if
+    // follow blocked forever: an immediate-return scenario (output/
+    // terminal already true at call time) would assert almost nothing
+    // about the one thing that makes this tool different from the other
+    // six. The backing job here writes its one line only after a real,
+    // short delay, and then keeps running past it (a second, much longer
+    // timer) - so `follow`, called immediately after minting and well
+    // before that delayed write lands, is still genuinely SUBSCRIBED and
+    // WAITING when the write happens (a real subscribe-then-wake, not the
+    // subscribe-then-recheck immediate path test/follow.test.ts's own
+    // "already true at call time" tests cover), and the job's own `state`
+    // is deterministically still "running" (never "exited") at the exact
+    // moment follow's response is built - which is what keeps this
+    // scenario's captured shape reproducible rather than racing the
+    // child's own natural exit against follow's own wake.
+    const minted = await runJob(client, {
+      command: [
+        process.execPath,
+        "-e",
+        "setTimeout(() => { process.stdout.write('golden-follow-line\\n'); }, 200); setTimeout(() => {}, 600000);",
+      ],
+      label: `${labelPrefix}-follow-job`,
+    });
+    const jobId = minted.job_id as string;
+    const followResult = (await client.callTool({
+      name: "follow",
+      arguments: { job_id: jobId, timeout_ms: 5000 },
+    })) as { content?: Array<{ type: string; text?: string }>; structuredContent?: unknown };
+    results.follow = toCanonicalResultPair(followResult);
+    // The backing job is still alive (blocked on its own long second
+    // timer, deliberately, per the comment above) - killed here purely
+    // for real-process hygiene, uncaptured and never part of this
+    // scenario's own result or the golden.
+    await client.callTool({ name: "kill", arguments: { job_id: jobId } });
+  }
+
   return results;
 }
 
-test("all six tools' plain-poll responses stay byte-identical (canonical projection) to the frozen pre-wake golden, with no OTHER connection ever engaging Tasks capability", async () => {
+test("all seven tools' plain-poll responses stay byte-identical (canonical projection) to the frozen pre-wake golden, with no OTHER connection ever engaging Tasks capability", async () => {
   const pair = await startPair(false);
   try {
     const live = await runPlainPollScenarios(pair.client, "plain-poll-absent");
@@ -1298,10 +1244,23 @@ test("all six tools' plain-poll responses stay byte-identical (canonical project
   }
 });
 
-test("run/status/output/tail/kill stay byte-identical (canonical projection) to the SAME frozen golden, and so does list's own scenario-owned entry, even while the Tasks adapter is ACTIVELY engaged elsewhere in the same process (a separate capable connection minting and wake-watching its own job) - every OTHER entry in the real process-wide list response is confirmed to share that entry's canonical key shape, not compared against a golden value; and the plain, non-capable connection receives ZERO wake notifications of its own, proving the push path is gated on capability negotiation rather than on any per-job state the plain connection could incidentally share", async () => {
+test("run/status/output/tail/kill/follow stay byte-identical (canonical projection) to the SAME frozen golden, and so does list's own scenario-owned entry, even while the Tasks adapter is ACTIVELY engaged elsewhere in the same process (a separate capable connection minting and wake-watching its own job) - every OTHER entry in the real process-wide list response is confirmed to share that entry's canonical key shape, not compared against a golden value; and the plain, non-capable connection receives ZERO wake notifications of its own, proving the push path is gated on capability negotiation rather than on any per-job state the plain connection could incidentally share", async () => {
   const capablePair = await startPair(true);
   const plainPair = await startPair(false);
   const plainReceived = registerWakeSpy(plainPair.client);
+  // The description claims ZERO wake notifications of any kind, not only
+  // the output-delta one - so this spies on BOTH methods the plain
+  // connection could receive, exactly like the tests elsewhere in this
+  // file that already register both spies on one client (see
+  // registerTaskStatusNotificationSpy's own doc comment).
+  const plainTaskStatusReceived = registerTaskStatusNotificationSpy(plainPair.client);
+  // startTaskStatusNotifier's own subscription is jobStore.onJobTerminal, so
+  // notifications/tasks can only ever fire on a terminal transition - a
+  // negative assertion below that the PLAIN peer received none of these is
+  // worthless unless a terminal transition has genuinely occurred somewhere
+  // in this process while both peers were connected. This spy on the
+  // CAPABLE peer's own client is that positive control.
+  const capableTaskStatusReceived = registerTaskStatusNotificationSpy(capablePair.client);
   let capableJobId: string | undefined;
   try {
     const mintedCapable = await mintJob(capablePair.client, {
@@ -1320,19 +1279,58 @@ test("run/status/output/tail/kill stay byte-identical (canonical projection) to 
       mock.timers.reset();
     }
     await new Promise((resolve) => setImmediate(resolve));
+
+    // Terminalize the capable peer's OWN job now, WHILE BOTH PEERS ARE
+    // STILL CONNECTED, and confirm its own notifications/tasks fires - the
+    // positive control. Only once this proves the mechanism is genuinely
+    // live in this process does the plain peer's "received none of it"
+    // assertion below mean anything; asserted against a still-live job (as
+    // this test previously did, terminalizing only in `finally`, after
+    // every assertion) it could never have failed regardless of whether the
+    // capability gate was actually wired correctly.
+    await killAndReapRealChild(capableJobId);
+    for (let attempt = 0; capableTaskStatusReceived.length === 0 && attempt < 50; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(
+      capableTaskStatusReceived.length > 0,
+      "expected the capable connection's own notifications/tasks to fire on its job's real terminal transition - without this, the plain peer's zero-notifications assertions below are asserted under conditions where they cannot fail either way"
+    );
+
     // The plain connection registered no interest in Tasks and shares this
-    // process with the capable connection whose job just woke - so this is
-    // the one point in the suite that can catch `startTaskWatch` being
-    // reached before the capability guard: that regression would push this
-    // exact notification here, at zero cost to every assertion above.
+    // process with the capable connection whose job just woke AND just
+    // terminalized - so this is the one point in the suite that can catch
+    // `startTaskWatch` or `startTaskStatusNotifier` being reached before the
+    // capability guard: that regression would push one of these exact
+    // notifications here, at zero cost to every assertion above.
     assert.strictEqual(
       plainReceived.length,
       0,
-      "a non-capable connection must never receive a Tasks status notification, even while sharing a process with an actively-waking capable one"
+      "a non-capable connection must never receive the output-delta wake notification, even while sharing a process with an actively-waking capable one"
+    );
+    assert.strictEqual(
+      plainTaskStatusReceived.length,
+      0,
+      "a non-capable connection must never receive the released spec's own notifications/tasks status notification either, even while sharing a process with a capable one whose own job has just genuinely terminalized"
     );
 
     const live = await runPlainPollScenarios(plainPair.client, "plain-poll-present");
     assertPlainPollByteIdentical(live, "a separate capable connection actively engaged elsewhere");
+
+    // runPlainPollScenarios drives several real terminal transitions of its
+    // own, on jobs the plain peer itself minted - recheck both arrays after
+    // it completes so those terminal paths are covered too, not only the
+    // capable peer's single terminalization above.
+    assert.strictEqual(
+      plainReceived.length,
+      0,
+      "a non-capable connection must never receive the output-delta wake notification, even after its own plain-poll scenarios drove several real terminal transitions"
+    );
+    assert.strictEqual(
+      plainTaskStatusReceived.length,
+      0,
+      "a non-capable connection must never receive notifications/tasks, even after its own plain-poll scenarios drove several real terminal transitions of jobs it minted itself"
+    );
   } finally {
     if (capableJobId !== undefined) await killAndReapRealChild(capableJobId);
     await capablePair.close();
