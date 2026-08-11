@@ -25,6 +25,7 @@
     "dist",
     "schema",
     "config/tasks-schema-digest.json",
+    "config/tasks-schema-provenance.json",
     "README.md",
     "LICENSE"
   ],

@@ -1,0 +1,66 @@
+{
+  "vendored_file": "schema/tasks-extension.schema.json",
+  "upstream": {
+    "repository": "https://github.com/modelcontextprotocol/ext-tasks",
+    "commit_sha": "2c1425d9a288b9b1f489430fe1e00bb392b47e48",
+    "path": "schema/draft/schema.json",
+    "fetch_url": "https://raw.githubusercontent.com/modelcontextprotocol/ext-tasks/2c1425d9a288b9b1f489430fe1e00bb392b47e48/schema/draft/schema.json",
+    "fetched_at": "2026-08-11T10:04:59Z",
+    "byte_length": 46903,
+    "sha256_as_fetched": "b17cb4a2534379c214b17770bd5d3d54f69fde16a953bfb542c58235a61274bb"
+  },
+  "governing_sep": {
+    "id": "SEP-2663",
+    "title": "Tasks Extension",
+    "status_as_fetched": "Final",
+    "path_at_commit": "seps/2663-tasks-extension.md",
+    "note": "The upstream repo's own directory is named schema/draft/ - that is the repo's spec-versioning convention (mirroring the MCP core spec's own 'draft' version label before a dated release is cut), not a signal that SEP-2663 itself is unfinalized. The SEP document's own Status field, read at this commit, says Final."
+  },
+  "how_to_reverify": "Fetch upstream.fetch_url and compute its SHA-256; compare against upstream.sha256_as_fetched. A public GitHub repository can, in principle, have a commit become unreachable (force-push, branch deletion, repo restructuring) even though this one shows no sign of that today - if the fetch 404s or the digest no longer matches, that divergence is itself the finding, not a bug in this record.",
+  "temporal_limit": "This binds the vendored schema to the upstream repository's CURRENT main-branch tip as observed at fetch time, because the upstream repo carries no release tags and no other stable pointer to consult. It does NOT establish that this is the exact commit the vendored schema's original author measured against when the file was first written - no prior commit reference was recorded anywhere in this repo's history for that comparison. What this record DOES establish, verified by direct field-by-field reading rather than by trusting the schema's own prose: the vendored schema and the upstream tip agree on every field name, required-set, and additionalProperties lock in every shape both sides define, for every shape this repo actually vendors - and diverge only in the ways enumerated below, all deliberate.",
+  "deliberate_divergences": [
+    {
+      "id": "1",
+      "class": "discriminated-union-keyword",
+      "already_documented_in": "schema/tasks-extension.schema.json's own top-level description",
+      "description": "Upstream expresses a closed status/branch discriminant as `anyOf` of `const` branches (TaskStatus, and the branch discriminant inside DetailedTask/CreateTaskResult/GetTaskResult). This schema uses `oneOf` for the discriminated getTaskResult union instead, because the four branches are mutually exclusive by construction and `oneOf` is the only one of the two keywords test/tasks.test.ts's hand-rolled validator implements."
+    },
+    {
+      "id": "2",
+      "class": "restated-not-composed",
+      "already_documented_in": "schema/tasks-extension.schema.json's own top-level description",
+      "description": "Upstream's CreateTaskResult and GetTaskResult are each an `allOf` of two inline sub-schemas (a generic Result envelope, and the Task-shaped payload) - confirmed by direct read of both defs at the fetched commit. This schema instead vendors each as one flat, fully-restated object (createTaskResult; getTaskResultWorking/Completed/Failed/Cancelled), because the hand-rolled validator resolves a `$ref` by replacing the node it appears on, so a `$ref` next to sibling properties would silently validate nothing, and `allOf` is not implemented."
+    },
+    {
+      "id": "3",
+      "class": "result-envelope-not-vendored",
+      "description": "Upstream's generic Result envelope - an object carrying an optional `_meta` (progressToken, an io.modelcontextprotocol/related-task echo) - is composed into CreateTaskResult, GetTaskResult, UpdateTaskResult, and CancelTaskResult alike. None of this schema's result defs declare a `_meta` property, and the strict ones (createTaskResult, getTaskResultWorking/Completed/Failed/Cancelled) lock `additionalProperties: false` with no allowance for it. A spec-legal response that DOES carry `_meta` would fail validation against this schema. Whether ghantika's adapter ever needs to emit `_meta` on these results is an adapter-behavior question this record does not answer - it is out of scope for a schema-provenance record. Flagged so it is not silently absent from the record; not fixed."
+    },
+    {
+      "id": "4",
+      "class": "feature-areas-not-vendored",
+      "description": "Whole categories of upstream shapes have no vendored counterpart in this schema, for different reasons per category - a claim about what the SCHEMA vendors, never a claim about what the adapter itself does at runtime: (a) the input_required flow (InputRequiredTask, InputRequest(s), InputResponse(s)) - already disclosed in src/tasksAdapter.ts's own header as structurally unreachable, since a job-backed task has no client-input step, so the adapter genuinely never emits this; (b) the notification/subscription delivery model's shapes (TaskStatusNotification, TaskStatusNotificationParams, TaskSubscriptionNotifications, TaskSubscriptionAcknowledgedNotifications) are not vendored here, but the adapter DOES send a server-initiated notification: TASKS_NOTIFICATION_METHOD ('notifications/tasks', src/tasksAdapter.ts) is emitted via server.notification (src/server.ts) on a task's terminal transition, unconditionally, to the Tasks-capable connection that minted that task - not broadcast to other connections. What the adapter does NOT implement is the released model's own task-id-scoped subscribe/acknowledge semantics (a client opts in per task id, a server honors only the acknowledged subset) - this adapter's notification is unconditional, not subscription-gated. That is a fact about DELIVERY SCOPE, checked directly against startTaskStatusNotifier's own call site in src/tasksAdapter.ts, which runs on the minting connection's own path alone. Its PAYLOAD is a separate fact, about SHAPE rather than delivery, and checked directly against the fetched upstream TaskStatusNotificationParams def: that def is `allOf` of an optional `_meta` envelope (already covered by divergence 3, not vendored here) plus the same status-branch shapes this schema's own DetailedTask variants already pin. `startTaskStatusNotifier` sends `buildDetailedTaskResult(record)` unchanged, so the notification's payload is the identical DetailedTask shape this schema already vendors - schema-shaped, not a separate unvendored one; (c) the three request shapes (CancelTaskRequest, GetTaskRequest, UpdateTaskRequest) are not vendored here - the adapter DOES implement and handle tasks/get, tasks/update, and tasks/cancel (see src/tasksAdapter.ts). That is a fact about OUR CODE: it validates their requests via its own hand-rolled StandardSchema validators, `taskIdParamsSchema()` and `taskUpdateParamsSchema()` (defined in src/tasksAdapter.ts, wired at src/server.ts's `setRequestHandler` calls) - never via the installed SDK's own generic JSON-RPC typing, and never against this schema, which pins only the response/result shapes the adapter emits; (d) TasksExtensionCapability - capability negotiation is enforced in code (isConnectionTasksCapable / the extensions bag), not schema-validated."
+    },
+    {
+      "id": "5",
+      "class": "cross-spec-vocabulary",
+      "already_documented_in": "the createTaskResult def's own description",
+      "description": "resultTypeTask and resultTypeComplete are the resultType discriminator this adapter's results carry, but that vocabulary belongs to a different spec entirely (SEP-2322, core-protocol multi-round-trip requests) - it is not redefined in ext-tasks's own generated schema at all. Vendored here because CreateTaskResult/emittedAckResult need to reference it, not because it is part of the ext-tasks contract this file otherwise pins."
+    },
+    {
+      "id": "6",
+      "class": "product-specific-additions",
+      "description": "taskOutputCounts, watchStoppedInfo, and ghantikaResultExtras have no upstream counterpart at all - they are ghantika-specific fields this adapter layers onto the spec's own result shapes, not part of io.modelcontextprotocol/tasks."
+    },
+    {
+      "id": "7",
+      "class": "closed-enum-idiom",
+      "description": "Upstream's TaskStatus is an `anyOf` of five `const` string branches. This schema's taskStatus is a flat `enum` of the same five values. Semantically identical (a five-value closed string set either way); listed for completeness."
+    },
+    {
+      "id": "8",
+      "class": "stricter-than-upstream-typing",
+      "description": "Several fields on the shared Task-shaped defs (verified directly on WorkingTask, and structurally identical across the other DetailedTask variants and createTaskResult by shared field definition) are typed STRICTER than the upstream contract requires: ttlMs and pollIntervalMs are `integer` here versus upstream's bare `number` (a spec-legal fractional value would fail this schema); ttlMs additionally carries `minimum: 0` versus upstream's unconstrained `anyOf: [{type: number}, {type: null}]` (a spec-legal negative value would fail this schema); taskId/createdAt/lastUpdatedAt carry `minLength: 1` versus upstream's unconstrained `string`; pollIntervalMs additionally carries `exclusiveMinimum: 0` versus upstream's unconstrained `number`. Separately, on the result/error payload rather than the shared Task-shaped defs: upstream's CompletedTask.result and FailedTask.error are both a genuinely free-form object (`propertyNames: {type: string}, additionalProperties: {}` - any JSON object validates), while this schema's getTaskResultCompleted.result and getTaskResultFailed.error both `$ref` the closed `ghantikaResultExtras` def (`additionalProperties: false`, three named keys only - see divergence 6). This narrows to what ghantika's own adapter actually emits (integers, non-negative values, non-empty strings, and its own fixed result-extras shape) - it is not a claim that the upstream spec itself requires these bounds, and it means this schema is a STRICTER bar than the real spec in these fields, not a looser one."
+    }
+  ]
+}
