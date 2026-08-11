@@ -2,21 +2,21 @@
  * Resolves a `WakeTarget` from the raw `_meta` object of an incoming
  * `tools/call` request, without ever fabricating one.
  *
- * A real Codex client (measured against Codex 0.147.0, n=4 across 3
- * independent sessions) sends the calling thread's identity in
- * `params._meta.threadId` - a UUID string, stable across multiple calls
- * within one session and distinct across separate sessions, exactly the
- * property a wake target needs. The same `_meta` object also carries a
- * vendor-specific `x-codex-turn-metadata` block with the same id under
- * `.thread_id`; `threadId` (top-level, spec-shaped) is read instead, since
- * it is the more stable, less vendor-specific of the two.
+ * This function treats `params._meta.threadId`, when present as a
+ * non-empty string, as a thread-identity signal - the meaning this
+ * codebase's own wake-target design assigns to that field. It makes no
+ * claim about which real MCP client populates the field, how reliably,
+ * or whether a given client's value stays stable and distinct across
+ * sessions; that is outside what this function, or the tests exercising
+ * it, establish. The same `_meta` object may also carry a
+ * vendor-specific `x-codex-turn-metadata` block with an id under
+ * `.thread_id`; the top-level, spec-shaped `threadId` is read instead of
+ * that vendor field, since it is the less vendor-specific of the two.
  *
- * Claude Code sends `_meta` shaped as `{claudecode/toolUseId,
- * progressToken}` - no thread identity at all. That is an ordinary,
- * expected shape for this function, not an error: Claude Code has its own
- * client-side auto-backgrounding as its wake path and does not need this
- * transport layer, so `"absent"` is the correct, unremarkable answer for
- * it.
+ * Any handler-visible metadata object lacking `threadId` resolves to the
+ * `"absent"` case rather than an error - a fact about this resolver,
+ * true regardless of which client sent the request, needing no claim
+ * about any particular client's shape.
  *
  * Three states, matching `src/tools/status.ts`'s own
  * `PublicBirthIdentityProjection` pattern - narrowing on `state` alone
@@ -27,13 +27,12 @@
  *
  * This is a pure extraction function, not an authentication one: it never
  * validates `threadId`'s shape beyond "present and a non-empty string"
- * (not a UUID-format check, not a length check), since imposing a
- * stricter format than the measured wire evidence actually constrains
- * would be inventing a rule with no evidence behind it. It never falls
- * back to anything else (an env var, a config guess, a correlation
- * heuristic) when a target cannot be extracted - a caller holding
- * anything other than `"resolved"` has definitively not been given a
- * target and must not construct one from another source.
+ * (not a UUID-format check, not a length check), since a stricter check
+ * would risk rejecting a legitimate value on no stated authority. It
+ * never falls back to anything else (an env var, a config guess, a
+ * correlation heuristic) when a target cannot be extracted - a caller
+ * holding anything other than `"resolved"` has definitively not been
+ * given a target and must not construct one from another source.
  */
 import type { WakeTarget } from "./wakeTransport.js";
 

@@ -90,10 +90,14 @@
  * six - including `follow`, the newest - stay plain), so the plain poll
  * floor (status/output/tail on a job_id) is reachable on every
  * connection, capable or not, exactly as it was before this capability
- * existed. `maybeAugmentRunResult` is a pure pass-through unless the
- * connection is capable AND a real job_id can be read back out of the
- * plain result it was just handed - never inventing a handle from
- * nothing, never mutating jobStore itself.
+ * existed. `maybeAugmentRunResult`'s RESPONSE SHAPE is a pure
+ * pass-through unless the connection is capable AND a real job_id can be
+ * read back out of the plain result it was just handed - never
+ * inventing a handle from nothing. It does register a real jobStore side
+ * effect regardless of capability: a terminal-transition listener for
+ * the transport-layer wake (see `startTransportWakeOnTerminal`'s own
+ * docs), whose callback is a no-op unless `GHANTIKA_WAKE_TRANSPORT_ENABLED`
+ * is set.
  *
  * ## taskId == job_id, one handle namespace
  *
@@ -1329,25 +1333,22 @@ function startTaskStatusNotifier(taskId: string, notifier: TaskWakeNotifier): vo
 }
 
 // ---------------------------------------------------------------------------
-// The transport-layer wake - genuinely resuming an idle AGENT SESSION on
-// the host machine (a Codex thread, a backgrounded Claude Code turn) via
-// `src/wake/selectTransport.ts`'s `selectAndWake`, rather than pushing an
-// MCP notification down THIS connection the way both mechanisms above do
-// (see `src/wake/wakeTransport.ts`'s own header for that same distinction,
-// stated from the transport side). This section wires that layer
-// REACHABLE and CALLABLE - closing the gap `resolveWakeTarget.ts` already
-// closed on the resolution side - while keeping it entirely INERT in every
-// real deployment today: `isTransportWakeEnabled` is the one gate every
-// path below passes through before a single transport call can happen.
+// The transport-layer wake - a mechanism for eventually resuming an idle
+// AGENT SESSION on the host machine (a Codex thread, a backgrounded
+// Claude Code turn) via `src/wake/selectTransport.ts`'s `selectAndWake`,
+// rather than pushing an MCP notification down THIS connection the way
+// both mechanisms above do (see `src/wake/wakeTransport.ts`'s own header
+// for that same distinction, stated from the transport side). This
+// section wires that layer so a resolved target can reach a gated wake
+// attempt. `isTransportWakeEnabled` is the one gate every path below
+// passes through before a single transport call can happen, and it
+// defaults to off.
 //
-// The PUBLIC surface shape of the opt-in (a `run` parameter, a separate
-// arming call, something else) is a deliberately separate, still-open
-// design decision - not settled here. So this is deliberately an
-// internal, undocumented, test-reachable toggle only, never a tool-schema
-// field, a documented flag, or anything a real client can discover or set
-// through the wire protocol. Follows this codebase's own house pattern
-// for exactly that shape - see `src/process.ts`'s
-// `GHANTIKA_TEST_DEGRADE_PROC_READ`.
+// This is deliberately an internal server-process environment variable
+// only, never a tool-schema field, a documented flag, or anything an MCP
+// client can discover or set through the wire protocol. Follows this
+// codebase's own house pattern for exactly that shape - see
+// `src/process.ts`'s `GHANTIKA_TEST_DEGRADE_PROC_READ`.
 // ---------------------------------------------------------------------------
 
 const WAKE_TRANSPORT_ENABLED_ENV = "GHANTIKA_WAKE_TRANSPORT_ENABLED";
@@ -1364,12 +1365,20 @@ function isTransportWakeEnabled(): boolean {
  * the exact terminal `JobState` it reached) and the concrete next step (the
  * poll floor), nothing about what happens next beyond what is literally
  * true.
+ *
+ * Names only `status`/`output`/`tail`, deliberately never `tasks/get` - this
+ * payload has no way to know which protocol era the RECIPIENT session is
+ * actually running (it travels out-of-band through a real transport, not
+ * back down the connection this job's own request arrived on), and
+ * `tasks/get` is unroutable on the modern 2026-07-28 era regardless of any
+ * capability this codebase controls. `status`/`output`/`tail` are the
+ * plain poll floor and work unconditionally on every era this codebase
+ * serves, so they are the only instruction this payload can make without
+ * risking sending a real recipient into a method their own connection may
+ * not even be able to route.
  */
 function buildTransportWakePayload(taskId: string, record: JobRecord): string {
-  return (
-    `ghantika job ${taskId} reached ${record.state} - call tasks/get or use ` +
-    `status/output/tail to read the result`
-  );
+  return `ghantika job ${taskId} reached ${record.state} - use status/output/tail to read the result`;
 }
 
 /**
@@ -1397,18 +1406,15 @@ function buildTransportWakePayload(taskId: string, record: JobRecord): string {
  * function does not need to track its own "already fired" state.
  *
  * `isTransportWakeEnabled()` is checked FIRST, before `resolution.state` is
- * even read - so with the env var unset (every real deployment today) this
- * subscription still gets CREATED (proving the wiring is genuinely
- * reachable), but its callback is a guaranteed no-op the instant it runs:
- * zero calls to `selectAndWake`, and therefore zero calls to any
- * transport's `probe()`/`wake()`. The gate is INTERNAL and UNDOCUMENTED -
- * see this section's own header comment for why (the public opt-in shape
- * is a deliberately separate, still-open design decision, not something
- * this file decides or hints at).
+ * even read - so this subscription is always created, regardless of the
+ * env var's value, and its callback is a guaranteed no-op whenever the
+ * gate is off: zero calls to `selectAndWake`, and therefore zero calls to
+ * any transport's `probe()`/`wake()`. The gate is INTERNAL and
+ * UNDOCUMENTED - see this section's own header comment for why.
  *
  * Fail-closed on every resolution state OTHER than `"resolved"`, whether
- * the gate is on or off: `"absent"` is Claude Code's ordinary, expected
- * case (see `resolveWakeTarget.ts`'s own doc comment) and stays entirely
+ * the gate is on or off: `"absent"` (see `resolveWakeTarget.ts`'s own
+ * doc comment for what makes a request resolve that way) stays entirely
  * silent - nothing to log, nothing attempted. `"malformed"` is logged (a
  * wrong target must be loud, never silently swallowed - matching
  * `sendTaskNotification`'s own `console.error` catch-pattern style) but
@@ -1428,10 +1434,20 @@ function buildTransportWakePayload(taskId: string, record: JobRecord): string {
  * whether this ever fires or what it finds when it does.
  */
 function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetResolution): void {
-  jobStore.onJobTerminal(taskId, () => {
+  const unsubscribeTerminal = jobStore.onJobTerminal(taskId, () => {
+    // Called first, unconditionally, before any of this callback's own
+    // early returns - `onJobTerminal` fires this at most once per task,
+    // but `fireJobTerminal` never removes a fired listener from its own
+    // Set on its own (see that method's own docs), so this closure - and,
+    // for a resolved target, the target-resolution data it captured -
+    // must unsubscribe itself to avoid staying registered for the job's
+    // whole remaining life. Matches `stopWatch`'s own `unsubscribeTerminal`
+    // call above, which does the same for its sibling subscription.
+    unsubscribeTerminal();
+
     if (!isTransportWakeEnabled()) return;
 
-    if (resolution.state === "absent") return; // Claude Code's ordinary case - silent, nothing to log, nothing attempted
+    if (resolution.state === "absent") return; // no target resolved - silent, nothing to log, nothing attempted
 
     if (resolution.state === "malformed") {
       // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- taskId is this codebase's own randomUUID(), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
@@ -1498,8 +1514,12 @@ function extractJobId(result: CallToolResult): string | undefined {
  * never trusted blindly) or replaces it ENTIRELY with the minted
  * `CreateTaskResult` for the SAME job the plain result already named.
  * Never mints for any job other than the one `result` itself is about,
- * and never touches `jobStore` beyond the SAME kind of read `getTask`
- * performs.
+ * and the RETURNED RESULT itself never touches `jobStore` beyond the
+ * SAME kind of read `getTask` performs. This function's own side
+ * effect - a terminal-transition listener registered via
+ * `startTransportWakeOnTerminal` (see its own docs) - is a real
+ * `jobStore` write made unconditionally, independent of what gets
+ * returned.
  *
  * REPLACES, never augments alongside, `content`/`structuredContent` - this
  * was an explicitly flagged open question before this adapter was built

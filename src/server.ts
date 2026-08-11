@@ -607,13 +607,17 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
         const capable = tasksAdapter.isConnectionTasksCapable(
           resolveRunClientCapabilities(server, ctx, servedModernEra)
         );
-        // Reads the SAME per-request `_meta` envelope
-        // `resolveRunClientCapabilities` reads (a different key on it -
-        // `threadId`, never `CLIENT_CAPABILITIES_META_KEY` - see
-        // `resolveWakeTarget`'s own doc comment), so this is a second call
-        // against a value already in hand, not a second envelope read. On
-        // the legacy era `ctx.mcpReq.envelope` reads `undefined` (the same
-        // branching fact `resolveRunClientCapabilities` above relies on),
+        // `threadId` is handler material, not envelope material: the SDK's
+        // per-request `_meta` lift only pulls the four reserved
+        // `io.modelcontextprotocol/*` keys (protocol version, client info,
+        // client capabilities, log level) into `ctx.mcpReq.envelope` -
+        // `resolveRunClientCapabilities` above reads one of THOSE, which is
+        // why envelope is the right source there. `threadId` is not a
+        // reserved key, so it stays in the handler-visible remainder, which
+        // the SDK surfaces separately at `ctx.mcpReq._meta` (its own doc
+        // comment: "Metadata from the original request, with the reserved
+        // envelope keys already lifted out"). On the legacy era
+        // `ctx.mcpReq._meta` reads `undefined` exactly as `envelope` does,
         // and `resolveWakeTarget(undefined)` correctly answers `{state:
         // "absent"}` - the right, safe answer for a legacy connection: no
         // wake attempt, poll floor only, no code path here needs to know
@@ -622,7 +626,7 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
         // `maybeAugmentRunResult`'s own doc comment ("server.ts resolves it
         // unconditionally on the `run` branch, in every era").
         const wakeTargetResolution = resolveWakeTarget(
-          ctx.mcpReq.envelope as Record<string, unknown> | undefined
+          ctx.mcpReq._meta as Record<string, unknown> | undefined
         );
         return tasksAdapter.maybeAugmentRunResult(
           result,
