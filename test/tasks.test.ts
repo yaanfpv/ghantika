@@ -1940,7 +1940,7 @@ test("seven-tool mint rule: on a capable connection, run() mints a handle while 
     const beforeFirstJobMs = Date.now();
     const minted = await mintJob(pair.client, {
       command: [process.execPath, "-e", "process.stdout.write('x');"],
-      label: "six-tool-mint-rule",
+      label: "seven-tool-mint-rule",
     });
     const taskId = minted.taskId as string;
     assert.equal(typeof minted.taskId, "string", "run() must mint on a capable connection");
@@ -2091,7 +2091,7 @@ test("seven-tool mint rule: on a capable connection, run() mints a handle while 
         diagnostic: undefined,
         queue_position: undefined,
         command_summary: path.basename(process.execPath),
-        label: "six-tool-mint-rule",
+        label: "seven-tool-mint-rule",
         counts: { stdout_lines: 1, stdout_bytes: 1, stderr_lines: 0, stderr_bytes: 0 },
         kill_confirmed: true,
         identity_confirmed: undefined,
@@ -2128,7 +2128,7 @@ test("seven-tool mint rule: on a capable connection, run() mints a handle while 
       listedEntry,
       {
         job_id: taskId,
-        label: "six-tool-mint-rule",
+        label: "seven-tool-mint-rule",
         state: "exited",
         started_at: statusResult.started_at,
         queue_position: undefined,
@@ -2189,7 +2189,7 @@ test("seven-tool mint rule: on a capable connection, run() mints a handle while 
     const beforeSecondJobMs = Date.now();
     const second = await mintJob(pair.client, {
       command: [process.execPath, "-e", "setTimeout(() => {}, 60000);"],
-      label: "six-tool-mint-rule-kill-target",
+      label: "seven-tool-mint-rule-kill-target",
     });
     const secondTaskId = second.taskId as string;
     await new Promise((resolve) => setTimeout(resolve, 50)); // let it actually start running
@@ -2281,7 +2281,7 @@ test("seven-tool mint rule: on a capable connection, run() mints a handle while 
         diagnostic: undefined,
         queue_position: undefined,
         command_summary: path.basename(process.execPath),
-        label: "six-tool-mint-rule-kill-target",
+        label: "seven-tool-mint-rule-kill-target",
         counts: { stdout_lines: 0, stdout_bytes: 0, stderr_lines: 0, stderr_bytes: 0 },
         kill_confirmed: true,
         escalation_refused_reason: undefined,

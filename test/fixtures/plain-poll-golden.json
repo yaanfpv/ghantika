@@ -198,5 +198,51 @@
         "stderr_bytes": 0
       }
     }
+  },
+  "follow": {
+    "structuredContent": {
+      "job_id": "<JOB_ID>",
+      "state": "running",
+      "started_at": "<TIMESTAMP>",
+      "command_summary": "node",
+      "label": "<LABEL>",
+      "counts": {
+        "stdout_lines": 1,
+        "stdout_bytes": 19,
+        "stderr_lines": 0,
+        "stderr_bytes": 0
+      },
+      "events": [
+        {
+          "seq": 1,
+          "stream": "stdout",
+          "text": "golden-follow-line"
+        }
+      ],
+      "next_cursor": 1,
+      "reason": "output"
+    },
+    "content": {
+      "job_id": "<JOB_ID>",
+      "state": "running",
+      "started_at": "<TIMESTAMP>",
+      "command_summary": "node",
+      "label": "<LABEL>",
+      "counts": {
+        "stdout_lines": 1,
+        "stdout_bytes": 19,
+        "stderr_lines": 0,
+        "stderr_bytes": 0
+      },
+      "events": [
+        {
+          "seq": 1,
+          "stream": "stdout",
+          "text": "golden-follow-line"
+        }
+      ],
+      "next_cursor": 1,
+      "reason": "output"
+    }
   }
 }
