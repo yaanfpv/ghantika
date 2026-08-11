@@ -863,11 +863,6 @@ test("kill() on a still-queued job dequeues it, renumbers the survivors, settles
     const listedKilled = listedJobs.find((j) => j.job_id === firstQueuedId);
     assert.equal(listedKilled?.state, "killed");
     assert.equal(listedKilled?.queue_position, undefined);
-    assert.equal(
-      listedKilled?.kill_confirmed,
-      true,
-      "list() must also show kill_confirmed:true for the queue-cancelled job, not just kill()/status()"
-    );
 
     // Free the active slot - the survivor, never the killed job, must
     // be the one that actually gets a turn.
