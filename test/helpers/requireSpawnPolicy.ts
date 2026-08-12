@@ -1,27 +1,29 @@
 /**
- * A shared preflight for the test files that spawn a real command through
- * this server's `run` tool and rely on the runner's ambient policy to do
- * so - whether via a real MCP client/server pair over `InMemoryTransport`,
- * a real spawned `dist/index.js` subprocess (see `./spawnServer.ts`), or a
- * direct in-process call to `src/tools/run.ts`'s own `handler`.
- * `test/policy.test.ts` is the one exception AMONG FILES THAT USE THIS
- * PATH: it also spawns real commands through that same `handler`, but
- * manages its own `GHANTIKA_POLICY_FILE` value per test (see
- * CONTRIBUTING.md) to exercise the gate's own absent/malformed/narrow-policy
- * behavior directly, so it stays unguarded rather than call this helper.
- * `test/process-slow-paths.test.ts` is a separate, unrelated case: it calls
- * `spawnManaged` directly rather than going through this tool's `handler`
- * at all, so it never reaches the policy gate below and needs no preflight
- * of its own (see CONTRIBUTING.md). Every ordinary path ends up inside
- * `src/policy.ts`'s
+ * A shared preflight for the tests that dispatch a real command through
+ * this server's `run` tool's policy gate and rely on the runner's ambient
+ * policy to do so - whether via a real MCP client/server pair over
+ * `InMemoryTransport`, a real spawned `dist/index.js` subprocess sent a
+ * real `tools/call` over the wire (see `./spawnServer.ts`), or a direct
+ * in-process call to `src/tools/run.ts`'s own `handler`. Every one of
+ * those paths ends up inside `src/policy.ts`'s
  * `decideRunPolicy`/`decideShellPolicy`, and that gate is default-deny: with
- * no `GHANTIKA_POLICY_FILE` configured, every spawn attempt is denied and
- * the backing job settles `failed` with `diagnostic.reason: "policy-denied"`.
- * That is the policy gate working exactly as designed - the defect this
- * helper exists to fix is downstream of it: a plain `assert.equal(state,
- * "completed")` against a policy-denied job reads as an ordinary, confusing
- * "expected completed got failed" failure, with nothing pointing a
- * contributor at the real cause.
+ * no `GHANTIKA_POLICY_FILE` configured, every spawn attempt through it is
+ * denied and the backing job settles `failed` with `diagnostic.reason:
+ * "policy-denied"`. That is the policy gate working exactly as designed -
+ * the defect this helper exists to fix is downstream of it: a plain
+ * `assert.equal(state, "completed")` against a policy-denied job reads as
+ * an ordinary, confusing "expected completed got failed" failure, with
+ * nothing pointing a contributor at the real cause.
+ *
+ * A call to `spawnManaged` (from `src/process.ts`) directly is a DIFFERENT
+ * path that never reaches this gate at all - `test/process-slow-paths.test.ts`
+ * is the clearest example, but any test anywhere that spawns via
+ * `spawnManaged` without going through `run.ts`'s handler needs this helper
+ * exactly as little, for the identical reason. `test/policy.test.ts` is a
+ * third, narrower case: it does reach the gate, but manages its own
+ * `GHANTIKA_POLICY_FILE` value per test (see CONTRIBUTING.md) to exercise
+ * the gate's own absent/malformed/narrow-policy behavior directly, so it
+ * stays unguarded rather than call this helper.
  *
  * `scripts/run-tests.mjs` (the supported entry point behind `npm test` /
  * `npm run coverage`) sets `GHANTIKA_POLICY_FILE` on its OWN process before
@@ -29,17 +31,25 @@
  * through it inherits an allowlist wide enough for this suite's own
  * fixtures (see that file's own `TEST_POLICY_ALLOW_PATH` doc comment). A
  * bare `node --test <file>` invocation bypasses that script entirely, so
- * the variable is simply never set there - every spawning test in the
- * bypassed file then denies immediately, for the identical reason, at
- * every call site.
+ * the variable is simply never set there - every test that reaches the
+ * policy gate in the bypassed file then denies immediately, for the
+ * identical reason, at every call site.
  *
- * Call `requireSpawnPolicy()` from a file-level `before()` hook (see any of
- * this repo's own spawning test files for the call-site pattern), never
- * inline at individual assertions: the check itself only needs to run once,
- * early, before the first test in the file. `node:test` then fails every
- * test the hook covers with this same, real message, rather than requiring
- * a contributor to trace one confusing state mismatch back to its actual
- * cause by hand.
+ * CALL `requireSpawnPolicy()` FROM THE NARROWEST `before()` HOOK THAT
+ * COVERS ONLY THE TESTS THAT ACTUALLY REACH THE POLICY GATE - never from a
+ * file-level `before()` unless every single test in the file reaches it.
+ * `node:test` fails EVERY test a `before()` hook covers when that hook
+ * throws, not just the ones that depend on its precondition: a file-level
+ * registration in a file that mixes gated and ungated tests fails the
+ * ungated ones too, as collateral damage, under an unset policy variable -
+ * exactly the confusing-failure class this helper exists to eliminate,
+ * just moved one level up. Scope the guard to a `describe()` block wrapping
+ * only the tests that dispatch through the gate (see any of this repo's
+ * spawning test files for the pattern: `describe("<name>", () => {
+ * before(requireSpawnPolicy); ...gated tests only... });`), and leave
+ * every other test in the file outside any such block. Register at file
+ * level only when every test in the file genuinely reaches the gate, so
+ * there is nothing to isolate the guard from.
  *
  * This deliberately does not import `src/policy.ts`'s own `loadPolicy` (or
  * anything else beyond the one exported constant naming the env var) - a

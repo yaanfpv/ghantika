@@ -35,18 +35,20 @@ import { runStrandedRetryScenario } from "./helpers/killScenarios.ts";
 import { retryBirthIdentityCapture } from "./helpers/birthIdentityRetry.ts";
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 
-// The tests in this file that spawn a real job - some directly via
-// spawnManaged, some through the real `run` tool dispatched over the
-// real wire - are grouped inside their own local describe() blocks
-// below, each with its own before(requireSpawnPolicy) call scoped to
-// just that block - see test/helpers/requireSpawnPolicy.ts for what
-// this checks and why. node:test scopes a describe-level before()
-// hook to the tests declared inside that describe, so it only ever
-// affects those tests' own pass/fail - the
+// The tests in this file that spawn a real job are grouped inside
+// their own local describe() blocks below. Only the blocks whose
+// tests dispatch through the real `run` tool's policy gate (over the
+// real wire) carry a before(requireSpawnPolicy) call scoped to just
+// that block - see test/helpers/requireSpawnPolicy.ts for what this
+// checks and why. A block whose tests spawn a real job directly via
+// spawnManaged (never through the real `run` tool) is grouped the
+// same way for organization, but carries NO guard: spawnManaged
+// bypasses the policy gate entirely, so those tests need no policy
+// file and would gain nothing from the check. The
 // schema/validation/not-found/already-terminal tests right below, and
 // the escape-boundary/prose/commit-history guard suite further down
 // (plus its own pure unit tests against local extraction helpers),
-// stay outside every such block and spawn nothing at all.
+// stay outside every describe block and spawn nothing at all.
 
 // ---------------------------------------------------------------------------
 // kill: unit-level handler tests (against the real dist/tools/kill.js, but
@@ -108,9 +110,10 @@ test("kill on an already-terminal job is an idempotent no-op, never an error", a
 });
 
 describe("kill: unit-level tests against a real spawned job", () => {
-  // Each test below spawns a real job directly via spawnManaged -
-  // scoped here per this file's own top-of-file comment.
-  before(requireSpawnPolicy);
+  // Each test below spawns a real job directly via spawnManaged, never
+  // through the real `run` tool - spawnManaged bypasses the policy
+  // gate entirely, so this block carries no before(requireSpawnPolicy)
+  // - see this file's own top-of-file comment.
 
   // DEFAULT TERMINATING path, the no-signal-argument half - the OTHER half
   // of the default path, an explicitly-supplied "SIGTERM", shares this same
@@ -2927,11 +2930,11 @@ test(
 // --- the combined-degraded cell's retry-safety contract, at the real handler/wire level: never re-signals, but can still recover via existence-only confirmation ---
 
 describe("kill: the combined-degraded cell's retry-safety contract (against a real spawned job)", () => {
-  // Both tests below spawn a real job - the CONTROL via the shared
-  // runStrandedRetryScenario helper (itself via spawnManaged), the
-  // concurrent-kill test directly via spawnManaged - scoped here per
-  // this file's own top-of-file comment.
-  before(requireSpawnPolicy);
+  // Both tests below spawn a real job via spawnManaged - the CONTROL
+  // through the shared runStrandedRetryScenario helper, the
+  // concurrent-kill test directly - never through the real `run` tool,
+  // so this block carries no before(requireSpawnPolicy) - see this
+  // file's own top-of-file comment.
 
   test(
     "kill: CONTROL - a forced mid-scenario failure still leaves no survivor leader or process group behind, verified via a real process-table lookup, never merely assumed",

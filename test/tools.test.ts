@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { before, test } from "node:test";
+import { before, describe, test } from "node:test";
 
 import type { CallToolResult } from "@modelcontextprotocol/server";
 // The SDK's own AJV-based schema validator (the schema-handler-agreement
@@ -26,13 +26,35 @@ import * as tailTool from "../dist/tools/tail.js";
 import { waitForFile } from "./harness.ts";
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 
-// Several tests below spawn a real job through the real `run` tool's
-// handler - see test/helpers/requireSpawnPolicy.ts for what this checks and
-// why. This is independent of the one test further down that scopes its
-// OWN extra policy entry for a freshly-generated fixture path: this hook
-// only checks the AMBIENT value at file-load time, well before that test's
-// own scoped mutation ever runs.
-before(requireSpawnPolicy);
+// Four tests below dispatch a real command through the real `run` tool's
+// own handler (in-process - shape (a), never spawnManaged directly) AND
+// assert something about the resulting job's own state - so each one
+// genuinely needs the ambient policy to ALLOW the command, not merely to
+// be reached: a policy-denied job is still a real, successfully-returned
+// job record (isError stays false), it just settles state "failed" rather
+// than "starting"/"running"/"exited". Each of those four is individually
+// wrapped in its own local describe() block carrying a before(requireSpawnPolicy)
+// call scoped to just that one test - see test/helpers/requireSpawnPolicy.ts
+// for what this checks and why, and see test/kill.test.ts for the same
+// scoped-guard pattern applied to a file with more than one gated test per
+// block.
+//
+// Every OTHER test in this file needs no guard at all, for one of four
+// distinct reasons: it never calls a job-creating handler in the first
+// place (a pure inputSchema/comparator check); it does call run()'s
+// handler but the input is schema-invalid, or the cwd/executable never
+// resolves, so the call returns before src/policy.ts's
+// decideRunPolicy/decideShellPolicy is ever reached at all (see
+// src/tools/run.ts's own "Three ways a job can be failed" doc comment -
+// only an unresolvable cwd/executable and an actual policy denial share
+// the "spawn-error" vs "policy-denied" diagnostic.reason split, and the
+// former never even reaches the latter's check); it does reach the policy
+// gate but never asserts anything sensitive to its outcome (e.g. a bare
+// `isError !== true` check, which holds for an ALLOWED job and a
+// policy-DENIED one alike); or it scopes its own dedicated
+// GHANTIKA_POLICY_FILE value directly inside the test body (see the
+// relative-PATH-entry test below), independent of whatever the ambient
+// value happens to be at the moment this file loads.
 
 /**
  * A schema-invalid tool call always returns a tool-execution error result
@@ -87,20 +109,28 @@ test("a bare shell string without shell: true is rejected (argv array required b
   assertToolError(result, "shell: true");
 });
 
-test("run: a valid argv command passes schema validation and returns a real job (never isError, never the old stub message)", () => {
-  const result = runTool.handler({ command: ["true"] });
-  assert.notEqual(result.isError, true);
-  assert.ok(Array.isArray(result.content) && result.content.length > 0);
-  assert.equal(result.content[0]!.type, "text");
-  assert.ok(
-    result.content[0]!.type === "text" && !result.content[0]!.text.includes("not implemented yet")
-  );
-  const structured = result.structuredContent as Record<string, unknown>;
-  assert.equal(typeof structured.job_id, "string");
-  assert.ok(
-    ["starting", "running", "exited"].includes(structured.state as string),
-    `unexpected state: ${structured.state as string}`
-  );
+describe("run: dispatches through the real run tool's policy gate", () => {
+  // Asserts the resulting job's state is one of ["starting", "running",
+  // "exited"] - a policy-denied job settles "failed" instead, so this
+  // genuinely needs the ambient policy to ALLOW "true", not merely to be
+  // reached. See this file's own top-of-file comment.
+  before(requireSpawnPolicy);
+
+  test("run: a valid argv command passes schema validation and returns a real job (never isError, never the old stub message)", () => {
+    const result = runTool.handler({ command: ["true"] });
+    assert.notEqual(result.isError, true);
+    assert.ok(Array.isArray(result.content) && result.content.length > 0);
+    assert.equal(result.content[0]!.type, "text");
+    assert.ok(
+      result.content[0]!.type === "text" && !result.content[0]!.text.includes("not implemented yet")
+    );
+    const structured = result.structuredContent as Record<string, unknown>;
+    assert.equal(typeof structured.job_id, "string");
+    assert.ok(
+      ["starting", "running", "exited"].includes(structured.state as string),
+      `unexpected state: ${structured.state as string}`
+    );
+  });
 });
 
 test("run: shell: true accepts a bare shell command-line string", () => {
@@ -522,19 +552,27 @@ test("(green control) status on an unknown job_id is a typed not-found isError r
   );
 });
 
-test("status: a real job's status is queryable immediately after run(), never the old not-implemented stub message", () => {
-  const runResult = runTool.handler({ command: ["true"] });
-  const jobId = (runResult.structuredContent as Record<string, unknown>).job_id as string;
-  const statusResult = statusTool.handler({ job_id: jobId });
-  assert.notEqual(statusResult.isError, true);
-  assert.ok(
-    statusResult.content[0]!.type === "text" &&
-      !statusResult.content[0]!.text.includes("not implemented yet")
-  );
-  const structured = statusResult.structuredContent as Record<string, unknown>;
-  assert.equal(structured.job_id, jobId);
-  assert.ok(["starting", "running", "exited"].includes(structured.state as string));
-  assert.equal(typeof structured.started_at, "string");
+describe("status: dispatches through the real run tool's policy gate (via a real run() call)", () => {
+  // Asserts the resulting job's state is one of ["starting", "running",
+  // "exited"] - a policy-denied job settles "failed" instead, so this
+  // genuinely needs the ambient policy to ALLOW "true", not merely to be
+  // reached. See this file's own top-of-file comment.
+  before(requireSpawnPolicy);
+
+  test("status: a real job's status is queryable immediately after run(), never the old not-implemented stub message", () => {
+    const runResult = runTool.handler({ command: ["true"] });
+    const jobId = (runResult.structuredContent as Record<string, unknown>).job_id as string;
+    const statusResult = statusTool.handler({ job_id: jobId });
+    assert.notEqual(statusResult.isError, true);
+    assert.ok(
+      statusResult.content[0]!.type === "text" &&
+        !statusResult.content[0]!.text.includes("not implemented yet")
+    );
+    const structured = statusResult.structuredContent as Record<string, unknown>;
+    assert.equal(structured.job_id, jobId);
+    assert.ok(["starting", "running", "exited"].includes(structured.state as string));
+    assert.equal(typeof structured.started_at, "string");
+  });
 });
 
 // status() must never fabricate exit_code on a failed job.
@@ -567,28 +605,37 @@ test("a failed job's status carries diagnostic + ended_at, and NEVER fabricates 
   assert.ok(structured.diagnostic, "a failed job must carry a diagnostic");
 });
 
-// status() must read fresh on every call, never a cached snapshot.
-test("status: reflects a job's live state transitions across separate calls, never a stale cached snapshot", async () => {
-  const runResult = runTool.handler({ command: [process.execPath, "-e", "process.exit(0)"] });
-  const jobId = (runResult.structuredContent as Record<string, unknown>).job_id as string;
-  const first = statusTool.handler({ job_id: jobId }).structuredContent as Record<string, unknown>;
-  assert.ok(
-    ["starting", "running"].includes(first.state as string),
-    `expected a non-terminal state right after run(), got ${first.state as string}`
-  );
+describe("status: dispatches through the real run tool's policy gate (live-transition polling)", () => {
+  // Asserts the resulting job's INITIAL state is one of ["starting",
+  // "running"] and later polls to "exited" - a policy-denied job settles
+  // "failed" immediately instead, so this genuinely needs the ambient
+  // policy to ALLOW the spawned node subprocess, not merely to be reached.
+  // See this file's own top-of-file comment.
+  before(requireSpawnPolicy);
 
-  const deadline = Date.now() + 5000;
-  let last: Record<string, unknown> = first;
-  while (Date.now() < deadline) {
-    last = statusTool.handler({ job_id: jobId }).structuredContent as Record<string, unknown>;
-    if (last.state === "exited") break;
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  assert.equal(
-    last.state,
-    "exited",
-    "a later status() call must observe the job's real, fresh terminal state"
-  );
+  // status() must read fresh on every call, never a cached snapshot.
+  test("status: reflects a job's live state transitions across separate calls, never a stale cached snapshot", async () => {
+    const runResult = runTool.handler({ command: [process.execPath, "-e", "process.exit(0)"] });
+    const jobId = (runResult.structuredContent as Record<string, unknown>).job_id as string;
+    const first = statusTool.handler({ job_id: jobId }).structuredContent as Record<string, unknown>;
+    assert.ok(
+      ["starting", "running"].includes(first.state as string),
+      `expected a non-terminal state right after run(), got ${first.state as string}`
+    );
+
+    const deadline = Date.now() + 5000;
+    let last: Record<string, unknown> = first;
+    while (Date.now() < deadline) {
+      last = statusTool.handler({ job_id: jobId }).structuredContent as Record<string, unknown>;
+      if (last.state === "exited") break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(
+      last.state,
+      "exited",
+      "a later status() call must observe the job's real, fresh terminal state"
+    );
+  });
 });
 
 // A syntactically-valid but unknown job_id must be a typed not-found error,
@@ -616,28 +663,36 @@ test("list: schema declares no required arguments", () => {
   );
 });
 
-test("list: enumerates a real job immediately after run(), never the old not-implemented stub message", () => {
-  const runResult = runTool.handler({ command: ["true"], label: "ghantika-list-unit-test" });
-  const jobId = (runResult.structuredContent as Record<string, unknown>).job_id as string;
-  const listResult = listTool.handler();
-  assert.notEqual(listResult.isError, true);
-  assert.ok(
-    listResult.content[0]!.type === "text" &&
-      !listResult.content[0]!.text.includes("not implemented yet")
-  );
-  const jobs = (listResult.structuredContent as Record<string, unknown>).jobs as Array<
-    Record<string, unknown>
-  >;
-  const found = jobs.find((j) => j.job_id === jobId);
-  assert.ok(found, "the job just created via run() must appear in list()'s output");
-  assert.equal(found?.label, "ghantika-list-unit-test");
-  assert.ok(["starting", "running", "exited"].includes(found?.state as string));
-  assert.equal(typeof found?.started_at, "string");
-  assert.equal("job_id" in found!, true);
-  assert.equal(
-    Object.keys(found!).sort().join(","),
-    ["job_id", "label", "started_at", "state", "queue_position"].sort().join(",")
-  );
+describe("list: dispatches through the real run tool's policy gate (via a real run() call)", () => {
+  // Asserts the enumerated job's state is one of ["starting", "running",
+  // "exited"] - a policy-denied job settles "failed" instead, so this
+  // genuinely needs the ambient policy to ALLOW "true", not merely to be
+  // reached. See this file's own top-of-file comment.
+  before(requireSpawnPolicy);
+
+  test("list: enumerates a real job immediately after run(), never the old not-implemented stub message", () => {
+    const runResult = runTool.handler({ command: ["true"], label: "ghantika-list-unit-test" });
+    const jobId = (runResult.structuredContent as Record<string, unknown>).job_id as string;
+    const listResult = listTool.handler();
+    assert.notEqual(listResult.isError, true);
+    assert.ok(
+      listResult.content[0]!.type === "text" &&
+        !listResult.content[0]!.text.includes("not implemented yet")
+    );
+    const jobs = (listResult.structuredContent as Record<string, unknown>).jobs as Array<
+      Record<string, unknown>
+    >;
+    const found = jobs.find((j) => j.job_id === jobId);
+    assert.ok(found, "the job just created via run() must appear in list()'s output");
+    assert.equal(found?.label, "ghantika-list-unit-test");
+    assert.ok(["starting", "running", "exited"].includes(found?.state as string));
+    assert.equal(typeof found?.started_at, "string");
+    assert.equal("job_id" in found!, true);
+    assert.equal(
+      Object.keys(found!).sort().join(","),
+      ["job_id", "label", "started_at", "state", "queue_position"].sort().join(",")
+    );
+  });
 });
 
 test("list: the most-recently-created real job appears FIRST (most-recent-first ordering)", () => {
