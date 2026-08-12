@@ -360,9 +360,12 @@ test(
     // not because it shares an independent race of its own:
     // `src/tools/kill.ts`'s default signal path writes `kill_confirmed`
     // and `identity_confirmed` synchronously, one statement apart, in the
-    // same handler call, with no `await` between them and no guard on
-    // either write (`JobStore.setIdentityConfirmation` carries none - see
-    // its own doc comments) - so `identity_confirmed`'s value is already
+    // same handler call, with no `await` between them. `setIdentityConfirmation`
+    // carries no guard at all (see its own doc comments); `setKillConfirmation`
+    // still guards against a since-vanished record (returning `false` rather
+    // than throwing), but that guard only ever refuses an already-gone
+    // record - it never delays or blocks the write's timing, so it changes
+    // nothing about when either field lands. So `identity_confirmed`'s value is already
     // correct on this loop's very FIRST response, whether or not
     // `kill_confirmed` still needs a retry. It is read from the polled
     // response only because the loop already exists for

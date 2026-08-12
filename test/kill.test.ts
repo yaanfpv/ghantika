@@ -269,9 +269,15 @@ test("kill: ALREADY-GONE REGRESSION (default path) - a group already empty at th
   t.mock.method(process, "kill", (target: number, signal?: string | number) => {
     if (target !== -pid || signal !== 0) return realKill(target, signal);
     // This is `killProcessGroupPosix`'s own FIRST call (`isProcessGroupAlive`,
-    // `process.kill(-pid, 0)`), which runs before the pre-signal identity
-    // gate's own check ever completes, and strictly before any real
-    // signal is even considered. Genuinely end the real process right
+    // `process.kill(-pid, 0)`) - and the pre-signal identity gate's own
+    // check has ALREADY completed by the time this fires, not the other
+    // way around: that gate runs BEFORE `killProcessGroupPosix` is ever
+    // invoked at all (see the `identity_confirmed` assertion below, which
+    // states the true ordering directly). It genuinely confirmed the
+    // process here, since the real target was still alive at that earlier
+    // point - this mocked existence check only ends it now, strictly
+    // before any real signal is even considered. Genuinely end the real
+    // process right
     // here (rather than merely faking the ESRCH) so the group really is
     // empty from this point on - matching the real race this reproduces,
     // where the group vacates before this exact check rather than the

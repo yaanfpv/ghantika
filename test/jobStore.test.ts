@@ -319,7 +319,7 @@ test("setKillConfirmation records true/false regardless of the job's own state, 
   assert.equal(
     store.get(killedRecord.job_id)!.kill_confirmed,
     false,
-    "must be overwritable - the confirmation is settled once, after the state transition, not locked on first write"
+    "must be overwritable - a later call's value replaces an earlier one, never locked after the first write (the state-transition-gated wait this once implied is the removed guard the sibling assertion below documents)"
   );
 
   // The terminal-state guard this method used to carry was removed after a
