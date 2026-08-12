@@ -30,10 +30,14 @@
  * spawning each test-file child process, so every file discovered and run
  * through it inherits an allowlist wide enough for this suite's own
  * fixtures (see that file's own `TEST_POLICY_ALLOW_PATH` doc comment). A
- * bare `node --test <file>` invocation bypasses that script entirely, so
- * the variable is simply never set there - every test that reaches the
- * policy gate in the bypassed file then denies immediately, for the
- * identical reason, at every call site.
+ * bare `node --test <file>` invocation bypasses that AUTOMATIC step, not
+ * the environment itself: the policy loader reads `GHANTIKA_POLICY_FILE`
+ * from the live process environment at load time, so a value you've
+ * already exported yourself before running `node --test` still applies -
+ * see CONTRIBUTING.md's "Running a single test" section. Only when the
+ * caller hasn't set it either is the variable genuinely absent, and every
+ * test that reaches the policy gate in that bypassed, unconfigured file
+ * then denies immediately, for the identical reason, at every call site.
  *
  * CALL `requireSpawnPolicy()` FROM THE NARROWEST `before()` HOOK THAT COVERS
  * ONLY THE TESTS WHOSE ASSERTED BEHAVIOR NEEDS A POLICY-ALLOWED COMMAND TO
@@ -54,12 +58,26 @@
  *     skipped, so an unconditioned registration still throws on an unset
  *     policy variable on the very platform where nothing it guards can ever
  *     run - the guard fires with nothing left to guard;
- *   - its assertion holds under DENIAL just as well as under ALLOW (an
- *     `assert.doesNotReject` against `dispatchToolCall`, or a bare
- *     `isError !== true` check) - `src/tools/run.ts`'s handler resolves a
- *     policy denial as an ordinary failed-job tool result rather than
- *     throwing, so an outcome-insensitive assertion never notices which way
- *     the gate decided.
+ *   - its assertion holds under DENIAL just as well as under ALLOW, AND
+ *     means something when it does - "holds under denial" alone is NOT the
+ *     predicate, only necessary half of it. An `assert.doesNotReject`
+ *     against `dispatchToolCall`, or a bare `isError !== true` check,
+ *     genuinely qualifies: `src/tools/run.ts`'s handler resolves a policy
+ *     denial as an ordinary failed-job tool result rather than throwing, so
+ *     the assertion is TRUE either way and PROVES something real either
+ *     way. But an assertion that a denied run also makes trivially true for
+ *     an unrelated reason - e.g. "some secret string is absent from
+ *     status()'s projection", when a denied job never spawns a child and so
+ *     never has the secret to redact in the first place - is VACUOUS on
+ *     that path: it cannot distinguish the property it claims to prove
+ *     (redaction worked) from an unrelated fact that would make it pass
+ *     regardless (there was nothing to redact). A rule that only asks
+ *     "will this fail spuriously without policy?" and never "will this
+ *     succeed MEANINGLESSLY without policy?" will, applied faithfully,
+ *     leave vacuous tests unguarded - which is exactly the mistake this
+ *     bullet exists to name and forbid, not merely a hypothetical: it
+ *     shipped once in this suite's own history. Guard any test whose
+ *     assertion would be true, but uninformative, under denial.
  *
  * `node:test` fails EVERY test a `before()` hook covers when that hook
  * throws, not just the ones that depend on its precondition: a file-level
@@ -102,10 +120,12 @@ export function requireSpawnPolicy(): void {
       "test covered by THIS `before()` hook needs a policy-allowed command " +
       "to pass its assertion, and each would otherwise fail with a " +
       "confusing, unrelated-looking assertion error instead of naming the " +
-      "real cause. (A test whose assertion holds under denial too - an " +
-      "outcome-insensitive `doesNotReject`, a pre-policy validation case, " +
-      "a fully-skipped platform suite - does not need this helper and " +
-      "should not be inside this hook's scope.) Run tests via `npm test` " +
+      "real cause. (A test whose assertion both holds under denial AND " +
+      "means something when it does - an outcome-insensitive " +
+      "`doesNotReject`, a pre-policy validation case, a fully-skipped " +
+      "platform suite - does not need this helper and should not be " +
+      "inside this hook's scope; one that merely holds VACUOUSLY under " +
+      "denial still belongs inside it.) Run tests via `npm test` " +
       "(or `node scripts/run-tests.mjs`), which set " +
       `${POLICY_FILE_ENV_VAR} automatically before spawning each test ` +
       "file. See CONTRIBUTING.md for how to run a single test directly."

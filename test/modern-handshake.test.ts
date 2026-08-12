@@ -234,20 +234,25 @@ test("legacy handshake, under serveStdio: tools/call sent before the initialize/
   server.child.kill("SIGKILL");
 });
 
-// The ten tests below (through the last of the tasks/get, tasks/update,
-// tasks/cancel task-method tests) each drive at least one real tools/call
-// dispatch to the real "run" tool - see this file's own top-of-file
-// comment for the shared rationale on why the guard lives here rather
-// than file-wide. The pre-handshake-rejection test just above sends a
-// tools/call naming "run" too, but is rejected by the gate before ever
-// reaching the real run() handler (see that test's own inline comment),
-// so it never actually spawns anything and stays outside this
+// The NINE tests below (this section's own last test ends at the "modern
+// wire: tasks/update" test; the guarded describe further down, "run-
+// dispatching tests: legacy task-method proof needs a real still-running
+// job", starts the next, genuinely-guarded section) each drive at least
+// one real tools/call dispatch to the real "run" tool - see this file's
+// own top-of-file comment for the shared rationale on why the guard lives
+// here rather than file-wide. The pre-handshake-rejection test just above
+// sends a tools/call naming "run" too, but is rejected by the gate before
+// ever reaching the real run() handler (see that test's own inline
+// comment), so it never actually spawns anything and stays outside this
 // describe() block, unaffected by the guard.
-// Every test below (through the guarded describe further down) reads only
-// wire-shape/protocol-negotiation state - which resultType a mint takes,
-// whether a method routes at all, capability-independence - none of it
-// depends on whether the underlying job's spawn was policy-allowed or
-// denied, so none of it needs a real spawn to be genuine.
+// Every one of these nine reads only wire-shape/protocol-negotiation state
+// - which resultType a mint takes, whether a method routes at all,
+// capability-independence - and each such property is decided by the
+// negotiation layer BEFORE and INDEPENDENTLY of whether the underlying
+// job's spawn is policy-allowed or denied, so a real defect in any of them
+// would be caught on either outcome; none of it needs a real spawn to be
+// genuine, and none of it is merely true-because-nothing-happened the way
+// an assertion about a spawn's OWN content would be under denial.
 
 test("legacy handshake, under serveStdio: a real initialize + notifications/initialized still opens the gate normally - the observer chaining does not break the legitimate handshake either", async (t) => {
   const server = tracked();

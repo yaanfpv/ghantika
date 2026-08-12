@@ -92,12 +92,14 @@ async function waitForTerminal(
 // Non-goal 1: NO child-output-secrecy claim
 // ---------------------------------------------------------------------------
 
-// Only the first test in this section genuinely needs a real spawn: it
-// waits for real stdout content from the child and asserts on that content,
-// which a policy-denied job never produces. The second test's assertion
-// (the secret is ABSENT from status()'s public projection) holds either
-// way - a denied job never prints the secret anywhere either - so it is
-// pulled out below rather than sharing this guard.
+// This is the real-output-stream pass-through claim: a policy-denied job
+// never spawns a child at all, so this test genuinely needs an allowed
+// spawn to be meaningful. The metadata-redaction test that pairs with it
+// (same secret, a different property) lives in its own guarded describe
+// further below - both need a real spawn, for different reasons: this one
+// because a denied job never produces the real stdout content asserted on,
+// that one because a denied job's status() would trivially lack the secret
+// whether or not redaction ever ran.
 describe("non-goal 1: child-output-secrecy claim (spawns a real job through the real `run` tool)", () => {
   before(requireSpawnPolicy);
 
@@ -130,32 +132,47 @@ describe("non-goal 1: child-output-secrecy claim (spawns a real job through the 
   });
 });
 
-// Pulled out of the guarded describe above: this assertion (the secret is
-// ABSENT from status()'s public projection) holds identically whether the
-// spawn was policy-allowed or policy-denied - a denied job never prints the
-// secret anywhere either, so nothing here needs a real spawn to be genuine.
-test("the same child-emitted secret never appears in the job's PUBLIC metadata projection (status), even though it passes through the real output stream untouched", async () => {
-  const statusTool = await import("../dist/tools/status.js");
+// RE-GUARDED (was pulled out unguarded as "outcome-insensitive" - that was
+// wrong). Under allow, a child prints the secret and status()'s projection
+// must not carry it: a real property, genuinely proven. Under denial,
+// run.handler() creates an already-terminal failed job, no child ever
+// spawns, and the secret never enters the system at all - so the same
+// assertion passing there is guaranteed by the secret's ABSENCE, never by
+// redaction. It cannot distinguish "redaction worked" from "there was
+// nothing to redact", which makes it vacuous on that path, not merely
+// differently justified - the predicate that matters for guarding a test is
+// not just "does it hold under denial" but "does it MEAN something under
+// denial", and this one does not. Guarded so its pass is never vacuous.
+describe("job-metadata-redaction: the same child-emitted secret is absent from status()'s public projection (spawns a real job through the real `run` tool)", () => {
+  before(requireSpawnPolicy);
 
-  const secret = "GHANTIKA-TEST-SECRET-token-never-in-metadata-7c3e";
-  const result = runTool.handler({
-    command: ["node", "-e", `process.stdout.write(${JSON.stringify(secret)})`],
+  test("the same child-emitted secret never appears in the job's PUBLIC metadata projection (status()'s command_summary/label)", async () => {
+    const statusTool = await import("../dist/tools/status.js");
+
+    // Literally the SAME secret the non-goal-1 control above uses (a
+    // separate spawn, same literal) - the title's "the same...secret"
+    // claim used to name a different string than the control's; this is
+    // what makes it true rather than merely evocative.
+    const secret = "GHANTIKA-TEST-SECRET-token-do-not-redact-me-9f2a";
+    const result = runTool.handler({
+      command: ["node", "-e", `process.stdout.write(${JSON.stringify(secret)})`],
+    });
+    assert.notEqual(result.isError, true, `run() must succeed: ${JSON.stringify(result)}`);
+    const jobId = jobIdOf(result);
+
+    await waitForTerminal(jobId, statusTool);
+
+    const status = structuredOf(
+      statusTool.handler({ job_id: jobId }) as {
+        structuredContent?: Record<string, unknown>;
+      }
+    );
+    const statusText = JSON.stringify(status);
+    assert.ok(
+      !statusText.includes(secret),
+      `expected the secret to be absent from status()'s public projection (command_summary/label never carry it), but found it in: ${statusText}`
+    );
   });
-  assert.notEqual(result.isError, true);
-  const jobId = jobIdOf(result);
-
-  await waitForTerminal(jobId, statusTool);
-
-  const status = structuredOf(
-    statusTool.handler({ job_id: jobId }) as {
-      structuredContent?: Record<string, unknown>;
-    }
-  );
-  const statusText = JSON.stringify(status);
-  assert.ok(
-    !statusText.includes(secret),
-    `expected the secret to be absent from status()'s public projection (command_summary/label never carry it), but found it in: ${statusText}`
-  );
 });
 
 // ---------------------------------------------------------------------------
