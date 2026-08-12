@@ -140,7 +140,7 @@ test("kill: the DEFAULT terminating path (no caller-supplied signal) - the job r
 });
 
 // Same ordering regression, for the EXPLICIT-SIGNAL branch (kill.ts's
-// custom-signal path) rather than the default phased path above - a
+// custom-signal path) rather than the default phased path below - a
 // second, separate call site carrying the identical bug (an
 // undifferentiated "ok" success result reaching the terminal-state write
 // regardless of whether anything was actually delivered).
@@ -160,7 +160,7 @@ test("kill: ORDERING REGRESSION (explicit-signal branch) - a group that exits na
     {
       onSpawn: () => jobStore.markRunning(record.job_id),
       onError: (message) => jobStore.markSpawnFailed(record.job_id, message),
-      onExit: () => {}, // driven manually below, same reasoning as the default-path regression above
+      onExit: () => {}, // driven manually below, same reasoning as the default-path regression further below
       onStdoutChunk: () => {},
       onStderrChunk: () => {},
       onStdoutEnd: () => {},
@@ -190,7 +190,7 @@ test("kill: ORDERING REGRESSION (explicit-signal branch) - a group that exits na
   assert.notEqual(result.isError, true, `expected kill to succeed: ${JSON.stringify(result)}`);
 
   // The real natural exit, deliberately delayed until after kill() has
-  // already returned - see the default-path regression above for why
+  // already returned - see the default-path regression below for why
   // this ordering is the one that actually exercises the old bug.
   jobStore.markExited(record.job_id, 0, null);
 

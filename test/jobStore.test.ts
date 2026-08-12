@@ -423,7 +423,7 @@ test(
     assert.equal(
       "child" in (handle as unknown as Record<string, unknown>),
       false,
-      "getChildHandle must never expose the raw ChildProcess, only {pid, spawnedAtMs}"
+      "getChildHandle must never expose the raw ChildProcess, only {pid, spawnedAtMs, birthIdentity, identityCapture}"
     );
 
     process.kill(-child!.pid!, "SIGKILL"); // cleanup

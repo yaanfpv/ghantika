@@ -1810,7 +1810,7 @@ test("on a capable connection, status/output/tail on the mapped job_id keep work
 
     const tailResult = (await pair.client.callTool({
       name: "tail",
-      arguments: { job_id: taskId, n: 5 },
+      arguments: { job_id: taskId },
     })) as { isError?: boolean };
     assert.notEqual(
       tailResult.isError,
@@ -2158,7 +2158,7 @@ test("seven-tool mint rule: on a capable connection, run() mints a handle while 
     );
 
     const tailResult = runResultStructured(
-      await pair.client.callTool({ name: "tail", arguments: { job_id: taskId, n: 1 } })
+      await pair.client.callTool({ name: "tail", arguments: { job_id: taskId } })
     );
     assert.ok(
       carriesNoHandleTellTale(tailResult),

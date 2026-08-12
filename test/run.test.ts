@@ -356,13 +356,20 @@ test(
     // `pollUntilKillConfirmed`'s own docs above for why this job, spawned
     // through the real `run()`/`beginSpawn`, needs the retry regardless of
     // the eager-reap-vs-terminal-transition history that doc explains.
-    // `identity_confirmed` is read from that SAME settled response, never
-    // the original, potentially-unsettled `killResult` - not because it
-    // shares `kill_confirmed`'s own reason for being racy (asynchronous
-    // settling with no ordering guarantee against the read), but because
-    // `JobStore.setIdentityConfirmation` carries its OWN, still-live
-    // terminal-state gate (see its own doc comments) that could just as
-    // easily make it read `undefined` on the original, unpolled response.
+    // `identity_confirmed` is read from that SAME settled response, but
+    // not because it shares an independent race of its own:
+    // `src/tools/kill.ts`'s default signal path writes `kill_confirmed`
+    // and `identity_confirmed` synchronously, one statement apart, in the
+    // same handler call, with no `await` between them and no guard on
+    // either write (`JobStore.setIdentityConfirmation` carries none - see
+    // its own doc comments) - so `identity_confirmed`'s value is already
+    // correct on this loop's very FIRST response, whether or not
+    // `kill_confirmed` still needs a retry. It is read from the polled
+    // response only because the loop already exists for
+    // `kill_confirmed`'s own genuine reason (real OS-level confirmation
+    // timing, not a write-ordering race) - piggybacking on it costs
+    // nothing and keeps both assertions reading from one consistent
+    // snapshot.
     const confirmedKillResult = await pollUntilKillConfirmed(jobId);
     assert.equal(confirmedKillResult.state, "killed");
     assert.equal(
@@ -451,24 +458,20 @@ test(
     // EVIDENCED SKIP (no `pollUntilKillConfirmed` here, unlike the sibling
     // test above): this test checks `identity_confirmed` alone -
     // `kill_confirmed` is never read here at all. `JobStore.
-    // setIdentityConfirmation` STILL carries the terminal-state guard
-    // `setKillConfirmation` no longer does (see both setters' own doc
-    // comments in `src/jobStore.ts` for why the two diverge), and for
-    // THIS scenario - a genuinely alive target
-    // (`sleep 5`) signaled by the default terminating path, whose
-    // `onSignaled` callback calls `jobStore.markKilled` SYNCHRONOUSLY,
-    // immediately after the send, well before this same handler's later,
-    // awaited confirmation step ever runs `setIdentityConfirmation` - that
-    // guard's own precondition should already have landed by the time the
-    // write is attempted, with nothing able to interleave in between
-    // (single-threaded, no `await` separates the two). Commit c12b111's
-    // own "run-only mint rule" fix (`test/tasks.test.ts`) independently
-    // records the matching empirical fact for this same structural
-    // scenario: "this test has never observed these two [identity_confirmed/
-    // identity_capture] flaking the way kill_confirmed does." This
-    // reasoning does not extend to `kill_confirmed` - see this file's own
-    // `pollUntilKillConfirmed` docs, which apply it wherever that field IS
-    // checked.
+    // setIdentityConfirmation` carries NO terminal-state guard at all (see
+    // its own doc comments in `src/jobStore.ts`) - unlike its sibling
+    // `setEscalationRefusedReason`, which keeps one for a reason specific
+    // to that field alone. So for THIS scenario there is no guard
+    // precondition to argue about: the write is unconditional, full stop,
+    // regardless of whether the default terminating path's `onSignaled`
+    // callback has already called `jobStore.markKilled` by the time it
+    // runs. Commit c12b111's own "run-only mint rule" fix
+    // (`test/tasks.test.ts`) independently records the matching empirical
+    // fact for this same structural scenario: "this test has never
+    // observed these two [identity_confirmed/identity_capture] flaking the
+    // way kill_confirmed does." This reasoning does not extend to
+    // `kill_confirmed` - see this file's own `pollUntilKillConfirmed`
+    // docs, which apply it wherever that field IS checked.
     const killResult = await killTool.handler({ job_id: jobId });
     assert.notEqual(
       killResult.isError,
