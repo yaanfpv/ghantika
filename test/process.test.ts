@@ -4942,9 +4942,15 @@ function runJobIdOf(result: ReturnType<typeof runTool.handler>): string {
   return jobId as string;
 }
 
-describe("Optional per-job execution deadline (real run() tool)", () => {
-  before(requireSpawnPolicy);
-
+// This suite's spawning children need requireSpawnPolicy; its pre-policy
+// validation children do not: each of the four tests below returns
+// before src/tools/run.ts ever reaches
+// decideRunPolicy/decideShellPolicy - the cwd-roots regression settles via
+// createFailedJob from resolveCwd, and the three deadline_ms rejections
+// settle via validateRunInput - so none of them needs, or is affected by,
+// GHANTIKA_POLICY_FILE being set. Guarding this describe would fail these
+// four under an unset policy for no reason connected to what they assert.
+describe("Optional per-job execution deadline (real run() tool) - pre-policy validation", () => {
   // REGRESSION for the fail-open GHANTIKA_CWD_ROOTS bug: a non-empty raw
   // value that splits and filters down to zero effective roots (a lone
   // `path.delimiter`, on its own) must NOT be read as "unrestricted" - it
@@ -4970,6 +4976,56 @@ describe("Optional per-job execution deadline (real run() tool)", () => {
       else process.env[CWD_ROOTS_ENV_VAR_NAME] = original;
     }
   });
+
+  test("run(): deadline_ms rejects a non-positive or non-finite value rather than silently accepting it", () => {
+    for (const badValue of [
+      0,
+      -1,
+      -1000,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+    ]) {
+      const result = runTool.handler({ command: ["true"], deadline_ms: badValue });
+      assert.equal(result.isError, true, `expected deadline_ms: ${badValue} to be rejected`);
+    }
+  });
+
+  test("run(): deadline_ms rejects a non-number value", () => {
+    for (const badValue of ["1000", true, [], {}, null]) {
+      const result = runTool.handler({
+        command: ["true"],
+        deadline_ms: badValue as unknown as number,
+      });
+      assert.equal(
+        result.isError,
+        true,
+        `expected deadline_ms: ${JSON.stringify(badValue)} to be rejected`
+      );
+    }
+  });
+
+  test("run(): deadline_ms rejects the first value above Node's own timer maximum, before ever spawning - Node itself would otherwise silently clamp this to a near-immediate deadline rather than honoring the requested one", () => {
+    const result = runTool.handler({ command: ["sleep", "60"], deadline_ms: 2_147_483_648 });
+    assert.equal(result.isError, true, "the first overflowing value must be rejected outright");
+    assert.match(
+      (result.content[0] as { text: string }).text,
+      /2147483647/,
+      "the rejection message must name Node's own maximum, not just say the value is invalid"
+    );
+    // validateRunInput (see validateDeadlineMs) fails and this handler
+    // returns via toolError() BEFORE ever reaching the block that resolves
+    // cwd/executable, calls spawnManaged, or generates a job id - reading
+    // that control flow directly shows no path from a rejected deadline_ms
+    // to a real spawn. So the isError assertion above already establishes
+    // "no job started" by construction; there is no observable job id or
+    // process to additionally check, the same way the sibling rejection
+    // tests below (non-positive/non-finite, non-number) don't either.
+  });
+});
+
+describe("Optional per-job execution deadline (real run() tool)", () => {
+  before(requireSpawnPolicy);
 
   test(
     "run(): omitting deadline_ms leaves a job's own natural lifecycle completely untouched, even across a huge mocked time jump - no deadline was ever scheduled to expire",
@@ -5151,52 +5207,6 @@ describe("Optional per-job execution deadline (real run() tool)", () => {
       );
     }
   );
-
-  test("run(): deadline_ms rejects a non-positive or non-finite value rather than silently accepting it", () => {
-    for (const badValue of [
-      0,
-      -1,
-      -1000,
-      Number.NaN,
-      Number.POSITIVE_INFINITY,
-      Number.NEGATIVE_INFINITY,
-    ]) {
-      const result = runTool.handler({ command: ["true"], deadline_ms: badValue });
-      assert.equal(result.isError, true, `expected deadline_ms: ${badValue} to be rejected`);
-    }
-  });
-
-  test("run(): deadline_ms rejects a non-number value", () => {
-    for (const badValue of ["1000", true, [], {}, null]) {
-      const result = runTool.handler({
-        command: ["true"],
-        deadline_ms: badValue as unknown as number,
-      });
-      assert.equal(
-        result.isError,
-        true,
-        `expected deadline_ms: ${JSON.stringify(badValue)} to be rejected`
-      );
-    }
-  });
-
-  test("run(): deadline_ms rejects the first value above Node's own timer maximum, before ever spawning - Node itself would otherwise silently clamp this to a near-immediate deadline rather than honoring the requested one", () => {
-    const result = runTool.handler({ command: ["sleep", "60"], deadline_ms: 2_147_483_648 });
-    assert.equal(result.isError, true, "the first overflowing value must be rejected outright");
-    assert.match(
-      (result.content[0] as { text: string }).text,
-      /2147483647/,
-      "the rejection message must name Node's own maximum, not just say the value is invalid"
-    );
-    // validateRunInput (see validateDeadlineMs) fails and this handler
-    // returns via toolError() BEFORE ever reaching the block that resolves
-    // cwd/executable, calls spawnManaged, or generates a job id - reading
-    // that control flow directly shows no path from a rejected deadline_ms
-    // to a real spawn. So the isError assertion above already establishes
-    // "no job started" by construction; there is no observable job id or
-    // process to additionally check, the same way the sibling rejection
-    // tests above (non-positive/non-finite, non-number) don't either.
-  });
 
   test(
     "run(): deadline_ms accepts Node's own exact timer maximum (2147483647) - the supported boundary is not accidentally excluded by the overflow rejection above",

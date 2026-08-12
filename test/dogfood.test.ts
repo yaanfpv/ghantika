@@ -89,11 +89,6 @@ import {
 import { type SpawnedServer, spawnServer } from "./helpers/spawnServer.ts";
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 
-// The real fswatch job below (and any other real spawn in this file) goes
-// through the real `run` tool - see test/helpers/requireSpawnPolicy.ts for
-// what this checks and why.
-before(requireSpawnPolicy);
-
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const TEST_MAILBOX_ROOT = path.join(REPO_ROOT, "local", "dogfood", "test-mailbox");
 
@@ -119,6 +114,18 @@ const DOGFOOD_SKIP =
     : !fswatchIsInstalled()
       ? "fswatch is not installed on this host - it's the real external tool a doorbell watcher runs, not a dependency of this project; install it (e.g. brew install fswatch / apt-get install fswatch) to run this dogfood proof for real"
       : false;
+
+// The real fswatch job below (and any other real spawn in this file) goes
+// through the real `run` tool - see test/helpers/requireSpawnPolicy.ts for
+// what this checks and why. But this file's ONE test is { skip:
+// DOGFOOD_SKIP } (Windows, or fswatch not installed), and when it skips
+// there is nothing left in this file that needs the policy - registering
+// this hook unconditionally would still throw under an unset policy
+// variable on a skip-only run. Register it only when the test can
+// actually reach the gate.
+if (!DOGFOOD_SKIP) {
+  before(requireSpawnPolicy);
+}
 
 // ---------------------------------------------------------------------------
 // The absence oracle - a real, external process-table check, anchored on

@@ -244,34 +244,42 @@ test("a malformed line arriving BEFORE initialize still gets -32700, and the rea
   server.child.kill("SIGKILL");
 });
 
+// Pulled out below: run()'s own contract resolves a policy denial as
+// toolSuccess() carrying a failed job (never isError:true) - see
+// src/tools/run.ts's createFailedJob() path - so "the gate stayed open,
+// isError never true" holds identically whether the spawn was allowed or
+// denied, and needs no real spawn to be genuine.
+test("a malformed line arriving mid-connection, AFTER a successful handshake, does not reopen or break the already-satisfied init-gate", async () => {
+  const server = tracked();
+  await completeHandshake(server);
+
+  server.sendRaw("{{{ still not json\n");
+  const parseErrorLine = await server.nextLine();
+  const parseErrorBody = parseErrorLine.parsed as { id: unknown; error: { code: number } };
+  assert.equal(parseErrorBody.id, null);
+  assert.equal(parseErrorBody.error.code, -32700);
+
+  server.send({
+    jsonrpc: "2.0",
+    id: 503,
+    method: "tools/call",
+    params: { name: "run", arguments: { command: ["true"] } },
+  });
+  const runLine = await server.nextLine();
+  const runBody = runLine.parsed as { result?: { isError?: boolean } };
+  assert.notEqual(
+    runBody.result?.isError,
+    true,
+    "a real tools/call after the malformed line must still succeed - the gate stayed open, unaffected"
+  );
+  server.child.kill("SIGKILL");
+});
+
+// This test genuinely needs a real spawn: it needs a real, large (several
+// MB) stdout stream from an actually-running job to force real
+// backpressure on the wire - a policy-denied job never produces any output.
 describe("malformed-line handling paired with a real `run` dispatch (needs a real spawn policy)", () => {
   before(requireSpawnPolicy);
-
-  test("a malformed line arriving mid-connection, AFTER a successful handshake, does not reopen or break the already-satisfied init-gate", async () => {
-    const server = tracked();
-    await completeHandshake(server);
-
-    server.sendRaw("{{{ still not json\n");
-    const parseErrorLine = await server.nextLine();
-    const parseErrorBody = parseErrorLine.parsed as { id: unknown; error: { code: number } };
-    assert.equal(parseErrorBody.id, null);
-    assert.equal(parseErrorBody.error.code, -32700);
-
-    server.send({
-      jsonrpc: "2.0",
-      id: 503,
-      method: "tools/call",
-      params: { name: "run", arguments: { command: ["true"] } },
-    });
-    const runLine = await server.nextLine();
-    const runBody = runLine.parsed as { result?: { isError?: boolean } };
-    assert.notEqual(
-      runBody.result?.isError,
-      true,
-      "a real tools/call after the malformed line must still succeed - the gate stayed open, unaffected"
-    );
-    server.child.kill("SIGKILL");
-  });
 
   // --- single-writer-of-stdout proof: the -32700 reply and a genuinely
   // LARGE real response must never interleave on the wire, even when one is
@@ -397,9 +405,13 @@ test("e2e: tools/call naming an unknown tool gets -32602 InvalidParams, never -3
   server.child.kill("SIGKILL");
 });
 
-describe("tools/call for run - error-class and success shapes (needs a real spawn policy)", () => {
-  before(requireSpawnPolicy);
-
+// This schema-invalid case does NOT need requireSpawnPolicy: `{ name: "run",
+// arguments: {} }` is rejected by request/schema validation before the
+// dispatch ever reaches run's policy gate, so the assertion below holds
+// identically whether GHANTIKA_POLICY_FILE is set or not. It used to be
+// bundled under the same `before()` as the valid-command test purely by
+// file position, not because it needs one.
+describe("tools/call for run - schema-invalid arguments (pre-policy validation)", () => {
   test("e2e: tools/call for run with schema-invalid arguments is a normal successful RPC with isError: true, NOT a JSON-RPC error", async () => {
     const server = tracked();
     await completeHandshake(server);
@@ -424,6 +436,10 @@ describe("tools/call for run - error-class and success shapes (needs a real spaw
     assert.ok(Array.isArray(body.result?.content) && (body.result?.content?.length ?? 0) > 0);
     server.child.kill("SIGKILL");
   });
+});
+
+describe("tools/call for run - success shape (needs a real spawn policy)", () => {
+  before(requireSpawnPolicy);
 
   test("tools/call for run with valid argv arguments succeeds at the RPC level and returns a real starting/running job", async () => {
     const server = tracked();
@@ -540,32 +556,34 @@ test("e2e: notifications/initialized sent FIRST, with NO prior initialize reques
   server.child.kill("SIGKILL");
 });
 
-describe("a legitimate handshake followed by a real `run` dispatch (needs a real spawn policy)", () => {
-  before(requireSpawnPolicy);
-
-  test("e2e: a real initialize request followed by notifications/initialized still accepts tools/call normally (green control - the gate does not break the legitimate handshake)", async () => {
-    const server = tracked();
-    await completeHandshake(server);
-    server.send({
-      jsonrpc: "2.0",
-      id: 31,
-      method: "tools/call",
-      params: { name: "run", arguments: { command: ["true"] } },
-    });
-    const line = await server.nextLine();
-    const body = line.parsed as {
-      error?: unknown;
-      result?: { isError?: boolean; structuredContent?: Record<string, unknown> };
-    };
-    assert.equal(
-      body.error,
-      undefined,
-      "a real, complete handshake must still let tools/call through normally"
-    );
-    assert.notEqual(body.result?.isError, true);
-    assert.equal(typeof body.result?.structuredContent?.job_id, "string");
-    server.child.kill("SIGKILL");
+// run.ts's contract holds identically whether the spawn was policy-allowed
+// or denied: no JSON-RPC error, isError never true, and a real job_id
+// string in structuredContent either way (a denied job still mints a
+// failed-but-tracked job record - see src/tools/run.ts's createFailedJob()
+// path) - so none of this test's assertions need a real spawn to be
+// genuine.
+test("e2e: a real initialize request followed by notifications/initialized still accepts tools/call normally (green control - the gate does not break the legitimate handshake)", async () => {
+  const server = tracked();
+  await completeHandshake(server);
+  server.send({
+    jsonrpc: "2.0",
+    id: 31,
+    method: "tools/call",
+    params: { name: "run", arguments: { command: ["true"] } },
   });
+  const line = await server.nextLine();
+  const body = line.parsed as {
+    error?: unknown;
+    result?: { isError?: boolean; structuredContent?: Record<string, unknown> };
+  };
+  assert.equal(
+    body.error,
+    undefined,
+    "a real, complete handshake must still let tools/call through normally"
+  );
+  assert.notEqual(body.result?.isError, true);
+  assert.equal(typeof body.result?.structuredContent?.job_id, "string");
+  server.child.kill("SIGKILL");
 });
 
 // --- the init-gate observes the SDK's own negotiation
@@ -674,52 +692,53 @@ test("tools/call succeeds normally once the full handshake (initialize + notific
 
 // --- dynamic half: stdio purity under real, rapid traffic ---
 
-describe("a rapid burst of real traffic that dispatches `run` (needs a real spawn policy)", () => {
-  before(requireSpawnPolicy);
+// This test only ever checks wire-shape purity (clean JSON-RPC, no stray
+// bytes) across a burst of requests - it never distinguishes an admitted
+// run() from a policy-denied one, and a denied run() still returns a clean
+// toolSuccess() response, so this holds identically either way and needs
+// no real spawn to be genuine.
+test("e2e, dynamic: under a rapid burst of real traffic, every single stdout line is clean, valid JSON-RPC - never a stray byte", async () => {
+  const server = tracked();
+  await completeHandshake(server);
 
-  test("e2e, dynamic: under a rapid burst of real traffic, every single stdout line is clean, valid JSON-RPC - never a stray byte", async () => {
-    const server = tracked();
-    await completeHandshake(server);
-
-    const REQUEST_COUNT = 60;
-    for (let i = 0; i < REQUEST_COUNT; i++) {
-      if (i % 2 === 0) {
-        server.send({ jsonrpc: "2.0", id: 100 + i, method: "tools/list" });
-      } else {
-        server.send({
-          jsonrpc: "2.0",
-          id: 100 + i,
-          method: "tools/call",
-          params: { name: "run", arguments: i % 3 === 0 ? {} : { command: ["echo", `${i}`] } },
-        });
-      }
+  const REQUEST_COUNT = 60;
+  for (let i = 0; i < REQUEST_COUNT; i++) {
+    if (i % 2 === 0) {
+      server.send({ jsonrpc: "2.0", id: 100 + i, method: "tools/list" });
+    } else {
+      server.send({
+        jsonrpc: "2.0",
+        id: 100 + i,
+        method: "tools/call",
+        params: { name: "run", arguments: i % 3 === 0 ? {} : { command: ["echo", `${i}`] } },
+      });
     }
+  }
 
-    // Drain exactly REQUEST_COUNT responses (each request gets exactly one
-    // response line - no notifications are sent by this server for these
-    // methods).
-    const responses = [];
-    for (let i = 0; i < REQUEST_COUNT; i++) {
-      responses.push(await server.nextLine(5000));
-    }
+  // Drain exactly REQUEST_COUNT responses (each request gets exactly one
+  // response line - no notifications are sent by this server for these
+  // methods).
+  const responses = [];
+  for (let i = 0; i < REQUEST_COUNT; i++) {
+    responses.push(await server.nextLine(5000));
+  }
 
-    assert.equal(responses.length, REQUEST_COUNT);
-    for (const line of responses) {
-      assert.equal(
-        line.parseError,
-        undefined,
-        `stdout produced a non-JSON line under load: ${JSON.stringify(line.raw)}`
-      );
-      const body = line.parsed as { jsonrpc?: string };
-      assert.equal(
-        body.jsonrpc,
-        "2.0",
-        `every stdout line must be a clean JSON-RPC 2.0 message, got: ${line.raw}`
-      );
-    }
+  assert.equal(responses.length, REQUEST_COUNT);
+  for (const line of responses) {
+    assert.equal(
+      line.parseError,
+      undefined,
+      `stdout produced a non-JSON line under load: ${JSON.stringify(line.raw)}`
+    );
+    const body = line.parsed as { jsonrpc?: string };
+    assert.equal(
+      body.jsonrpc,
+      "2.0",
+      `every stdout line must be a clean JSON-RPC 2.0 message, got: ${line.raw}`
+    );
+  }
 
-    server.child.kill("SIGKILL");
-  });
+  server.child.kill("SIGKILL");
 });
 
 test("nothing unexpected was ever written to stderr as a protocol-breaking side effect (diagnostics only)", async () => {
@@ -794,84 +813,98 @@ describe("run()'s real spawn-and-track behavior (needs a real spawn policy)", ()
 
     server.child.kill("SIGKILL");
   });
+});
 
-  test("a real invalid-binary attempt over the wire returns a normal (non-error) result with a real job_id, state failed, diagnostic.reason spawn-error", async () => {
-    const server = tracked();
-    await completeHandshake(server);
-    server.send({
-      jsonrpc: "2.0",
-      id: 21,
-      method: "tools/call",
-      params: {
-        name: "run",
-        arguments: { command: ["this-command-definitely-does-not-exist-ghantika-e2e"] },
-      },
-    });
-    const line = await server.nextLine();
-    const body = line.parsed as RunResponseBody;
-    assert.equal(body.error, undefined, "a bad binary must never be a JSON-RPC protocol error");
-    assert.notEqual(
-      body.result?.isError,
-      true,
-      "a bad binary must never be a tool-execution error either - it's a real, queryable job"
-    );
-    const structured = body.result?.structuredContent;
-    assert.equal(typeof structured?.job_id, "string");
-    assert.equal(structured?.state, "failed");
-    assert.deepEqual(structured?.diagnostic, {
-      reason: "spawn-error",
-      message: "command not found or not executable",
-    });
-    server.child.kill("SIGKILL");
-  });
+// The three tests below all return BEFORE the policy decision in
+// src/tools/run.ts: an unresolvable binary and both cwd-validation failures
+// are pre-policy returns (resolveExecutable() / cwd checks run ahead of
+// decideRunPolicy()), so every one of them fails the same way whether a
+// spawn policy is configured or not - none needs the guard.
 
-  test("a real invalid-cwd attempt over the wire returns state failed, diagnostic.reason spawn-error - never silently defaulted to the server's own cwd", async () => {
-    const server = tracked();
-    await completeHandshake(server);
-    server.send({
-      jsonrpc: "2.0",
-      id: 22,
-      method: "tools/call",
-      params: {
-        name: "run",
-        arguments: { command: ["true"], cwd: "/no/such/directory/ghantika-e2e-test" },
-      },
-    });
-    const line = await server.nextLine();
-    const body = line.parsed as RunResponseBody;
-    assert.equal(body.error, undefined);
-    assert.notEqual(body.result?.isError, true);
-    const structured = body.result?.structuredContent;
-    assert.equal(structured?.state, "failed");
-    assert.deepEqual(structured?.diagnostic, {
-      reason: "spawn-error",
-      message: "cwd does not exist",
-    });
-    server.child.kill("SIGKILL");
+test("a real invalid-binary attempt over the wire returns a normal (non-error) result with a real job_id, state failed, diagnostic.reason spawn-error", async () => {
+  const server = tracked();
+  await completeHandshake(server);
+  server.send({
+    jsonrpc: "2.0",
+    id: 21,
+    method: "tools/call",
+    params: {
+      name: "run",
+      arguments: { command: ["this-command-definitely-does-not-exist-ghantika-e2e"] },
+    },
   });
+  const line = await server.nextLine();
+  const body = line.parsed as RunResponseBody;
+  assert.equal(body.error, undefined, "a bad binary must never be a JSON-RPC protocol error");
+  assert.notEqual(
+    body.result?.isError,
+    true,
+    "a bad binary must never be a tool-execution error either - it's a real, queryable job"
+  );
+  const structured = body.result?.structuredContent;
+  assert.equal(typeof structured?.job_id, "string");
+  assert.equal(structured?.state, "failed");
+  assert.deepEqual(structured?.diagnostic, {
+    reason: "spawn-error",
+    message: "command not found or not executable",
+  });
+  server.child.kill("SIGKILL");
+});
 
-  test("cwd that exists but is a FILE (not a directory) also fails the job, never silently defaulted", async () => {
-    const server = tracked();
-    await completeHandshake(server);
-    const dir = makeTempDir();
-    const filePath = path.join(dir, "im-a-file-not-a-directory");
-    fs.writeFileSync(filePath, "x");
-    server.send({
-      jsonrpc: "2.0",
-      id: 23,
-      method: "tools/call",
-      params: { name: "run", arguments: { command: ["true"], cwd: filePath } },
-    });
-    const line = await server.nextLine();
-    const body = line.parsed as RunResponseBody;
-    const structured = body.result?.structuredContent;
-    assert.equal(structured?.state, "failed");
-    assert.deepEqual(structured?.diagnostic, {
-      reason: "spawn-error",
-      message: "cwd exists but is not a directory",
-    });
-    server.child.kill("SIGKILL");
+test("a real invalid-cwd attempt over the wire returns state failed, diagnostic.reason spawn-error - never silently defaulted to the server's own cwd", async () => {
+  const server = tracked();
+  await completeHandshake(server);
+  server.send({
+    jsonrpc: "2.0",
+    id: 22,
+    method: "tools/call",
+    params: {
+      name: "run",
+      arguments: { command: ["true"], cwd: "/no/such/directory/ghantika-e2e-test" },
+    },
   });
+  const line = await server.nextLine();
+  const body = line.parsed as RunResponseBody;
+  assert.equal(body.error, undefined);
+  assert.notEqual(body.result?.isError, true);
+  const structured = body.result?.structuredContent;
+  assert.equal(structured?.state, "failed");
+  assert.deepEqual(structured?.diagnostic, {
+    reason: "spawn-error",
+    message: "cwd does not exist",
+  });
+  server.child.kill("SIGKILL");
+});
+
+test("cwd that exists but is a FILE (not a directory) also fails the job, never silently defaulted", async () => {
+  const server = tracked();
+  await completeHandshake(server);
+  const dir = makeTempDir();
+  const filePath = path.join(dir, "im-a-file-not-a-directory");
+  fs.writeFileSync(filePath, "x");
+  server.send({
+    jsonrpc: "2.0",
+    id: 23,
+    method: "tools/call",
+    params: { name: "run", arguments: { command: ["true"], cwd: filePath } },
+  });
+  const line = await server.nextLine();
+  const body = line.parsed as RunResponseBody;
+  const structured = body.result?.structuredContent;
+  assert.equal(structured?.state, "failed");
+  assert.deepEqual(structured?.diagnostic, {
+    reason: "spawn-error",
+    message: "cwd exists but is not a directory",
+  });
+  server.child.kill("SIGKILL");
+});
+
+// The tests below all genuinely need a real spawn - each one waits for a
+// real, on-disk side effect (a marker file, a piped write, a dumped env)
+// written by an actually-running child, which a policy-denied job never
+// produces.
+describe("run()'s real spawn-and-track behavior: background execution needs a real spawn (needs a real spawn policy)", () => {
+  before(requireSpawnPolicy);
 
   test("a real command that writes known output actually runs in the background (proven via a real filesystem side effect, an oracle outside the server's own reporting)", async () => {
     const server = tracked();
@@ -1024,56 +1057,62 @@ describe("run()'s real spawn-and-track behavior (needs a real spawn policy)", ()
     assert.deepEqual(childEnv, { ONLY_VAR: "only-value" });
     server.child.kill("SIGKILL");
   });
+});
 
-  test("e2e: the public run() result never includes env or the raw argv array in any form, over the real wire", async () => {
-    const server = tracked();
-    await completeHandshake(server);
-    server.send({
-      jsonrpc: "2.0",
-      id: 28,
-      method: "tools/call",
-      params: {
-        name: "run",
-        arguments: {
-          command: ["true", "--do-not-leak-this-argument"],
-          env: { mode: "merge", vars: { SECRET_TOKEN: "do-not-leak-this-value" } },
-        },
+// Both tests below hold identically under a policy denial: toPublicProjection
+// strips env/argv from EVERY job's public projection regardless of admission
+// state, and command_summary/label are set from the caller-supplied argv[0]
+// and label at job-creation time in EVERY src/tools/run.ts branch, including
+// createFailedJob()'s policy-denial path - so neither needs a real spawn.
+
+test("e2e: the public run() result never includes env or the raw argv array in any form, over the real wire", async () => {
+  const server = tracked();
+  await completeHandshake(server);
+  server.send({
+    jsonrpc: "2.0",
+    id: 28,
+    method: "tools/call",
+    params: {
+      name: "run",
+      arguments: {
+        command: ["true", "--do-not-leak-this-argument"],
+        env: { mode: "merge", vars: { SECRET_TOKEN: "do-not-leak-this-value" } },
       },
-    });
-    const line = await server.nextLine();
-    assert.equal(
-      line.raw.includes("do-not-leak-this-value"),
-      false,
-      "the raw stdout line must never contain a leaked env value"
-    );
-    assert.equal(
-      line.raw.includes("--do-not-leak-this-argument"),
-      false,
-      "the raw stdout line must never contain a leaked argv element"
-    );
-    const body = line.parsed as RunResponseBody;
-    assert.equal("env" in (body.result?.structuredContent ?? {}), false);
-    assert.equal("argv" in (body.result?.structuredContent ?? {}), false);
-    assert.equal(body.result?.structuredContent?.command_summary, "true");
-    server.child.kill("SIGKILL");
+    },
   });
+  const line = await server.nextLine();
+  assert.equal(
+    line.raw.includes("do-not-leak-this-value"),
+    false,
+    "the raw stdout line must never contain a leaked env value"
+  );
+  assert.equal(
+    line.raw.includes("--do-not-leak-this-argument"),
+    false,
+    "the raw stdout line must never contain a leaked argv element"
+  );
+  const body = line.parsed as RunResponseBody;
+  assert.equal("env" in (body.result?.structuredContent ?? {}), false);
+  assert.equal("argv" in (body.result?.structuredContent ?? {}), false);
+  assert.equal(body.result?.structuredContent?.command_summary, "true");
+  server.child.kill("SIGKILL");
+});
 
-  test("e2e, green control: a valid run with a caller label round-trips cleanly, never trips any validation path", async () => {
-    const server = tracked();
-    await completeHandshake(server);
-    server.send({
-      jsonrpc: "2.0",
-      id: 29,
-      method: "tools/call",
-      params: { name: "run", arguments: { command: ["true"], label: "nightly-smoke-test" } },
-    });
-    const line = await server.nextLine();
-    const body = line.parsed as RunResponseBody;
-    assert.equal(body.error, undefined);
-    assert.notEqual(body.result?.isError, true);
-    assert.equal(body.result?.structuredContent?.label, "nightly-smoke-test");
-    server.child.kill("SIGKILL");
+test("e2e, green control: a valid run with a caller label round-trips cleanly, never trips any validation path", async () => {
+  const server = tracked();
+  await completeHandshake(server);
+  server.send({
+    jsonrpc: "2.0",
+    id: 29,
+    method: "tools/call",
+    params: { name: "run", arguments: { command: ["true"], label: "nightly-smoke-test" } },
   });
+  const line = await server.nextLine();
+  const body = line.parsed as RunResponseBody;
+  assert.equal(body.error, undefined);
+  assert.notEqual(body.result?.isError, true);
+  assert.equal(body.result?.structuredContent?.label, "nightly-smoke-test");
+  server.child.kill("SIGKILL");
 });
 
 // ---------------------------------------------------------------------------
@@ -1176,57 +1215,6 @@ describe("status()/list() against real spawned jobs (needs a real spawn policy)"
     server.child.kill("SIGKILL");
   });
 
-  test("list() over the real wire enumerates real jobs most-recent-first", async () => {
-    const server = tracked();
-    await completeHandshake(server);
-    server.send({
-      jsonrpc: "2.0",
-      id: 33,
-      method: "tools/call",
-      params: { name: "run", arguments: { command: ["true"], label: "e2e-list-a" } },
-    });
-    const firstLine = await server.nextLine();
-    const firstJobId = (firstLine.parsed as RunResponseBody).result?.structuredContent
-      ?.job_id as string;
-
-    server.send({
-      jsonrpc: "2.0",
-      id: 34,
-      method: "tools/call",
-      params: { name: "run", arguments: { command: ["true"], label: "e2e-list-b" } },
-    });
-    const secondLine = await server.nextLine();
-    const secondJobId = (secondLine.parsed as RunResponseBody).result?.structuredContent
-      ?.job_id as string;
-
-    server.send({
-      jsonrpc: "2.0",
-      id: 35,
-      method: "tools/call",
-      params: { name: "list", arguments: {} },
-    });
-    const listLine = await server.nextLine();
-    const listBody = listLine.parsed as {
-      error?: unknown;
-      result?: { isError?: boolean; structuredContent?: { jobs?: Array<Record<string, unknown>> } };
-    };
-    assert.equal(listBody.error, undefined);
-    assert.notEqual(listBody.result?.isError, true);
-    const jobs = listBody.result?.structuredContent?.jobs ?? [];
-    const firstIndex = jobs.findIndex((j) => j.job_id === firstJobId);
-    const secondIndex = jobs.findIndex((j) => j.job_id === secondJobId);
-    assert.ok(
-      firstIndex !== -1 && secondIndex !== -1,
-      "both real jobs must appear in list()'s output"
-    );
-    assert.ok(
-      secondIndex < firstIndex,
-      "the job created SECOND (more recently) must sort BEFORE the job created first"
-    );
-
-    server.child.kill("SIGKILL");
-  });
-
   test("status()/list() are non-blocking - both return promptly over the wire while a real, actively-running slow job is in flight", async () => {
     const server = tracked();
     await completeHandshake(server);
@@ -1292,4 +1280,61 @@ describe("status()/list() against real spawned jobs (needs a real spawn policy)"
 
     server.child.kill("SIGKILL");
   });
+});
+
+// list()'s enumeration and most-recent-first ordering are derived from each
+// job's tracked creation entry in jobStore, which every run() branch writes
+// - including createFailedJob()'s policy-denial path - so both a denied
+// job's presence in the list and its ordering hold identically whether the
+// spawn was policy-allowed or denied, and this test needs no real spawn to
+// be genuine.
+test("list() over the real wire enumerates real jobs most-recent-first", async () => {
+  const server = tracked();
+  await completeHandshake(server);
+  server.send({
+    jsonrpc: "2.0",
+    id: 33,
+    method: "tools/call",
+    params: { name: "run", arguments: { command: ["true"], label: "e2e-list-a" } },
+  });
+  const firstLine = await server.nextLine();
+  const firstJobId = (firstLine.parsed as RunResponseBody).result?.structuredContent
+    ?.job_id as string;
+
+  server.send({
+    jsonrpc: "2.0",
+    id: 34,
+    method: "tools/call",
+    params: { name: "run", arguments: { command: ["true"], label: "e2e-list-b" } },
+  });
+  const secondLine = await server.nextLine();
+  const secondJobId = (secondLine.parsed as RunResponseBody).result?.structuredContent
+    ?.job_id as string;
+
+  server.send({
+    jsonrpc: "2.0",
+    id: 35,
+    method: "tools/call",
+    params: { name: "list", arguments: {} },
+  });
+  const listLine = await server.nextLine();
+  const listBody = listLine.parsed as {
+    error?: unknown;
+    result?: { isError?: boolean; structuredContent?: { jobs?: Array<Record<string, unknown>> } };
+  };
+  assert.equal(listBody.error, undefined);
+  assert.notEqual(listBody.result?.isError, true);
+  const jobs = listBody.result?.structuredContent?.jobs ?? [];
+  const firstIndex = jobs.findIndex((j) => j.job_id === firstJobId);
+  const secondIndex = jobs.findIndex((j) => j.job_id === secondJobId);
+  assert.ok(
+    firstIndex !== -1 && secondIndex !== -1,
+    "both real jobs must appear in list()'s output"
+  );
+  assert.ok(
+    secondIndex < firstIndex,
+    "the job created SECOND (more recently) must sort BEFORE the job created first"
+  );
+
+  server.child.kill("SIGKILL");
 });

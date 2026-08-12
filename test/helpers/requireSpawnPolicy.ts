@@ -35,21 +35,37 @@
  * policy gate in the bypassed file then denies immediately, for the
  * identical reason, at every call site.
  *
- * CALL `requireSpawnPolicy()` FROM THE NARROWEST `before()` HOOK THAT
- * COVERS ONLY THE TESTS THAT ACTUALLY REACH THE POLICY GATE - never from a
- * file-level `before()` unless every single test in the file reaches it.
+ * CALL `requireSpawnPolicy()` FROM THE NARROWEST `before()` HOOK THAT COVERS
+ * ONLY THE TESTS WHOSE ASSERTED BEHAVIOR NEEDS A POLICY-ALLOWED COMMAND TO
+ * PASS - never from a file-level `before()` unless every single test in the
+ * file needs one. "Reaches the policy gate" is NOT the predicate: a call can
+ * reach `decideRunPolicy`/`decideShellPolicy` and still not need this helper,
+ * in three distinct ways -
+ *
+ *   - it returns BEFORE the policy decision (pre-policy validation, a
+ *     schema-invalid request, an unconfigured/rejected cwd);
+ *   - every test that would reach it is SKIPPED first (a Windows-only or
+ *     availability-gated suite where no child ever runs the spawning path);
+ *   - its assertion holds under DENIAL just as well as under ALLOW (an
+ *     `assert.doesNotReject` against `dispatchToolCall`, or a bare
+ *     `isError !== true` check) - `src/tools/run.ts`'s handler resolves a
+ *     policy denial as an ordinary failed-job tool result rather than
+ *     throwing, so an outcome-insensitive assertion never notices which way
+ *     the gate decided.
+ *
  * `node:test` fails EVERY test a `before()` hook covers when that hook
  * throws, not just the ones that depend on its precondition: a file-level
- * registration in a file that mixes gated and ungated tests fails the
- * ungated ones too, as collateral damage, under an unset policy variable -
- * exactly the confusing-failure class this helper exists to eliminate,
- * just moved one level up. Scope the guard to a `describe()` block wrapping
- * only the tests that dispatch through the gate (see any of this repo's
- * spawning test files for the pattern: `describe("<name>", () => {
- * before(requireSpawnPolicy); ...gated tests only... });`), and leave
- * every other test in the file outside any such block. Register at file
- * level only when every test in the file genuinely reaches the gate, so
- * there is nothing to isolate the guard from.
+ * registration in a file that mixes tests needing the policy with tests that
+ * do not fails the latter too, as collateral damage, under an unset policy
+ * variable - exactly the confusing-failure class this helper exists to
+ * eliminate, just moved one level up. Scope the guard to a `describe()`
+ * block wrapping only the tests whose assertion actually depends on a
+ * policy-allowed outcome (see any of this repo's spawning test files for the
+ * pattern: `describe("<name>", () => { before(requireSpawnPolicy);
+ * ...policy-dependent tests only... });`), and leave every other test in the
+ * file outside any such block. Register at file level only when every test
+ * in the file genuinely needs the policy allowed, so there is nothing to
+ * isolate the guard from.
  *
  * This deliberately does not import `src/policy.ts`'s own `loadPolicy` (or
  * anything else beyond the one exported constant naming the env var) - a
@@ -75,10 +91,15 @@ export function requireSpawnPolicy(): void {
   throw new Error(
     `${POLICY_FILE_ENV_VAR} is not set. This repo's command-execution ` +
       "policy (src/policy.ts) is default-deny with no fallback, so every " +
-      "spawning test in this file would otherwise fail with a confusing, " +
-      "unrelated-looking assertion error instead of naming the real cause. " +
-      "Run tests via `npm test` (or `node scripts/run-tests.mjs`), which " +
-      `set ${POLICY_FILE_ENV_VAR} automatically before spawning each test ` +
+      "test covered by THIS `before()` hook needs a policy-allowed command " +
+      "to pass its assertion, and each would otherwise fail with a " +
+      "confusing, unrelated-looking assertion error instead of naming the " +
+      "real cause. (A test whose assertion holds under denial too - an " +
+      "outcome-insensitive `doesNotReject`, a pre-policy validation case, " +
+      "a fully-skipped platform suite - does not need this helper and " +
+      "should not be inside this hook's scope.) Run tests via `npm test` " +
+      "(or `node scripts/run-tests.mjs`), which set " +
+      `${POLICY_FILE_ENV_VAR} automatically before spawning each test ` +
       "file. See CONTRIBUTING.md for how to run a single test directly."
   );
 }

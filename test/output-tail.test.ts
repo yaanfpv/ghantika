@@ -21,16 +21,22 @@ import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/sp
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 
 // Only the "non-blocking snapshot consistency, HARDENED" test (Tier 2.5)
-// and the `run`-driven end-to-end tests in Tier 3 below spawn a real job
-// through the real `run` tool - see test/helpers/requireSpawnPolicy.ts for
-// what this checks and why. Every other test in this file builds a
+// and the `run`-driven end-to-end tests in Tier 3 below dispatch `run`
+// through the real spawn-policy gate - see test/helpers/requireSpawnPolicy.ts
+// for what this checks and why. Most other tests in this file build a
 // synthetic job directly via makeJobWithRawOutput() or a hand-built
-// snapshot and never touches policy at all, so the guard is scoped
-// locally to just those two sections' own describe() blocks below,
-// instead of running once file-wide: node:test scopes a describe()-level
-// before() hook to only the tests nested inside that describe(), so a
-// missing or invalid policy fails ONLY the tests that genuinely spawn a
-// real job, leaving every synthetic-job test in this file unaffected.
+// snapshot and never touch policy at all; two tests near the end of the
+// file (the "tools/list advertises output/tail" e2e test and the unknown-
+// job_id e2e test) DO start a real spawned server, but only call
+// `tools/list`/`output`/`tail` over it, never `run` - `spawnServer()` itself
+// bypasses `run`'s policy gate, so those two need the guard exactly as
+// little as the synthetic-job tests do. The guard is scoped locally to just
+// the two genuinely `run`-dispatching sections' own describe() blocks
+// below, instead of running once file-wide: node:test scopes a
+// describe()-level before() hook to only the tests nested inside that
+// describe(), so a missing or invalid policy fails ONLY the tests that
+// genuinely spawn a real job through `run`, leaving every other test in
+// this file unaffected.
 
 // ---------------------------------------------------------------------------
 // Small local helpers
@@ -1339,9 +1345,14 @@ test("output()/tail() real handler bodies: a stream genuinely empty at reclaim t
 // =============================================================================
 
 // The one test in this tier spawns a real job via runTool.handler(), so
-// the policy guard is scoped to just this describe() block.
+// the policy guard is scoped to just this describe() block. That single
+// test is itself win32-skipped (no POSIX pgrep-oracle equivalent there),
+// so the registration is conditioned on the same predicate - otherwise
+// the hook would throw on unset policy on win32 with nothing left to guard.
 describe("Tier 2.5: real concurrent-write stress", () => {
-  before(requireSpawnPolicy);
+  if (process.platform !== "win32") {
+    before(requireSpawnPolicy);
+  }
 
   test(
     "non-blocking snapshot consistency, HARDENED: real PGID-alive assertions bracketing both output() and tail(), a per-call deadline, and full seq-integrity checks within every response - never a torn/corrupted/out-of-order event",

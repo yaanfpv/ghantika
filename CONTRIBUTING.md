@@ -35,7 +35,7 @@ This is honest about what it does and doesn't give you: it bypasses `scripts/run
 
 - `test/policy.test.ts` manages its own policy value per test, deliberately, to exercise the gate's own absent/malformed/narrow-policy behavior directly - it needs no guard because that is the whole point of the file.
 - `test/process-slow-paths.test.ts` spawns via the low-level `spawnManaged` primitive directly rather than going through the `run` tool's handler, so it never reaches the policy gate at all - it needs no guard because the gate is simply not in its path.
-- `test/tools.test.ts` is guarded normally like any other spawning file, but one test inside it temporarily scopes a fixture-specific policy override on top of the ambient baseline (restored in a `finally` block afterward) - this is a single test managing an additional, narrower policy value, not a reason the file is unguarded.
+- `test/tools.test.ts` uses the same scoped `describe()` guard as any other spawning file, but one test inside it temporarily REPLACES `GHANTIKA_POLICY_FILE` with a narrower, fixture-specific policy file for the duration of that one test, restoring the original value (or unsetting it) in a `finally` block afterward - this is a single test managing an additional, narrower policy value, not a reason the file is unguarded.
 
 For everything else, set the variable as shown.
 

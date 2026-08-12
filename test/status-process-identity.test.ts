@@ -231,8 +231,14 @@ describe("status: the real end-to-end birth-identity race (against a real spawne
   // is what actually reaches decideRunPolicy - see this file's own
   // top-of-file comment for the full breakdown of which tests in this
   // file do and don't, and test/helpers/requireSpawnPolicy.ts for what
-  // this guard checks and why.
-  before(requireSpawnPolicy);
+  // this guard checks and why. But every one of them is also marked
+  // POSIX_ONLY_SKIP below - on win32 that skips all three, so
+  // registering this hook unconditionally would still throw there under an
+  // unset policy variable with nothing left to run. Register it only
+  // where a child can actually reach it.
+  if (process.platform !== "win32") {
+    before(requireSpawnPolicy);
+  }
 
   test(
     "a1/a2/a7: status() called synchronously right after run() (no await between them) observes birth_identity still pending, with a real pid already present alongside it - never the pid alone",

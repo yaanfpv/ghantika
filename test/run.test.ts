@@ -55,10 +55,18 @@ import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 // spawns a real job through the real `run` tool's handler. That one test
 // only runs on win32 and never spawns - it calls captureBirthIdentityPosix
 // directly on this test process's own pid - so it sits outside the
-// describe() block below rather than under a file-level before(), which
-// would (on win32, where it is not individually skipped) fail it too under
-// an unset policy variable despite it never needing the policy at all -
-// see test/helpers/requireSpawnPolicy.ts for what this checks and why.
+// describe() block below rather than under a file-level before(). Sitting
+// outside the describe() is NOT what protects it on win32, though - a
+// separate describe()'s before() hook runs regardless of whether the
+// describe() it belongs to is a different one from this test's, and every
+// child of that OTHER describe is itself win32-skipped ({ skip:
+// POSIX_ONLY_SKIP }), so an unconditional before() there would still have
+// thrown under an unset policy variable with nothing left in that suite to
+// run - the actual reason nothing here fails on win32 is that describe's
+// own before() call is now itself conditioned on `process.platform !==
+// "win32"` (see that describe's own comment). This test simply never
+// needed the policy at all - see
+// test/helpers/requireSpawnPolicy.ts for what this checks and why.
 const POSIX_ONLY_SKIP =
   process.platform === "win32"
     ? "birth-identity capture is a real `ps -o etime=` read, POSIX-only - see captureBirthIdentityPosix's own docs"
@@ -228,7 +236,14 @@ function makeFakePsDir(scriptBody: string): string {
 // ---------------------------------------------------------------------------
 
 describe("run(): real job dispatch through the run tool's policy gate (birth-identity capture, kill round-trip, degraded-observer paths)", () => {
-  before(requireSpawnPolicy);
+  // Every child test in this block is { skip: POSIX_ONLY_SKIP } - on win32
+  // that skips ALL of them, so no child ever reaches the policy gate there.
+  // Registering the hook unconditionally would still throw on win32 under
+  // an unset policy variable, failing a suite with nothing left to run.
+  // Register it only where a child can actually reach it.
+  if (process.platform !== "win32") {
+    before(requireSpawnPolicy);
+  }
 
   test(
     "run(): a successful spawn captures a REAL birth identity and persists it on the tracked child handle",

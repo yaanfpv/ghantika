@@ -1101,8 +1101,14 @@ test("resolveBirthIdentityForKill returns undefined for an untracked job id", as
   assert.equal(await store.resolveBirthIdentityForKill("nope"), undefined);
 });
 
+// Its one covered test is itself win32-skipped (shadows ps on PATH,
+// POSIX-only), so the registration is conditioned on the same predicate -
+// otherwise the hook would throw on unset policy on win32 with nothing left
+// to guard.
 describe("OWNER 7: kill()'s real caller settles a pending capture (real run()/kill() round trip)", () => {
-  before(requireSpawnPolicy);
+  if (process.platform !== "win32") {
+    before(requireSpawnPolicy);
+  }
 
   test(
     "OWNER 7 - kill()'s real caller (resolveBirthIdentityForKill) settles a genuinely still-pending capture by the aggregate cap, never hanging past it",
@@ -2118,99 +2124,108 @@ test("jobStore reached via a second import of the same module specifier is the e
   );
 });
 
-describe("jobStore-singleton-sharing regression (real run()/tools-call round trip)", () => {
+// ---------------------------------------------------------------------------
+// jobStore-singleton-sharing regression
+// ---------------------------------------------------------------------------
+//
+// Prior coverage above this section only ever unit-tested a STANDALONE
+// `new JobStore()` - never proved that `src/tools/run.ts` (and every
+// other handler that touches job state) actually reads/writes through the
+// SAME `jobStore` singleton this file can import directly. jobStore.ts's
+// header comment already documents the real design (a module-level
+// singleton export, not a `server.ts`-constructed instance threaded
+// through the registry - see its own docs above the `JobStore` class) -
+// what these tests add is a real regression that goes red if that design
+// were ever violated (e.g. a future refactor that accidentally gives
+// `run.ts` its own `new JobStore()`, or duplicates the module via a
+// build/packaging mistake).
+//
+// The two tests immediately below need no spawn guard: run.ts's
+// createFailedJob() path (src/tools/run.ts's policy-denial branch) sets
+// argv/env/label identically to the admitted path, so a job's visibility
+// through the shared jobStore singleton, and those fields' exact values,
+// hold whether or not the spawn was policy-allowed.
+
+test("a job created through run.ts's OWN internal jobStore reference is visible via this file's directly-imported jobStore.get() - proving run.ts and this test share one store, not two compatible-looking ones", () => {
+  // run.ts never re-exports jobStore (by design - see its own header:
+  // "holds no state of its own, real job/output state lives in
+  // src/jobStore.ts's jobStore singleton") - the only way to observe
+  // "which jobStore instance did run.ts's handler actually write to" is
+  // indirectly, through the job it creates. If run.ts held its own
+  // separate JobStore (the exact regression class this guards against),
+  // the job it creates would be invisible to this test's directly-
+  // imported jobStore.get() - the assertion would find `undefined`
+  // instead of a matching record.
+  const result = runTool.handler({ command: ["true"], label: "singleton-sharing-check" });
+  assert.notEqual(result.isError, true);
+  const jobId = (result.structuredContent as Record<string, unknown> | undefined)?.job_id as
+    string | undefined;
+  assert.equal(typeof jobId, "string");
+
+  const record = jobStore.get(jobId!);
+  assert.notEqual(
+    record,
+    undefined,
+    "the job run.ts's handler created must be visible through this test's directly-imported jobStore singleton"
+  );
+  // Cross-check an INTERNAL-only field (argv) that the public projection
+  // returned by the tool call redacts (see toPublicProjection's docs) -
+  // this can only be read by genuinely reaching the same internal
+  // JobRecord through the same JobStore instance, never by re-deriving it
+  // from the public result alone.
+  assert.deepEqual(record!.argv, ["true"]);
+  assert.equal(record!.label, "singleton-sharing-check");
+});
+
+test("end-to-end: a real `run` tools/call driven through a real Client/Server round trip produces a job visible via the directly-imported jobStore.get() - proving the running server and this test's store are genuinely the same instance", async () => {
+  // A real SDK Client and a real ghantika Server (via createServer(), the
+  // exact production wiring - including the init-gate), linked by
+  // the SDK's own InMemoryTransport so both ends live in THIS Node
+  // process (a genuinely spawned child process, as test/e2e-server.test.ts
+  // uses, runs in a separate OS process with its own memory - a directly-
+  // imported jobStore in this test could never observe a spawned child's
+  // jobs no matter how correct the singleton design is, so proving this
+  // specific property requires staying in-process while still driving the
+  // real Client/Server/Protocol dispatch machinery, not a bypass straight
+  // to dispatchToolCall).
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const instance = createServer(serverTransport);
+  await instance.server.connect(instance.transport);
+
+  const client = new Client({ name: "ghantika-jobstore-singleton-e2e-test", version: "0.0.0" });
+  await client.connect(clientTransport); // real initialize request + real notifications/initialized, per the SDK's own Client.connect()
+
+  const callResult = (await client.callTool({
+    name: "run",
+    arguments: { command: ["true"], label: "e2e-singleton-sharing-check" },
+  })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
+
+  assert.notEqual(callResult.isError, true);
+  const jobId = callResult.structuredContent?.job_id as string | undefined;
+  assert.equal(
+    typeof jobId,
+    "string",
+    `expected a real job_id in the tools/call result, got: ${JSON.stringify(callResult)}`
+  );
+
+  const record = jobStore.get(jobId!);
+  assert.notEqual(
+    record,
+    undefined,
+    "the job created by a real tools/call, driven through a real Client/Server round trip, must be visible through this test's directly-imported jobStore singleton"
+  );
+  assert.deepEqual(record!.argv, ["true"]);
+  assert.equal(record!.label, "e2e-singleton-sharing-check");
+
+  await client.close();
+  await instance.shutdown("test cleanup");
+});
+
+// This test genuinely needs a real spawn: it dereferences
+// jobStore.getChildHandle() and asserts a real attached child pid, which a
+// policy-denied job never has.
+describe("jobStore-singleton-sharing regression: shutdown reap needs a real spawn (real run()/tools-call round trip)", () => {
   before(requireSpawnPolicy);
-
-  // ---------------------------------------------------------------------------
-  // jobStore-singleton-sharing regression
-  // ---------------------------------------------------------------------------
-  //
-  // Prior coverage above this section only ever unit-tested a STANDALONE
-  // `new JobStore()` - never proved that `src/tools/run.ts` (and every
-  // other handler that touches job state) actually reads/writes through the
-  // SAME `jobStore` singleton this file can import directly. jobStore.ts's
-  // header comment already documents the real design (a module-level
-  // singleton export, not a `server.ts`-constructed instance threaded
-  // through the registry - see its own docs above the `JobStore` class) -
-  // what these tests add is a real regression that goes red if that design
-  // were ever violated (e.g. a future refactor that accidentally gives
-  // `run.ts` its own `new JobStore()`, or duplicates the module via a
-  // build/packaging mistake).
-
-  test("a job created through run.ts's OWN internal jobStore reference is visible via this file's directly-imported jobStore.get() - proving run.ts and this test share one store, not two compatible-looking ones", () => {
-    // run.ts never re-exports jobStore (by design - see its own header:
-    // "holds no state of its own, real job/output state lives in
-    // src/jobStore.ts's jobStore singleton") - the only way to observe
-    // "which jobStore instance did run.ts's handler actually write to" is
-    // indirectly, through the job it creates. If run.ts held its own
-    // separate JobStore (the exact regression class this guards against),
-    // the job it creates would be invisible to this test's directly-
-    // imported jobStore.get() - the assertion would find `undefined`
-    // instead of a matching record.
-    const result = runTool.handler({ command: ["true"], label: "singleton-sharing-check" });
-    assert.notEqual(result.isError, true);
-    const jobId = (result.structuredContent as Record<string, unknown> | undefined)?.job_id as
-      string | undefined;
-    assert.equal(typeof jobId, "string");
-
-    const record = jobStore.get(jobId!);
-    assert.notEqual(
-      record,
-      undefined,
-      "the job run.ts's handler created must be visible through this test's directly-imported jobStore singleton"
-    );
-    // Cross-check an INTERNAL-only field (argv) that the public projection
-    // returned by the tool call redacts (see toPublicProjection's docs) -
-    // this can only be read by genuinely reaching the same internal
-    // JobRecord through the same JobStore instance, never by re-deriving it
-    // from the public result alone.
-    assert.deepEqual(record!.argv, ["true"]);
-    assert.equal(record!.label, "singleton-sharing-check");
-  });
-
-  test("end-to-end: a real `run` tools/call driven through a real Client/Server round trip produces a job visible via the directly-imported jobStore.get() - proving the running server and this test's store are genuinely the same instance", async () => {
-    // A real SDK Client and a real ghantika Server (via createServer(), the
-    // exact production wiring - including the init-gate), linked by
-    // the SDK's own InMemoryTransport so both ends live in THIS Node
-    // process (a genuinely spawned child process, as test/e2e-server.test.ts
-    // uses, runs in a separate OS process with its own memory - a directly-
-    // imported jobStore in this test could never observe a spawned child's
-    // jobs no matter how correct the singleton design is, so proving this
-    // specific property requires staying in-process while still driving the
-    // real Client/Server/Protocol dispatch machinery, not a bypass straight
-    // to dispatchToolCall).
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    const instance = createServer(serverTransport);
-    await instance.server.connect(instance.transport);
-
-    const client = new Client({ name: "ghantika-jobstore-singleton-e2e-test", version: "0.0.0" });
-    await client.connect(clientTransport); // real initialize request + real notifications/initialized, per the SDK's own Client.connect()
-
-    const callResult = (await client.callTool({
-      name: "run",
-      arguments: { command: ["true"], label: "e2e-singleton-sharing-check" },
-    })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
-
-    assert.notEqual(callResult.isError, true);
-    const jobId = callResult.structuredContent?.job_id as string | undefined;
-    assert.equal(
-      typeof jobId,
-      "string",
-      `expected a real job_id in the tools/call result, got: ${JSON.stringify(callResult)}`
-    );
-
-    const record = jobStore.get(jobId!);
-    assert.notEqual(
-      record,
-      undefined,
-      "the job created by a real tools/call, driven through a real Client/Server round trip, must be visible through this test's directly-imported jobStore singleton"
-    );
-    assert.deepEqual(record!.argv, ["true"]);
-    assert.equal(record!.label, "e2e-singleton-sharing-check");
-
-    await client.close();
-    await instance.shutdown("test cleanup");
-  });
 
   /** A real `pgrep -g <pgid>` call - see test/kill.test.ts's identical helper for the full rationale. Returns the real pids found, `[]` when pgrep finds none. */
   function pgrepGroupMembers(pgid: number): number[] {

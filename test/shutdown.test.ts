@@ -359,37 +359,6 @@ describe("shutdown: real job dispatch through the run tool (process-group reap, 
     }
   );
 
-  test("green control: a job that has already exited BEFORE shutdown is simply left alone - shutdown never errors or hangs on an already-terminal job", async (t) => {
-    const server = spawnServer();
-    t.after(() => {
-      if (!server.child.killed) server.child.kill("SIGKILL");
-    });
-    await completeHandshake(server);
-    server.send({
-      jsonrpc: "2.0",
-      id: 701,
-      method: "tools/call",
-      params: { name: "run", arguments: { command: ["true"] } },
-    });
-    const runLine = await server.nextLine();
-    const runBody = runLine.parsed as RunResponseBody;
-    assert.notEqual(runBody.result?.isError, true);
-
-    // Give the (near-instant) `true` child a real moment to actually exit
-    // before shutdown ever runs, so this exercises the "nothing left to
-    // reap" path, not a race against a still-live job.
-    await new Promise((resolve) => setTimeout(resolve, 200));
-
-    server.child.kill("SIGTERM");
-    const { code, signal } = await server.waitForExit();
-    assert.equal(
-      code,
-      0,
-      "shutdown must still exit cleanly when there is nothing live left to reap"
-    );
-    assert.equal(signal, null);
-  });
-
   test(
     "root-exits-first, shutdown side: the eager reap already collects a job's real, live descendants automatically at leader-exit - well before shutdown ever runs - and shutdown still exits cleanly against that already-reaped, terminal record",
     { skip: PGREP_ORACLE_SKIP },

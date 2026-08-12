@@ -542,8 +542,14 @@ test(
 // test in this file spawns via a direct `spawnManaged` call instead,
 // which never reaches the `run` tool's policy gate at all, so a
 // file-level guard would fail them without any of them ever needing it.
+// Its one covered test is itself win32-skipped (sends a real SIGSTOP and
+// reads real pgrep output, POSIX-only), so the registration is conditioned
+// on the same predicate - otherwise the hook would throw on unset policy
+// on win32 with nothing left to guard.
 describe("kill: caller-supplied signal over the real wire (spawns through the real `run` tool)", () => {
-  before(requireSpawnPolicy);
+  if (process.platform !== "win32") {
+    before(requireSpawnPolicy);
+  }
 
   test(
     "a caller-supplied signal that never gets externally confirmed leaves the job NON-TERMINAL, with kill_confirmed/identity_confirmed genuinely ABSENT on the real wire (both content and structuredContent) - never present as false - and the job stays reachable for a follow-up kill",

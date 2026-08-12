@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { before, describe, test } from "node:test";
+import { test } from "node:test";
 
 import { ProtocolError } from "@modelcontextprotocol/server";
 
@@ -12,21 +12,22 @@ import { ProtocolError } from "@modelcontextprotocol/server";
 // `npm run build` first for exactly this reason (see package.json).
 import { TOOL_NAMES, dispatchToolCall, listToolDefinitions } from "../dist/registry.js";
 
-import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
-
-// Only the "mutation control" test below actually reaches the policy gate:
-// it dispatches "run" for real through dispatchToolCall(), which calls
-// src/tools/run.ts's own handler, which threads into src/policy.ts's
-// decideRunPolicy/decideShellPolicy - the same ambient-policy gate every
-// other spawning test file in this suite guards. Every other test in this
-// file only inspects TOOL_NAMES / listToolDefinitions(), or dispatches
+// No test in this file needs requireSpawnPolicy. The "mutation control"
+// test below dispatches "run" for real through dispatchToolCall(), which
+// does reach src/policy.ts's
+// decideRunPolicy/decideShellPolicy - but its own assertion is
+// `assert.doesNotReject`, and src/tools/run.ts's handler resolves a policy
+// denial as an ordinary failed-job tool result rather than throwing, so
+// that assertion holds identically whether the policy allows or denies the
+// command. Guarding this test bought nothing: what it actually proves
+// (dispatching each of the seven real tool names never throws, unlike an
+// unregistered name) is true under either policy state. Every other test in
+// this file only inspects TOOL_NAMES / listToolDefinitions(), or dispatches
 // "list" (dist/tools/list.js never touches policy.ts) or an unregistered
 // name (dispatchToolCall throws before ever reaching a handler), so none of
-// them need this guard. See test/helpers/requireSpawnPolicy.ts for what
-// this checks and why, including its own instruction to scope the guard to
-// the narrowest describe() block rather than register it file-level: a
-// file-level before() fails EVERY test the hook covers when it throws, not
-// just the ones that depend on its precondition.
+// them ever needed it either. See test/helpers/requireSpawnPolicy.ts for
+// the actual predicate: guard a test only when its own assertion needs a
+// policy-ALLOWED command to pass, not merely when it reaches the gate.
 
 const EXPECTED_TOOL_NAMES = ["run", "status", "list", "output", "tail", "kill", "follow"];
 
@@ -96,22 +97,19 @@ test("dispatching an unknown tool name throws ProtocolError with code -32602 (In
   );
 });
 
-describe('registry: dispatching the real "run" tool, which reaches the real policy gate', () => {
-  // This block's one test dispatches "run" for real through
-  // dispatchToolCall() - see this file's own top-of-file comment for why
-  // the guard is scoped here and not file-level.
-  before(requireSpawnPolicy);
-
-  test("mutation control: the SAME unknown-tool-name check, applied to each of the seven real tool names, never throws", async () => {
-    for (const name of EXPECTED_TOOL_NAMES) {
-      // Every real name must dispatch successfully (resolve, not reject) -
-      // proves the -32602 path is reached only for names NOT in the
-      // registered set, not for every call indiscriminately.
-      await assert.doesNotReject(async () =>
-        dispatchToolCall(name, name === "run" ? { command: ["true"] } : { job_id: "x" })
-      );
-    }
-  });
+test("mutation control: the SAME unknown-tool-name check, applied to each of the seven real tool names, never throws", async () => {
+  // No requireSpawnPolicy: dispatching "run" here reaches the real policy
+  // gate, but the assertion below is doesNotReject, and a policy denial
+  // resolves as an ordinary failed-job result rather than throwing - see
+  // this file's own top-of-file comment.
+  for (const name of EXPECTED_TOOL_NAMES) {
+    // Every real name must dispatch successfully (resolve, not reject) -
+    // proves the -32602 path is reached only for names NOT in the
+    // registered set, not for every call indiscriminately.
+    await assert.doesNotReject(async () =>
+      dispatchToolCall(name, name === "run" ? { command: ["true"] } : { job_id: "x" })
+    );
+  }
 });
 
 test("dispatching a known tool delegates to its handler and returns a CallToolResult, never throws", async () => {

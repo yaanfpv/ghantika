@@ -1336,8 +1336,14 @@ describe("shutdown admission race (real server)", () => {
 // unverified claim in a doc comment.
 // ---------------------------------------------------------------------------
 
+// Its one covered test is itself win32-skipped (symlink creation needs
+// elevated privileges on win32 in CI), so the registration is conditioned
+// on the same predicate - otherwise the hook would throw on unset policy
+// on win32 with nothing left to guard.
 describe("GHANTIKA_CWD_ROOTS TOCTOU residual (real run() tool)", () => {
-  before(requireSpawnPolicy);
+  if (process.platform !== "win32") {
+    before(requireSpawnPolicy);
+  }
 
   test(
     "DISCLOSED RESIDUAL, pinned by a real reproduction: a queued job's cwd is not re-validated at actual spawn time - swapping the checked directory for a symlink escaping the configured root WHILE the job is queued lets the real spawn land outside every configured root",

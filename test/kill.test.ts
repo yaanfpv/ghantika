@@ -48,7 +48,12 @@ import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 // schema/validation/not-found/already-terminal tests right below, and
 // the escape-boundary/prose/commit-history guard suite further down
 // (plus its own pure unit tests against local extraction helpers),
-// stay outside every describe block and spawn nothing at all.
+// stay outside every describe block and never reach `run`'s policy
+// gate - though one ungrouped test further down (the real-wire
+// unknown-job_id test) DOES start a real spawned server via
+// tracked()/spawnServer(), it only ever calls `kill()` against it, and
+// `spawnServer()` itself bypasses `run`'s policy gate the same way
+// `spawnManaged` does, so it needs no guard either.
 
 // ---------------------------------------------------------------------------
 // kill: unit-level handler tests (against the real dist/tools/kill.js, but
@@ -558,10 +563,16 @@ function parseContentProjection(body: RunResponseBody): Record<string, unknown> 
   return JSON.parse(first!.text!) as Record<string, unknown>;
 }
 
+// Every one of this describe's covered tests carries its own win32 skip -
+// see each test's own skip clause below - so the registration is conditioned
+// on the same predicate: otherwise the hook would throw on unset policy on
+// win32 with nothing left to guard.
 describe("kill: the real end-to-end wire proof (against a real spawned job)", () => {
   // Each test below dispatches the real `run` tool over the real
   // wire - scoped here per this file's own top-of-file comment.
-  before(requireSpawnPolicy);
+  if (process.platform !== "win32") {
+    before(requireSpawnPolicy);
+  }
 
   test(
     "kill() reaps a REAL process group - a real job that itself forked real descendant processes - confirmed by a REAL external pgrep after the kill showing zero surviving process-group members, not just the direct child",
@@ -1842,10 +1853,16 @@ const FORBIDDEN_ZERO_DESCENDANTS_CLAIM_SUBSTRING = "Zero descendant processes ev
 // SCOPE LIMIT: a stdio response cannot prove README semantics, so this test
 // never asserts README content - the prose-guard tests below own that
 // separately.
+// Its one covered test is itself win32-skipped (spawns a real detached
+// escapee and reads real pgrep output, POSIX-only), so the registration is
+// conditioned on the same predicate - otherwise the hook would throw on
+// unset policy on win32 with nothing left to guard.
 describe("kill: the real setsid-class escaped-descendant regression (against a real spawned job)", () => {
   // Dispatches the real `run` tool over the real wire - scoped here
   // per this file's own top-of-file comment.
-  before(requireSpawnPolicy);
+  if (process.platform !== "win32") {
+    before(requireSpawnPolicy);
+  }
 
   test(
     "kill: a REAL setsid-class escaped descendant (detached:true + unref()) survives kill() and is honestly out of scope - the original process group is confirmed gone, the escapee is not claimed to be",
