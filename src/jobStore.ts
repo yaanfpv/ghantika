@@ -191,30 +191,39 @@ export interface JobRecord {
   readonly seq: number;
   readonly is_shell: boolean;
   /**
-   * Set only for a POSIX kill (Windows has no process-group verification
-   * mechanism today - see `killProcessTreeWindows`'s own docs - so this is
-   * left `undefined` there rather than claiming a confirmation that was
-   * never attempted): whether a bounded, external `pgrep`-based
-   * process-group check (`process.confirmProcessGroupReapedPosix`)
-   * actually observed zero surviving process-group members after the kill
-   * signal(s) completed (`true`), the bound elapsed without confirming
-   * (`false` - an honest "attempted, not confirmed" disclosure, NEVER
-   * silently upgraded to `true`), or the job never spawned at all (also
-   * `true`, but by construction rather than by observation - see below).
+   * TWO DISJOINT REASONS this field is ever `true`, one platform-scoped and
+   * one not, and a caller that only cares whether it is safe to treat the
+   * job as settled does not need to tell them apart:
    *
-   * TWO DISJOINT REASONS this reads `true`, and a caller that only cares
-   * whether it is safe to treat the job as settled does not need to tell
-   * them apart: (1) the ordinary case - a real external check actually
-   * observed zero survivors; (2) a job that never spawned a process group
-   * in the first place, so this is written `true` vacuously, with NO
-   * external check ever run - either a SYNC preflight rejection via
-   * `createFailedJob` (invalid cwd, unresolvable executable, or a policy
-   * denial - see its own docs), settled as part of that call, or an ASYNC
-   * spawn failure past those checks via `markSpawnFailed` (see its own
-   * docs), settled as part of that job's terminal transition. `diagnostic`
-   * (always populated for either never-spawned route) and `state:
-   * "failed"` together tell a caller that DOES care which reason applied,
-   * without needing a third value here.
+   * (1) POSIX EXTERNAL OBSERVATION - a job that genuinely spawned a
+   * process group. A bounded, external `pgrep`-based check
+   * (`process.confirmProcessGroupReapedPosix`) actually observed zero
+   * surviving process-group members after the kill signal(s) completed
+   * (`true`), or the bound elapsed without confirming (`false` - an
+   * honest "attempted, not confirmed" disclosure, NEVER silently upgraded
+   * to `true`). Windows has no process-group verification mechanism today
+   * (see `killProcessTreeWindows`'s own docs), so this reason leaves the
+   * field `undefined` there rather than claiming a confirmation that was
+   * never attempted.
+   *
+   * (2) NEVER-SPAWNED TRUTH - a job that never had a process group to
+   * check in the first place, so the field is written `true` vacuously,
+   * with NO external check ever run and NO platform condition: there is
+   * nothing to observe on any OS. Four call sites settle a job this way,
+   * and they split into two distinct shapes rather than one:
+   *   - `createFailedJob` (a SYNC preflight rejection: invalid cwd,
+   *     unresolvable executable, or a policy denial - see its own docs)
+   *     and `markSpawnFailed` (an ASYNC spawn failure past those checks -
+   *     see its own docs) both settle `state: "failed"` with `diagnostic`
+   *     always populated, so a caller that DOES care which reason applied
+   *     can read those two fields together without needing a third value
+   *     here.
+   *   - the queue-cancellation path in `src/tools/kill.ts` and the
+   *     shutdown queue-drain path in `src/jobStore.ts` both settle
+   *     `state: "killed"` with NO `diagnostic` - a job dequeued before it
+   *     ever spawned is not a failure, so `diagnostic`/`state: "failed"`
+   *     is NOT a universal never-spawned discriminator; it identifies
+   *     only the first pair above.
    *
    * Set via `setKillConfirmation`, which writes as soon as its own
    * `confirmed` argument is known - reflecting whichever of the two cases
