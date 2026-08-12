@@ -1546,10 +1546,12 @@ test("TASK_STATUSES is a SUBSET of the vendored schema's own taskStatus enum (ne
 // be genuine.
 
 // ---------------------------------------------------------------------------
-// tasks/get(taskId) resolves via the identity mapping to the SAME job
-// status()/output() already reports, live, including after the job reaches
-// a real terminal state (real exit code, real output - never a canned
-// 'working')
+// tasks/get(taskId) resolves via the documented status mapping to the SAME
+// job status() already reports, live, cross-checked on createdAt/started_at
+// agreement with the real job record - self-referential rather than fixed:
+// it derives the EXPECTED task status from status()'s own OBSERVED state
+// through the mapping table, whatever that state happens to be, so it never
+// waits for or asserts a specific terminal state or output
 // ---------------------------------------------------------------------------
 
 test("tasks/get(taskId) resolves to the SAME job status()/output() reports - not just a matching taskId, but genuine cross-field agreement with the real status(), including createdAt/lastUpdatedAt agreement with the real job record", async () => {

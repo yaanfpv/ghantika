@@ -5024,8 +5024,13 @@ describe("Optional per-job execution deadline (real run() tool) - pre-policy val
   });
 });
 
+// Every test below is POSIX_PROCESS_GROUP_SKIP on win32, so the
+// registration is conditioned on the same predicate - otherwise the hook
+// would throw on unset policy on win32 with nothing left to guard.
 describe("Optional per-job execution deadline (real run() tool)", () => {
-  before(requireSpawnPolicy);
+  if (process.platform !== "win32") {
+    before(requireSpawnPolicy);
+  }
 
   test(
     "run(): omitting deadline_ms leaves a job's own natural lifecycle completely untouched, even across a huge mocked time jump - no deadline was ever scheduled to expire",

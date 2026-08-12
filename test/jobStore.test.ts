@@ -2223,9 +2223,14 @@ test("end-to-end: a real `run` tools/call driven through a real Client/Server ro
 
 // This test genuinely needs a real spawn: it dereferences
 // jobStore.getChildHandle() and asserts a real attached child pid, which a
-// policy-denied job never has.
+// policy-denied job never has. Its one covered test is itself win32-skipped
+// (exercises a real POSIX pgrep oracle, no win32 equivalent), so the
+// registration is conditioned on the same predicate - otherwise the hook
+// would throw on unset policy on win32 with nothing left to guard.
 describe("jobStore-singleton-sharing regression: shutdown reap needs a real spawn (real run()/tools-call round trip)", () => {
-  before(requireSpawnPolicy);
+  if (process.platform !== "win32") {
+    before(requireSpawnPolicy);
+  }
 
   /** A real `pgrep -g <pgid>` call - see test/kill.test.ts's identical helper for the full rationale. Returns the real pids found, `[]` when pgrep finds none. */
   function pgrepGroupMembers(pgid: number): number[] {

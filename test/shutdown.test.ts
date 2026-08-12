@@ -280,8 +280,14 @@ async function spawnServerWithLiveTree(
 
 describe("shutdown: real job dispatch through the run tool (process-group reap, green/root-exits-first controls, identity-mismatch and aggregate-cap owners)", () => {
   // Each test below dispatches a real job through the real `run` tool -
-  // scoped here per this file's own top-of-file comment.
-  before(requireSpawnPolicy);
+  // scoped here per this file's own top-of-file comment. All six are
+  // themselves win32-skipped (four by PGREP_ORACLE_SKIP, two individually),
+  // so the registration is conditioned on the same predicate - otherwise
+  // the hook would throw on unset policy on win32 with nothing left to
+  // guard.
+  if (process.platform !== "win32") {
+    before(requireSpawnPolicy);
+  }
 
   test(
     "stdin EOF reaps a REAL live job's WHOLE process group - zero survivors confirmed by a real external pgrep",

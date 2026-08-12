@@ -162,15 +162,15 @@ test("the same child-emitted secret never appears in the job's PUBLIC metadata p
 // Non-goal 2: NO isolation-from-inspection claim
 // ---------------------------------------------------------------------------
 
-// This test spawns a real job through the real `run` tool's handler - see
-// test/helpers/requireSpawnPolicy.ts for what this checks and why. Scoped
-// to just this describe block (rather than the whole file, or even the
-// whole "Non-goal 2" section below) because the "mutation control" test
-// that immediately follows this one never calls `run` at all - see the
-// module-scope comment above the imports.
+// This test spawns a real job through the real `run` tool's handler, but
+// its assertion holds under policy denial just as well as under allow:
+// src/tools/run.ts's policy-denial branch calls createFailedJob with the
+// same resolvedEnv a policy-allowed spawn would use, so the JobRecord
+// carries the caller's exact env either way - the assertion never needs a
+// policy-allowed command to pass, so this does not register
+// requireSpawnPolicy (see test/helpers/requireSpawnPolicy.ts's own
+// outcome-insensitive-assertion exception).
 describe("non-goal 2a: internal JobRecord holds the exact env (spawns a real job through the real `run` tool)", () => {
-  before(requireSpawnPolicy);
-
   test("NEGATIVE CONTROL: this server's own internal JobRecord holds a job's exact env in PLAIN, UNREDACTED form - env minimization is real, hiding it from anyone with server-level access is NOT something this codebase attempts or claims", () => {
     const result = runTool.handler({
       command: ["node", "-e", "setTimeout(() => {}, 2000)"],
@@ -220,8 +220,14 @@ test("mutation control: the negative control above is actually discriminating - 
 // test/helpers/requireSpawnPolicy.ts for what this checks and why. Scoped
 // to just this describe block for the same reason as non-goal 2a above:
 // the "mutation control" test that precedes this one never calls `run`.
+// Its one covered test is itself win32-skipped (ps eww-based same-uid
+// inspection, POSIX-only), so the registration is conditioned on the same
+// predicate - otherwise the hook would throw on unset policy on win32
+// with nothing left to guard.
 describe("non-goal 2b: external same-uid OS process inspection (spawns a real job through the real `run` tool)", () => {
-  before(requireSpawnPolicy);
+  if (process.platform !== "win32") {
+    before(requireSpawnPolicy);
+  }
 
   test(
     "NEGATIVE CONTROL: a genuinely EXTERNAL same-uid OS process inspection (a real `ps eww` call, not an in-process read) can observe a live child's own env - the actual hazard this non-goal names, exercised directly rather than substituted with a weaker in-process proxy",

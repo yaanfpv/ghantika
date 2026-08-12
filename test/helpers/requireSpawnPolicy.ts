@@ -45,7 +45,15 @@
  *   - it returns BEFORE the policy decision (pre-policy validation, a
  *     schema-invalid request, an unconfigured/rejected cwd);
  *   - every test that would reach it is SKIPPED first (a Windows-only or
- *     availability-gated suite where no child ever runs the spawning path);
+ *     availability-gated suite where no child ever runs the spawning path) -
+ *     in this case the REMEDY is not to omit the call, it is to CONDITION
+ *     the `before()` REGISTRATION ITSELF on the identical predicate that
+ *     skips its tests (`if (process.platform !== "win32") {
+ *     before(requireSpawnPolicy); }`), never to register it unconditionally.
+ *     `before()` runs regardless of whether its covered tests end up
+ *     skipped, so an unconditioned registration still throws on an unset
+ *     policy variable on the very platform where nothing it guards can ever
+ *     run - the guard fires with nothing left to guard;
  *   - its assertion holds under DENIAL just as well as under ALLOW (an
  *     `assert.doesNotReject` against `dispatchToolCall`, or a bare
  *     `isError !== true` check) - `src/tools/run.ts`'s handler resolves a

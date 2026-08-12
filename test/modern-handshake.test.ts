@@ -57,9 +57,12 @@ import { TASKS_CAPABILITY_DESCRIPTOR, TASKS_EXTENSION_URI } from "../dist/tasksA
 // the guard is scoped locally to just the describe() blocks below whose
 // tests genuinely spawn one, instead of running once file-wide:
 // node:test scopes a describe()-level before() hook to only the tests
-// nested inside that describe(), so a missing or invalid policy fails
-// ONLY the tests that genuinely spawn a real job, leaving every test
-// named above unaffected.
+// nested inside that describe(), so an unset or empty policy variable -
+// the only two conditions requireSpawnPolicy() itself preflights; a
+// malformed, unreadable, or non-allowlisting policy file is a different
+// failure, denied later inside the real spawn path by loadPolicy() rather
+// than caught here - fails ONLY the tests that genuinely spawn a real job,
+// leaving every test named above unaffected.
 
 const NEGATIVE_CONTROL_FIXTURE = fileURLToPath(
   new URL("./fixtures/negative-control-server.ts", import.meta.url)

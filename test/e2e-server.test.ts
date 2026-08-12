@@ -19,18 +19,18 @@ import { parsesAsJsonObject, waitForFile } from "./harness.ts";
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 
 // Every test in this file spawns a real `dist/index.js` server subprocess -
-// see test/helpers/requireSpawnPolicy.ts for what this checks and why. Only
-// the tests that genuinely dispatch a real `run` tool call over the wire
-// need it; the handshake, tools/list, malformed-JSON, unknown-method, and
-// init-gate rejection tests below talk to that same real server without
-// ever minting a job - several of them assert exactly that (a rejected
-// `run` call must never reach the job handler) - and must keep passing
-// with no policy configured at all. So requireSpawnPolicy() is called from
-// a LOCAL before() inside each describe() block below that actually
-// dispatches `run`, never once at file level: node:test scopes a
-// describe-level before() to only the tests nested inside it, so a thrown
-// preflight failure there fails just those run-dispatching tests with the
-// guard's real, actionable message instead of every test in this file.
+// see test/helpers/requireSpawnPolicy.ts for what this checks and why.
+// Dispatching `run` is not itself the predicate: the schema-invalid-arguments
+// describe() below also dispatches `run` over the wire, but its assertion is
+// about the rejection happening before any job is minted, so it holds with
+// no policy configured and stays unguarded - see its own comment. The
+// predicate is whether the asserted outcome needs a policy-allowed command
+// to pass; requireSpawnPolicy() is called from a LOCAL before() inside only
+// the describe() blocks below whose assertions actually depend on that,
+// never once at file level: node:test scopes a describe-level before() to
+// only the tests nested inside it, so a thrown preflight failure there fails
+// just those tests with the guard's real, actionable message instead of
+// every test in this file.
 
 /**
  * The real end-to-end proof: a real spawned `dist/index.js` process, real
