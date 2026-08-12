@@ -832,8 +832,12 @@ test("kill() on a still-queued job dequeues it, renumbers the survivors, settles
     );
     // A job cancelled while still queued never spawned a process group, so
     // there is nothing left to confirm - the invariant settles it true on
-    // kill()'s own synchronous return, the same public field a client
-    // reads to know whether a kill actually landed.
+    // kill()'s own synchronous return, exactly as it does for every other
+    // never-spawned case (see jobStore.ts's own `kill_confirmed` field
+    // doc). This test's own outcome is the counterexample to reading
+    // `kill_confirmed: true` as "a signal reached and terminated the
+    // group": no signal was ever sent here, since there was never a
+    // process to send one to.
     assert.equal(
       structured(killResult).kill_confirmed,
       true,

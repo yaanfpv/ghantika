@@ -247,29 +247,32 @@ export interface JobRecord {
    */
   kill_confirmed?: boolean;
   /**
-   * Whether the PRE-signal identity check (`process.evaluatePreSignalIdentityGate`)
-   * that ran before a real signal was actually sent to this job's process
-   * group came back genuinely CONFIRMED (`true`), or had to proceed via
-   * the honest DEGRADED path - no captured birth identity was ever
-   * available, or the kill-time observer itself failed - without
-   * verifying identity at all (`false`). On the DEFAULT path (no caller
-   * signal, or `SIGTERM`), set as soon as this codebase actually attempts
-   * to signal the group, since that path's `killed` transition is
-   * synchronous and unconditional. A caller-supplied signal other than
-   * `SIGTERM` is different: a real signal is still attempted, but this
-   * field is only ever recorded once the confirmation check itself
-   * actually resolves - for a signal with no termination guarantee
-   * (SIGSTOP is the worked case), that is also the only way the job ever
-   * reaches a terminal state at all, so a signal genuinely being sent is
-   * NOT enough on its own to guarantee this field gets set. For a signal
-   * that cannot be caught or ignored (an explicit SIGKILL), the job's
-   * state can independently turn terminal via its own real exit before
-   * this field is ever written - but the field itself still waits on
-   * confirmation regardless, staying absent until it resolves.
-   * Never set for a job that was refused (identity-mismatch) or skipped
-   * (already gone). Distinct from `kill_confirmed` above, which is a
-   * POST-signal process-group confirmation - this is the PRE-signal identity
-   * confirmation. POSIX only, matching `kill_confirmed`.
+   * The result of the COMPLETED pre-signal identity check
+   * (`process.evaluatePreSignalIdentityGate`) that ran before a real
+   * signal was attempted against this job's process group: genuinely
+   * CONFIRMED (`true`), or the honest DEGRADED path - no captured birth
+   * identity was ever available, or the kill-time observer itself failed -
+   * without verifying identity at all (`false`). This is the gate's own
+   * result and nothing more: it says what the identity check found BEFORE
+   * any signal went out, never whether a signal actually reached, or
+   * terminated, the group afterward - that is `kill_confirmed`'s job, a
+   * separate, independently-timed fact. A job can settle this field with
+   * no signal ever having been delivered to it at all (the group was
+   * already gone by the time the attempt ran, or the job's own natural
+   * exit raced ahead of the write) - the gate still completed and
+   * produced a real answer before that outcome was known, and that answer
+   * is recorded regardless. Written via `setIdentityConfirmation` once
+   * the corresponding attempt at each of this codebase's four real call
+   * sites (`kill.ts`'s custom-signal and default branches, `run.ts`'s
+   * deadline enforcement, `src/server.ts`'s shutdown reap) has run its
+   * course - which does NOT wait for, or gate, the record's own `state`
+   * reaching terminal; see `setIdentityConfirmation`'s own docs for why
+   * that requirement was removed. Never set for a job whose gate was
+   * refused (identity-mismatch) or skipped (already gone before the gate
+   * itself could even run) - `gate.action` is `"proceed"` at every site
+   * that writes this field. Distinct from `kill_confirmed` above, which is
+   * a POST-signal process-group confirmation - this is the PRE-signal
+   * identity confirmation. POSIX only, matching `kill_confirmed`.
    */
   identity_confirmed?: boolean;
   /**
@@ -3029,18 +3032,24 @@ export class JobStore {
   }
 
   /**
-   * Records whether the PRE-signal identity check that ran before `kill`/
-   * the shutdown reaper actually signaled this job's process group came
-   * back genuinely confirmed, or had to proceed via the honest DEGRADED
-   * path - see `JobRecord.identity_confirmed`'s own docs. Requires the
-   * record to already be terminal (unlike `setKillConfirmation` above,
-   * which does not - see its own docs for why the two setters diverge:
-   * this one has no analogous eager, pre-terminal caller today, so
-   * nothing has yet forced the same broadening here).
+   * Records the PRE-signal identity check's own completed result - see
+   * `JobRecord.identity_confirmed`'s own docs for exactly what this does
+   * and does not claim. Unlike the guard this method used to carry,
+   * writing no longer waits for the record's own `state` to reach
+   * terminal: an audit of all four real call sites (`kill.ts`'s
+   * custom-signal and default branches, `run.ts`'s deadline enforcement,
+   * `src/server.ts`'s shutdown reap) found the identical already-gone /
+   * no-delivery race `setKillConfirmation`'s own docs describe above - the
+   * pre-signal gate can complete, and this write can run, before the SAME
+   * job's independent natural-exit transition has landed, at every one of
+   * those four sites. A terminal-state guard there silently dropped a
+   * true, already-known result in exactly that race, the same defect this
+   * field's twin was fixed for above - so the guard is removed here too,
+   * for the same reason.
    */
   setIdentityConfirmation(jobId: string, confirmed: boolean): void {
     const record = this.jobs.get(jobId);
-    if (!record || !isTerminalJobState(record.state)) return;
+    if (!record) return;
     record.identity_confirmed = confirmed;
   }
 
@@ -3048,14 +3057,22 @@ export class JobStore {
    * Records the escalation identity gate's own refusal reason - see
    * `JobRecord.escalation_refused_reason`'s own docs for exactly what this
    * discloses and why it is never present when escalation proceeded or
-   * was never reached. Same terminal-state guard as `setIdentityConfirmation`
-   * above (see its own docs for why it diverges from `setKillConfirmation`):
-   * by the time the default terminating path's `killProcessGroupPosix` call
-   * resolves, the job's `killed` transition has already happened
-   * synchronously (see `src/tools/kill.ts`'s own docs on the kill/exit
-   * race), so this always writes onto an already-terminal record - it
-   * never gates or precedes that transition, it only ever adds an honest
-   * disclosure alongside it.
+   * was never reached. Keeps its own terminal-state guard, unlike its two
+   * siblings above (`setKillConfirmation`, `setIdentityConfirmation`), and
+   * for a reason specific to this field rather than shared with either of
+   * them: this only ever writes when `result.escalationRefusedReason` is
+   * set, which itself only happens once the group has survived its SIGTERM
+   * grace period - meaning a real SIGTERM was genuinely delivered, meaning
+   * the default terminating path's `killProcessGroupPosix` call already
+   * claimed the terminal slot synchronously in its `onSignaled` callback
+   * (see `src/tools/kill.ts`'s own docs on the kill/exit race) before this
+   * method's two real call sites (`kill.ts`'s default path, `run.ts`'s
+   * deadline enforcement) ever reach it. So this always writes onto an
+   * already-terminal record on both of its call sites - it never gates or
+   * precedes that transition, it only ever adds an honest disclosure
+   * alongside it. Neither sibling's call sites share that guarantee - see
+   * each of their own docs for the already-gone / no-delivery race that
+   * forced their guards off.
    */
   setEscalationRefusedReason(jobId: string, reason: string): void {
     const record = this.jobs.get(jobId);
