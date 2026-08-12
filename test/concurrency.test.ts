@@ -436,6 +436,18 @@ test("a slot releases only after the finishing job's reap has been awaited to co
     );
     assert.equal(queuedAfterShutdown.queue_position, undefined);
     assert.equal(jobStore.getQueueLength(), 0, "the queue must be fully drained after shutdown");
+    // Tool-visible, not just the internal record above: the same public
+    // projection a real status() call returns must also show
+    // kill_confirmed:true for a job the shutdown drain never spawned - the
+    // MCP client transport is already closed at this point, but
+    // statusTool.handler is the exact same handler wired to the live
+    // "status" tool, called directly rather than over that transport.
+    const queuedStatusAfterShutdown = structured(statusTool.handler({ job_id: queuedJobId }));
+    assert.equal(
+      queuedStatusAfterShutdown.kill_confirmed,
+      true,
+      "status() on a job drained at shutdown must report kill_confirmed:true, not leave it unset"
+    );
     assert.notEqual(
       jobStore.get(runningJobId),
       undefined,
@@ -818,12 +830,30 @@ test("kill() on a still-queued job dequeues it, renumbers the survivors, settles
       true,
       `kill() on a queued job must succeed, not report an internal inconsistency: ${JSON.stringify(killResult)}`
     );
+    // A job cancelled while still queued never spawned a process group, so
+    // there is nothing left to confirm - the invariant settles it true on
+    // kill()'s own synchronous return, exactly as it does for every other
+    // never-spawned case (see jobStore.ts's own `kill_confirmed` field
+    // doc). This test's own outcome is the counterexample to reading
+    // `kill_confirmed: true` as "a signal reached and terminated the
+    // group": no signal was ever sent here, since there was never a
+    // process to send one to.
+    assert.equal(
+      structured(killResult).kill_confirmed,
+      true,
+      "a job killed while still queued must report kill_confirmed:true on kill()'s own return, not leave it unset"
+    );
 
     // It is removed from the queue, not merely marked terminal in place.
     assert.equal(jobStore.getQueueLength(), 1);
     const statusAfterKill = structured(statusTool.handler({ job_id: firstQueuedId }));
     assert.equal(statusAfterKill.state, "killed");
     assert.equal(statusAfterKill.queue_position, undefined);
+    assert.equal(
+      statusAfterKill.kill_confirmed,
+      true,
+      "status() on the same job afterward must keep reporting kill_confirmed:true, not just kill()'s own return"
+    );
 
     // The survivor renumbers up from position 2 to position 1.
     const survivorStatus = structured(statusTool.handler({ job_id: secondQueuedId }));
