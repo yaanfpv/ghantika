@@ -1310,12 +1310,12 @@ describe("spawning tests: output-driven wake, firehose auto-stop, exit reporting
   // ---------------------------------------------------------------------------
   // The output-arrival seam itself: a generic, core-decoupled
   // subscribe/listener mechanism on src/jobStore.ts's JobStore.appendOutput.
-  // The first two tests below drive a real run() path with a real spawned
+  // The first test below drives a real run() path with a real spawned
   // process, proving multi-line, in-order delivery; the remaining tests use
   // a synthetic job (jobStore.createJob - no real child at all, matching
   // this file's own established low-level-mechanics convention) for byte-
-  // exact control over split-chunk/stream-end/unsubscribe/isolation, none of
-  // which need real process timing.
+  // exact control over multi-line/split-chunk/stream-end/unsubscribe/
+  // isolation, none of which need real process timing.
   // ---------------------------------------------------------------------------
 
   test("a registered listener receives each REAL stdout line, in order, as the REAL run.ts -> jobStore.appendOutput path materializes them", async () => {

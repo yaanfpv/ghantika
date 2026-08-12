@@ -243,8 +243,8 @@ test("legacy handshake, under serveStdio: tools/call sent before the initialize/
 // here rather than file-wide. The pre-handshake-rejection test just above
 // sends a tools/call naming "run" too, but is rejected by the gate before
 // ever reaching the real run() handler (see that test's own inline
-// comment), so it never actually spawns anything and stays outside this
-// describe() block, unaffected by the guard.
+// comment), so it never actually spawns anything and is unaffected by
+// the guard regardless.
 // Every one of these nine reads only wire-shape/protocol-negotiation state
 // - which resultType a mint takes, whether a method routes at all,
 // capability-independence - and each such property is decided by the
