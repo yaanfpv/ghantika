@@ -617,7 +617,10 @@ describe("status: dispatches through the real run tool's policy gate (live-trans
   test("status: reflects a job's live state transitions across separate calls, never a stale cached snapshot", async () => {
     const runResult = runTool.handler({ command: [process.execPath, "-e", "process.exit(0)"] });
     const jobId = (runResult.structuredContent as Record<string, unknown>).job_id as string;
-    const first = statusTool.handler({ job_id: jobId }).structuredContent as Record<string, unknown>;
+    const first = statusTool.handler({ job_id: jobId }).structuredContent as Record<
+      string,
+      unknown
+    >;
     assert.ok(
       ["starting", "running"].includes(first.state as string),
       `expected a non-terminal state right after run(), got ${first.state as string}`

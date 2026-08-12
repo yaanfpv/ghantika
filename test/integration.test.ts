@@ -386,14 +386,21 @@ describe('run-dispatching tests (spawn a real job through the real "run" tool)',
     // real wire for real output/tail() calls (test/kill.test.ts's own unit
     // coverage could only prove this indirectly, via a filesystem side effect,
     // because output/tail aren't exercised over the real wire there).
-    const outputBody = await callTool(server, nextId(), "output", { job_id: jobId, stream: "both" });
+    const outputBody = await callTool(server, nextId(), "output", {
+      job_id: jobId,
+      stream: "both",
+    });
     const outputStructured = requireStructuredContent(outputBody, "output() after kill()");
     const outputEvents = outputStructured.events as Array<{ text: string; stream: string }>;
     assert.ok(
-      outputEvents.some((event) => event.stream === "stdout" && event.text === "before-kill-line-one")
+      outputEvents.some(
+        (event) => event.stream === "stdout" && event.text === "before-kill-line-one"
+      )
     );
     assert.ok(
-      outputEvents.some((event) => event.stream === "stderr" && event.text === "before-kill-line-two")
+      outputEvents.some(
+        (event) => event.stream === "stderr" && event.text === "before-kill-line-two"
+      )
     );
 
     const tailBody = await callTool(server, nextId(), "tail", {
@@ -969,8 +976,10 @@ describe('run-dispatching tests (spawn a real job through the real "run" tool)',
         shell: true,
         label: "guard-buggy-resistant-leader",
       });
-      const jobId = requireStructuredContent(runBody, "run() for the guard's buggy resistant leader")
-        .job_id as string;
+      const jobId = requireStructuredContent(
+        runBody,
+        "run() for the guard's buggy resistant leader"
+      ).job_id as string;
 
       const pgidText = await waitForFile(pgidMarker, { timeoutMs: 15_000, until: parsesAsPgid });
       const pgid = Number(pgidText.trim());
@@ -1177,7 +1186,9 @@ describe('run-dispatching tests (spawn a real job through the real "run" tool)',
         assert.equal(signal, null);
 
         const afterMembersByJob = await Promise.all(
-          pgids.map((pgid) => waitForPgrepGroupMembers(pgid, (members) => members.length === 0, 5000))
+          pgids.map((pgid) =>
+            waitForPgrepGroupMembers(pgid, (members) => members.length === 0, 5000)
+          )
         );
         afterMembersByJob.forEach((members, i) => {
           assert.deepEqual(

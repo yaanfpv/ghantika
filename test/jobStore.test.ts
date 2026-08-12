@@ -1165,7 +1165,11 @@ describe("OWNER 7: kill()'s real caller settles a pending capture (real run()/ki
           name: "run",
           arguments: { command: ["sleep", "30"], label: "kill-aggregate-cap-check" },
         })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
-        assert.notEqual(runResult.isError, true, `run() must succeed: ${JSON.stringify(runResult)}`);
+        assert.notEqual(
+          runResult.isError,
+          true,
+          `run() must succeed: ${JSON.stringify(runResult)}`
+        );
         const jobId = runResult.structuredContent?.job_id as string;
         assert.equal(typeof jobId, "string");
 

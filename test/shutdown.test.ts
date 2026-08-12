@@ -382,7 +382,11 @@ describe("shutdown: real job dispatch through the run tool (process-group reap, 
 
     server.child.kill("SIGTERM");
     const { code, signal } = await server.waitForExit();
-    assert.equal(code, 0, "shutdown must still exit cleanly when there is nothing live left to reap");
+    assert.equal(
+      code,
+      0,
+      "shutdown must still exit cleanly when there is nothing live left to reap"
+    );
     assert.equal(signal, null);
   });
 

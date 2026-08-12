@@ -439,7 +439,10 @@ describe("spawning tests: keepalive and TTL frozen-separation sweep", () => {
 
       const handle = jobStore.getChildHandle(jobId);
       assert.ok(handle, "expected the keepalive job to have a real tracked child");
-      assert.ok(isProcessAlive(handle.pid), "expected the keepalive job's real process to be alive");
+      assert.ok(
+        isProcessAlive(handle.pid),
+        "expected the keepalive job's real process to be alive"
+      );
     } finally {
       if (jobId !== undefined) await killAndReapRealChild(jobId);
       await pair.close();
@@ -648,7 +651,11 @@ describe("spawning tests: output-driven wake, firehose auto-stop, exit reporting
       // synchronously.
       await new Promise((resolve) => setImmediate(resolve));
 
-      assert.equal(received.length, 1, `expected exactly one wake, got ${JSON.stringify(received)}`);
+      assert.equal(
+        received.length,
+        1,
+        `expected exactly one wake, got ${JSON.stringify(received)}`
+      );
 
       // Suppressed-notification case: a SEPARATE, non-subscribing
       // client must still observe everything via the poll floor. Registering
@@ -837,7 +844,10 @@ describe("spawning tests: output-driven wake, firehose auto-stop, exit reporting
     const pair = await startPair(true);
     let jobId: string | undefined;
     try {
-      const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "coalesce-window" });
+      const minted = await mintJob(pair.client, {
+        command: IDLE_COMMAND,
+        label: "coalesce-window",
+      });
       jobId = minted.taskId as string;
       const received = registerWakeSpy(pair.client);
 
@@ -900,7 +910,10 @@ describe("spawning tests: output-driven wake, firehose auto-stop, exit reporting
     const pair = await startPair(true);
     let jobId: string | undefined;
     try {
-      const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "firehose-trigger" });
+      const minted = await mintJob(pair.client, {
+        command: IDLE_COMMAND,
+        label: "firehose-trigger",
+      });
       jobId = minted.taskId as string;
       const received = registerWakeSpy(pair.client);
 
@@ -1179,7 +1192,11 @@ describe("spawning tests: output-driven wake, firehose auto-stop, exit reporting
 
       mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
       try {
-        jobStore.appendOutput(jobId, "stdout", Buffer.concat([line("pending-1"), line("pending-2")]));
+        jobStore.appendOutput(
+          jobId,
+          "stdout",
+          Buffer.concat([line("pending-1"), line("pending-2")])
+        );
         // The window is open (WAKE_COALESCE_WINDOW_MS hasn't elapsed) -
         // force the terminal transition NOW, directly, before ever ticking.
         jobStore.markKilled(jobId, "SIGTERM-test-forced");

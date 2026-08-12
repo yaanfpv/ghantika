@@ -96,7 +96,7 @@ test("dispatching an unknown tool name throws ProtocolError with code -32602 (In
   );
 });
 
-describe("registry: dispatching the real \"run\" tool, which reaches the real policy gate", () => {
+describe('registry: dispatching the real "run" tool, which reaches the real policy gate', () => {
   // This block's one test dispatches "run" for real through
   // dispatchToolCall() - see this file's own top-of-file comment for why
   // the guard is scoped here and not file-level.

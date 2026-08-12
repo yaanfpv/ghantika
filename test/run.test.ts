@@ -667,7 +667,11 @@ describe("run(): real job dispatch through the run tool's policy gate (birth-ide
       await new Promise((resolve) => setTimeout(resolve, 100));
       fs.writeFileSync(releaseFile, "go");
       const killResult = await killPromise;
-      assert.notEqual(killResult.isError, true, `kill() must succeed: ${JSON.stringify(killResult)}`);
+      assert.notEqual(
+        killResult.isError,
+        true,
+        `kill() must succeed: ${JSON.stringify(killResult)}`
+      );
       const firstStructured = killResult.structuredContent as Record<string, unknown>;
       assert.equal(firstStructured.state, "killed");
       // `killPromise` above is THE call this test exists to exercise (kill()
@@ -781,11 +785,14 @@ describe("run(): real job dispatch through the run tool's policy gate (birth-ide
         false,
         "identity could never be established (the observer genuinely failed) - must be honestly disclosed as unconfirmed"
       );
-      assert.equal(structured.kill_confirmed, true, "the real process must still actually be reaped");
+      assert.equal(
+        structured.kill_confirmed,
+        true,
+        "the real process must still actually be reaped"
+      );
     }
   );
 });
-
 
 test(
   "run(): on Windows, birth-identity capture is never even attempted - birthIdentity is always undefined there",
