@@ -242,18 +242,18 @@ On Claude Code specifically, there's a second wake path, independent of the Task
 
 What this needs depends on the kind of session you're in:
 
-- In an **interactive** session, setting `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` to a **positive** duration below the client's own MCP tool timeout is enough on its own — the threshold has to be strictly greater than zero as well as below the timeout.
-- In a **non-interactive** session, that setting alone does nothing: `CLAUDE_AUTO_BACKGROUND_TASKS` also has to be enabled, or the wake silently never fires. If you're not sure which kind of session you're in, set both together as one instruction — a session that doesn't need the second variable simply ignores it, while a session that does need it and doesn't have it is left believing it configured something that never took effect.
+- In an **interactive** session, setting `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` to a **positive** duration below the client's own MCP tool timeout is enough on its own - the threshold has to be strictly greater than zero as well as below the timeout.
+- In a **non-interactive** session, that setting alone does nothing: `CLAUDE_AUTO_BACKGROUND_TASKS` also has to be enabled, or the wake silently never fires. If you're not sure which kind of session you're in, set both together as one instruction - a session that doesn't need the second variable simply ignores it, while a session that does need it and doesn't have it is left believing it configured something that never took effect.
 
 Both variables belong in Claude Code's own launch environment, not ghantika's configuration. There's no install step that can set this for you: macOS starts a GUI client via `launchd`, which does not inherit a shell's environment, so a value exported from your shell profile never reaches it.
 
-**This setting is global to Claude Code, not scoped to ghantika.** A low `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` value changes when MCP tool calls on that client are eligible to background, across every server it talks to that qualifies, not just ghantika's — the client also has its own exclusions (for example, disabling the feature outright, or specific call-path/server/transport conditions) that this document doesn't control. Choose the value knowing that; ghantika has no way to scope it narrower.
+**This setting is global to Claude Code, not scoped to ghantika.** A low `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` value changes when MCP tool calls on that client are eligible to background, across every server it talks to that qualifies, not just ghantika's - the client also has its own exclusions (for example, disabling the feature outright, or specific call-path/server/transport conditions) that this document doesn't control. Choose the value knowing that; ghantika has no way to scope it narrower.
 
-The tool this actually interacts with is `follow`: a `run`, `status`, `output`, or `tail` call normally returns quickly and doesn't hold the connection open waiting on your command, so it doesn't get the chance to background — but a `follow` call with a `timeout_ms` above your configured threshold can. Ask your agent to `follow` a job rather than poll it, once both variables are set as your session needs them, and Claude Code backgrounds that wait and delivers the result as a wake instead of holding the agent's turn open on it.
+The tool this actually interacts with is `follow`: a `run`, `status`, `output`, or `tail` call normally returns quickly and doesn't hold the connection open waiting on your command, so it doesn't get the chance to background - but a `follow` call with a `timeout_ms` above your configured threshold can. Ask your agent to `follow` a job rather than poll it, once both variables are set as your session needs them, and Claude Code backgrounds that wait and delivers the result as a wake instead of holding the agent's turn open on it.
 
 This wake never reaches a subagent or delegated context: auto-background is skipped entirely whenever the calling context carries an agent id, so a subagent's `follow` call runs inline no matter what either variable is set to, and `status`/`output`/`tail` remain how a subagent checks a job instead.
 
-None of this is required for ghantika to work. Every tool answers by polling, on every client, with zero configuration; this wake is strictly an upgrade on top of that, and setting nothing at all still gives you the full product, just without this particular shortcut.
+None of this is required for ghantika to work: every tool answers by polling on every client regardless, and this wake is strictly an upgrade on top of that same poll floor, never a replacement for it.
 
 ## Roadmap
 
