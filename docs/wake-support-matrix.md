@@ -39,11 +39,11 @@ Codex is covered here as **the desktop app, with a session actually open in a wi
 
 ### Ghantika's own app-server wake
 
-**Status: `worked`.** Unlike the Claude Code mechanism above, this one is ghantika's own code: when a job Codex started finishes, ghantika sends a message over the same app-server protocol Codex's own tooling already uses, aimed at the thread that started the job.
+**Status: `worked`.** Unlike the Claude Code mechanism above, this one is ghantika's own code: when a `run` request's metadata carries a non-empty raw thread ID and that job later reaches a terminal state, an enabled server attempts to send a message over the same app-server protocol Codex's own tooling already uses, addressed to whatever that ID names. The code accepts any non-empty string there and never checks which client sent the request, so this describes an observed Codex route rather than a client-identity check the code performs - and the ID's presence does not by itself prove it names the thread that started the job, only what this codebase's own wake-target design assigns to it. An attempt is not the same as a delivery either: a configured transport has to report success before this counts as reaching anyone, and a refused, unavailable, or thrown attempt is only logged, never treated as a wake that happened.
 
 **What it needs.** `GHANTIKA_WAKE_TRANSPORT_ENABLED=1` set in the ghantika server's own environment - this is server-side configuration, not something a client sets. Unset by default, so this is inert unless you turn it on.
 
-**What a successful wake looks like.** The thread that started the job receives a new turn whose content names the finished job and points at the tools to read its result:
+**What a successful wake looks like.** The thread named by the resolved wake target - not provably the job's own originating thread, per the caveat above - receives a new turn whose content names the finished job and points at the tools to read its result:
 
     ghantika job <id> reached exited - use status/output/tail to read the result
 
