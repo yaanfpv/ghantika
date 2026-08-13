@@ -199,14 +199,34 @@ export function armKillConfirmedWatchdog(
   boundMs: number = KILL_CONFIRMED_POLL_BOUND_MS
 ): KillConfirmedWatchdog {
   const controller = new AbortController();
+  // Deliberately NOT `.unref()`'d. An earlier version of this watchdog did
+  // unref this timer as a defense-in-depth layer against a future call
+  // site forgetting its `finally { watchdog.dispose() }` - reasonable in
+  // isolation, but it collides with node:test's own event-loop-idle
+  // detection whenever `race()` is racing a promise that has not yet
+  // settled at the moment this timer fires: an unref'd timer's own
+  // callback running is exactly the point at which node considers the
+  // process's event loop "empty" if nothing else is ref'd, and firing
+  // this timer's callback (which settles race()'s own wrapper promise via
+  // the abort path while leaving the raced promise's `.then()`
+  // continuation still pending) lands squarely in that window on node 22 -
+  // it reports "Promise resolution is still pending but the event loop
+  // has already resolved" and cancels every other test still queued in
+  // this file, regardless of what those tests do. Confirmed by isolating
+  // the mechanism down to exactly this shape on a real node v22.23.2:
+  // an unref'd timer whose fire calls `controller.abort()` while racing a
+  // promise that has not yet settled reproduces it every time, and
+  // dropping only `.unref()` - with nothing else about the shape changed -
+  // eliminates it every time. Every real call site already disposes in a
+  // `finally` (see this file's own header doc comment), so a normal,
+  // ref'd timer is cleared through the ordinary path in practice; the
+  // remaining exposure - a future call site that forgets to dispose -
+  // would now keep the TEST process alive for up to `boundMs`, which
+  // `scripts/run-tests.mjs`'s own idle-watchdog is built to catch loudly
+  // (see its own header doc comment), rather than the timer silently
+  // never being why anything hangs. That is the intended failure mode for
+  // test-harness-only code: a leaked handle should be loud, not silent.
   const timer = setTimeout(() => controller.abort(), boundMs);
-  // Never lets this timer keep the process alive on its own - every real
-  // call site's own `finally` block calls `dispose()` once the poll
-  // settles, which already clears it, but `unref()` is a defense-in-depth
-  // second layer: if a FUTURE call site ever forgot the `finally`, an
-  // un-awaited leftover timer would still never be the reason a process
-  // hangs.
-  timer.unref();
   return {
     signal: controller.signal,
     throwIfTripped(diagnostic: Record<string, unknown>): void {
