@@ -253,7 +253,7 @@ The tool this actually interacts with is `follow`: a `run`, `status`, `output`, 
 
 This wake never reaches a subagent or delegated context: auto-background is skipped entirely whenever the calling context carries an agent id, so a subagent's `follow` call runs inline no matter what either variable is set to, and `status`/`output`/`tail` remain how a subagent checks a job instead.
 
-None of this is required for ghantika to work: every tool answers by polling on every client regardless, and this wake is strictly an upgrade on top of that same poll floor, never a replacement for it.
+None of this is required for ghantika to work: `status`, `output`, and `tail` remain the retrieval floor for any job id, retrievable by polling on every client with no configuration needed. `follow` stays available as a client-independent bounded wait on that same floor - the very tool this document tells you to reach for instead of polling - and needs neither variable set to work. `run`, `kill`, and `list` are ordinary request-response operations, never polling endpoints in the first place. This wake is strictly an upgrade on top of that floor, never a replacement for it.
 
 ## Roadmap
 
