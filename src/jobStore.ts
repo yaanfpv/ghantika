@@ -191,62 +191,88 @@ export interface JobRecord {
   readonly seq: number;
   readonly is_shell: boolean;
   /**
-   * Set only once `state` is TERMINAL (`killed`, `exited`, or `failed` -
-   * broadened from an earlier "only `killed`" restriction so a
-   * root-exits-first terminal-record reap can disclose its own honest
-   * outcome regardless of the leader's own disposition; see
-   * `setKillConfirmation`'s own docs), and only for a POSIX kill (Windows
-   * has no process-group verification mechanism today - see
-   * `killProcessTreeWindows`'s own docs - so this is left `undefined` there
-   * rather than claiming a confirmation that was never attempted): whether
-   * a bounded, external `pgrep`-based process-group check
+   * TWO DISJOINT REASONS this field is ever `true`, one platform-scoped and
+   * one not, and a caller that only cares whether it is safe to treat the
+   * job as settled does not need to tell them apart:
+   *
+   * (1) POSIX EXTERNAL OBSERVATION - a job that genuinely spawned a
+   * process group. A bounded, external `pgrep`-based check
    * (`process.confirmProcessGroupReapedPosix`) actually observed zero
    * surviving process-group members after the kill signal(s) completed
-   * (`true`), or the bound elapsed without confirming (`false` - an honest
-   * "attempted, not confirmed" disclosure, NEVER silently upgraded to
-   * `true`). Set via `setKillConfirmation`, which itself only ever WRITES
-   * once the record is already terminal - on the DEFAULT path (no caller
-   * signal, or `SIGTERM`) that write happens strictly AFTER, and never
-   * gates, the synchronous `killed` state transition `markKilled`/
-   * `markExited` already performed, so this field only ever refines an
-   * already-settled result's honesty there. A caller-supplied signal other
-   * than `SIGTERM` is the one exception, and it splits in two: for a
-   * signal with no termination guarantee (SIGSTOP is the worked case),
-   * THIS check's own result is what decides whether the job becomes
-   * terminal at all (see `src/tools/kill.ts`'s explicit-signal branch), so
-   * the field is the gate there, not a refinement after one. For a signal
-   * that cannot be caught or ignored (an explicit SIGKILL), the job's
-   * state can independently reach terminal via its own real exit
-   * (`markExited`), unmediated by this check - but this field itself
-   * still only ever gets written once this check actually confirms, so it
-   * stays absent, never `false`, for as long as it hasn't - regardless of
-   * whether the record itself is already terminal by then.
+   * (`true`), or the bound elapsed without confirming (`false` - an
+   * honest "attempted, not confirmed" disclosure, NEVER silently upgraded
+   * to `true`). Windows has no process-group verification mechanism today
+   * (see `killProcessTreeWindows`'s own docs), so this reason leaves the
+   * field `undefined` there rather than claiming a confirmation that was
+   * never attempted.
+   *
+   * (2) NEVER-SPAWNED TRUTH - a job that never had a process group to
+   * check in the first place, so the field is written `true` vacuously,
+   * with NO external check ever run and NO platform condition: there is
+   * nothing to observe on any OS. Four call sites settle a job this way,
+   * and they split into two distinct shapes rather than one:
+   *   - `createFailedJob` (a SYNC preflight rejection: invalid cwd,
+   *     unresolvable executable, or a policy denial - see its own docs)
+   *     and `markSpawnFailed` (an ASYNC spawn failure past those checks -
+   *     see its own docs) both settle `state: "failed"` with `diagnostic`
+   *     always populated, so a caller that DOES care which reason applied
+   *     can read those two fields together without needing a third value
+   *     here.
+   *   - the queue-cancellation path in `src/tools/kill.ts` and the
+   *     shutdown queue-drain path in `src/jobStore.ts` both settle
+   *     `state: "killed"` with NO `diagnostic` - a job dequeued before it
+   *     ever spawned is not a failure, so `diagnostic`/`state: "failed"`
+   *     is NOT a universal never-spawned discriminator; it identifies
+   *     only the first pair above.
+   *
+   * Set via `setKillConfirmation`, which writes as soon as its own
+   * `confirmed` argument is known - reflecting whichever of the two cases
+   * above produced it, never a value carried forward - and does
+   * NOT wait for, or gate, the record's own `state` reaching terminal; the
+   * two typically settle within the same synchronous window (both are
+   * consequences of the same real process-group event) but neither is
+   * ordered strictly before the other (see `setKillConfirmation`'s own
+   * docs for why this field used to require `state` already terminal, and
+   * why that requirement was removed). A caller-supplied signal other than
+   * `SIGTERM` splits in two: for a signal with no termination guarantee
+   * (SIGSTOP is the worked case), THIS check's own result is what decides
+   * whether the job becomes terminal at all (see `src/tools/kill.ts`'s
+   * explicit-signal branch), so the field is the gate there, not a
+   * refinement after one. For a signal that cannot be caught or ignored
+   * (an explicit SIGKILL), the job's state can independently reach
+   * terminal via its own real exit (`markExited`), unmediated by this
+   * check - but this field itself still only ever gets written once this
+   * check actually confirms, so it stays absent, never `false`, for as
+   * long as it hasn't.
    */
   kill_confirmed?: boolean;
   /**
-   * Whether the PRE-signal identity check (`process.evaluatePreSignalIdentityGate`)
-   * that ran before a real signal was actually sent to this job's process
-   * group came back genuinely CONFIRMED (`true`), or had to proceed via
-   * the honest DEGRADED path - no captured birth identity was ever
-   * available, or the kill-time observer itself failed - without
-   * verifying identity at all (`false`). On the DEFAULT path (no caller
-   * signal, or `SIGTERM`), set as soon as this codebase actually attempts
-   * to signal the group, since that path's `killed` transition is
-   * synchronous and unconditional. A caller-supplied signal other than
-   * `SIGTERM` is different: a real signal is still attempted, but this
-   * field is only ever recorded once the confirmation check itself
-   * actually resolves - for a signal with no termination guarantee
-   * (SIGSTOP is the worked case), that is also the only way the job ever
-   * reaches a terminal state at all, so a signal genuinely being sent is
-   * NOT enough on its own to guarantee this field gets set. For a signal
-   * that cannot be caught or ignored (an explicit SIGKILL), the job's
-   * state can independently turn terminal via its own real exit before
-   * this field is ever written - but the field itself still waits on
-   * confirmation regardless, staying absent until it resolves.
-   * Never set for a job that was refused (identity-mismatch) or skipped
-   * (already gone). Distinct from `kill_confirmed` above, which is a
-   * POST-signal process-group confirmation - this is the PRE-signal identity
-   * confirmation. POSIX only, matching `kill_confirmed`.
+   * The result of the COMPLETED pre-signal identity check
+   * (`process.evaluatePreSignalIdentityGate`) that ran before a real
+   * signal was attempted against this job's process group: genuinely
+   * CONFIRMED (`true`), or the honest DEGRADED path - no captured birth
+   * identity was ever available, or the kill-time observer itself failed -
+   * without verifying identity at all (`false`). This is the gate's own
+   * result and nothing more: it says what the identity check found BEFORE
+   * any signal went out, never whether a signal actually reached, or
+   * terminated, the group afterward - that is `kill_confirmed`'s job, a
+   * separate, independently-timed fact. A job can settle this field with
+   * no signal ever having been delivered to it at all (the group was
+   * already gone by the time the attempt ran, or the job's own natural
+   * exit raced ahead of the write) - the gate still completed and
+   * produced a real answer before that outcome was known, and that answer
+   * is recorded regardless. Written via `setIdentityConfirmation` once
+   * the corresponding attempt at each of this codebase's four real call
+   * sites (`kill.ts`'s custom-signal and default branches, `run.ts`'s
+   * deadline enforcement, `src/server.ts`'s shutdown reap) has run its
+   * course - which does NOT wait for, or gate, the record's own `state`
+   * reaching terminal; see `setIdentityConfirmation`'s own docs for why
+   * that requirement was removed. Never set for a job whose gate was
+   * refused (identity-mismatch) or skipped (already gone before the gate
+   * itself could even run) - `gate.action` is `"proceed"` at every site
+   * that writes this field. Distinct from `kill_confirmed` above, which is
+   * a POST-signal process-group confirmation - this is the PRE-signal
+   * identity confirmation. POSIX only, matching `kill_confirmed`.
    */
   identity_confirmed?: boolean;
   /**
@@ -1898,6 +1924,15 @@ export class JobStore {
       is_shell: input.isShell,
     };
     this.jobs.set(record.job_id, record);
+    // A job that never reached child_process.spawn never had a process
+    // group to begin with - its membership is trivially empty, the exact
+    // fact kill_confirmed exists to report, so this settles it immediately
+    // rather than leaving it unset until some later, unrelated kill() call
+    // happens to observe the same zero-member group. setKillConfirmation
+    // cannot fail here (the record was just inserted above), but its
+    // return value is intentionally unchecked - there is no retry path to
+    // gate on it the way markReapAttempted's caller does.
+    this.setKillConfirmation(record.job_id, true);
     // Same shared-counter construction as createJob above, even though a
     // failed-to-spawn job will realistically never produce any output -
     // keeping both constructors identical means there is no separate,
@@ -2538,6 +2573,10 @@ export class JobStore {
       const record = this.jobs.get(entry.jobId);
       if (record) record.queue_position = undefined;
       this.markKilled(entry.jobId, "queue-drained-at-shutdown");
+      // Same settling as the queue-cancellation path in src/tools/kill.ts:
+      // a job drained here never spawned a process group, so there is
+      // nothing left to confirm and the invariant settles it now.
+      this.setKillConfirmation(entry.jobId, true);
     }
   }
 
@@ -2778,6 +2817,14 @@ export class JobStore {
     // Same instant as ended_at - a terminal transition IS a real,
     // observable state change. See JobRecord.last_updated_at's own docs.
     record.last_updated_at = now;
+    // Same reasoning as createFailedJob's own identical call: an async
+    // spawn failure this deep means child_process.spawn itself never
+    // produced a real OS process, so no process group was ever created -
+    // see run.ts's beginSpawn onError callback, whose own comment states
+    // this directly ("no real child was ever attached"). Set before
+    // fireJobTerminal so any subscriber reacting to this same terminal
+    // transition observes the settled value, never the unset one.
+    this.setKillConfirmation(jobId, true);
     this.clearDeadlineTimer(jobId);
     this.fireJobTerminal(jobId);
   }
@@ -2923,59 +2970,86 @@ export class JobStore {
   /**
    * Records a POSIX kill's bounded, external `pgrep`-based process-group
    * confirmation result - see `JobRecord.kill_confirmed`'s own docs for
-   * exactly what `true`/`false` mean. A no-op unless the job is ALREADY
-   * terminal (broadened from "already `killed`" - see below). On the
-   * default path and the terminal-record reap, that means this write
-   * never fires before, and never re-triggers, whatever state transition
-   * already settled the job - it only ever refines the already-settled
-   * result's honesty there. A caller-supplied signal other than `SIGTERM`
-   * is different: `src/tools/kill.ts`'s explicit-signal branch calls
-   * `markKilled` and this setter back-to-back, in that order, ONLY once
-   * its own process-group check result comes back confirmed - so from this
-   * setter's own narrow point of view the record is indeed already
-   * terminal by the time it runs, but the SAME check this setter's value
-   * records is what decided, a line earlier, whether that transition
-   * happened at all. This setter is never called for that path while the
-   * result is unconfirmed.
+   * exactly what `true`/`false` mean, and for the one case (a job that
+   * never spawned at all) where `true` is written without any external
+   * check ever running. A no-op only when `jobId` names no record at all
+   * (e.g. after `deleteJob`'s TTL purge) - this WRITES regardless of the
+   * record's own `state`, deliberately: `kill_confirmed`'s real meaning
+   * ("did an external check confirm the job's process group holds zero
+   * members, or is that trivially true because it never had one") never
+   * depended on the record's own `state` in the first place, and every
+   * caller of this method already knows `confirmed` at the moment of the
+   * call - a genuine, current external observation for the ordinary case,
+   * or the vacuous `true` a never-spawned job settles by construction (see
+   * `JobRecord.kill_confirmed`'s own docs) - never a value carried forward
+   * from an earlier point in time - so gating the write on `state` having
+   * already caught up could only ever DROP an honest, already-true
+   * observation, never protect against a false one.
    *
-   * Broadened from "only a `killed` job" to "any terminal job" so a
-   * TERMINAL record whose leader `exited` (or `failed`) on its own can
-   * still record an honest reap-confirmation outcome: a real process
-   * GROUP where the leader forks descendants and then exits naturally
-   * (root-exits-first) can leave those descendants alive under the SAME
-   * pgid, and `kill`/the shutdown reaper now attempt a real group-level
-   * reap for exactly that case even though the job record itself is
-   * already `exited`, not `killed` - see `src/tools/kill.ts`'s own
-   * "terminal-record" reap docs. The reap's honest confirmed/unconfirmed
-   * outcome deserves the identical disclosure a `killed` job's own reap
-   * gets, regardless of which specific terminal disposition the LEADER's
-   * own record carries - `kill_confirmed`'s real meaning ("did an
-   * external check confirm the job's process group holds zero members")
-   * never depended on the record's own `state` in the first place, and
-   * never depended on a signal having actually been sent either: the
-   * eager reap-at-exit can set this `true` for a job whose group
-   * had nothing left to signal at all, so the field is a STATE claim
-   * (the group was observed empty), never an ACTION claim (a kill was
-   * performed) - see `src/jobStore.ts`'s `reapProcessGroupOnce` docs.
+   * An earlier version of this method required the record to already be
+   * terminal before it would write at all. That guard was removed after a
+   * real, external race was found and confirmed between the eager reap at
+   * process exit (`reapProcessGroupOnce`, called from `beginSpawn`'s own
+   * `onExit` handler) and the SAME record's stdio-close-gated terminal
+   * transition (`createTerminalMarkGate` in `src/tools/run.ts`): Node's
+   * own `exit` event can fire before either stream's `end` event, so the
+   * reap can resolve with a genuine confirmation before the record has
+   * transitioned - and the old guard silently discarded exactly that
+   * write, with the reap-once tracking (`markReapAttempted`) already
+   * having consumed the one attempt, so no later call ever retried it.
+   * `kill_confirmed` stayed `undefined` permanently, not merely late.
+   *
+   * Returns whether the write actually landed (`true`) or was refused
+   * because the record no longer exists (`false`). Callers that also
+   * track the one-time reap-attempt flag (`markReapAttempted`) check this
+   * before consuming it, and the check does TWO different jobs depending
+   * on why it failed - conflating them was the original bug:
+   *
+   * `confirmed: false, wrote: true` - the record still exists and the
+   * reap genuinely could not confirm. This is the GENUINE RETRY case:
+   * leaving the flag unset is what lets a later `kill()` call reach this
+   * job's terminal record and re-consult the reap (existence-only, never
+   * a second signal - see that method's own "RETRY SAFETY" docs).
+   *
+   * `confirmed: true, wrote: false` - the record was deleted out from
+   * under a confirmed write (the only production path today is a lazy
+   * TTL purge racing an in-flight reap's own `await`). There is no
+   * record left to retry against. This is STALE-BOOKKEEPING CLEANUP:
+   * `markReapAttempted` has no existence check of its own, so calling it
+   * anyway would add this job id to the reap-attempted set with no
+   * corresponding record - `hasReapBeenAttempted` reading `true` for an
+   * id `get` can no longer find. Skipping the mark keeps that invariant
+   * intact.
+   *
+   * See that method's own call-site docs for which of the two applies at
+   * each site.
    */
-  setKillConfirmation(jobId: string, confirmed: boolean): void {
+  setKillConfirmation(jobId: string, confirmed: boolean): boolean {
     const record = this.jobs.get(jobId);
-    if (!record || !isTerminalJobState(record.state)) return;
+    if (!record) return false;
     record.kill_confirmed = confirmed;
+    return true;
   }
 
   /**
-   * Records whether the PRE-signal identity check that ran before `kill`/
-   * the shutdown reaper actually signaled this job's process group came
-   * back genuinely confirmed, or had to proceed via the honest DEGRADED
-   * path - see `JobRecord.identity_confirmed`'s own docs. Same
-   * terminal-state guard as `setKillConfirmation` above, for the same
-   * reason (never fires before, or re-triggers, the state transition that
-   * already settled the job).
+   * Records the PRE-signal identity check's own completed result - see
+   * `JobRecord.identity_confirmed`'s own docs for exactly what this does
+   * and does not claim. Unlike the guard this method used to carry,
+   * writing no longer waits for the record's own `state` to reach
+   * terminal: an audit of all four real call sites (`kill.ts`'s
+   * custom-signal and default branches, `run.ts`'s deadline enforcement,
+   * `src/server.ts`'s shutdown reap) found the identical already-gone /
+   * no-delivery race `setKillConfirmation`'s own docs describe above - the
+   * pre-signal gate can complete, and this write can run, before the SAME
+   * job's independent natural-exit transition has landed, at every one of
+   * those four sites. A terminal-state guard there silently dropped a
+   * true, already-known result in exactly that race, the same defect this
+   * field's twin was fixed for above - so the guard is removed here too,
+   * for the same reason.
    */
   setIdentityConfirmation(jobId: string, confirmed: boolean): void {
     const record = this.jobs.get(jobId);
-    if (!record || !isTerminalJobState(record.state)) return;
+    if (!record) return;
     record.identity_confirmed = confirmed;
   }
 
@@ -2983,13 +3057,22 @@ export class JobStore {
    * Records the escalation identity gate's own refusal reason - see
    * `JobRecord.escalation_refused_reason`'s own docs for exactly what this
    * discloses and why it is never present when escalation proceeded or
-   * was never reached. Same terminal-state guard as `setKillConfirmation`/
-   * `setIdentityConfirmation` above: by the time the default terminating
-   * path's `killProcessGroupPosix` call resolves, the job's `killed`
-   * transition has already happened synchronously (see
-   * `src/tools/kill.ts`'s own docs on the kill/exit race), so this always
-   * writes onto an already-terminal record - it never gates or precedes
-   * that transition, it only ever adds an honest disclosure alongside it.
+   * was never reached. Keeps its own terminal-state guard, unlike its two
+   * siblings above (`setKillConfirmation`, `setIdentityConfirmation`), and
+   * for a reason specific to this field rather than shared with either of
+   * them: this only ever writes when `result.escalationRefusedReason` is
+   * set, which itself only happens once the group has survived its SIGTERM
+   * grace period - meaning a real SIGTERM was genuinely delivered, meaning
+   * the default terminating path's `killProcessGroupPosix` call already
+   * claimed the terminal slot synchronously in its `onSignaled` callback
+   * (see `src/tools/kill.ts`'s own docs on the kill/exit race) before this
+   * method's two real call sites (`kill.ts`'s default path, `run.ts`'s
+   * deadline enforcement) ever reach it. So this always writes onto an
+   * already-terminal record on both of its call sites - it never gates or
+   * precedes that transition, it only ever adds an honest disclosure
+   * alongside it. Neither sibling's call sites share that guarantee - see
+   * each of their own docs for the already-gone / no-delivery race that
+   * forced their guards off.
    */
   setEscalationRefusedReason(jobId: string, reason: string): void {
     const record = this.jobs.get(jobId);
@@ -3164,7 +3247,22 @@ export class JobStore {
       };
     }
     const handle = this.getChildHandle(jobId);
-    if (handle === undefined) return { kind: "no-child" };
+    if (handle === undefined) {
+      // A job that never had a child attached - either a SYNC preflight
+      // rejection via `createFailedJob` (invalid cwd, unresolvable
+      // executable, or a policy denial) or an ASYNC spawn failure past
+      // those checks via `markSpawnFailed`; `attachChild` is this store's
+      // only writer to `children`, called unconditionally on every
+      // successful spawn, so no-child here means never spawned via EITHER
+      // route, not merely already reaped - never had a process group to check, so this
+      // is `true` by construction - see `JobRecord.kill_confirmed`'s own
+      // docs for the two disjoint reasons this field reads `true`. No
+      // external check ever runs for this case; the write is still made so
+      // a poller waiting on `kill_confirmed !== undefined` settles instead
+      // of waiting forever on a check that will never happen.
+      this.setKillConfirmation(jobId, true);
+      return { kind: "no-child" };
+    }
 
     // TWO conditions, ORed, because they close two DIFFERENT gaps and
     // neither alone covers both: `hasReapEntered` is set SYNCHRONOUSLY
@@ -3195,8 +3293,17 @@ export class JobStore {
       this.hasReapEntered(jobId) || this.jobs.get(jobId)?.kill_confirmed !== undefined;
     if (isRetry) {
       const confirmed = await existenceOnlyReaper(handle.pid);
-      this.setKillConfirmation(jobId, confirmed);
-      if (confirmed) {
+      // Only consume the one reap-attempt flag once the write it is
+      // supposed to correspond to actually landed - see
+      // `setKillConfirmation`'s own docs for the two distinct reasons
+      // this can fail: an unconfirmed outcome on a record that still
+      // exists (the genuine retry case this method's own "RETRY SAFETY"
+      // docs cover), or a confirmed outcome whose record was deleted out
+      // from under this call (stale-bookkeeping cleanup - there is no
+      // record left to retry, but marking anyway would still add this
+      // job id to the reap-attempted set with nothing behind it).
+      const wrote = this.setKillConfirmation(jobId, confirmed);
+      if (confirmed && wrote) {
         this.markReapAttempted(jobId);
         return { kind: "confirmed" };
       }
@@ -3227,8 +3334,10 @@ export class JobStore {
       this.setKillConfirmation(jobId, false);
       throw err;
     }
-    this.setKillConfirmation(jobId, result.confirmed);
-    if (result.confirmed) {
+    // Same reasoning as the isRetry branch above: only consume the one
+    // reap-attempt flag once this write actually landed.
+    const wrote = this.setKillConfirmation(jobId, result.confirmed);
+    if (result.confirmed && wrote) {
       this.markReapAttempted(jobId);
       return { kind: "confirmed" };
     }

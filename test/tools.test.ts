@@ -13,6 +13,7 @@ import { AjvJsonSchemaValidator } from "@modelcontextprotocol/server/validators/
 
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
 // import comment for why.
+import { jobStore } from "../dist/jobStore.js";
 import * as killTool from "../dist/tools/kill.js";
 import * as listTool from "../dist/tools/list.js";
 import * as outputTool from "../dist/tools/output.js";
@@ -147,6 +148,15 @@ test("run: an invalid cwd produces a real (non-error) job whose state is failed,
   const structured = result.structuredContent as Record<string, unknown>;
   assert.equal(structured.state, "failed");
   assert.deepEqual(structured.diagnostic, { reason: "spawn-error", message: "cwd does not exist" });
+  // Caller-level/wire-level regression: run()'s own structured response,
+  // not a store-level helper call - a job that never reached
+  // child_process.spawn never had a process group, so kill_confirmed must
+  // already read true in this exact response, not undefined.
+  assert.equal(
+    structured.kill_confirmed,
+    true,
+    "an invalid-cwd job's process group trivially holds zero members, and run()'s own response must say so immediately"
+  );
 });
 
 test("run: an invalid binary produces a real (non-error) job whose state is failed, diagnostic.reason spawn-error", () => {
@@ -157,6 +167,71 @@ test("run: an invalid binary produces a real (non-error) job whose state is fail
   const structured = result.structuredContent as Record<string, unknown>;
   assert.equal(structured.state, "failed");
   assert.equal((structured.diagnostic as { reason?: string } | undefined)?.reason, "spawn-error");
+  // Same caller-level regression as the invalid-cwd case above.
+  assert.equal(
+    structured.kill_confirmed,
+    true,
+    "an unresolvable-executable job's process group trivially holds zero members, and run()'s own response must say so immediately"
+  );
+});
+
+test("run: a policy-denied command produces a real (non-error) job whose state is failed, diagnostic.reason policy-denied, with kill_confirmed already true in run()'s own response", () => {
+  // "cat" resolves to a real executable but is not on the test suite's
+  // shared command-policy allowlist (test/fixtures/policy-allow.json, set
+  // via GHANTIKA_POLICY_FILE by scripts/run-tests.mjs) - denied AFTER
+  // resolution, distinct from the missing-executable case above, which
+  // never resolves at all. Same three-route sync createFailedJob class
+  // test/concurrency.test.ts's own releaseSlot-ownership test already
+  // exercises at the wire level for a different concern (slot
+  // accounting) - this is the kill_confirmed regression for the same
+  // three routes.
+  const result = runTool.handler({
+    command: ["cat"],
+  });
+  assert.notEqual(result.isError, true);
+  const structured = result.structuredContent as Record<string, unknown>;
+  assert.equal(structured.state, "failed");
+  assert.equal((structured.diagnostic as { reason?: string } | undefined)?.reason, "policy-denied");
+  assert.equal(
+    structured.kill_confirmed,
+    true,
+    "a policy-denied job's process group trivially holds zero members, and run()'s own response must say so immediately"
+  );
+});
+
+test("the async markSpawnFailed path also settles kill_confirmed true, observed through the real status() tool response - not a store-level read of the record", () => {
+  // The three tests above cover run()'s three SYNC preflight-failure
+  // routes; this covers the one ASYNC route, src/tools/run.ts's own
+  // beginSpawn onError callback, which fires after run() has already
+  // returned a "starting"/"running" job - so it can only be observed via
+  // a LATER tool call, never in run()'s own response. Mints the job via
+  // jobStore.createJob directly (the same simulated-async-transition
+  // pattern this codebase already uses for markSpawnFailed elsewhere -
+  // see test/concurrency.test.ts's dequeue-spawn-failure test and
+  // test/kill.test.ts's own onError wiring - since a genuine OS-level
+  // spawn() failure past the sync resolveExecutable check that already
+  // gates run() is not reliably reproducible), then reads the outcome
+  // through the REAL status() tool handler - the same toPublicProjection
+  // path run()'s own response goes through - rather than jobStore.get().
+  const record = jobStore.createJob({
+    argv: ["this-would-have-spawned"],
+    cwd: "/tmp",
+    env: {},
+    isShell: false,
+    label: "caller-level-mark-spawn-failed",
+  });
+  jobStore.markSpawnFailed(record.job_id, "simulated async spawn failure");
+
+  const statusResult = statusTool.handler({ job_id: record.job_id });
+  assert.notEqual(statusResult.isError, true);
+  const structured = statusResult.structuredContent as Record<string, unknown>;
+  assert.equal(structured.state, "failed");
+  assert.equal((structured.diagnostic as { reason?: string } | undefined)?.reason, "spawn-error");
+  assert.equal(
+    structured.kill_confirmed,
+    true,
+    "a job whose spawn failed asynchronously never had a process group either, and a real status() call must report the settled value, not undefined"
+  );
 });
 
 // A REAL spawn (not just a unit-level resolveExecutable check - that

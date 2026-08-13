@@ -233,14 +233,137 @@ describe("kill: unit-level tests against a real spawned job", () => {
       undefined,
       "a naturally-exited job must never carry the caller-supplied signal it was never actually delivered"
     );
-    // kill_confirmed stays UNSET here, not true - `setKillConfirmation`
-    // only ever writes onto an ALREADY-terminal record, and at the moment
-    // this handler ran it, the job was still genuinely `running` (the
-    // natural exit is deliberately delayed until after kill() returns, see
-    // above). This is the same honest "never silently upgraded" behavior
-    // the codebase already applies elsewhere - confirmation racing ahead
-    // of terminality writes nothing rather than fabricating a value.
-    assert.equal(finalRecord?.kill_confirmed, undefined);
+    // kill_confirmed IS true here, even though the record was still
+    // genuinely `running` (state-wise) at the exact moment this handler's
+    // own confirmProcessGroupReapedPosix call resolved - the natural exit
+    // is deliberately delayed until after kill() returns, see above.
+    // setKillConfirmation no longer requires the record to already be
+    // terminal (see its own docs): the real, external pgrep check that
+    // produced `confirmed` observed the group genuinely empty at that
+    // moment, and that observation is true independent of whether this
+    // store's own bookkeeping has caught up yet. Writing it honestly here
+    // is the corrected behavior - the old terminal-state guard would have
+    // silently discarded a real, true observation instead.
+    assert.equal(finalRecord?.kill_confirmed, true);
+  });
+
+  // ALREADY-GONE / NO-DELIVERY REGRESSION (default path) - a spawned
+  // default-path job whose process group has already emptied by the time
+  // `killProcessGroupPosix`'s own first existence check runs, before any
+  // signal is ever attempted. Confirms both `kill_confirmed` and
+  // `identity_confirmed` still settle to a correct, complete projection in
+  // this cell, and that the natural-exit transition landing afterward
+  // produces `state: "exited"`, never `"killed"` (no signal was ever sent
+  // for this job to have been killed BY).
+  test("kill: ALREADY-GONE REGRESSION (default path) - a group already empty at the first existence check settles both kill_confirmed and identity_confirmed with no signal ever sent, and the job ends up 'exited'", async (t) => {
+    const record = jobStore.createJob({
+      argv: ["sleep", "10"],
+      cwd: process.cwd(),
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+      isShell: false,
+    });
+    const child = spawnManaged(
+      {
+        argv: ["sleep", "10"],
+        cwd: process.cwd(),
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+      },
+      {
+        onSpawn: () => jobStore.markRunning(record.job_id),
+        onError: (message) => jobStore.markSpawnFailed(record.job_id, message),
+        onExit: () => {}, // driven manually below, matching the ordering-regression tests above
+        onStdoutChunk: () => {},
+        onStderrChunk: () => {},
+        onStdoutEnd: () => {},
+        onStderrEnd: () => {},
+      }
+    );
+    const pid = child!.pid!;
+    // Real, successfully-settled capture, attached directly - matching the
+    // reliable pattern the identity-mismatch test further below in this
+    // file uses, rather than a fixed wall-clock delay racing the implicit
+    // async auto-capture kicked off inside spawnManaged/attachChild's own
+    // default path.
+    const birthIdentity = await retryBirthIdentityCapture(
+      () => captureBirthIdentityPosix(pid),
+      "captureBirthIdentityPosix"
+    );
+    assert.notEqual(birthIdentity, undefined, "expected a real, successful capture to poke");
+    jobStore.attachChild(record.job_id, child!, birthIdentity);
+
+    const realKill = process.kill.bind(process);
+    let sawExistenceCheck = false;
+    t.mock.method(process, "kill", (target: number, signal?: string | number) => {
+      if (target !== -pid || signal !== 0) return realKill(target, signal);
+      // This is `killProcessGroupPosix`'s own FIRST call (`isProcessGroupAlive`,
+      // `process.kill(-pid, 0)`) - and the pre-signal identity gate's own
+      // check has ALREADY completed by the time this fires, not the other
+      // way around: that gate runs BEFORE `killProcessGroupPosix` is ever
+      // invoked at all (see the `identity_confirmed` assertion below, which
+      // states the true ordering directly). It genuinely confirmed the
+      // process here, since the real target was still alive at that earlier
+      // point - this mocked existence check only ends it now, strictly
+      // before any real signal is even considered. Genuinely end the real
+      // process right
+      // here (rather than merely faking the ESRCH) so the group really is
+      // empty from this point on - matching the real race this reproduces,
+      // where the group vacates before this exact check rather than the
+      // check merely being told it did.
+      sawExistenceCheck = true;
+      realKill(-pid, "SIGKILL");
+      const err = new Error("kill ESRCH") as NodeJS.ErrnoException;
+      err.code = "ESRCH";
+      throw err;
+    });
+
+    const result = await killTool.handler({ job_id: record.job_id });
+    assert.ok(sawExistenceCheck, "expected killProcessGroupPosix's own existence check to run");
+    assert.notEqual(result.isError, true, `expected kill to succeed: ${JSON.stringify(result)}`);
+
+    // Both fields must have already settled by the time kill() returns -
+    // the record is STILL genuinely non-terminal here (markExited has not
+    // been called yet, deliberately, see below), so this is the exact
+    // pre-terminal write both setKillConfirmation and setIdentityConfirmation
+    // now make without their old guards.
+    const midFlightRecord = jobStore.get(record.job_id);
+    assert.notEqual(
+      midFlightRecord?.state,
+      "exited",
+      "the record must still be non-terminal at this point - the natural exit is deliberately deferred below"
+    );
+    assert.equal(
+      midFlightRecord?.kill_confirmed,
+      true,
+      "the already-gone group is a genuine, immediate confirmation - killProcessGroupPosix's own first check returns confirmed:true with no signal attempted"
+    );
+    assert.equal(
+      midFlightRecord?.identity_confirmed,
+      true,
+      "the pre-signal identity gate ran against the still-genuinely-alive process before this mock's existence check fired, and genuinely confirmed it - that already-known result must be recorded now, not dropped for arriving before the record's own terminal transition"
+    );
+
+    // The real natural exit, deliberately delayed until after kill() has
+    // already returned and both fields have already been asserted above -
+    // see the ordering-regression tests earlier in this file for why this
+    // ordering is the one that actually exercises the race.
+    jobStore.markExited(record.job_id, 0, null);
+
+    const finalRecord = jobStore.get(record.job_id);
+    assert.equal(
+      finalRecord?.state,
+      "exited",
+      `expected the job to end up 'exited', never 'killed' - no signal was ever sent for this job to have been killed by: ${JSON.stringify(finalRecord)}`
+    );
+    assert.equal(
+      finalRecord?.signal,
+      undefined,
+      "an already-gone job must never carry a signal it was never actually sent"
+    );
+    // The full projected shape survives the terminal transition unchanged -
+    // neither field is a value carried forward or recomputed at that point,
+    // see setKillConfirmation's and setIdentityConfirmation's own docs.
+    assert.equal(finalRecord?.kill_confirmed, true);
+    assert.equal(finalRecord?.identity_confirmed, true);
   });
 
   // DEFAULT TERMINATING path, the explicitly-supplied "SIGTERM" half - an

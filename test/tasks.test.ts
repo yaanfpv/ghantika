@@ -423,15 +423,21 @@ async function pollUntilKillConfirmed(
 ): Promise<Record<string, unknown>> {
   const breadcrumbIntervalMs = 5000;
   let lastBreadcrumbAt = Date.now();
+  let iteration = 0;
   for (;;) {
+    iteration += 1;
     const result = await client.callTool({ name: "kill", arguments: { job_id: jobId } });
     const last = runResultStructured(result);
     if (last.kill_confirmed !== undefined) {
       return last;
     }
     if (Date.now() - lastBreadcrumbAt >= breadcrumbIntervalMs) {
+      const hasChild = jobStore.getChildHandle(jobId) !== undefined;
+      const reapAttempted = jobStore.hasReapBeenAttempted(jobId);
       console.error(
-        `still waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(last)}`
+        `still waiting for kill_confirmed to settle for job ${jobId}, iteration ${iteration}, ` +
+          `hasChild=${hasChild}, reapAttempted=${reapAttempted}, ` +
+          `last saw: ${JSON.stringify(last)}`
       );
       lastBreadcrumbAt = Date.now();
     }
@@ -1943,7 +1949,7 @@ test("on a capable connection, status/output/tail on the mapped job_id keep work
 
     const tailResult = (await pair.client.callTool({
       name: "tail",
-      arguments: { job_id: taskId, n: 5 },
+      arguments: { job_id: taskId },
     })) as { isError?: boolean };
     assert.notEqual(
       tailResult.isError,
@@ -2156,9 +2162,11 @@ describe("spawning tests: seven-tool mint rule (run mints, every other tool stay
       // "both streams already ended" FAST PATH can mark `state` "exited"
       // with NO dependency on that reap promise at all, so a plain
       // `pollUntilTerminal` can observe a terminal `state` before the reap's
-      // own `JobStore.setKillConfirmation` write (itself gated on the job
-      // already being terminal - see that setter's own doc comment) has
-      // landed. Poll via `pollUntilKillConfirmed` (established by commit
+      // own `JobStore.setKillConfirmation` write - real, asynchronous
+      // event-loop scheduling latency with no ordering guarantee against
+      // that read, never gated on the job's own state (see that setter's
+      // own doc comment for why it no longer requires the record already
+      // be terminal) - has landed. Poll via `pollUntilKillConfirmed` (established by commit
       // c12b111 for exactly this class, just triggered there by an explicit
       // `kill()` call instead of the natural-exit eager reap) exactly like
       // this test's own second job does below.
@@ -2317,7 +2325,7 @@ describe("spawning tests: seven-tool mint rule (run mints, every other tool stay
       );
 
       const tailResult = runResultStructured(
-        await pair.client.callTool({ name: "tail", arguments: { job_id: taskId, n: 1 } })
+        await pair.client.callTool({ name: "tail", arguments: { job_id: taskId } })
       );
       assert.ok(
         carriesNoHandleTellTale(tailResult),
