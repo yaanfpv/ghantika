@@ -90,13 +90,12 @@ export function loadTruncationMarker(filePath = TRUNCATION_MARKER_PATH) {
 }
 
 /**
- * The exit code this script (and, by the same convention, any other gate
- * leg that needs to report the identical "ran, but refuses to certify a
+ * The exit code this script (and, by the same convention, any other check
+ * that needs to report the identical "ran, but refuses to certify a
  * verdict" state) uses for VOID: a third outcome, distinguishable from both
  * PASS (exit 0) and FAIL (exit 1) by the exit code alone, before a reader
- * ever has to read the printed message. This repo's own local gate tooling
- * reads this same value to classify a leg's outcome as voided rather than
- * an ordinary failure.
+ * ever has to read the printed message. Any caller reading this exit code
+ * can classify VOID as an outcome distinct from an ordinary failure.
  */
 export const VOID_EXIT_CODE = 2;
 

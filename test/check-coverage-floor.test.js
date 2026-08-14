@@ -185,8 +185,7 @@ test("mutation control: CLI exits non-zero when the summary file is missing, not
 // tests below drive the real CLI via GHANTIKA_TRUNCATION_MARKER_PATH; the
 // fourth is a real end-to-end negative control - a genuine idle-watchdog
 // fire from scripts/run-tests.mjs's own runOnce(), through to the real
-// refusal, then restored to a real verdict - never asserted, always
-// observed.
+// refusal, then restored to a real verdict.
 // =============================================================================
 
 test("VOID: a present truncation marker makes the CLI refuse and exit VOID_EXIT_CODE, distinct from 0 and 1", () => {
@@ -263,16 +262,15 @@ test("loadTruncationMarker returns null (not a throw) when the file is genuinely
   }
 });
 
-// A real negative control: force a truncated run via a REAL, deliberately
-// hanging fixture file and a lowered idleTimeoutMs, driving the REAL
-// production runOnce() from scripts/run-tests.mjs (in its own child
-// process, since its termination path calls process.exit(1) - which would
-// kill this test process too, if imported and called in-process). Observes:
-// the marker is genuinely written by run-tests.mjs itself (not synthesized
-// by this test), the real check-coverage-floor.mjs CLI then refuses on it,
-// and after restoring (deleting the marker) the CLI reports a real verdict
-// again. This exercises the whole VOID mechanism end to end, for real.
-test("AC3 negative control: a genuine idle-watchdog fire produces VOID; restoring produces a real verdict again", async () => {
+// A negative control: force a truncated run via a deliberately hanging
+// fixture file and a lowered idleTimeoutMs, driving production runOnce()
+// from scripts/run-tests.mjs in its own child process (its termination
+// path calls process.exit(1), which would kill this test process too if
+// imported and called in-process). The marker is written by run-tests.mjs
+// itself; the check-coverage-floor.mjs CLI then refuses on it, and after
+// restoring (deleting the marker) the CLI reports a verdict again. This
+// exercises the whole VOID mechanism end to end.
+test("an idle-watchdog fire produces VOID; restoring produces a verdict again", async () => {
   const scratchDir = mkdtempSync(path.join(tmpdir(), "ghantika-void-e2e-"));
   const markerPath = path.join(REPO_ROOT, "coverage", "run-truncated.json");
   const hadPriorMarker = existsSync(markerPath);
@@ -356,8 +354,7 @@ test("AC3 negative control: a genuine idle-watchdog fire produces VOID; restorin
     );
     assert.ok(floorOutput.includes("REFUSED"));
 
-    // RESTORE: clear the marker, confirm a real verdict is reported again -
-    // observed, not merely inferred from the code no longer being present.
+    // RESTORE: clear the marker, confirm a verdict is reported again.
     rmSync(markerPath, { force: true });
     let restoredStatus = null;
     let restoredOutput = "";

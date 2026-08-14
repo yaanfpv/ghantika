@@ -102,8 +102,8 @@ async function main() {
   // repo's own coverage/ directory. Leaving this at the shared default
   // would let a deliberately-hung fixture scenario write a real truncation
   // marker that a later, genuinely complete top-level `npm run coverage`
-  // run - sharing the same process tree in one gate invocation - would then
-  // read and wrongly refuse to certify.
+  // run, sharing the same process tree during one full test run, would
+  // then read it and wrongly refuse to certify.
   const truncationMarkerPath = path.join(testDir, ".truncation-marker.json");
 
   // tracked: null - see the module doc comment above for why this harness

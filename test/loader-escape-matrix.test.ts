@@ -235,15 +235,14 @@ function classifyTerminatedSpawnSync(
 }
 
 /**
- * Best-effort cleanup for runPermanentGuardSuite()'s nested supervisor,
- * applying the orphan remedy this repo identified on 2026-08-03
- * (nodejs/node#43704, cited in scripts/run-tests.mjs's idleTimeoutMs
- * comment, closed as not_planned in 2023, cited here for the mechanism it
- * documents): a child_process timeout's SIGTERM reaches only the
- * immediate child, never a grandchild it spawned, so a nested
- * `node --test` supervisor whose OWN timeout fires can still leave its
- * own per-file test children (each isolation:'process' spawns one)
- * running after the supervisor itself is gone.
+ * Best-effort cleanup for runPermanentGuardSuite()'s nested supervisor. A
+ * child_process timeout's SIGTERM reaches only the immediate child, never
+ * a grandchild it spawned (nodejs/node#43704, cited in
+ * scripts/run-tests.mjs's idleTimeoutMs comment, documents the
+ * mechanism), so a nested `node --test` supervisor whose OWN timeout
+ * fires can still leave its own per-file test children (each
+ * isolation:'process' spawns one) running after the supervisor itself is
+ * gone.
  *
  * Spawning the supervisor with `detached: true` (POSIX only - see below)
  * makes it the leader of its own process group, so `-supervisorPid`
@@ -262,11 +261,9 @@ function classifyTerminatedSpawnSync(
  * SIGKILL, not SIGTERM: this call runs only as a cleanup sweep AFTER
  * spawnSync's own timeout has already attempted the graceful signal, so
  * there is no remaining reason to give a straggler a chance to shut down
- * cleanly - and SIGKILL, unlike SIGTERM, cannot be trapped or ignored,
- * closing the "a nested child that explicitly traps and ignores SIGTERM
- * would not be reaped by this path" residual this file used to disclose
- * for the SIGTERM-only case (see runPermanentGuardSuite's own doc comment
- * below, updated to describe the now-closed state).
+ * cleanly - and SIGKILL, unlike SIGTERM, cannot be trapped or ignored, so
+ * a nested child that explicitly traps and ignores SIGTERM is still
+ * reached (see runPermanentGuardSuite's own doc comment below).
  *
  * Two remaining residuals, disclosed rather than hidden:
  *
@@ -318,15 +315,12 @@ function reapSupervisorProcessGroup(supervisorPid: number | undefined): void {
  * across every platform this guard runs on.
  *
  * A nested child that explicitly traps and ignores `SIGTERM` (none of the
- * three files here do that) USED TO not be reaped by this path - that was
- * this file's disclosed residual until 2026-08-14. It no longer is: the
- * supervisor now spawns detached and reapSupervisorProcessGroup() (see its
- * own doc comment above) sweeps the whole process group with SIGKILL,
- * unconditionally, after every call - SIGKILL cannot be trapped or
- * ignored, so a stubborn nested child is reached regardless. What remains
- * open is POSIX-only reach (win32 has no process-group signalling) and the
- * PGID-reuse race reapSupervisorProcessGroup's own comment discloses -
- * narrower than the residual this comment used to describe, not zero.
+ * three files here do that) is still reached: the supervisor spawns
+ * detached and reapSupervisorProcessGroup() (see its own doc comment
+ * above) sweeps the whole process group with SIGKILL, unconditionally,
+ * after every call - SIGKILL cannot be trapped or ignored. What remains
+ * open is POSIX-only reach (win32 has no process-group signalling) and
+ * the PGID-reuse race reapSupervisorProcessGroup's own comment discloses.
  */
 function runPermanentGuardSuite(): { tests: number; pass: number; fail: number; raw: string } {
   // NODE_TEST_CONTEXT / NODE_TEST_WORKER_ID are set by the OUTER `node
@@ -364,10 +358,10 @@ function runPermanentGuardSuite(): { tests: number; pass: number; fail: number; 
       ...(process.platform === "win32" ? {} : { detached: true }),
     }
   );
-  // Applies the orphan remedy this repo identified on 2026-08-03: spawn
-  // detached, signal the whole group. Runs unconditionally, before the
-  // classify-and-maybe-throw call below, so cleanup happens regardless of
-  // outcome - see reapSupervisorProcessGroup's own doc comment.
+  // Spawns detached and signals the whole group; runs unconditionally,
+  // before the classify-and-maybe-throw call below, so cleanup happens
+  // regardless of outcome - see reapSupervisorProcessGroup's own doc
+  // comment.
   reapSupervisorProcessGroup(result.pid);
   classifyTerminatedSpawnSync(
     result,
@@ -1716,7 +1710,7 @@ test("classifyTerminatedSpawnSync classifies a maxBuffer overflow (ENOBUFS) the 
 });
 
 test(
-  "reapSupervisorProcessGroup reaps a grandchild that survives a signal sent only to its immediate parent - the exact orphan shape nodejs/node#43704 documents (cited in scripts/run-tests.mjs's idleTimeoutMs comment), driven with real spawned processes, never asserted",
+  "reapSupervisorProcessGroup reaps a grandchild that survives a signal sent only to its immediate parent - the exact orphan shape nodejs/node#43704 documents (cited in scripts/run-tests.mjs's idleTimeoutMs comment)",
   {
     skip:
       process.platform === "win32"
@@ -1767,9 +1761,8 @@ test(
 
     // BASELINE: signal only the supervisor's own pid - exactly what
     // spawnSync's `timeout` option does internally (`child.kill(killSignal)`,
-    // never the group) - and confirm the grandchild survives. This is the
-    // orphan nodejs/node#43704 documents, proven real here rather than
-    // assumed.
+    // never the group) - and confirm the grandchild survives, reproducing
+    // the orphan nodejs/node#43704 documents.
     process.kill(supervisorPid, "SIGTERM");
     await waitForPgrepGroupMembers(
       supervisorPid,
@@ -1782,7 +1775,7 @@ test(
       `setup check: the grandchild (pid ${grandchildPid}) must survive a signal sent only to the supervisor - if it does not, this environment does not reproduce the orphan this test exists to close, and the assertion below would prove nothing. Survivors observed: ${JSON.stringify(survivorsAfterDirectKill)}`
     );
 
-    // THE FIX: applies the remedy this repo identified on 2026-08-03.
+    // Reap: spawns detached and signals the whole group.
     reapSupervisorProcessGroup(supervisorPid);
     const survivorsAfterReap = await waitForPgrepGroupMembers(
       supervisorPid,

@@ -88,27 +88,24 @@
  * file/handle so a human can go kill it by hand if the OS does not reap it
  * on its own.
  *
- * Locating the 2026-08-03 orphan remedy (spawn detached, signal the
- * process group) at THIS file specifically: this file never calls
- * child_process.spawn/spawnSync itself for the per-test-file children
- * above - node:test's own run() spawns and reaps them internally
+ * Why the known limitation above is not narrowed at this layer: this file
+ * never calls child_process.spawn/spawnSync itself for the per-test-file
+ * children above - node:test's own run() spawns and reaps them internally
  * (isolation:'process' is its default), with no documented option to
- * spawn them detached. So the remedy cannot be applied at that layer from
- * here, and the "known limitation" paragraph above is not narrowed by it:
- * on a watchdog fire, whatever run() was still running is still left to
- * the OS exactly as described.
+ * spawn them detached. So on a watchdog fire, whatever run() was still
+ * running is still left to the OS exactly as described.
  *
- * The nested supervisor the remedy actually targets - the one whose own
- * timeout's SIGTERM reaches only its immediate child, never a
- * grandchild, per nodejs/node#43704 (cited above) - is
- * runPermanentGuardSuite() in test/loader-escape-matrix.test.ts, one
- * level down: it is itself one of the test files this script discovers
- * and runs, and it spawns its OWN nested `node --test` process over three
- * other test files. As of 2026-08-14 that spawnSync call spawns detached
+ * A spawn-detached-and-signal-the-group approach is applied one level
+ * down instead, where it is actually reachable: runPermanentGuardSuite()
+ * in test/loader-escape-matrix.test.ts - itself one of the test files
+ * this script discovers and runs - spawns its OWN nested `node --test`
+ * process over three other test files, whose own timeout's SIGTERM
+ * reaches only its immediate child, never a grandchild, per
+ * nodejs/node#43704 (cited above). That spawnSync call spawns detached
  * (POSIX only) and a SIGKILL sweep of the whole process group runs after
- * every invocation, closing the SIGTERM-survives residual this file used
- * to leave open. See that function's own doc comment for the mechanism
- * and its remaining disclosed limits (win32, the PGID-reuse race).
+ * every invocation, so a SIGTERM-surviving grandchild is still reached.
+ * See that function's own doc comment for the mechanism and its
+ * remaining disclosed limits (win32, the PGID-reuse race).
  *
  * One environment variable this script consults at all: GHANTIKA_JUNIT,
  * additive-only - setting it adds a junit XML file at that path; leaving it
@@ -175,17 +172,15 @@ const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const TEST_DIR = path.join(REPO_ROOT, "test");
 
 // Where a truncation is recorded so scripts/check-coverage-floor.mjs (a
-// SEPARATE process, invoked as its own later gate leg after `npm run
-// coverage` - see that script's own header) can tell a genuinely partial
-// run apart from a complete one. c8's own coverage-summary.json carries no
-// such signal: it honestly reports whatever coverage it collected up to
-// whatever point this process exited, and that table is indistinguishable
-// from a real, complete run's - exactly the shape of a real incident where a
-// coverage run silently truncated on the idle watchdog and its honest
-// partial numbers read as a real 0-50% coverage regression. Lives under
-// coverage/ (gitignored, same directory c8 itself writes into) rather than
-// test/ or scripts/, so it is never mistaken for a tracked, checked-in
-// artifact.
+// SEPARATE process, run after `npm run coverage` - see that script's own
+// header) can tell a genuinely partial run apart from a complete one.
+// c8's own coverage-summary.json carries no such signal: it honestly
+// reports whatever coverage it collected up to whatever point this
+// process exited, and that table is indistinguishable from a real,
+// complete run's - so a run truncated by the idle watchdog can otherwise
+// read as an ordinary coverage regression. Lives under coverage/
+// (gitignored, same directory c8 itself writes into) rather than test/ or
+// scripts/, so it is never mistaken for a tracked, checked-in artifact.
 export const TRUNCATION_MARKER_PATH = path.join(REPO_ROOT, "coverage", "run-truncated.json");
 
 // The `.test.` infix, not merely a directory, is what makes something a
@@ -795,8 +790,8 @@ function flushJunitSync(junitPath, buffer) {
  * paths, BEFORE the matching process.exit(1) call - synchronous, same
  * write-then-hard-exit shape as flushJunitSync above, for the same reason:
  * a hard exit drops anything not already durably on disk. Read by
- * scripts/check-coverage-floor.mjs, a later, separate gate leg, so it can
- * refuse to compare whatever coverage numbers this run's own partial
+ * scripts/check-coverage-floor.mjs, run afterward as a separate process,
+ * so it can refuse to compare whatever coverage numbers this run's own partial
  * execution produced rather than reporting them as a real verdict. Overwrites
  * unconditionally - only ONE of the three termination paths can ever fire per
  * run (each sets `terminationFired` before doing anything else), so there is
@@ -842,11 +837,7 @@ function writeTruncationMarkerSync(markerPath, reason, message) {
  * invocation clears it at its own start - meaning a later, genuinely
  * complete top-level `npm run coverage` run occurring in the SAME process
  * tree before that clearing happens would find the stale marker and wrongly
- * refuse to certify its own honest result. Measured, not hypothetical: this
- * exact sequence happened via scripts/run-tests-fixture-harness.mjs's own
- * deliberately-hung-fixture test (test/skip-discipline.test.ts) running
- * ahead of the real `coverage` gate leg inside one canonical local-gate
- * invocation, before this parameter existed.
+ * refuse to certify its own honest result.
  *
  * @param {{
  *   discovered: string[],
