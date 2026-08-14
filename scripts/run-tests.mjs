@@ -88,6 +88,28 @@
  * file/handle so a human can go kill it by hand if the OS does not reap it
  * on its own.
  *
+ * Locating the 2026-08-03 orphan remedy (spawn detached, signal the
+ * process group) at THIS file specifically: this file never calls
+ * child_process.spawn/spawnSync itself for the per-test-file children
+ * above - node:test's own run() spawns and reaps them internally
+ * (isolation:'process' is its default), with no documented option to
+ * spawn them detached. So the remedy cannot be applied at that layer from
+ * here, and the "known limitation" paragraph above is not narrowed by it:
+ * on a watchdog fire, whatever run() was still running is still left to
+ * the OS exactly as described.
+ *
+ * The nested supervisor the remedy actually targets - the one whose own
+ * timeout's SIGTERM reaches only its immediate child, never a
+ * grandchild, per nodejs/node#43704 (cited above) - is
+ * runPermanentGuardSuite() in test/loader-escape-matrix.test.ts, one
+ * level down: it is itself one of the test files this script discovers
+ * and runs, and it spawns its OWN nested `node --test` process over three
+ * other test files. As of 2026-08-14 that spawnSync call spawns detached
+ * (POSIX only) and a SIGKILL sweep of the whole process group runs after
+ * every invocation, closing the SIGTERM-survives residual this file used
+ * to leave open. See that function's own doc comment for the mechanism
+ * and its remaining disclosed limits (win32, the PGID-reuse race).
+ *
  * One environment variable this script consults at all: GHANTIKA_JUNIT,
  * additive-only - setting it adds a junit XML file at that path; leaving it
  * unset means no junit file is written at all, and it cannot narrow the
@@ -135,7 +157,7 @@
  */
 import { run } from "node:test";
 import { spec, junit } from "node:test/reporters";
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -151,6 +173,20 @@ const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 // scripts/run-tests-fixture-harness.mjs for how a fixture tree is
 // exercised instead.
 const TEST_DIR = path.join(REPO_ROOT, "test");
+
+// Where a truncation is recorded so scripts/check-coverage-floor.mjs (a
+// SEPARATE process, invoked as its own later gate leg after `npm run
+// coverage` - see that script's own header) can tell a genuinely partial
+// run apart from a complete one. c8's own coverage-summary.json carries no
+// such signal: it honestly reports whatever coverage it collected up to
+// whatever point this process exited, and that table is indistinguishable
+// from a real, complete run's - exactly the shape of a real incident where a
+// coverage run silently truncated on the idle watchdog and its honest
+// partial numbers read as a real 0-50% coverage regression. Lives under
+// coverage/ (gitignored, same directory c8 itself writes into) rather than
+// test/ or scripts/, so it is never mistaken for a tracked, checked-in
+// artifact.
+export const TRUNCATION_MARKER_PATH = path.join(REPO_ROOT, "coverage", "run-truncated.json");
 
 // The `.test.` infix, not merely a directory, is what makes something a
 // suite. `test/harness.ts` and `test/helpers/spawnServer.ts` sit under
@@ -755,11 +791,62 @@ function flushJunitSync(junitPath, buffer) {
 }
 
 /**
+ * Records that this run terminated via one of the three hang-recovery
+ * paths, BEFORE the matching process.exit(1) call - synchronous, same
+ * write-then-hard-exit shape as flushJunitSync above, for the same reason:
+ * a hard exit drops anything not already durably on disk. Read by
+ * scripts/check-coverage-floor.mjs, a later, separate gate leg, so it can
+ * refuse to compare whatever coverage numbers this run's own partial
+ * execution produced rather than reporting them as a real verdict. Overwrites
+ * unconditionally - only ONE of the three termination paths can ever fire per
+ * run (each sets `terminationFired` before doing anything else), so there is
+ * never a stale-vs-fresh marker to reconcile within a single invocation.
+ *
+ * @param {string} markerPath where to write it - the real production path
+ *   by default, but see runOnce's own `truncationMarkerPath` parameter for
+ *   why a caller driving this against a throwaway fixture tree must redirect
+ *   it elsewhere.
+ * @param {"idle-watchdog" | "wall-cap" | "post-completion-leak"} reason
+ * @param {string} message human-readable - the same text already printed
+ *   via printDiagnosticHeader, so a reader of the marker sees the identical
+ *   explanation a reader of the console output would.
+ */
+function writeTruncationMarkerSync(markerPath, reason, message) {
+  try {
+    mkdirSync(path.dirname(markerPath), { recursive: true });
+    writeFileSync(
+      markerPath,
+      JSON.stringify({ reason, message, at: new Date().toISOString() }, null, 2)
+    );
+  } catch (err) {
+    console.error(`run-tests: failed to write truncation marker to ${markerPath}: ${err.message}`);
+  }
+}
+
+/**
  * Runs the discovered suite once. Resolves once the process's own decision
  * about its exit code has been made (either by setting process.exitCode
  * for a clean run, or by calling process.exit(1) directly on one of the
  * three termination paths). Exported for tests to drive against a
  * throwaway fixture directory instead of this repo's real test/.
+ *
+ * `truncationMarkerPath` defaults to the real, shared TRUNCATION_MARKER_PATH
+ * - correct for the production CLI entrypoint (main(), below), which never
+ * overrides it. Any OTHER caller driving this function directly against a
+ * throwaway fixture tree - scripts/run-tests-fixture-harness.mjs, or a test
+ * deliberately forcing a watchdog fire to prove the mechanism itself - MUST
+ * redirect it to a path scoped to that caller's own fixture directory.
+ * Leaving it at the shared default in that case writes a truncation marker
+ * into the real repo's own coverage/ directory as a side effect of testing
+ * something unrelated, where it then sits until the next real `main()`
+ * invocation clears it at its own start - meaning a later, genuinely
+ * complete top-level `npm run coverage` run occurring in the SAME process
+ * tree before that clearing happens would find the stale marker and wrongly
+ * refuse to certify its own honest result. Measured, not hypothetical: this
+ * exact sequence happened via scripts/run-tests-fixture-harness.mjs's own
+ * deliberately-hung-fixture test (test/skip-discipline.test.ts) running
+ * ahead of the real `coverage` gate leg inside one canonical local-gate
+ * invocation, before this parameter existed.
  *
  * @param {{
  *   discovered: string[],
@@ -768,9 +855,18 @@ function flushJunitSync(junitPath, buffer) {
  *   options: { testTimeoutMs: number, idleTimeoutMs: number, wallTimeoutMs: number, leakWindowMs: number },
  *   skipBaseline: Record<string, string[]>,
  *   criticalTests: string[],
+ *   truncationMarkerPath?: string,
  * }} args
  */
-export function runOnce({ discovered, tracked, junitPath, options, skipBaseline, criticalTests }) {
+export function runOnce({
+  discovered,
+  tracked,
+  junitPath,
+  options,
+  skipBaseline,
+  criticalTests,
+  truncationMarkerPath = TRUNCATION_MARKER_PATH,
+}) {
   return new Promise((resolve) => {
     const stream = run({ files: discovered, timeout: options.testTimeoutMs });
 
@@ -918,6 +1014,7 @@ export function runOnce({ discovered, tracked, junitPath, options, skipBaseline,
       terminationFired = true;
       clearTimeout(wallTimer);
       const incomplete = discovered.filter((f) => !filesWithOwnCompletion.has(f));
+      const idleMessage = `IDLE WATCHDOG: no test-runner event for ${options.idleTimeoutMs}ms - ${incomplete.length} input file(s) never reported their own completion (last event: ${JSON.stringify(lastEvent)})`;
       printDiagnosticHeader(`IDLE WATCHDOG: no test-runner event for ${options.idleTimeoutMs}ms`, [
         `last event received: ${JSON.stringify(lastEvent)}`,
         "input files with no completion event of their own yet " +
@@ -925,6 +1022,7 @@ export function runOnce({ discovered, tracked, junitPath, options, skipBaseline,
           "without ever reporting completion - e.g. an import-time hang):",
         ...incomplete.map((f) => `  - ${rel(f)}`),
       ]);
+      writeTruncationMarkerSync(truncationMarkerPath, "idle-watchdog", idleMessage);
       flushJunitSync(junitPath, junitBuffer);
       process.exit(1);
     }
@@ -933,9 +1031,11 @@ export function runOnce({ discovered, tracked, junitPath, options, skipBaseline,
       if (terminationFired || streamEnded) return;
       terminationFired = true;
       clearTimeout(idleTimer);
+      const wallMessage = `WALL CAP: total run time exceeded ${options.wallTimeoutMs}ms (last event: ${JSON.stringify(lastEvent)})`;
       printDiagnosticHeader(`WALL CAP: total run time exceeded ${options.wallTimeoutMs}ms`, [
         `last event received: ${JSON.stringify(lastEvent)}`,
       ]);
+      writeTruncationMarkerSync(truncationMarkerPath, "wall-cap", wallMessage);
       flushJunitSync(junitPath, junitBuffer);
       process.exit(1);
     }
@@ -950,6 +1050,14 @@ export function runOnce({ discovered, tracked, junitPath, options, skipBaseline,
           `--test-force-exit: the process is being forced to exit anyway, ` +
           `but only after naming that it should not have needed to be.`,
       ]);
+      // NOT a truncation in the same sense as the other two paths: every
+      // file's own test:complete DID fire (streamEnded is true by the time
+      // this can run - see tryFinalizeNormal/onNormalCompletion above), so
+      // whatever coverage c8 collected reflects a run that node:test itself
+      // considers finished. What is stuck is a lingering handle, not an
+      // unfinished test file - c8's own numbers here are not the same kind
+      // of untrustworthy the idle/wall paths produce, so this path
+      // deliberately does NOT write the truncation marker.
       flushJunitSync(junitPath, junitBuffer);
       process.exit(1);
     }
@@ -964,6 +1072,20 @@ async function main() {
     console.error(`run-tests: ${err.message}`);
     process.exitCode = 1;
     return;
+  }
+
+  // A stale marker from a PREVIOUS truncated run must never be read as
+  // belonging to THIS one - clear it unconditionally before anything else
+  // runs, so a normal completion always starts (and, if it completes
+  // normally, ends) with no marker on disk. Only the three termination
+  // paths in runOnce() ever write it back. Absence is not an error (the
+  // common case, and the very first run ever).
+  try {
+    unlinkSync(TRUNCATION_MARKER_PATH);
+  } catch {
+    // ENOENT (nothing to clear - normal) or any other error; either way
+    // there is nothing actionable here, and a failed best-effort delete
+    // must never block the run it is merely tidying up before.
   }
 
   const discovered = discoverTestFiles(TEST_DIR);

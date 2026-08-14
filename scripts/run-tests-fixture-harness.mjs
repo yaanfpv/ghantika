@@ -95,9 +95,28 @@ async function main() {
 
   const junitPath = process.env.GHANTIKA_JUNIT ? path.resolve(process.env.GHANTIKA_JUNIT) : null;
 
+  // Scoped to this fixture's OWN directory, never the real, shared default
+  // - a scenario driven through this harness (including one that
+  // deliberately forces a watchdog fire, to prove the watchdog mechanism
+  // itself against a throwaway fixture) must never write into the real
+  // repo's own coverage/ directory. Leaving this at the shared default
+  // would let a deliberately-hung fixture scenario write a real truncation
+  // marker that a later, genuinely complete top-level `npm run coverage`
+  // run - sharing the same process tree in one gate invocation - would then
+  // read and wrongly refuse to certify.
+  const truncationMarkerPath = path.join(testDir, ".truncation-marker.json");
+
   // tracked: null - see the module doc comment above for why this harness
   // never checks tracked-file parity against a fixture tree.
-  await runOnce({ discovered, tracked: null, junitPath, options, skipBaseline, criticalTests });
+  await runOnce({
+    discovered,
+    tracked: null,
+    junitPath,
+    options,
+    skipBaseline,
+    criticalTests,
+    truncationMarkerPath,
+  });
 }
 
 if (isMainModule(import.meta.url)) {

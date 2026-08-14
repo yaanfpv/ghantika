@@ -37,6 +37,17 @@ export const COVERAGE_SUMMARY_PATH =
   process.env.GHANTIKA_COVERAGE_SUMMARY_PATH ??
   path.join(REPO_ROOT, "coverage", "coverage-summary.json");
 
+// Same override pattern as COVERAGE_SUMMARY_PATH above, and read from the
+// same directory scripts/run-tests.mjs's own TRUNCATION_MARKER_PATH writes
+// to - deliberately not IMPORTED from that module (this script must be
+// able to run, and to be tested, with no dependency on run-tests.mjs ever
+// having executed in the same process; the two are coupled only through
+// this one well-known path on disk, the same loose coupling
+// COVERAGE_SUMMARY_PATH already has with c8's own output).
+export const TRUNCATION_MARKER_PATH =
+  process.env.GHANTIKA_TRUNCATION_MARKER_PATH ??
+  path.join(REPO_ROOT, "coverage", "run-truncated.json");
+
 /**
  * Metric name -> minimum acceptable percentage. See the module doc comment
  * above for the measured baseline each floor is set below, and why.
@@ -55,6 +66,39 @@ export const COVERAGE_FLOORS = {
 export function loadCoverageSummary(filePath = COVERAGE_SUMMARY_PATH) {
   return JSON.parse(readFileSync(filePath, "utf8"));
 }
+
+/**
+ * Reads the truncation marker scripts/run-tests.mjs writes when its own
+ * idle watchdog or wall cap fires, before it force-exits. Returns null
+ * when the file is absent - the common case, and read as "the run
+ * completed" - never as an error: a missing marker is the expected state
+ * after every ordinary, complete run (run-tests.mjs's own main() clears it
+ * unconditionally at the START of every invocation, so a stale marker from
+ * a PRIOR truncated run can never survive into reading a fresh, complete
+ * one's summary).
+ *
+ * @param {string} [filePath]
+ * @returns {{ reason: string, message: string, at: string } | null}
+ */
+export function loadTruncationMarker(filePath = TRUNCATION_MARKER_PATH) {
+  try {
+    return JSON.parse(readFileSync(filePath, "utf8"));
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+/**
+ * The exit code this script (and, by the same convention, any other gate
+ * leg that needs to report the identical "ran, but refuses to certify a
+ * verdict" state) uses for VOID: a third outcome, distinguishable from both
+ * PASS (exit 0) and FAIL (exit 1) by the exit code alone, before a reader
+ * ever has to read the printed message. This repo's own local gate tooling
+ * reads this same value to classify a leg's outcome as voided rather than
+ * an ordinary failure.
+ */
+export const VOID_EXIT_CODE = 2;
 
 /**
  * Compares a coverage summary's "total" row against a set of floors.
@@ -85,6 +129,31 @@ export function checkCoverageFloors(summary, floors = COVERAGE_FLOORS) {
 }
 
 function main() {
+  // A truncated run must not produce a coverage verdict. Checked BEFORE the
+  // summary is even loaded - a truncated run's coverage-summary.json is not
+  // wrong to read, it is simply not evidence of anything: c8 honestly
+  // reports whatever partial coverage it collected before
+  // scripts/run-tests.mjs's own idle watchdog or wall cap force-exited it,
+  // and that table is indistinguishable, by itself, from a real, complete
+  // run's. Refusing here, before ever computing a single percentage, is
+  // what makes this the check that prevents a partial run from ever being
+  // reported as a real coverage regression.
+  const truncation = loadTruncationMarker();
+  if (truncation) {
+    console.error(
+      `coverage floor check: REFUSED - the underlying test run was truncated (${truncation.reason} at ${truncation.at}), ` +
+        `so coverage/coverage-summary.json describes a partial execution and cannot be compared to a floor.`
+    );
+    console.error(`  run-tests.mjs's own diagnostic: ${truncation.message}`);
+    console.error(
+      `  this is VOID, not a pass and not a fail - see ${path.relative(REPO_ROOT, TRUNCATION_MARKER_PATH)}. ` +
+        `Fix whatever made the run hang (see the run's own console output / :error: diagnostics for which ` +
+        `file never completed) and re-run "npm run coverage" to produce a trustworthy summary.`
+    );
+    process.exitCode = VOID_EXIT_CODE;
+    return;
+  }
+
   let summary;
   try {
     summary = loadCoverageSummary();
