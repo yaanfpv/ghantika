@@ -367,24 +367,38 @@ test("an idle-watchdog fire produces VOID; restoring produces a verdict again", 
     );
     assert.ok(floorOutput.includes("REFUSED"));
 
-    // RESTORE: clear the marker, confirm a verdict is reported again.
+    // RESTORE: clear the marker, confirm a REAL VERDICT is produced again -
+    // not merely that VOID/REFUSED is absent, which an unrelated failure
+    // (this repo's own coverage/coverage-summary.json need not exist, or
+    // need not already clear every floor, at the moment this test runs)
+    // would also satisfy: a missing summary file exits 1 with neither
+    // VOID_EXIT_CODE nor the string "REFUSED" anywhere in its output,
+    // passing both of the assertions this block used to make without a
+    // floor comparison ever happening. Point the restored run at a
+    // controlled, synthetic, comfortably-above-every-floor summary via the
+    // same GHANTIKA_COVERAGE_SUMMARY_PATH override runCliAgainstFixture
+    // uses everywhere else in this file, then assert both the exact
+    // success exit code and the exact success message the script only
+    // prints once it has actually compared real numbers against every
+    // floor and found them all clear - proving a verdict was produced, not
+    // just that a refusal was avoided.
     rmSync(markerPath, { force: true });
-    let restoredStatus = null;
-    let restoredOutput = "";
-    try {
-      restoredOutput = execFileSync(process.execPath, [SCRIPT_PATH], {
-        cwd: REPO_ROOT,
-        encoding: "utf8",
-      });
-      restoredStatus = 0;
-    } catch (err) {
-      restoredStatus = err.status ?? null;
-      restoredOutput = (err.stdout ?? "") + (err.stderr ?? "");
-    }
-    assert.notEqual(
+    const restoredSummary = summaryWith(
+      Object.fromEntries(
+        Object.entries(COVERAGE_FLOORS).map(([metric, floor]) => [metric, floor + 10])
+      )
+    );
+    const { status: restoredStatus, output: restoredOutput } = runCliAgainstFixture(
+      JSON.stringify(restoredSummary)
+    );
+    assert.equal(
       restoredStatus,
-      VOID_EXIT_CODE,
-      `restoring must produce a real verdict, never VOID again; output: ${restoredOutput}`
+      0,
+      `restoring must produce a real PASS verdict against the synthetic above-floor summary, not merely avoid VOID; output: ${restoredOutput}`
+    );
+    assert.ok(
+      restoredOutput.includes("every coverage metric is at or above its configured floor"),
+      `restored run must print the real success verdict, not just any exit-0 output; output: ${restoredOutput}`
     );
     assert.ok(
       !restoredOutput.includes("REFUSED"),
