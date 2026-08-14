@@ -4,6 +4,7 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+- Bounded every `kill_confirmed` poll loop in the test suite well under node:test's opaque per-test timeout. Most loops now fail with a specific, job-scoped diagnostic; the rest already bound themselves independently and keep their own timeout. Test-harness only; no production behavior changed.
 - README.md now tells readers to set both Claude Code wake environment variables together: `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` as a positive duration below the client's own MCP tool timeout, and `CLAUDE_AUTO_BACKGROUND_TASKS` enabled. This replaces guidance that split the instruction by session kind. The headline promise stays scoped to client and configuration rather than unconditional.
 - Updated js-yaml to 5.2.3, typescript-eslint to 8.66.0, and the CodeQL action to 4.37.6.
 - Corrected the vendored Tasks-extension schema's own description, which claimed a digest check verifies the adapter conforms to the pin. The check compares the schema file's own bytes to a recorded SHA-256 and nothing else - it never reads the adapter. A narrower version of the same overclaim in the adapter's own header, which said every result shape is checked against the schema, is also corrected: two of three result shapes are checked against the adapter's own emitted output, the third only against a hand-written literal.
