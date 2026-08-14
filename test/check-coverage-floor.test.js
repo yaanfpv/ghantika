@@ -278,10 +278,21 @@ test("an idle-watchdog fire produces VOID; restoring produces a verdict again", 
   try {
     rmSync(markerPath, { force: true });
 
+    // The pending promise alone is not enough: node:test's own runtime
+    // detects an unsettled promise once nothing else is keeping the event
+    // loop alive and cancels the test itself, well under this test's own
+    // idleTimeoutMs - confirmed on node 22.23.2, where that self-cancel
+    // fires in ~3.5ms with "Promise resolution is still pending but the
+    // event loop has already resolved" and produces a fast, marker-less
+    // exit that looks identical to this control never having exercised the
+    // idle-watchdog path at all. The uncleared interval keeps a real handle
+    // alive so the only way this ever terminates is run-tests.mjs's own
+    // idle-watchdog, on every Node version.
     const hangingFile = path.join(scratchDir, "hangs.test.mjs");
     writeFileSync(
       hangingFile,
-      `import { test } from "node:test";\ntest("never resolves", () => new Promise(() => {}));\n`
+      `import { test } from "node:test";\n` +
+        `test("never resolves", () => new Promise(() => { setInterval(() => {}, 1_000_000); }));\n`
     );
 
     const driverPath = path.join(scratchDir, "drive.mjs");
