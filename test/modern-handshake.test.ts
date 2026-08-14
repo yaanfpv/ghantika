@@ -1003,9 +1003,11 @@ test("modern wire: tasks/update - the one task method the legacy vocabulary neve
   server.child.kill("SIGKILL");
 });
 
-// This test alone genuinely needs a real spawn: it asserts the job's real
-// status field reads "working" on a still-running job, which a
-// policy-denied job (immediately terminal) can never satisfy.
+// The describe() block below is one of two in this file that genuinely
+// need a real spawn (the other is the wake-target hand-off block further
+// down): this one asserts the job's real status field reads "working" on
+// a still-running job, which a policy-denied job (immediately terminal)
+// can never satisfy.
 describe('run-dispatching tests: legacy task-method proof needs a real still-running job (spawn a real job through the real "run" tool)', () => {
   before(requireSpawnPolicy);
 

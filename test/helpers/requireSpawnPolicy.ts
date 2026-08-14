@@ -31,10 +31,10 @@
  * through it inherits an allowlist wide enough for this suite's own
  * fixtures (see that file's own `TEST_POLICY_ALLOW_PATH` doc comment). A
  * bare `node --test <file>` invocation bypasses that AUTOMATIC step, not
- * the environment itself: the policy loader reads `GHANTIKA_POLICY_FILE`
- * from the live process environment at load time, so a value you've
- * already exported yourself before running `node --test` still applies -
- * see CONTRIBUTING.md's "Running a single test" section. Only when the
+ * the environment itself: the policy loader reads the current process
+ * environment each time it evaluates policy, so a value you've already
+ * exported yourself before running `node --test` still applies - see
+ * CONTRIBUTING.md's "Running a single test" section. Only when the
  * caller hasn't set it either is the variable genuinely absent, and every
  * test that reaches the policy gate in that bypassed, unconfigured file
  * then denies immediately, for the identical reason, at every call site.

@@ -45,14 +45,15 @@ import * as runTool from "../dist/tools/run.js";
 
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 
-// Two isolated spots in this file spawn a real job through the real `run`
-// tool - the OWNER 7 test below, and the jobStore-singleton-sharing
-// regression section at the end of the file. Each owns its own
-// `before(requireSpawnPolicy)` inside a describe() block rather than
-// registering the guard here at file scope: this file has 85 tests and
-// spawning is confined to those two spots, so a file-level hook would fail
-// every other test under an unset policy variable too - see
-// test/helpers/requireSpawnPolicy.ts for what this checks and why.
+// A handful of spots in this file call the real `run` tool - the OWNER 7
+// test below, and the jobStore-singleton-sharing regression section at the
+// end of the file. Only the sites whose assertion genuinely needs a
+// policy-allowed spawn to succeed register `before(requireSpawnPolicy)`,
+// each inside its own describe() block rather than at file scope: this
+// file has 88 tests, and most of them assert nothing about spawn outcome,
+// so a file-level hook would fail every other test under an unset policy
+// variable too - see test/helpers/requireSpawnPolicy.ts for what this
+// checks and why.
 
 // ---------------------------------------------------------------------------
 // JobStore: basic registration
