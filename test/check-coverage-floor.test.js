@@ -312,25 +312,27 @@ test("an idle-watchdog fire produces VOID; restoring produces a verdict again", 
     delete driverEnv.NODE_TEST_WORKER_ID;
 
     let driverExit = null;
+    let driverOutput = "";
     try {
-      execFileSync(process.execPath, [driverPath], {
+      driverOutput = execFileSync(process.execPath, [driverPath], {
         cwd: REPO_ROOT,
         env: driverEnv,
-        stdio: "pipe",
+        encoding: "utf8",
       });
       driverExit = 0;
     } catch (err) {
       driverExit = err.status ?? null;
+      driverOutput = (err.stdout ?? "") + (err.stderr ?? "");
     }
     assert.equal(
       driverExit,
       1,
-      "run-tests.mjs's own idle-watchdog path must still exit 1 - unchanged by adding the truncation marker"
+      `run-tests.mjs's own idle-watchdog path must still exit 1 - unchanged by adding the truncation marker; driver output:\n${driverOutput}`
     );
 
     assert.ok(
       existsSync(markerPath),
-      "runOnce()'s own idle-watchdog path must have written the real marker file"
+      `runOnce()'s own idle-watchdog path must have written the real marker file; driver output:\n${driverOutput}`
     );
     const marker = JSON.parse(readFileSync(markerPath, "utf8"));
     assert.equal(marker.reason, "idle-watchdog");
