@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-- Decoupled the `readPidStartTimesBatchPosix` malformed-row test from host-scheduling speed, replacing an implicit timeout with a generous explicit bound; the row-parsing assertion no longer depends on how fast the host happened to be.
+- Decoupled the `readPidStartTimesBatchPosix` malformed-row test from host-scheduling speed, replacing an implicit timeout with a generous explicit bound; the row-parsing assertion no longer depends on how fast the host happened to be. Four other call sites in the test file share the same implicit-timeout shape and are not repaired by this change; they are named in the test file rather than left implicit.
 - Bounded every `kill_confirmed` poll loop in the test suite well under node:test's opaque per-test timeout. Most loops now fail with a specific, job-scoped diagnostic; the rest already bound themselves independently and keep their own timeout. Test-harness only; no production behavior changed.
 - README.md now tells readers to set both Claude Code wake environment variables together: `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` as a positive duration below the client's own MCP tool timeout, and `CLAUDE_AUTO_BACKGROUND_TASKS` enabled. This replaces guidance that split the instruction by session kind. The headline promise stays scoped to client and configuration rather than unconditional.
 - Updated js-yaml to 5.2.3, typescript-eslint to 8.66.0, and the CodeQL action to 4.37.6.

@@ -4173,6 +4173,15 @@ test(
       // A large fixed bound keeps the assertion tied to row-parsing
       // correctness rather than to how fast the host happens to be,
       // without touching the parsing assertions below at all.
+      //
+      // Four other call sites in this file share this test's exact shape -
+      // a real `readPidStartTimesBatchPosix` call with no explicit
+      // timeoutMs, riding the implicit PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS
+      // default instead: the single-pid read at :3966, the "reads MULTIPLE
+      // real pids in ONE batched call" test at :3982, the alive/already-gone
+      // mix at :4067, and the all-nonexistent-pids read at :4078. This
+      // change repairs only the test above; those four are named here
+      // rather than left implicit, and are not repaired by this change.
       result = await readPidStartTimesBatchPosix([pid, 999_999], 30_000);
     } finally {
       process.env.PATH = realPath;
