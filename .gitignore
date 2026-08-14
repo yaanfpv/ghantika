@@ -56,6 +56,10 @@ out/
 .parcel-cache/
 .cache/
 coverage/
+# scripts/run-tests.mjs's fallback truncation-marker location, used only
+# when coverage/'s own directory could not be written to - see
+# TRUNCATION_MARKER_FALLBACK_PATH's doc comment in that file.
+.run-truncated-fallback.json
 .nyc_output/
 *.lcov
 *.profraw

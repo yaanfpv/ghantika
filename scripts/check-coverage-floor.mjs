@@ -48,6 +48,16 @@ export const TRUNCATION_MARKER_PATH =
   process.env.GHANTIKA_TRUNCATION_MARKER_PATH ??
   path.join(REPO_ROOT, "coverage", "run-truncated.json");
 
+// Same override pattern, read from the same fallback location
+// scripts/run-tests.mjs's own TRUNCATION_MARKER_FALLBACK_PATH writes to when
+// the primary marker's own directory could not be written to - see that
+// constant's doc comment for why a fallback exists at all, and
+// loadTruncationMarker's own doc comment below for how the two are checked
+// together.
+export const TRUNCATION_MARKER_FALLBACK_PATH =
+  process.env.GHANTIKA_TRUNCATION_MARKER_FALLBACK_PATH ??
+  path.join(REPO_ROOT, ".run-truncated-fallback.json");
+
 /**
  * Metric name -> minimum acceptable percentage. See the module doc comment
  * above for the measured baseline each floor is set below, and why.
@@ -69,20 +79,36 @@ export function loadCoverageSummary(filePath = COVERAGE_SUMMARY_PATH) {
 
 /**
  * Reads the truncation marker scripts/run-tests.mjs writes when its own
- * idle watchdog or wall cap fires, before it force-exits. Returns null
- * when the file is absent - the common case, and read as "the run
- * completed" - never as an error: a missing marker is the expected state
- * after every ordinary, complete run (run-tests.mjs's own main() clears it
- * unconditionally at the START of every invocation, so a stale marker from
- * a PRIOR truncated run can never survive into reading a fresh, complete
- * one's summary).
+ * idle watchdog or wall cap fires, before it force-exits. Checks the
+ * PRIMARY location first, then the FALLBACK - run-tests.mjs's own
+ * writeTruncationMarkerSync tries the primary path first and only ever
+ * falls back to the second when the primary write itself failed, so
+ * checking both here is what actually closes that failure mode: a caller
+ * that read only the primary path would read "absent" for exactly the run
+ * QA's own negative control reproduces (the primary marker directory made
+ * unwritable), and report the truncated run's partial coverage numbers as
+ * an ordinary verdict. Absence of BOTH is the common case, and read as "the
+ * run completed" - never as an error: that is the expected state after
+ * every ordinary, complete run (run-tests.mjs's own main() clears both
+ * locations unconditionally at the START of every invocation, so a stale
+ * marker from a PRIOR truncated run - at either path - can never survive
+ * into reading a fresh, complete one's summary).
  *
  * @param {string} [filePath]
+ * @param {string} [fallbackPath]
  * @returns {{ reason: string, message: string, at: string } | null}
  */
-export function loadTruncationMarker(filePath = TRUNCATION_MARKER_PATH) {
+export function loadTruncationMarker(
+  filePath = TRUNCATION_MARKER_PATH,
+  fallbackPath = TRUNCATION_MARKER_FALLBACK_PATH
+) {
   try {
     return JSON.parse(readFileSync(filePath, "utf8"));
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  try {
+    return JSON.parse(readFileSync(fallbackPath, "utf8"));
   } catch (err) {
     if (err.code === "ENOENT") return null;
     throw err;
@@ -145,9 +171,11 @@ function main() {
     );
     console.error(`  run-tests.mjs's own diagnostic: ${truncation.message}`);
     console.error(
-      `  this is VOID, not a pass and not a fail - see ${path.relative(REPO_ROOT, TRUNCATION_MARKER_PATH)}. ` +
-        `Fix whatever made the run hang (see the run's own console output / :error: diagnostics for which ` +
-        `file never completed) and re-run "npm run coverage" to produce a trustworthy summary.`
+      `  this is VOID, not a pass and not a fail - see ${path.relative(REPO_ROOT, TRUNCATION_MARKER_PATH)} ` +
+        `(or its fallback, ${path.relative(REPO_ROOT, TRUNCATION_MARKER_FALLBACK_PATH)}, if the primary ` +
+        `location could not be written to). Fix whatever made the run hang (see the run's own console ` +
+        `output / :error: diagnostics for which file never completed) and re-run "npm run coverage" to ` +
+        `produce a trustworthy summary.`
     );
     process.exitCode = VOID_EXIT_CODE;
     return;

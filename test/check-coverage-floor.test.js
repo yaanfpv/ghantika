@@ -1,13 +1,22 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
   COVERAGE_FLOORS,
+  TRUNCATION_MARKER_FALLBACK_PATH,
   VOID_EXIT_CODE,
   checkCoverageFloors,
   loadTruncationMarker,
@@ -408,5 +417,221 @@ test("an idle-watchdog fire produces VOID; restoring produces a verdict again", 
     rmSync(scratchDir, { recursive: true, force: true });
     rmSync(markerPath, { force: true });
     if (hadPriorMarker) writeFileSync(markerPath, priorMarkerContent);
+  }
+});
+
+// =============================================================================
+// AC1 fail-open: a genuinely truncated run must produce VOID even when its
+// primary truncation-marker location cannot be written to. QA's own real
+// negative control (chmod the primary marker's parent directory unwritable,
+// force a genuine idle-watchdog fire) proved that before this fix,
+// writeTruncationMarkerSync's write failure was only logged - the marker
+// never landed anywhere - so loadTruncationMarker() found nothing and
+// check-coverage-floor.mjs reported the truncated run's partial coverage
+// numbers as an ordinary verdict. The two tests below drive the real CLI and
+// the real runOnce() end to end, exactly like the idle-watchdog control
+// above, but with the primary marker directory deliberately locked down
+// first.
+// =============================================================================
+
+test("sanity: the real production fallback path lives at REPO_ROOT, not under coverage/", () => {
+  // REPO_ROOT (from fileURLToPath on a URL directory) carries a trailing
+  // separator; path.dirname() never does - trim before comparing.
+  assert.equal(path.dirname(TRUNCATION_MARKER_FALLBACK_PATH) + path.sep, REPO_ROOT);
+  assert.equal(path.basename(TRUNCATION_MARKER_FALLBACK_PATH), ".run-truncated-fallback.json");
+});
+
+test("AC1: an unwritable primary marker directory still produces VOID, via the fallback location", async () => {
+  const scratchDir = mkdtempSync(path.join(tmpdir(), "ghantika-ac1-failclosed-"));
+  const unwritableDir = path.join(scratchDir, "locked-coverage");
+  mkdirSync(unwritableDir, { recursive: true });
+  const primaryMarkerPath = path.join(unwritableDir, "run-truncated.json");
+  const fallbackMarkerPath = path.join(scratchDir, "fallback-marker.json");
+  try {
+    // Lock the primary marker's own directory down AFTER creating it -
+    // matching QA's exact repro (chmod coverage/ to 0500) rather than a
+    // directory that never existed, which would exercise mkdirSync's own
+    // ENOENT/EACCES on the parent instead of writeFileSync's on the file
+    // itself. 0500 = read + execute (list + traverse) but not write.
+    chmodSync(unwritableDir, 0o500);
+
+    const hangingFile = path.join(scratchDir, "hangs.test.mjs");
+    writeFileSync(
+      hangingFile,
+      `import { test } from "node:test";\n` +
+        `test("never resolves", () => new Promise(() => { setInterval(() => {}, 1_000_000); }));\n`
+    );
+
+    const driverPath = path.join(scratchDir, "drive.mjs");
+    writeFileSync(
+      driverPath,
+      `import { runOnce } from ${JSON.stringify(RUN_TESTS_SCRIPT_PATH)};\n` +
+        `await runOnce({\n` +
+        `  discovered: [${JSON.stringify(hangingFile)}],\n` +
+        `  tracked: null,\n` +
+        `  junitPath: null,\n` +
+        `  options: { testTimeoutMs: 60000, idleTimeoutMs: 400, wallTimeoutMs: 60000, leakWindowMs: 5000 },\n` +
+        `  skipBaseline: {},\n` +
+        `  criticalTests: [],\n` +
+        `  truncationMarkerPath: ${JSON.stringify(primaryMarkerPath)},\n` +
+        `  truncationMarkerFallbackPath: ${JSON.stringify(fallbackMarkerPath)},\n` +
+        `});\n`
+    );
+
+    // Same recursion-guard strip as the idle-watchdog control above - see
+    // its own comment for why.
+    const driverEnv = { ...process.env };
+    delete driverEnv.NODE_TEST_CONTEXT;
+    delete driverEnv.NODE_TEST_WORKER_ID;
+
+    let driverExit = null;
+    let driverOutput = "";
+    try {
+      driverOutput = execFileSync(process.execPath, [driverPath], {
+        cwd: REPO_ROOT,
+        env: driverEnv,
+        encoding: "utf8",
+      });
+      driverExit = 0;
+    } catch (err) {
+      driverExit = err.status ?? null;
+      driverOutput = (err.stdout ?? "") + (err.stderr ?? "");
+    }
+    assert.equal(
+      driverExit,
+      1,
+      `the idle-watchdog path must still exit 1 even when its primary marker write fails; driver output:\n${driverOutput}`
+    );
+
+    // The primary write must have genuinely FAILED and been reported by
+    // name - not silently skipped, not silently succeeded despite the
+    // chmod. This control is void (proves nothing about the fix) if the
+    // directory turned out writable after all.
+    assert.ok(
+      driverOutput.includes("failed to write truncation marker") &&
+        driverOutput.includes(primaryMarkerPath),
+      `expected the primary write's own failure to be reported by name; driver output:\n${driverOutput}`
+    );
+    assert.ok(
+      !existsSync(primaryMarkerPath),
+      "the primary marker path must genuinely not exist - a real write failure, not a partial one"
+    );
+
+    // THE FIX: the fallback write must have landed, and been reported.
+    assert.ok(
+      existsSync(fallbackMarkerPath),
+      `expected the fallback truncation marker to exist once the primary write failed; driver output:\n${driverOutput}`
+    );
+    assert.ok(
+      driverOutput.includes("wrote the truncation marker to its fallback location"),
+      `expected the fallback write to be reported by name; driver output:\n${driverOutput}`
+    );
+    const fallbackMarker = JSON.parse(readFileSync(fallbackMarkerPath, "utf8"));
+    assert.equal(fallbackMarker.reason, "idle-watchdog");
+
+    // THE READER SIDE OF THE FIX: check-coverage-floor.mjs, pointed at the
+    // SAME two paths, must find the fallback marker and refuse VOID - never
+    // silently fall through to an ordinary verdict against whatever partial
+    // (or, here, entirely absent) coverage-summary.json this truncated run
+    // produced.
+    const floorEnv = {
+      ...process.env,
+      GHANTIKA_TRUNCATION_MARKER_PATH: primaryMarkerPath,
+      GHANTIKA_TRUNCATION_MARKER_FALLBACK_PATH: fallbackMarkerPath,
+      GHANTIKA_COVERAGE_SUMMARY_PATH: path.join(scratchDir, "does-not-exist-summary.json"),
+    };
+    let floorStatus = null;
+    let floorOutput = "";
+    try {
+      floorOutput = execFileSync(process.execPath, [SCRIPT_PATH], {
+        cwd: REPO_ROOT,
+        env: floorEnv,
+        encoding: "utf8",
+      });
+      floorStatus = 0;
+    } catch (err) {
+      floorStatus = err.status ?? null;
+      floorOutput = (err.stdout ?? "") + (err.stderr ?? "");
+    }
+    assert.equal(
+      floorStatus,
+      VOID_EXIT_CODE,
+      `THE FAIL-OPEN THIS CONTROL EXISTS TO CATCH: an unwritable primary marker directory must never yield ` +
+        `an exit-0 or exit-1-from-a-missing-summary floor verdict - it must VOID. Before the fallback fix, ` +
+        `this exited 1 here (an ordinary FAIL from the missing coverage-summary.json) rather than VOID, ` +
+        `because loadTruncationMarker found neither marker and never refused. output:\n${floorOutput}`
+    );
+    assert.ok(floorOutput.includes("REFUSED"));
+  } finally {
+    // Restore permissions BEFORE recursive removal - rmSync recursing into
+    // a still-0500 directory to delete its own entries would itself fail.
+    try {
+      chmodSync(unwritableDir, 0o700);
+    } catch {
+      // best-effort; the recursive rm below will surface anything real
+    }
+    rmSync(scratchDir, { recursive: true, force: true });
+  }
+});
+
+// Green control, paired with the negative control above: when the primary
+// location IS writable, the fallback must never be touched at all. Without
+// this, a bug that always wrote both locations (a silent, undocumented
+// double-write) would pass the negative control above just as easily as the
+// real fix does - this is what actually proves the fallback is a genuine
+// RESCUE path, not a routine second copy.
+test("green control: a writable primary marker location never touches the fallback", async () => {
+  const scratchDir = mkdtempSync(path.join(tmpdir(), "ghantika-ac1-green-"));
+  const primaryMarkerPath = path.join(scratchDir, "run-truncated.json");
+  const fallbackMarkerPath = path.join(scratchDir, "fallback-marker.json");
+  try {
+    const hangingFile = path.join(scratchDir, "hangs.test.mjs");
+    writeFileSync(
+      hangingFile,
+      `import { test } from "node:test";\n` +
+        `test("never resolves", () => new Promise(() => { setInterval(() => {}, 1_000_000); }));\n`
+    );
+    const driverPath = path.join(scratchDir, "drive.mjs");
+    writeFileSync(
+      driverPath,
+      `import { runOnce } from ${JSON.stringify(RUN_TESTS_SCRIPT_PATH)};\n` +
+        `await runOnce({\n` +
+        `  discovered: [${JSON.stringify(hangingFile)}],\n` +
+        `  tracked: null,\n` +
+        `  junitPath: null,\n` +
+        `  options: { testTimeoutMs: 60000, idleTimeoutMs: 400, wallTimeoutMs: 60000, leakWindowMs: 5000 },\n` +
+        `  skipBaseline: {},\n` +
+        `  criticalTests: [],\n` +
+        `  truncationMarkerPath: ${JSON.stringify(primaryMarkerPath)},\n` +
+        `  truncationMarkerFallbackPath: ${JSON.stringify(fallbackMarkerPath)},\n` +
+        `});\n`
+    );
+    const driverEnv = { ...process.env };
+    delete driverEnv.NODE_TEST_CONTEXT;
+    delete driverEnv.NODE_TEST_WORKER_ID;
+    let driverOutput = "";
+    try {
+      driverOutput = execFileSync(process.execPath, [driverPath], {
+        cwd: REPO_ROOT,
+        env: driverEnv,
+        encoding: "utf8",
+      });
+    } catch (err) {
+      driverOutput = (err.stdout ?? "") + (err.stderr ?? "");
+    }
+    assert.ok(
+      existsSync(primaryMarkerPath),
+      `expected the primary marker to exist when its directory is writable; driver output:\n${driverOutput}`
+    );
+    assert.ok(
+      !existsSync(fallbackMarkerPath),
+      "the fallback must never be written when the primary write already succeeded"
+    );
+    assert.ok(
+      !driverOutput.includes("wrote the truncation marker to its fallback location"),
+      `must not report a fallback write that never happened; driver output:\n${driverOutput}`
+    );
+  } finally {
+    rmSync(scratchDir, { recursive: true, force: true });
   }
 });

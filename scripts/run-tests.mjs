@@ -183,6 +183,16 @@ const TEST_DIR = path.join(REPO_ROOT, "test");
 // scripts/, so it is never mistaken for a tracked, checked-in artifact.
 export const TRUNCATION_MARKER_PATH = path.join(REPO_ROOT, "coverage", "run-truncated.json");
 
+// Fallback write location, used only when the primary path above cannot be
+// written to - see writeTruncationMarkerSync's own doc comment for why this
+// exists and what happens if this ALSO fails. Lives at REPO_ROOT itself,
+// never under coverage/: coverage/ is exactly the directory a real run
+// could plausibly find unwritable (it is c8's own output directory, gitignored,
+// and the one QA's own repro locks down), while REPO_ROOT is where dist/,
+// node_modules/, and this file's own junit output already have to be
+// writable for the run to have gotten this far at all.
+export const TRUNCATION_MARKER_FALLBACK_PATH = path.join(REPO_ROOT, ".run-truncated-fallback.json");
+
 // The `.test.` infix, not merely a directory, is what makes something a
 // suite. `test/harness.ts` and `test/helpers/spawnServer.ts` sit under
 // test/ but carry no `.test.` infix and are never discovered here - they
@@ -786,35 +796,76 @@ function flushJunitSync(junitPath, buffer) {
 }
 
 /**
- * Records that this run terminated via one of the three hang-recovery
- * paths, BEFORE the matching process.exit(1) call - synchronous, same
- * write-then-hard-exit shape as flushJunitSync above, for the same reason:
- * a hard exit drops anything not already durably on disk. Read by
- * scripts/check-coverage-floor.mjs, run afterward as a separate process,
- * so it can refuse to compare whatever coverage numbers this run's own partial
- * execution produced rather than reporting them as a real verdict. Overwrites
- * unconditionally - only ONE of the three termination paths can ever fire per
- * run (each sets `terminationFired` before doing anything else), so there is
- * never a stale-vs-fresh marker to reconcile within a single invocation.
+ * Records that this run terminated via one of the two hang-recovery paths
+ * that write a marker at all (idle-watchdog, wall-cap - never
+ * post-completion-leak, whose own call site never invokes this function;
+ * see onPostCompletionLeak's own comment for why), BEFORE the matching
+ * process.exit(1) call - synchronous, same write-then-hard-exit shape as
+ * flushJunitSync above, for the same reason: a hard exit drops anything not
+ * already durably on disk. Read by scripts/check-coverage-floor.mjs, run
+ * afterward as a separate process, so it can refuse to compare whatever
+ * coverage numbers this run's own partial execution produced rather than
+ * reporting them as a real verdict. Overwrites unconditionally - only ONE of
+ * the three termination paths can ever fire per run (each sets
+ * `terminationFired` before doing anything else), so there is never a
+ * stale-vs-fresh marker to reconcile within a single invocation.
  *
- * @param {string} markerPath where to write it - the real production path
- *   by default, but see runOnce's own `truncationMarkerPath` parameter for
- *   why a caller driving this against a throwaway fixture tree must redirect
- *   it elsewhere.
- * @param {"idle-watchdog" | "wall-cap" | "post-completion-leak"} reason
+ * FAIL-CLOSED ON THE WRITE ITSELF: a caller of loadTruncationMarker
+ * (check-coverage-floor.mjs) treats an ABSENT marker as proof the run
+ * completed - so if THIS write silently failed (the marker's own directory
+ * turned read-only, a full disk, anything else writeFileSync can throw) and
+ * this function only logged and returned, a genuinely truncated run would
+ * read as an ordinary complete one and its partial coverage numbers would be
+ * compared against the floor as if real. That is the exact fail-open QA's
+ * negative control demonstrated: chmod the marker's parent directory
+ * unwritable, force a real idle-watchdog fire, and the primary write throws
+ * a real EACCES while the reader still finds nothing and reports PASS. So on
+ * a primary-write failure this makes ONE more attempt, at `fallbackPath` -
+ * REPO_ROOT itself by default (see TRUNCATION_MARKER_FALLBACK_PATH's own
+ * comment for why that location), independent of whatever made the primary
+ * path unwritable. If BOTH writes fail, that is disclosed as its own loud,
+ * distinct error rather than silently swallowed: a run cannot write ANYWHERE
+ * under its own checkout, which is a considerably more catastrophic
+ * environment than "coverage/ specifically is locked down" and is not
+ * something this function can recover from - but it must never look like
+ * ordinary silence.
+ *
+ * @param {string} markerPath where to write it first - the real production
+ *   path by default, but see runOnce's own `truncationMarkerPath` parameter
+ *   for why a caller driving this against a throwaway fixture tree must
+ *   redirect it elsewhere.
+ * @param {"idle-watchdog" | "wall-cap"} reason
  * @param {string} message human-readable - the same text already printed
  *   via printDiagnosticHeader, so a reader of the marker sees the identical
  *   explanation a reader of the console output would.
+ * @param {string} fallbackPath where to retry if the primary write throws -
+ *   TRUNCATION_MARKER_FALLBACK_PATH by default; see runOnce's own
+ *   `truncationMarkerFallbackPath` parameter for the fixture-redirect case.
  */
-function writeTruncationMarkerSync(markerPath, reason, message) {
+function writeTruncationMarkerSync(markerPath, reason, message, fallbackPath) {
+  const payload = JSON.stringify({ reason, message, at: new Date().toISOString() }, null, 2);
   try {
     mkdirSync(path.dirname(markerPath), { recursive: true });
-    writeFileSync(
-      markerPath,
-      JSON.stringify({ reason, message, at: new Date().toISOString() }, null, 2)
-    );
+    writeFileSync(markerPath, payload);
+    return;
   } catch (err) {
     console.error(`run-tests: failed to write truncation marker to ${markerPath}: ${err.message}`);
+  }
+  try {
+    mkdirSync(path.dirname(fallbackPath), { recursive: true });
+    writeFileSync(fallbackPath, payload);
+    console.error(
+      `run-tests: wrote the truncation marker to its fallback location instead: ${fallbackPath}`
+    );
+  } catch (fallbackErr) {
+    console.error(
+      `run-tests: the FALLBACK truncation-marker write to ${fallbackPath} ALSO failed: ` +
+        `${fallbackErr.message} - this run's truncation cannot be recorded on disk at all. ` +
+        `A downstream check reading for a marker and finding neither file present has no way ` +
+        `to distinguish this from a genuinely complete run; treat any coverage verdict following ` +
+        `an idle-watchdog or wall-cap diagnostic in this run's own console output as untrustworthy ` +
+        `regardless of what it reports.`
+    );
   }
 }
 
@@ -847,6 +898,7 @@ function writeTruncationMarkerSync(markerPath, reason, message) {
  *   skipBaseline: Record<string, string[]>,
  *   criticalTests: string[],
  *   truncationMarkerPath?: string,
+ *   truncationMarkerFallbackPath?: string,
  * }} args
  */
 export function runOnce({
@@ -857,6 +909,7 @@ export function runOnce({
   skipBaseline,
   criticalTests,
   truncationMarkerPath = TRUNCATION_MARKER_PATH,
+  truncationMarkerFallbackPath = TRUNCATION_MARKER_FALLBACK_PATH,
 }) {
   return new Promise((resolve) => {
     const stream = run({ files: discovered, timeout: options.testTimeoutMs });
@@ -1013,7 +1066,12 @@ export function runOnce({
           "without ever reporting completion - e.g. an import-time hang):",
         ...incomplete.map((f) => `  - ${rel(f)}`),
       ]);
-      writeTruncationMarkerSync(truncationMarkerPath, "idle-watchdog", idleMessage);
+      writeTruncationMarkerSync(
+        truncationMarkerPath,
+        "idle-watchdog",
+        idleMessage,
+        truncationMarkerFallbackPath
+      );
       flushJunitSync(junitPath, junitBuffer);
       process.exit(1);
     }
@@ -1026,7 +1084,12 @@ export function runOnce({
       printDiagnosticHeader(`WALL CAP: total run time exceeded ${options.wallTimeoutMs}ms`, [
         `last event received: ${JSON.stringify(lastEvent)}`,
       ]);
-      writeTruncationMarkerSync(truncationMarkerPath, "wall-cap", wallMessage);
+      writeTruncationMarkerSync(
+        truncationMarkerPath,
+        "wall-cap",
+        wallMessage,
+        truncationMarkerFallbackPath
+      );
       flushJunitSync(junitPath, junitBuffer);
       process.exit(1);
     }
@@ -1066,17 +1129,22 @@ async function main() {
   }
 
   // A stale marker from a PREVIOUS truncated run must never be read as
-  // belonging to THIS one - clear it unconditionally before anything else
-  // runs, so a normal completion always starts (and, if it completes
-  // normally, ends) with no marker on disk. Only the three termination
-  // paths in runOnce() ever write it back. Absence is not an error (the
-  // common case, and the very first run ever).
-  try {
-    unlinkSync(TRUNCATION_MARKER_PATH);
-  } catch {
-    // ENOENT (nothing to clear - normal) or any other error; either way
-    // there is nothing actionable here, and a failed best-effort delete
-    // must never block the run it is merely tidying up before.
+  // belonging to THIS one - clear both the primary and fallback locations
+  // unconditionally before anything else runs, so a normal completion
+  // always starts (and, if it completes normally, ends) with neither marker
+  // on disk. Only the two watchdog termination paths in runOnce() ever
+  // write either back (via writeTruncationMarkerSync's own primary-then-
+  // fallback attempt), and only one of the two markers is ever written per
+  // run. Absence is not an error (the common case, and the very first run
+  // ever).
+  for (const marker of [TRUNCATION_MARKER_PATH, TRUNCATION_MARKER_FALLBACK_PATH]) {
+    try {
+      unlinkSync(marker);
+    } catch {
+      // ENOENT (nothing to clear - normal) or any other error; either way
+      // there is nothing actionable here, and a failed best-effort delete
+      // must never block the run it is merely tidying up before.
+    }
   }
 
   const discovered = discoverTestFiles(TEST_DIR);
