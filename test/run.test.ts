@@ -50,6 +50,9 @@ import * as runTool from "../dist/tools/run.js";
 // immediate capture-then-assert can hit - see this helper's own header.
 import { retryBirthIdentityCapture } from "./helpers/birthIdentityRetry.ts";
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+// The test-harness-only watchdog `pollUntilKillConfirmed` (below) arms -
+// see that helper's own header doc comment for the full "why".
+import { armKillConfirmedWatchdog } from "./helpers/killConfirmedPollWatchdog.ts";
 
 // Every test in this file except the Windows-only assertion at the end
 // spawns a real job through the real `run` tool's handler. That one test
@@ -178,39 +181,49 @@ async function waitForBirthIdentity(jobId: string): Promise<void> {
  * landed yet by that instant. Retrying (never re-signaling, see above)
  * gives that write time to land.
  *
- * This loop carries NO wall-clock deadline and never throws on elapsed
- * time. Every job here goes through the same fire-and-forget eager reap
- * at OS-level exit (see this doc comment's own paragraph above) whose
- * confirmation write is real event-loop scheduling latency with no
- * stated upper bound - a fixed deadline would assert a bound the
- * contract declines to give, whether the job was explicitly killed or
- * exited on its own. It waits for as long as the surrounding test is
- * willing to run; a genuine hang is caught by the test runner's own
- * timeout, not by this function. To keep that outer failure legible if
- * it ever fires, this writes a breadcrumb to stderr on a fixed logging
- * cadence (never a threshold) while still waiting.
+ * This loop carries NO wall-clock deadline on `kill_confirmed` itself and
+ * never throws on elapsed time reading that field - a fixed deadline
+ * there would assert a bound the contract declines to give, whether the
+ * job was explicitly killed or exited on its own. It polls for as long as
+ * a REAL settlement takes, exactly as before. What it also carries now is
+ * a test-harness-only watchdog (see `test/helpers/killConfirmedPollWatchdog.ts`'s
+ * own header doc comment for the full "why" - it is a bound on this
+ * TEST's own patience, never on the field): previously a genuine hang here
+ * fell through to node:test's own opaque 120s per-test ceiling with no
+ * indication of which job or field was involved; now it fails first, well
+ * inside that ceiling, naming the job id and the last observed record. A
+ * breadcrumb to stderr on a fixed logging cadence (never a threshold)
+ * still keeps this legible while it waits either way.
  */
 async function pollUntilKillConfirmed(jobId: string): Promise<Record<string, unknown>> {
   const breadcrumbIntervalMs = 5000;
   let lastBreadcrumbAt = Date.now();
-  for (;;) {
-    const result = await killTool.handler({ job_id: jobId });
-    assert.notEqual(
-      result.isError,
-      true,
-      `kill() must succeed for job ${jobId} while polling for kill_confirmed to settle: ${JSON.stringify(result)}`
-    );
-    const structured = result.structuredContent as Record<string, unknown>;
-    if (structured.kill_confirmed !== undefined) {
-      return structured;
-    }
-    if (Date.now() - lastBreadcrumbAt >= breadcrumbIntervalMs) {
-      console.error(
-        `still waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(structured)}`
+  let lastSeen: Record<string, unknown> = {};
+  const watchdog = armKillConfirmedWatchdog(jobId);
+  try {
+    for (;;) {
+      watchdog.throwIfTripped(lastSeen);
+      const result = await watchdog.race(killTool.handler({ job_id: jobId }), lastSeen);
+      assert.notEqual(
+        result.isError,
+        true,
+        `kill() must succeed for job ${jobId} while polling for kill_confirmed to settle: ${JSON.stringify(result)}`
       );
-      lastBreadcrumbAt = Date.now();
+      const structured = result.structuredContent as Record<string, unknown>;
+      lastSeen = structured;
+      if (structured.kill_confirmed !== undefined) {
+        return structured;
+      }
+      if (Date.now() - lastBreadcrumbAt >= breadcrumbIntervalMs) {
+        console.error(
+          `still waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(structured)}`
+        );
+        lastBreadcrumbAt = Date.now();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    await new Promise((resolve) => setTimeout(resolve, 25));
+  } finally {
+    watchdog.dispose();
   }
 }
 

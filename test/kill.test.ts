@@ -34,6 +34,9 @@ import { runStrandedRetryScenario } from "./helpers/killScenarios.ts";
 // immediate capture-then-assert can hit - see this helper's own header.
 import { retryBirthIdentityCapture } from "./helpers/birthIdentityRetry.ts";
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+// The test-harness-only watchdog every `kill_confirmed` poll loop in this
+// file arms - see that helper's own header doc comment for the full "why".
+import { armKillConfirmedWatchdog } from "./helpers/killConfirmedPollWatchdog.ts";
 
 // The tests in this file that spawn a real job are grouped inside
 // their own local describe() blocks below. Only the blocks whose
@@ -822,35 +825,46 @@ describe("kill: the real end-to-end wire proof (against a real spawned job)", ()
       // until `kill_confirmed` has actually settled - never re-assert on
       // the stale `killBody` snapshot above.
       //
-      // No fixed deadline: this explicit kill() sends a real signal, and the
-      // process's own OS-level exit (whether from that signal or otherwise)
-      // independently triggers `run.ts`'s `onExit` fire-and-forget eager
-      // reap - the SAME unbounded-latency path a natural exit takes. Which
-      // of that path or `kill.ts`'s own in-call confirmation actually lands
-      // first is a real race with no ordering guarantee, so this poll is
-      // exposed to the identical hazard as a natural exit, not a lesser one.
-      // A one-line breadcrumb to stderr on a fixed cadence (never a
-      // threshold) keeps a runner-level timeout legible if it ever fires.
+      // No fixed deadline on `kill_confirmed` itself: this explicit kill()
+      // sends a real signal, and the process's own OS-level exit (whether
+      // from that signal or otherwise) independently triggers `run.ts`'s
+      // `onExit` fire-and-forget eager reap - the SAME unbounded-latency path
+      // a natural exit takes. Which of that path or `kill.ts`'s own in-call
+      // confirmation actually lands first is a real race with no ordering
+      // guarantee, so this poll is exposed to the identical hazard as a
+      // natural exit, not a lesser one. A one-line breadcrumb to stderr on a
+      // fixed cadence (never a threshold) keeps this legible while it waits,
+      // and a test-harness-only watchdog (see
+      // `test/helpers/killConfirmedPollWatchdog.ts`'s own header doc comment)
+      // fails first, well inside node:test's own opaque per-test ceiling,
+      // naming the job id and the last observed record instead of leaving a
+      // bare runner-level timeout.
       const confirmBreadcrumbIntervalMs = 5000;
       let confirmLastBreadcrumbAt = Date.now();
       let confirmedBody: RunResponseBody | undefined;
-      for (;;) {
-        server.send({
-          jsonrpc: "2.0",
-          id: 502,
-          method: "tools/call",
-          params: { name: "status", arguments: { job_id: jobId } },
-        });
-        const statusLine = await server.nextLine();
-        confirmedBody = statusLine.parsed as RunResponseBody;
-        if (confirmedBody.result?.structuredContent?.kill_confirmed !== undefined) break;
-        if (Date.now() - confirmLastBreadcrumbAt >= confirmBreadcrumbIntervalMs) {
-          console.error(
-            `still waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(confirmedBody?.result?.structuredContent)}`
-          );
-          confirmLastBreadcrumbAt = Date.now();
+      const confirmWatchdog = armKillConfirmedWatchdog(jobId);
+      try {
+        for (;;) {
+          confirmWatchdog.throwIfTripped(confirmedBody?.result?.structuredContent ?? {});
+          server.send({
+            jsonrpc: "2.0",
+            id: 502,
+            method: "tools/call",
+            params: { name: "status", arguments: { job_id: jobId } },
+          });
+          const statusLine = await server.nextLine();
+          confirmedBody = statusLine.parsed as RunResponseBody;
+          if (confirmedBody.result?.structuredContent?.kill_confirmed !== undefined) break;
+          if (Date.now() - confirmLastBreadcrumbAt >= confirmBreadcrumbIntervalMs) {
+            console.error(
+              `still waiting for kill_confirmed to settle for job ${jobId}, last saw: ${JSON.stringify(confirmedBody?.result?.structuredContent)}`
+            );
+            confirmLastBreadcrumbAt = Date.now();
+          }
+          await new Promise((resolve) => setTimeout(resolve, 25));
         }
-        await new Promise((resolve) => setTimeout(resolve, 25));
+      } finally {
+        confirmWatchdog.dispose();
       }
       assert.equal(
         confirmedBody.result?.structuredContent?.kill_confirmed,
@@ -982,34 +996,45 @@ describe("kill: the real end-to-end wire proof (against a real spawned job)", ()
       // is assumed from a fixed sleep, and NO kill() call has been made at
       // any point before this.
       //
-      // No fixed deadline: `reapProcessGroupOnce`'s confirmation write is
-      // real event-loop scheduling latency with no stated upper bound (see
-      // src/tools/kill.ts's own doc comment) - a fixed number here asserts a
-      // bound the contract declines to give. A breadcrumb on a fixed cadence
-      // (never a threshold) keeps a runner-level timeout legible if it fires.
+      // No fixed deadline on `kill_confirmed` itself: `reapProcessGroupOnce`'s
+      // confirmation write is real event-loop scheduling latency with no
+      // stated upper bound (see src/tools/kill.ts's own doc comment) - a
+      // fixed number here asserts a bound the contract declines to give. A
+      // breadcrumb on a fixed cadence (never a threshold) keeps this legible
+      // while it waits, and a test-harness-only watchdog (see
+      // `test/helpers/killConfirmedPollWatchdog.ts`'s own header doc comment)
+      // fails first, well inside node:test's own opaque per-test ceiling,
+      // naming the job id and the last observed record instead of leaving a
+      // bare runner-level timeout.
       const statusBreadcrumbIntervalMs = 5000;
       let statusLastBreadcrumbAt = Date.now();
       let statusBody: RunResponseBody | undefined;
-      for (;;) {
-        server.send({
-          jsonrpc: "2.0",
-          id: 521,
-          method: "tools/call",
-          params: { name: "status", arguments: { job_id: jobId } },
-        });
-        const statusLine = await server.nextLine();
-        statusBody = statusLine.parsed as RunResponseBody;
-        const state = statusBody.result?.structuredContent?.state as string | undefined;
-        const killConfirmed = statusBody.result?.structuredContent?.kill_confirmed;
-        const isTerminal = state !== undefined && state !== "starting" && state !== "running";
-        if (isTerminal && killConfirmed !== undefined) break;
-        if (Date.now() - statusLastBreadcrumbAt >= statusBreadcrumbIntervalMs) {
-          console.error(
-            `still waiting for the leader's own job record to go terminal AND the eager reap's confirmation to land for job ${jobId}, last saw: ${JSON.stringify(statusBody?.result?.structuredContent)}`
-          );
-          statusLastBreadcrumbAt = Date.now();
+      const leaderExitWatchdog = armKillConfirmedWatchdog(jobId);
+      try {
+        for (;;) {
+          leaderExitWatchdog.throwIfTripped(statusBody?.result?.structuredContent ?? {});
+          server.send({
+            jsonrpc: "2.0",
+            id: 521,
+            method: "tools/call",
+            params: { name: "status", arguments: { job_id: jobId } },
+          });
+          const statusLine = await server.nextLine();
+          statusBody = statusLine.parsed as RunResponseBody;
+          const state = statusBody.result?.structuredContent?.state as string | undefined;
+          const killConfirmed = statusBody.result?.structuredContent?.kill_confirmed;
+          const isTerminal = state !== undefined && state !== "starting" && state !== "running";
+          if (isTerminal && killConfirmed !== undefined) break;
+          if (Date.now() - statusLastBreadcrumbAt >= statusBreadcrumbIntervalMs) {
+            console.error(
+              `still waiting for the leader's own job record to go terminal AND the eager reap's confirmation to land for job ${jobId}, last saw: ${JSON.stringify(statusBody?.result?.structuredContent)}`
+            );
+            statusLastBreadcrumbAt = Date.now();
+          }
+          await new Promise((resolve) => setTimeout(resolve, 25));
         }
-        await new Promise((resolve) => setTimeout(resolve, 25));
+      } finally {
+        leaderExitWatchdog.dispose();
       }
       assert.equal(
         statusBody?.result?.structuredContent?.state,
@@ -1335,32 +1360,43 @@ describe("kill: the real end-to-end wire proof (against a real spawned job)", ()
       // above's own docs for why both conditions are needed) - never
       // assumed from a fixed sleep, and NO kill() call has been made yet.
       //
-      // No fixed deadline: same unbounded reap-confirmation latency as the
-      // test above (see its own note); a breadcrumb on a fixed cadence
-      // (never a threshold) keeps a runner-level timeout legible if it fires.
+      // No fixed deadline on `kill_confirmed` itself: same unbounded
+      // reap-confirmation latency as the test above (see its own note); a
+      // breadcrumb on a fixed cadence (never a threshold) keeps this legible
+      // while it waits, and a test-harness-only watchdog (see
+      // `test/helpers/killConfirmedPollWatchdog.ts`'s own header doc comment)
+      // fails first, well inside node:test's own opaque per-test ceiling,
+      // naming the job id and the last observed record instead of leaving a
+      // bare runner-level timeout.
       const statusBreadcrumbIntervalMs = 5000;
       let statusLastBreadcrumbAt = Date.now();
       let statusBody: RunResponseBody | undefined;
-      for (;;) {
-        server.send({
-          jsonrpc: "2.0",
-          id: 551,
-          method: "tools/call",
-          params: { name: "status", arguments: { job_id: jobId } },
-        });
-        const statusLine = await server.nextLine();
-        statusBody = statusLine.parsed as RunResponseBody;
-        const state = statusBody.result?.structuredContent?.state as string | undefined;
-        const killConfirmed = statusBody.result?.structuredContent?.kill_confirmed;
-        const isTerminal = state !== undefined && state !== "starting" && state !== "running";
-        if (isTerminal && killConfirmed !== undefined) break;
-        if (Date.now() - statusLastBreadcrumbAt >= statusBreadcrumbIntervalMs) {
-          console.error(
-            `still waiting for the leader's own job record to go terminal AND the eager reap's confirmation to land for job ${jobId}, last saw: ${JSON.stringify(statusBody?.result?.structuredContent)}`
-          );
-          statusLastBreadcrumbAt = Date.now();
+      const twoDescendantsWatchdog = armKillConfirmedWatchdog(jobId);
+      try {
+        for (;;) {
+          twoDescendantsWatchdog.throwIfTripped(statusBody?.result?.structuredContent ?? {});
+          server.send({
+            jsonrpc: "2.0",
+            id: 551,
+            method: "tools/call",
+            params: { name: "status", arguments: { job_id: jobId } },
+          });
+          const statusLine = await server.nextLine();
+          statusBody = statusLine.parsed as RunResponseBody;
+          const state = statusBody.result?.structuredContent?.state as string | undefined;
+          const killConfirmed = statusBody.result?.structuredContent?.kill_confirmed;
+          const isTerminal = state !== undefined && state !== "starting" && state !== "running";
+          if (isTerminal && killConfirmed !== undefined) break;
+          if (Date.now() - statusLastBreadcrumbAt >= statusBreadcrumbIntervalMs) {
+            console.error(
+              `still waiting for the leader's own job record to go terminal AND the eager reap's confirmation to land for job ${jobId}, last saw: ${JSON.stringify(statusBody?.result?.structuredContent)}`
+            );
+            statusLastBreadcrumbAt = Date.now();
+          }
+          await new Promise((resolve) => setTimeout(resolve, 25));
         }
-        await new Promise((resolve) => setTimeout(resolve, 25));
+      } finally {
+        twoDescendantsWatchdog.dispose();
       }
       assert.equal(
         statusBody?.result?.structuredContent?.state,
@@ -1558,32 +1594,43 @@ describe("kill: the real end-to-end wire proof (against a real spawned job)", ()
         // assertion (kill_confirmed === true, below) reading a snapshot
         // that could still be mid-race - now fixed to match its sibling.
         //
-        // No fixed deadline: a breadcrumb on a fixed cadence (never a
-        // threshold) keeps a runner-level timeout legible if it fires,
-        // without asserting a bound the contract declines to give.
+        // No fixed deadline on `kill_confirmed` itself: a breadcrumb on a
+        // fixed cadence (never a threshold) keeps this legible while it
+        // waits, without asserting a bound the contract declines to give,
+        // and a test-harness-only watchdog (see
+        // `test/helpers/killConfirmedPollWatchdog.ts`'s own header doc
+        // comment) fails first, well inside node:test's own opaque per-test
+        // ceiling, naming the job id and the last observed record instead of
+        // leaving a bare runner-level timeout.
         const statusBreadcrumbIntervalMs = 5000;
         let statusLastBreadcrumbAt = Date.now();
         let statusBody: RunResponseBody | undefined;
-        for (;;) {
-          server.send({
-            jsonrpc: "2.0",
-            id: 561,
-            method: "tools/call",
-            params: { name: "status", arguments: { job_id: jobId } },
-          });
-          const statusLine = await server.nextLine();
-          statusBody = statusLine.parsed as RunResponseBody;
-          const state = statusBody.result?.structuredContent?.state as string | undefined;
-          const killConfirmed = statusBody.result?.structuredContent?.kill_confirmed;
-          const isTerminal = state !== undefined && state !== "starting" && state !== "running";
-          if (isTerminal && killConfirmed !== undefined) break;
-          if (Date.now() - statusLastBreadcrumbAt >= statusBreadcrumbIntervalMs) {
-            console.error(
-              `still waiting for the job's own record to go terminal AND the eager reap's confirmation to land for job ${jobId}, last saw: ${JSON.stringify(statusBody?.result?.structuredContent)}`
-            );
-            statusLastBreadcrumbAt = Date.now();
+        const noContinuityWatchdog = armKillConfirmedWatchdog(jobId);
+        try {
+          for (;;) {
+            noContinuityWatchdog.throwIfTripped(statusBody?.result?.structuredContent ?? {});
+            server.send({
+              jsonrpc: "2.0",
+              id: 561,
+              method: "tools/call",
+              params: { name: "status", arguments: { job_id: jobId } },
+            });
+            const statusLine = await server.nextLine();
+            statusBody = statusLine.parsed as RunResponseBody;
+            const state = statusBody.result?.structuredContent?.state as string | undefined;
+            const killConfirmed = statusBody.result?.structuredContent?.kill_confirmed;
+            const isTerminal = state !== undefined && state !== "starting" && state !== "running";
+            if (isTerminal && killConfirmed !== undefined) break;
+            if (Date.now() - statusLastBreadcrumbAt >= statusBreadcrumbIntervalMs) {
+              console.error(
+                `still waiting for the job's own record to go terminal AND the eager reap's confirmation to land for job ${jobId}, last saw: ${JSON.stringify(statusBody?.result?.structuredContent)}`
+              );
+              statusLastBreadcrumbAt = Date.now();
+            }
+            await new Promise((resolve) => setTimeout(resolve, 25));
           }
-          await new Promise((resolve) => setTimeout(resolve, 25));
+        } finally {
+          noContinuityWatchdog.dispose();
         }
         assert.equal(
           statusBody?.result?.structuredContent?.state,
