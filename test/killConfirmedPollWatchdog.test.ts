@@ -30,7 +30,7 @@ test("armKillConfirmedWatchdog: throwIfTripped is a no-op before the bound elaps
   }
 });
 
-test("armKillConfirmedWatchdog: throwIfTripped throws KillConfirmedPollTimeoutError once the bound has genuinely elapsed - RED half of the pair, a poll that never settles now fails with a named diagnostic instead of hanging forever", async () => {
+test("armKillConfirmedWatchdog: throwIfTripped throws KillConfirmedPollTimeoutError once the bound has genuinely elapsed - a poll that never settles fails with a named diagnostic instead of hanging forever", async () => {
   const watchdog = armKillConfirmedWatchdog("job-never-settles", SHORT_BOUND_MS);
   try {
     // Real wall-clock wait, comfortably past SHORT_BOUND_MS - this is what
@@ -44,9 +44,8 @@ test("armKillConfirmedWatchdog: throwIfTripped throws KillConfirmedPollTimeoutEr
       state: "exited",
       exit_code: 0,
       identity_capture: "captured",
-      // kill_confirmed deliberately absent - this is the exact CI-observed
-      // shape: a job that ran to completion with kill_confirmed still
-      // undefined.
+      // kill_confirmed deliberately absent: a job that ran to completion
+      // with kill_confirmed still undefined.
     };
 
     assert.throws(
@@ -144,7 +143,7 @@ async function pollShapeUnderTest(
   }
 }
 
-test("the real poll-loop SHAPE (arm, check first, dispose in finally) settles normally against a fetcher that eventually returns kill_confirmed - GREEN half, a healthy settlement is completely unaffected by the watchdog", async () => {
+test("the real poll-loop SHAPE (arm, check first, dispose in finally) settles normally against a fetcher that eventually returns kill_confirmed - a healthy settlement is completely unaffected by the watchdog", async () => {
   let calls = 0;
   const result = await pollShapeUnderTest("job-shape-settles", SHORT_BOUND_MS * 10, async () => {
     calls += 1;
@@ -155,7 +154,7 @@ test("the real poll-loop SHAPE (arm, check first, dispose in finally) settles no
   assert.equal(calls, 3, "must have actually retried, never returned on the first unsettled read");
 });
 
-test("the real poll-loop SHAPE fails with KillConfirmedPollTimeoutError, never hangs, against a fetcher that never returns kill_confirmed - RED half, the exact CI-observed shape (state exited, exit_code 0, kill_confirmed permanently undefined) reproduced against the fixed poll loop", async () => {
+test("the real poll-loop SHAPE fails with KillConfirmedPollTimeoutError, never hangs, against a fetcher that never returns kill_confirmed - a job whose state is exited, exit_code 0, and kill_confirmed permanently undefined", async () => {
   const staleForever = {
     job_id: "job-shape-never-settles",
     state: "exited",
@@ -206,7 +205,7 @@ test("the real poll-loop SHAPE fails with KillConfirmedPollTimeoutError against 
   );
 });
 
-test("KillConfirmedPollTimeoutError: a circular diagnostic does not replace the named failure with an unrelated JSON error - RED half, a bare JSON.stringify would throw here instead", async () => {
+test("KillConfirmedPollTimeoutError: a circular diagnostic does not replace the named failure with an unrelated JSON error - a bare JSON.stringify would throw here instead", async () => {
   const watchdog = armKillConfirmedWatchdog("job-circular-diagnostic", SHORT_BOUND_MS);
   try {
     await new Promise((resolve) => setTimeout(resolve, SHORT_BOUND_MS * 3));
@@ -230,7 +229,7 @@ test("KillConfirmedPollTimeoutError: a circular diagnostic does not replace the 
   }
 });
 
-test("armKillConfirmedWatchdog: race() ends the caller's wrapper wait on a promise that never resolves at all - RED half, a bare per-iteration throwIfTripped() cannot reach this case since a hung await never returns control for the next check to run", async () => {
+test("armKillConfirmedWatchdog: race() ends the caller's wrapper wait on a promise that never resolves at all - a bare per-iteration throwIfTripped() cannot reach this case since a hung await never returns control for the next check to run", async () => {
   const watchdog = armKillConfirmedWatchdog("job-hung-await", SHORT_BOUND_MS);
   try {
     const neverResolves = new Promise<never>(() => {
@@ -262,7 +261,7 @@ test("armKillConfirmedWatchdog: race() ends the caller's wrapper wait on a promi
   }
 });
 
-test("armKillConfirmedWatchdog: race() resolves normally when the raced promise settles well before the bound - GREEN control, the mechanism above does not disturb a healthy call", async () => {
+test("armKillConfirmedWatchdog: race() resolves normally when the raced promise settles well before the bound - the watchdog does not disturb a healthy call", async () => {
   const watchdog = armKillConfirmedWatchdog("job-race-healthy", SHORT_BOUND_MS);
   try {
     const settlesFast = Promise.resolve({ state: "exited", kill_confirmed: true });
