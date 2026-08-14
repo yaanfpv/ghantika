@@ -4164,7 +4164,16 @@ test(
     let result: Awaited<ReturnType<typeof readPidStartTimesBatchPosix>>;
     try {
       process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
-      result = await readPidStartTimesBatchPosix([pid, 999_999]);
+      // A generous explicit timeoutMs, well past this repo's own
+      // PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS (2000ms) default. This
+      // test's actual subject is the malformed-row-discard behavior in
+      // parseLstartBatchOutput, not the observer's own timing - the fake
+      // `ps` here does nothing but echo two lines, so its real cost is the
+      // host's fork/exec scheduling latency, not any work of substance.
+      // A large fixed bound keeps the assertion tied to row-parsing
+      // correctness rather than to how fast the host happens to be,
+      // without touching the parsing assertions below at all.
+      result = await readPidStartTimesBatchPosix([pid, 999_999], 30_000);
     } finally {
       process.env.PATH = realPath;
     }
