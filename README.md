@@ -240,10 +240,15 @@ On Windows, that platform shell is resolved from this server's own `ComSpec` (fa
 
 On Claude Code specifically, there's a second wake path, independent of the Tasks-extension notification described in the "Early days" note above: the client itself can auto-background a long-running tool call and later deliver its result as a task notification that resumes an idle agent, with no extension declaration needed on ghantika's side at all.
 
-What this needs depends on the kind of session you're in:
+Set both, in Claude Code's own launch environment:
 
-- In an **interactive** session, setting `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` to a **positive** duration below the client's own MCP tool timeout is enough on its own - the threshold has to be strictly greater than zero as well as below the timeout.
-- In a **non-interactive** session, that setting alone does nothing: `CLAUDE_AUTO_BACKGROUND_TASKS` also has to be enabled, or the wake silently never fires. If you're not sure which kind of session you're in, set both together as one instruction - a session that doesn't need the second variable simply ignores it, while a session that does need it and doesn't have it is left believing it configured something that never took effect.
+- `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS`, a **positive** duration below the client's own MCP tool
+  timeout. The threshold has to be strictly greater than zero as well as below the timeout.
+- `CLAUDE_AUTO_BACKGROUND_TASKS`, enabled.
+
+Setting both is the configuration this has been observed working under. A session that does not
+need the second variable ignores it; one that does need it and lacks it is left believing it
+configured something that never took effect.
 
 Both variables belong in Claude Code's own launch environment, not ghantika's configuration. There's no install step that can set this for you: macOS starts a GUI client via `launchd`, which does not inherit a shell's environment, so a value exported from your shell profile never reaches it.
 
