@@ -280,14 +280,8 @@ async function spawnServerWithLiveTree(
 
 describe("shutdown: real job dispatch through the run tool (process-group reap, green/root-exits-first controls, identity-mismatch and aggregate-cap owners)", () => {
   // Each test below dispatches a real job through the real `run` tool -
-  // scoped here per this file's own top-of-file comment. All six are
-  // themselves win32-skipped (four by PGREP_ORACLE_SKIP, two individually),
-  // so the registration is conditioned on the same predicate - otherwise
-  // the hook would throw on unset policy on win32 with nothing left to
-  // guard.
-  if (process.platform !== "win32") {
-    before(requireSpawnPolicy);
-  }
+  // scoped here per this file's own top-of-file comment.
+  before(requireSpawnPolicy);
 
   test(
     "stdin EOF reaps a REAL live job's WHOLE process group - zero survivors confirmed by a real external pgrep",
@@ -364,6 +358,37 @@ describe("shutdown: real job dispatch through the run tool (process-group reap, 
       );
     }
   );
+
+  test("green control: a job that has already exited BEFORE shutdown is simply left alone - shutdown never errors or hangs on an already-terminal job", async (t) => {
+    const server = spawnServer();
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    });
+    await completeHandshake(server);
+    server.send({
+      jsonrpc: "2.0",
+      id: 701,
+      method: "tools/call",
+      params: { name: "run", arguments: { command: ["true"] } },
+    });
+    const runLine = await server.nextLine();
+    const runBody = runLine.parsed as RunResponseBody;
+    assert.notEqual(runBody.result?.isError, true);
+
+    // Give the (near-instant) `true` child a real moment to actually exit
+    // before shutdown ever runs, so this exercises the "nothing left to
+    // reap" path, not a race against a still-live job.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    server.child.kill("SIGTERM");
+    const { code, signal } = await server.waitForExit();
+    assert.equal(
+      code,
+      0,
+      "shutdown must still exit cleanly when there is nothing live left to reap"
+    );
+    assert.equal(signal, null);
+  });
 
   test(
     "root-exits-first, shutdown side: the eager reap already collects a job's real, live descendants automatically at leader-exit - well before shutdown ever runs - and shutdown still exits cleanly against that already-reaped, terminal record",
