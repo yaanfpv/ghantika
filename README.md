@@ -269,6 +269,8 @@ None of this is required for ghantika to work: `status`, `output`, and `tail` re
 
 Contributions are welcome. The design is deliberately small, so open an issue before starting anything large and we'll figure out whether it belongs here. A worked recipe for a job people genuinely sit around waiting on is one of the most useful things you can bring.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and how to run the tests, including a single test.
+
 ## License
 
 MIT. See [LICENSE](LICENSE). Built by [@YaanFPV](https://github.com/YaanFPV).
