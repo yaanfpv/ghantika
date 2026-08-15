@@ -267,7 +267,7 @@ Independent of both the Tasks-extension notification described in the "Early day
 
 Set, in the ghantika server's own environment (not a client's):
 
-- `GHANTIKA_WAKE_TRANSPORT_ENABLED=1`. Unset by default, so this ships inert.
+- `GHANTIKA_WAKE_TRANSPORT_ENABLED=1`. Unset by default, so this ships inert. This is an experimental opt-in, not a stable configuration surface this project commits to keeping: its name, shape, or existence can change in a future release without the usual deprecation notice.
 
 When a `run` request's own metadata carries a non-empty raw thread ID and that job later reaches a terminal state, ghantika attempts a wake over an ordered pair of transports - the app-server protocol Codex's own tooling uses first, then the desktop app's IPC socket - addressed to whatever that ID names. A refused, unavailable, or thrown attempt on one transport falls through to the next rather than stopping there; only once every configured transport has been tried and none delivered does the final, exhausted outcome get logged. An attempt is not the same as a delivery, and the ID's presence doesn't by itself prove it names the job's own originating thread - only what this codebase's own wake-target design assigns to it.
 
