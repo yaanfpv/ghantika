@@ -14,15 +14,17 @@ import { parsesAsPgid, waitForFile } from "./harness.ts";
 import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 
 // Only the "orphan-proof teardown" section far below - the real
-// process-group-reap tests, the green/root-exits-first controls, and the
-// identity-mismatch/aggregate-cap owners - spawns a real job through the
-// real `run` tool (via a real spawned server subprocess or a real
-// in-memory transport) - see test/helpers/requireSpawnPolicy.ts for what
-// this checks and why. The three plain-signal tests right below
-// (SIGTERM/SIGINT/stdin EOF reaching the cleanup path) and the mutation
-// control just after them only spawn a bare process and signal it
-// directly - they never dispatch `run`, so a file-level before() would
-// fail them too under an unset policy variable. That section owns its own
+// process-group-reap tests, the green/root-exits-first controls, the
+// terminal-state-poll proof, and the identity-mismatch/aggregate-cap
+// owners - spawns a real job through the real `run` tool (via a real
+// spawned server subprocess or a real in-memory transport) - see
+// test/helpers/requireSpawnPolicy.ts for what this checks and why. The
+// three plain-signal tests right below (SIGTERM/SIGINT/stdin EOF reaching
+// the cleanup path), the mutation control just after them, and the guard
+// proof just after that (an unrecognized JSON-RPC method, which never
+// reaches `tools/call` dispatch at all) only spawn a bare process/server
+// and never dispatch `run` - a file-level before() would fail them too
+// under an unset policy variable. That section owns its own
 // before(requireSpawnPolicy) inside a describe() block instead.
 
 // Real client, real IN-PROCESS transport, real server - only the one test
@@ -147,6 +149,46 @@ test("mutation control: without any handler, SIGTERM tears a process down via th
     "a process with no SIGTERM handler is torn down BY the signal, not exited with a code"
   );
   assert.notEqual(code, 0);
+});
+
+// --- guard proof: a real protocol error carries a defined `error` and no
+// `result` at all - the exact shape the green control test far below now
+// checks for on every `run` call before trusting its response, so a
+// regression that dropped that check back to a bare `isError` read (which
+// a protocol error also happens to satisfy, since `undefined` is
+// `!= true`) would not be caught by anything else in this file. ---
+
+test("guard proof: an unrecognized JSON-RPC method never reaches run() at all - a defined protocol error, no result, no job ever created", async (t) => {
+  const server = spawnServer();
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
+  await completeHandshake(server);
+  // Same params a real `run` call would send - only the top-level
+  // JSON-RPC method itself is wrong, so this never reaches `tools/call`
+  // dispatch (and therefore never reaches run()'s own policy gate, or
+  // creates a job) at all: the SDK's base Protocol class replies
+  // MethodNotFound for any method with no registered handler, before
+  // params are ever inspected - see src/server.ts's own "Error-class
+  // behavior" docs.
+  server.send({
+    jsonrpc: "2.0",
+    id: 160,
+    method: "tools/call-negative-control",
+    params: { name: "run", arguments: { command: ["true"] } },
+  });
+  const line = await server.nextLine();
+  const body = line.parsed as { error?: unknown; result?: unknown };
+  assert.notEqual(
+    body.error,
+    undefined,
+    "an unrecognized JSON-RPC method must produce a real, defined protocol error"
+  );
+  assert.equal(
+    body.result,
+    undefined,
+    "run() was never dispatched for this request - there is no result, no structuredContent, and no job_id at all"
+  );
 });
 
 // =============================================================================
@@ -278,6 +320,83 @@ async function spawnServerWithLiveTree(
   return { server, pgid };
 }
 
+/**
+ * The three terminal `state` values a job record is ever assigned once its
+ * lifecycle ends (`JobState` in src/jobStore.ts - "starting" and "running"
+ * are the only non-terminal values). `status`'s own handler
+ * (src/tools/status.ts) reports this straight from the store on every
+ * call, never a cached snapshot.
+ */
+const TERMINAL_JOB_STATES: ReadonlySet<string> = new Set(["exited", "killed", "failed"]);
+
+/**
+ * One raw `status` round trip over this file's own send()/nextLine() wire -
+ * never the MCP `Client` wrapper other suites (e.g.
+ * test/wake-integration.test.ts) use. Returns just the reported `state`,
+ * for a caller that wants a single real snapshot rather than a poll to
+ * terminal (see `pollStatusUntilTerminal` below, built on this).
+ */
+async function getJobState(
+  server: SpawnedServer,
+  jobId: string,
+  id: number
+): Promise<string | undefined> {
+  server.send({
+    jsonrpc: "2.0",
+    id,
+    method: "tools/call",
+    params: { name: "status", arguments: { job_id: jobId } },
+  });
+  const line = await server.nextLine();
+  const body = line.parsed as RunResponseBody;
+  assert.equal(
+    body.error,
+    undefined,
+    `status() must not itself protocol-error while polling: ${JSON.stringify(body)}`
+  );
+  return body.result?.structuredContent?.state as string | undefined;
+}
+
+/**
+ * Polls the real `status` tool - via `getJobState` above - until the given
+ * job's reported `state` is one of the three values a job record is ever
+ * assigned once terminal (`TERMINAL_JOB_STATES`), or `maxWaitMs` has
+ * elapsed with none reached. Returns the terminal state string.
+ *
+ * A real poll against the job's actual reported state, never a fixed
+ * sleep: this is what lets a caller prove a job genuinely REACHED a
+ * terminal state before proceeding, rather than merely having waited
+ * "probably long enough" for one near-instant command on a shared,
+ * possibly-loaded host.
+ *
+ * `startId` seeds the JSON-RPC id for each poll's own `status` call - each
+ * poll sends and fully awaits its own response before the next is ever
+ * sent, so nothing here depends on these ids being globally unique; the
+ * parameter exists only so a caller's own literal ids for its other
+ * requests in the same test stay visually distinct from a poll's.
+ */
+async function pollStatusUntilTerminal(
+  server: SpawnedServer,
+  jobId: string,
+  startId: number,
+  maxWaitMs = 5000,
+  intervalMs = 20
+): Promise<string> {
+  const deadline = Date.now() + maxWaitMs;
+  let attempt = 0;
+  for (;;) {
+    const state = await getJobState(server, jobId, startId + attempt);
+    if (state !== undefined && TERMINAL_JOB_STATES.has(state)) return state;
+    if (Date.now() > deadline) {
+      throw new Error(
+        `job ${jobId} never reached a terminal state within ${maxWaitMs}ms (last observed state: ${JSON.stringify(state)})`
+      );
+    }
+    attempt += 1;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
 describe("shutdown: real job dispatch through the run tool (process-group reap, green/root-exits-first controls, identity-mismatch and aggregate-cap owners)", () => {
   // Each test below dispatches a real job through the real `run` tool -
   // scoped here per this file's own top-of-file comment.
@@ -373,12 +492,27 @@ describe("shutdown: real job dispatch through the run tool (process-group reap, 
     });
     const runLine = await server.nextLine();
     const runBody = runLine.parsed as RunResponseBody;
-    assert.notEqual(runBody.result?.isError, true);
+    assert.equal(runBody.error, undefined);
+    assert.notEqual(
+      runBody.result?.isError,
+      true,
+      `run() must succeed: ${JSON.stringify(runBody)}`
+    );
+    const jobId = runBody.result?.structuredContent?.job_id as string;
+    assert.equal(typeof jobId, "string");
+    assert.ok(jobId, `expected a real, truthy job id, got: ${JSON.stringify(jobId)}`);
 
-    // Give the (near-instant) `true` child a real moment to actually exit
-    // before shutdown ever runs, so this exercises the "nothing left to
-    // reap" path, not a race against a still-live job.
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // Wait for the job to genuinely REACH a terminal state, never a fixed
+    // delay this codebase has no way to confirm was long enough - see
+    // pollStatusUntilTerminal's own docs. This is what makes the test
+    // actually exercise the "nothing left to reap" path, rather than
+    // racing a still-live job against an arbitrary sleep.
+    const terminalState = await pollStatusUntilTerminal(server, jobId, 705);
+    assert.equal(
+      terminalState,
+      "exited",
+      `expected the \`true\` job to have exited cleanly, got state: ${terminalState}`
+    );
 
     server.child.kill("SIGTERM");
     const { code, signal } = await server.waitForExit();
@@ -388,6 +522,56 @@ describe("shutdown: real job dispatch through the run tool (process-group reap, 
       "shutdown must still exit cleanly when there is nothing live left to reap"
     );
     assert.equal(signal, null);
+  });
+
+  test("the terminal-state poll above genuinely reads real job state: not yet terminal immediately after a still-running job starts, terminal once it actually finishes", async (t) => {
+    const server = spawnServer();
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    });
+    await completeHandshake(server);
+    server.send({
+      jsonrpc: "2.0",
+      id: 740,
+      method: "tools/call",
+      params: { name: "run", arguments: { command: ["sleep", "1"] } },
+    });
+    const runLine = await server.nextLine();
+    const runBody = runLine.parsed as RunResponseBody;
+    assert.equal(runBody.error, undefined);
+    assert.notEqual(
+      runBody.result?.isError,
+      true,
+      `run() must succeed: ${JSON.stringify(runBody)}`
+    );
+    const jobId = runBody.result?.structuredContent?.job_id as string;
+    assert.equal(typeof jobId, "string");
+
+    // Immediately after the run() response - well before a real 1-second
+    // sleep can plausibly have finished - a real status() read must
+    // report a genuinely non-terminal state. If a poll to terminal
+    // simply returned right away regardless of what the job actually
+    // reported, this direct check alone would already fail: that is
+    // exactly what proves pollStatusUntilTerminal is reading real state,
+    // not sleeping blindly.
+    const immediateState = await getJobState(server, jobId, 741);
+    assert.notEqual(
+      immediateState,
+      undefined,
+      "expected a real state field back from status() for a job that was just created"
+    );
+    assert.equal(
+      TERMINAL_JOB_STATES.has(immediateState as string),
+      false,
+      `expected a non-terminal state immediately after starting a 1s job, got: ${JSON.stringify(immediateState)}`
+    );
+
+    const terminalState = await pollStatusUntilTerminal(server, jobId, 750);
+    assert.equal(
+      terminalState,
+      "exited",
+      `expected the sleep job to eventually exit cleanly, got state: ${terminalState}`
+    );
   });
 
   test(
