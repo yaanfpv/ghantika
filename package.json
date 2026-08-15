@@ -37,7 +37,7 @@
     "test": "npm run build && node scripts/run-tests.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "coverage": "npm run build && c8 --reporter=text --reporter=json-summary node scripts/run-tests.mjs",
+    "coverage": "npm run build && node scripts/coverage-lock-worker-wrapper.mjs -- c8 --reporter=text --reporter=json-summary node scripts/run-tests.mjs",
     "guard:npm-ci": "node scripts/check-npm-ci-usage.mjs",
     "guard:sdk-pin": "node scripts/check-sdk-exact-pin.mjs",
     "guard:module-boundaries": "node scripts/check-module-boundaries.mjs",
@@ -52,7 +52,7 @@
     "verify:install-repro": "node scripts/verify-install-reproducibility.mjs",
     "verify:workflow-topology": "node scripts/verify-workflow-topology.mjs",
     "lint:workflow-jobs": "node scripts/lint-workflow-jobs.mjs",
-    "check:coverage-floor": "node scripts/check-coverage-floor.mjs",
+    "check:coverage-floor": "node scripts/coverage-lock-floor-wrapper.mjs -- node scripts/check-coverage-floor.mjs",
     "report:coverage-delta": "node scripts/report-coverage-delta.mjs"
   },
   "dependencies": {
