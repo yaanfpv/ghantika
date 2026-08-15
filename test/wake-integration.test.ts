@@ -55,7 +55,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { mock, test } from "node:test";
+import { before, mock, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { Client } from "@modelcontextprotocol/client";
@@ -89,6 +89,11 @@ import {
   canonicalizePlainPollResponse,
   toCanonicalResultPair,
 } from "./helpers/plainPollCanonicalization.ts";
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// Every test in this file mints a real job through the real `run` tool -
+// see test/helpers/requireSpawnPolicy.ts for what this checks and why.
+before(requireSpawnPolicy);
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const GOLDEN_PATH = path.join(REPO_ROOT, "test", "fixtures", "plain-poll-golden.json");
@@ -1548,8 +1553,8 @@ test(
     // explicit server.child.kill("SIGTERM") below - a real live "sleep 60"
     // backing job is spawned well before that signal, so a thrown setup
     // assertion here would otherwise leave both the server AND that live
-    // process group behind. See test/modern-handshake.test.ts's
-    // the guaranteed-cleanup fix in test/modern-handshake.test.ts for the
+    // process group behind. See the guaranteed-cleanup fix in
+    // test/modern-handshake.test.ts for the
     // full rationale.
     t.after(() => {
       if (!server.child.killed) server.child.kill("SIGKILL");

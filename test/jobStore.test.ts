@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { before, describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 // Real client, real in-process transport, real server - the end-to-end
@@ -42,6 +42,18 @@ import {
 import { isProcessAlive, spawnManaged } from "../dist/process.js";
 import { createServer } from "../dist/server.js";
 import * as runTool from "../dist/tools/run.js";
+
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// A handful of spots in this file call the real `run` tool - the OWNER 7
+// test below, and the jobStore-singleton-sharing regression section at the
+// end of the file. Only the sites whose assertion genuinely needs a
+// policy-allowed spawn to succeed register `before(requireSpawnPolicy)`,
+// each inside its own describe() block rather than at file scope: this
+// file has 88 tests, and most of them assert nothing about spawn outcome,
+// so a file-level hook would fail every other test under an unset policy
+// variable too - see test/helpers/requireSpawnPolicy.ts for what this
+// checks and why.
 
 // ---------------------------------------------------------------------------
 // JobStore: basic registration
@@ -1192,135 +1204,149 @@ test("resolveBirthIdentityForKill returns undefined for an untracked job id", as
   assert.equal(await store.resolveBirthIdentityForKill("nope"), undefined);
 });
 
-test(
-  "OWNER 7 - kill()'s real caller (resolveBirthIdentityForKill) settles a genuinely still-pending capture by the aggregate cap, never hanging past it",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
-  async () => {
-    // Real server, real SDK Client, real tools/call round trip for BOTH
-    // run() and kill() - not resolveBirthIdentityForKill called directly on
-    // a bare JobStore. The real kill() handler (src/tools/kill.ts:388) is
-    // what actually awaits resolveBirthIdentityForKill, then runs the real
-    // pre-signal identity gate, then dispatches the real signal - a direct
-    // call to resolveBirthIdentityForKill alone would skip all three and
-    // prove nothing about kill()'s own real behavior.
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    const instance = createServer(serverTransport);
-    await instance.server.connect(instance.transport);
+// Its one covered test is itself win32-skipped (shadows ps on PATH,
+// POSIX-only), so the registration is conditioned on the same predicate -
+// otherwise the hook would throw on unset policy on win32 with nothing left
+// to guard.
+describe("OWNER 7: kill()'s real caller settles a pending capture (real run()/kill() round trip)", () => {
+  if (process.platform !== "win32") {
+    before(requireSpawnPolicy);
+  }
 
-    const client = new Client({ name: "ghantika-kill-aggregate-cap-test", version: "0.0.0" });
-    await client.connect(clientTransport);
+  test(
+    "OWNER 7 - kill()'s real caller (resolveBirthIdentityForKill) settles a genuinely still-pending capture by the aggregate cap, never hanging past it",
+    { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+    async () => {
+      // Real server, real SDK Client, real tools/call round trip for BOTH
+      // run() and kill() - not resolveBirthIdentityForKill called directly on
+      // a bare JobStore. The real kill() handler (src/tools/kill.ts:388) is
+      // what actually awaits resolveBirthIdentityForKill, then runs the real
+      // pre-signal identity gate, then dispatches the real signal - a direct
+      // call to resolveBirthIdentityForKill alone would skip all three and
+      // prove nothing about kill()'s own real behavior.
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const instance = createServer(serverTransport);
+      await instance.server.connect(instance.transport);
 
-    const realPath = process.env.PATH;
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-kill-aggregate-cap-ps-"));
-    const invocationMarker = path.join(dir, "invocations.txt");
-    const psPath = path.join(dir, "ps");
-    // First invocation: sleeps ~2.7 real seconds before reporting not-found
-    // - this is the REAL production call path (no injectable clock, unlike
-    // the isolated jobStore-level owner), so the aggregate cap's remaining-
-    // budget capping on the retry's own timeout only becomes numerically
-    // distinguishable from the uncapped nominal timeout once real wall-
-    // clock time has genuinely been consumed. Second invocation (the
-    // retry): a real, SIGTERM-resistant ps that sleeps far longer than
-    // either timeout - proving kill()'s own real caller
-    // (resolveBirthIdentityForKill) does not hang past the aggregate cap.
-    fs.writeFileSync(
-      psPath,
-      `#!/bin/sh\ntrap '' TERM\ncount=$(wc -l < '${invocationMarker}' 2>/dev/null || echo 0)\necho x >> '${invocationMarker}'\nif [ "$count" -eq 0 ]; then\n  sleep 2.0\n  exit 1\nfi\nsleep 10\necho '00:01'\n`
-    );
-    fs.chmodSync(psPath, 0o755);
+      const client = new Client({ name: "ghantika-kill-aggregate-cap-test", version: "0.0.0" });
+      await client.connect(clientTransport);
 
-    const realDegrade = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
-    const realDegradeMarker = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
-    let realPid: number | undefined;
-    try {
-      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
-      // Engages the Linux-only degrade hatch (src/process.ts's
-      // GHANTIKA_TEST_DEGRADE_PROC_READ) to the same not-found-then-hang
-      // shape as the fake ps script above, writing to the SAME
-      // invocationMarker so the assertion below reads one real external
-      // artifact regardless of which platform actually ran - captureBirthIdentityPosixAsync
-      // never shells out to ps on Linux, so the fake-ps-on-PATH lever above
-      // has zero effect there; on every other platform this hatch is simply
-      // never read, so setting it is inert.
-      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "not-found-then-hang";
-      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = invocationMarker;
-
-      // The real run() handler fires its own captureBirthIdentityPosixAsync
-      // call with the shipped defaults - our fake ps on PATH (or, on Linux,
-      // the degrade hatch above) is what forces that real, unmodified
-      // production call toward its own aggregate cap.
-      const runResult = (await client.callTool({
-        name: "run",
-        arguments: { command: ["sleep", "30"], label: "kill-aggregate-cap-check" },
-      })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
-      assert.notEqual(runResult.isError, true, `run() must succeed: ${JSON.stringify(runResult)}`);
-      const jobId = runResult.structuredContent?.job_id as string;
-      assert.equal(typeof jobId, "string");
-
-      const handle = jobStore.getChildHandle(jobId);
-      assert.notEqual(handle, undefined, "expected a real attached child for this job");
-      realPid = handle!.pid;
-
-      const before = Date.now();
-      // signal: "SIGKILL" sends exactly once with no grace-period
-      // escalation (src/tools/kill.ts), isolating the aggregate-cap wait
-      // itself from POSIX_KILL_GRACE_PERIOD_MS's separate 5s window.
-      const killResult = (await client.callTool({
-        name: "kill",
-        arguments: { job_id: jobId, signal: "SIGKILL" },
-      })) as { isError?: boolean };
-      const elapsedMs = Date.now() - before;
-      assert.notEqual(
-        killResult.isError,
-        true,
-        `kill() must succeed even via the degraded identity path: ${JSON.stringify(killResult)}`
+      const realPath = process.env.PATH;
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-kill-aggregate-cap-ps-"));
+      const invocationMarker = path.join(dir, "invocations.txt");
+      const psPath = path.join(dir, "ps");
+      // First invocation: sleeps ~2.7 real seconds before reporting not-found
+      // - this is the REAL production call path (no injectable clock, unlike
+      // the isolated jobStore-level owner), so the aggregate cap's remaining-
+      // budget capping on the retry's own timeout only becomes numerically
+      // distinguishable from the uncapped nominal timeout once real wall-
+      // clock time has genuinely been consumed. Second invocation (the
+      // retry): a real, SIGTERM-resistant ps that sleeps far longer than
+      // either timeout - proving kill()'s own real caller
+      // (resolveBirthIdentityForKill) does not hang past the aggregate cap.
+      fs.writeFileSync(
+        psPath,
+        `#!/bin/sh\ntrap '' TERM\ncount=$(wc -l < '${invocationMarker}' 2>/dev/null || echo 0)\necho x >> '${invocationMarker}'\nif [ "$count" -eq 0 ]; then\n  sleep 2.0\n  exit 1\nfi\nsleep 10\necho '00:01'\n`
       );
+      fs.chmodSync(psPath, 0o755);
 
-      // At least 2: the capture's own not-found-then-retry pair. This real
-      // end-to-end path may add more (kill's own pre-signal identity
-      // re-check also shells out to ps against the same shadowed PATH), so
-      // this only asserts the retry itself genuinely started - it does not
-      // pin the exact incidental total the way an isolated unit-level owner
-      // would.
-      const invocationCount = fs
-        .readFileSync(invocationMarker, "utf8")
-        .split("\n")
-        .filter((line) => line.trim().length > 0).length;
-      assert.ok(
-        invocationCount >= 2,
-        `expected the retry to genuinely start (at least 2 attempts observed) before the aggregate cap force-reaps it - saw ${invocationCount} invocations`
-      );
-      assert.ok(
-        elapsedMs < 4500,
-        `expected kill()'s own wait (aggregate-cap-bounded, ~3.25s from the real spawn) to settle well short of the resistant observer's own 10s sleep or the retry's uncapped nominal timeout (~6s) - took ${elapsedMs}ms`
-      );
-      // The proof that kill() actually reaped the job (not just that the
-      // call returned): a real, external isProcessAlive check, never our
-      // own internal bookkeeping.
-      assert.equal(
-        isProcessAlive(realPid),
-        false,
-        "kill()'s own real caller must have actually killed the job's real process via the degraded-but-honest path, not merely settled the capture and returned"
-      );
-      realPid = undefined;
-    } finally {
-      process.env.PATH = realPath;
-      if (realDegrade === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
-      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegrade;
-      if (realDegradeMarker === undefined)
-        delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
-      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = realDegradeMarker;
-      await client.close();
-      if (realPid !== undefined) {
-        try {
-          process.kill(-realPid, "SIGKILL");
-        } catch {
-          // already gone - nothing to do
+      const realDegrade = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      const realDegradeMarker = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
+      let realPid: number | undefined;
+      try {
+        process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+        // Engages the Linux-only degrade hatch (src/process.ts's
+        // GHANTIKA_TEST_DEGRADE_PROC_READ) to the same not-found-then-hang
+        // shape as the fake ps script above, writing to the SAME
+        // invocationMarker so the assertion below reads one real external
+        // artifact regardless of which platform actually ran - captureBirthIdentityPosixAsync
+        // never shells out to ps on Linux, so the fake-ps-on-PATH lever above
+        // has zero effect there; on every other platform this hatch is simply
+        // never read, so setting it is inert.
+        process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "not-found-then-hang";
+        process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = invocationMarker;
+
+        // The real run() handler fires its own captureBirthIdentityPosixAsync
+        // call with the shipped defaults - our fake ps on PATH (or, on Linux,
+        // the degrade hatch above) is what forces that real, unmodified
+        // production call toward its own aggregate cap.
+        const runResult = (await client.callTool({
+          name: "run",
+          arguments: { command: ["sleep", "30"], label: "kill-aggregate-cap-check" },
+        })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
+        assert.notEqual(
+          runResult.isError,
+          true,
+          `run() must succeed: ${JSON.stringify(runResult)}`
+        );
+        const jobId = runResult.structuredContent?.job_id as string;
+        assert.equal(typeof jobId, "string");
+
+        const handle = jobStore.getChildHandle(jobId);
+        assert.notEqual(handle, undefined, "expected a real attached child for this job");
+        realPid = handle!.pid;
+
+        const before = Date.now();
+        // signal: "SIGKILL" sends exactly once with no grace-period
+        // escalation (src/tools/kill.ts), isolating the aggregate-cap wait
+        // itself from POSIX_KILL_GRACE_PERIOD_MS's separate 5s window.
+        const killResult = (await client.callTool({
+          name: "kill",
+          arguments: { job_id: jobId, signal: "SIGKILL" },
+        })) as { isError?: boolean };
+        const elapsedMs = Date.now() - before;
+        assert.notEqual(
+          killResult.isError,
+          true,
+          `kill() must succeed even via the degraded identity path: ${JSON.stringify(killResult)}`
+        );
+
+        // At least 2: the capture's own not-found-then-retry pair. This real
+        // end-to-end path may add more (kill's own pre-signal identity
+        // re-check also shells out to ps against the same shadowed PATH), so
+        // this only asserts the retry itself genuinely started - it does not
+        // pin the exact incidental total the way an isolated unit-level owner
+        // would.
+        const invocationCount = fs
+          .readFileSync(invocationMarker, "utf8")
+          .split("\n")
+          .filter((line) => line.trim().length > 0).length;
+        assert.ok(
+          invocationCount >= 2,
+          `expected the retry to genuinely start (at least 2 attempts observed) before the aggregate cap force-reaps it - saw ${invocationCount} invocations`
+        );
+        assert.ok(
+          elapsedMs < 4500,
+          `expected kill()'s own wait (aggregate-cap-bounded, ~3.25s from the real spawn) to settle well short of the resistant observer's own 10s sleep or the retry's uncapped nominal timeout (~6s) - took ${elapsedMs}ms`
+        );
+        // The proof that kill() actually reaped the job (not just that the
+        // call returned): a real, external isProcessAlive check, never our
+        // own internal bookkeeping.
+        assert.equal(
+          isProcessAlive(realPid),
+          false,
+          "kill()'s own real caller must have actually killed the job's real process via the degraded-but-honest path, not merely settled the capture and returned"
+        );
+        realPid = undefined;
+      } finally {
+        process.env.PATH = realPath;
+        if (realDegrade === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+        else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegrade;
+        if (realDegradeMarker === undefined)
+          delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
+        else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = realDegradeMarker;
+        await client.close();
+        if (realPid !== undefined) {
+          try {
+            process.kill(-realPid, "SIGKILL");
+          } catch {
+            // already gone - nothing to do
+          }
         }
       }
     }
-  }
-);
+  );
+});
 
 // ---------------------------------------------------------------------------
 // JobStore: output buffering integration (per-job, per-stream)
@@ -2183,22 +2209,6 @@ test("a buffer that never exceeds either cap is never marked truncated, and drop
   assert.equal(snapshot.droppedCount, 0);
 });
 
-// ---------------------------------------------------------------------------
-// jobStore-singleton-sharing regression
-// ---------------------------------------------------------------------------
-//
-// Prior coverage above this section only ever unit-tested a STANDALONE
-// `new JobStore()` - never proved that `src/tools/run.ts` (and every
-// other handler that touches job state) actually reads/writes through the
-// SAME `jobStore` singleton this file can import directly. jobStore.ts's
-// header comment already documents the real design (a module-level
-// singleton export, not a `server.ts`-constructed instance threaded
-// through the registry - see its own docs above the `JobStore` class) -
-// what these tests add is a real regression that goes red if that design
-// were ever violated (e.g. a future refactor that accidentally gives
-// `run.ts` its own `new JobStore()`, or duplicates the module via a
-// build/packaging mistake).
-
 test("jobStore reached via a second import of the same module specifier is the exact same singleton instance (referential identity)", async () => {
   // Two different consumption points for the SAME singleton: this file's
   // own top-level static import (above), and a fresh dynamic `import()`
@@ -2216,6 +2226,28 @@ test("jobStore reached via a second import of the same module specifier is the e
     "a second import of the same jobStore.js specifier must resolve to the identical singleton instance"
   );
 });
+
+// ---------------------------------------------------------------------------
+// jobStore-singleton-sharing regression
+// ---------------------------------------------------------------------------
+//
+// Prior coverage above this section only ever unit-tested a STANDALONE
+// `new JobStore()` - never proved that `src/tools/run.ts` (and every
+// other handler that touches job state) actually reads/writes through the
+// SAME `jobStore` singleton this file can import directly. jobStore.ts's
+// header comment already documents the real design (a module-level
+// singleton export, not a `server.ts`-constructed instance threaded
+// through the registry - see its own docs above the `JobStore` class) -
+// what these tests add is a real regression that goes red if that design
+// were ever violated (e.g. a future refactor that accidentally gives
+// `run.ts` its own `new JobStore()`, or duplicates the module via a
+// build/packaging mistake).
+//
+// The two tests immediately below need no spawn guard: run.ts's
+// createFailedJob() path (src/tools/run.ts's policy-denial branch) sets
+// argv/env/label identically to the admitted path, so a job's visibility
+// through the shared jobStore singleton, and those fields' exact values,
+// hold whether or not the spawn was policy-allowed.
 
 test("a job created through run.ts's OWN internal jobStore reference is visible via this file's directly-imported jobStore.get() - proving run.ts and this test share one store, not two compatible-looking ones", () => {
   // run.ts never re-exports jobStore (by design - see its own header:
@@ -2292,111 +2324,123 @@ test("end-to-end: a real `run` tools/call driven through a real Client/Server ro
   await instance.shutdown("test cleanup");
 });
 
-/** A real `pgrep -g <pgid>` call - see test/kill.test.ts's identical helper for the full rationale. Returns the real pids found, `[]` when pgrep finds none. */
-function pgrepGroupMembers(pgid: number): number[] {
-  try {
-    const output = execFileSync("pgrep", ["-g", String(pgid)], { encoding: "utf8" });
-    return output
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0)
-      .map(Number);
-  } catch (error) {
-    const err = error as NodeJS.ErrnoException & { status?: number };
-    if (err.status === 1) return []; // pgrep's own "nothing matched" exit code - a real, expected zero-survivors result
-    throw error;
+// This test genuinely needs a real spawn: it dereferences
+// jobStore.getChildHandle() and asserts a real attached child pid, which a
+// policy-denied job never has. Its one covered test is itself win32-skipped
+// (exercises a real POSIX pgrep oracle, no win32 equivalent), so the
+// registration is conditioned on the same predicate - otherwise the hook
+// would throw on unset policy on win32 with nothing left to guard.
+describe("jobStore-singleton-sharing regression: shutdown reap needs a real spawn (real run()/tools-call round trip)", () => {
+  if (process.platform !== "win32") {
+    before(requireSpawnPolicy);
   }
-}
 
-test(
-  "REGRESSION: shutdown reaping a job whose process group already exited naturally emits NO false kill error even when the signal-send deterministically reports EPERM, and a real external pgrep independently confirms zero survivors",
-  {
-    skip:
-      process.platform === "win32"
-        ? "exercises a real POSIX pgrep oracle, no win32 equivalent path here"
-        : false,
-  },
-  async (t) => {
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    const instance = createServer(serverTransport);
-    await instance.server.connect(instance.transport);
-
-    const client = new Client({ name: "ghantika-eperm-race-regression-test", version: "0.0.0" });
-    await client.connect(clientTransport);
-
-    const callResult = (await client.callTool({
-      name: "run",
-      arguments: { command: ["true"], label: "eperm-race-regression-check" },
-    })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
-    assert.notEqual(callResult.isError, true);
-    const jobId = callResult.structuredContent?.job_id as string | undefined;
-    assert.equal(typeof jobId, "string");
-
-    const record = jobStore.get(jobId!);
-    assert.notEqual(record, undefined);
-    const childHandle = jobStore.getChildHandle(jobId!);
-    assert.notEqual(childHandle, undefined, "expected a real attached child pid for this job");
-    const pgid = childHandle!.pid;
-
-    // `true` exits almost immediately, but the OS fully reclaiming it from
-    // the process table (as opposed to a transient zombie entry) is a
-    // separate, real async step - observed empirically to take measurably
-    // longer on Linux CI than on macOS. Waits out that real gap here so
-    // the injected EPERM below lands against a group already confirmed
-    // gone by the SAME external oracle (`pgrep`) the production
-    // arbitration itself consults, rather than a fixed guess at timing.
-    const deadline = Date.now() + 2000;
-    while (pgrepGroupMembers(pgid).length > 0 && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
+  /** A real `pgrep -g <pgid>` call - see test/kill.test.ts's identical helper for the full rationale. Returns the real pids found, `[]` when pgrep finds none. */
+  function pgrepGroupMembers(pgid: number): number[] {
+    try {
+      const output = execFileSync("pgrep", ["-g", String(pgid)], { encoding: "utf8" });
+      return output
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+        .map(Number);
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException & { status?: number };
+      if (err.status === 1) return []; // pgrep's own "nothing matched" exit code - a real, expected zero-survivors result
+      throw error;
     }
-
-    // Deterministically injects the EXACT race this regression guards,
-    // rather than relying on it happening to occur naturally: `["true"]`
-    // reliably exits before shutdown's per-job reap runs, so the group is
-    // already gone by construction, but the injected EPERM (instead of the
-    // ESRCH the old code already handled) is what actually distinguishes
-    // this test from one the prior, buggy code could also have passed.
-    // Everything else - the real MCP round trip, the real shutdown path,
-    // the real external pgrep survivor proof - stays fully end-to-end and
-    // unmocked.
-    const realKill = process.kill.bind(process);
-    t.mock.method(process, "kill", (target: number, signal?: string | number) => {
-      if (target === -pgid && signal === "SIGTERM") {
-        const err = new Error("kill EPERM") as NodeJS.ErrnoException;
-        err.code = "EPERM";
-        throw err;
-      }
-      return realKill(target, signal);
-    });
-
-    // Spies on the real console.error (calls through by default - `t.mock`
-    // records without replacing behavior) rather than silencing it: this
-    // test proves the FIX at the real, unmocked, end-to-end shutdown
-    // layer, with only the signal-send's reported errno controlled.
-    const errorSpy = t.mock.method(console, "error");
-
-    await client.close();
-    await instance.shutdown("test cleanup");
-
-    const falseErrorCalls = errorSpy.mock.calls.filter((call) =>
-      String(call.arguments[0]).includes(`error killing job ${jobId}'s process group`)
-    );
-    assert.deepEqual(
-      falseErrorCalls,
-      [],
-      `expected NO false kill-error diagnostic for a job whose group already exited naturally, even under an injected EPERM, got: ${JSON.stringify(
-        falseErrorCalls.map((c) => c.arguments.map(String))
-      )}`
-    );
-
-    // Independent, external-of-this-codebase's-own-bookkeeping proof the
-    // group really is gone - never trusting that the absence of a printed
-    // error means the same thing as an actually-reaped group.
-    const survivors = pgrepGroupMembers(pgid);
-    assert.deepEqual(
-      survivors,
-      [],
-      `expected zero real process-group survivors after shutdown, pgrep still saw: ${JSON.stringify(survivors)}`
-    );
   }
-);
+
+  test(
+    "REGRESSION: shutdown reaping a job whose process group already exited naturally emits NO false kill error even when the signal-send deterministically reports EPERM, and a real external pgrep independently confirms zero survivors",
+    {
+      skip:
+        process.platform === "win32"
+          ? "exercises a real POSIX pgrep oracle, no win32 equivalent path here"
+          : false,
+    },
+    async (t) => {
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const instance = createServer(serverTransport);
+      await instance.server.connect(instance.transport);
+
+      const client = new Client({ name: "ghantika-eperm-race-regression-test", version: "0.0.0" });
+      await client.connect(clientTransport);
+
+      const callResult = (await client.callTool({
+        name: "run",
+        arguments: { command: ["true"], label: "eperm-race-regression-check" },
+      })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
+      assert.notEqual(callResult.isError, true);
+      const jobId = callResult.structuredContent?.job_id as string | undefined;
+      assert.equal(typeof jobId, "string");
+
+      const record = jobStore.get(jobId!);
+      assert.notEqual(record, undefined);
+      const childHandle = jobStore.getChildHandle(jobId!);
+      assert.notEqual(childHandle, undefined, "expected a real attached child pid for this job");
+      const pgid = childHandle!.pid;
+
+      // `true` exits almost immediately, but the OS fully reclaiming it from
+      // the process table (as opposed to a transient zombie entry) is a
+      // separate, real async step - observed empirically to take measurably
+      // longer on Linux CI than on macOS. Waits out that real gap here so
+      // the injected EPERM below lands against a group already confirmed
+      // gone by the SAME external oracle (`pgrep`) the production
+      // arbitration itself consults, rather than a fixed guess at timing.
+      const deadline = Date.now() + 2000;
+      while (pgrepGroupMembers(pgid).length > 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+
+      // Deterministically injects the EXACT race this regression guards,
+      // rather than relying on it happening to occur naturally: `["true"]`
+      // reliably exits before shutdown's per-job reap runs, so the group is
+      // already gone by construction, but the injected EPERM (instead of the
+      // ESRCH the old code already handled) is what actually distinguishes
+      // this test from one the prior, buggy code could also have passed.
+      // Everything else - the real MCP round trip, the real shutdown path,
+      // the real external pgrep survivor proof - stays fully end-to-end and
+      // unmocked.
+      const realKill = process.kill.bind(process);
+      t.mock.method(process, "kill", (target: number, signal?: string | number) => {
+        if (target === -pgid && signal === "SIGTERM") {
+          const err = new Error("kill EPERM") as NodeJS.ErrnoException;
+          err.code = "EPERM";
+          throw err;
+        }
+        return realKill(target, signal);
+      });
+
+      // Spies on the real console.error (calls through by default - `t.mock`
+      // records without replacing behavior) rather than silencing it: this
+      // test proves the FIX at the real, unmocked, end-to-end shutdown
+      // layer, with only the signal-send's reported errno controlled.
+      const errorSpy = t.mock.method(console, "error");
+
+      await client.close();
+      await instance.shutdown("test cleanup");
+
+      const falseErrorCalls = errorSpy.mock.calls.filter((call) =>
+        String(call.arguments[0]).includes(`error killing job ${jobId}'s process group`)
+      );
+      assert.deepEqual(
+        falseErrorCalls,
+        [],
+        `expected NO false kill-error diagnostic for a job whose group already exited naturally, even under an injected EPERM, got: ${JSON.stringify(
+          falseErrorCalls.map((c) => c.arguments.map(String))
+        )}`
+      );
+
+      // Independent, external-of-this-codebase's-own-bookkeeping proof the
+      // group really is gone - never trusting that the absence of a printed
+      // error means the same thing as an actually-reaped group.
+      const survivors = pgrepGroupMembers(pgid);
+      assert.deepEqual(
+        survivors,
+        [],
+        `expected zero real process-group survivors after shutdown, pgrep still saw: ${JSON.stringify(survivors)}`
+      );
+    }
+  );
+});
