@@ -1730,63 +1730,86 @@ test(
       { detached: true, stdio: ["ignore", "pipe", "ignore"] }
     );
     const supervisorPid = supervisor.pid;
-    assert.ok(typeof supervisorPid === "number", "setup check: supervisor must have a real pid");
-    supervisor.on("error", (err) => {
-      throw new Error(`setup check: supervisor failed to spawn: ${err.message}`);
-    });
+    try {
+      assert.ok(typeof supervisorPid === "number", "setup check: supervisor must have a real pid");
+      supervisor.on("error", (err) => {
+        throw new Error(`setup check: supervisor failed to spawn: ${err.message}`);
+      });
 
-    let stdoutBuffer = "";
-    const grandchildPid = await new Promise<number>((resolve, reject) => {
-      const timeoutHandle = setTimeout(
-        () => reject(new Error("setup check: supervisor never reported its grandchild's pid")),
-        5000
+      let stdoutBuffer = "";
+      const grandchildPid = await new Promise<number>((resolve, reject) => {
+        const timeoutHandle = setTimeout(
+          () => reject(new Error("setup check: supervisor never reported its grandchild's pid")),
+          5000
+        );
+        const onData = (chunk: Buffer) => {
+          stdoutBuffer += chunk.toString("utf8");
+          const newlineIndex = stdoutBuffer.indexOf("\n");
+          if (newlineIndex === -1) return;
+          supervisor.stdout?.off("data", onData);
+          clearTimeout(timeoutHandle);
+          try {
+            const parsed = JSON.parse(stdoutBuffer.slice(0, newlineIndex)) as {
+              grandchildPid: number;
+            };
+            resolve(parsed.grandchildPid);
+          } catch (err) {
+            reject(err);
+          }
+        };
+        supervisor.stdout?.on("data", onData);
+      });
+
+      // BASELINE: signal only the supervisor's own pid - exactly what
+      // spawnSync's `timeout` option does internally (`child.kill(killSignal)`,
+      // never the group) - and confirm the grandchild survives, reproducing
+      // the orphan nodejs/node#43704 documents.
+      process.kill(supervisorPid, "SIGTERM");
+      await waitForPgrepGroupMembers(
+        supervisorPid,
+        (members) => !members.includes(supervisorPid),
+        3000
       );
-      const onData = (chunk: Buffer) => {
-        stdoutBuffer += chunk.toString("utf8");
-        const newlineIndex = stdoutBuffer.indexOf("\n");
-        if (newlineIndex === -1) return;
-        supervisor.stdout?.off("data", onData);
-        clearTimeout(timeoutHandle);
-        try {
-          const parsed = JSON.parse(stdoutBuffer.slice(0, newlineIndex)) as {
-            grandchildPid: number;
-          };
-          resolve(parsed.grandchildPid);
-        } catch (err) {
-          reject(err);
+      const survivorsAfterDirectKill = pgrepGroupMembers(supervisorPid);
+      assert.ok(
+        survivorsAfterDirectKill.includes(grandchildPid),
+        `setup check: the grandchild (pid ${grandchildPid}) must survive a signal sent only to the supervisor - if it does not, this environment does not reproduce the orphan this test exists to close, and the assertion below would prove nothing. Survivors observed: ${JSON.stringify(survivorsAfterDirectKill)}`
+      );
+
+      // Reap: spawns detached and signals the whole group.
+      reapSupervisorProcessGroup(supervisorPid);
+      const survivorsAfterReap = await waitForPgrepGroupMembers(
+        supervisorPid,
+        (members) => members.length === 0,
+        3000
+      );
+      assert.deepEqual(
+        survivorsAfterReap,
+        [],
+        `reapSupervisorProcessGroup must reap every remaining member of the group, including the grandchild a direct signal to the supervisor alone could not reach; still alive: ${JSON.stringify(survivorsAfterReap)}`
+      );
+    } finally {
+      // Guaranteed cleanup, on every path: reapSupervisorProcessGroup is
+      // idempotent (it catches ESRCH/EPERM internally and never throws), so
+      // a thrown setup check or assertion above - before the try body's own
+      // reap ever ran - can never leave the supervisor or its grandchild
+      // running. Deliberately never throws or asserts here: a throw inside
+      // `finally` would replace whatever real assertion failure sent
+      // execution here in the first place, masking it.
+      if (typeof supervisorPid === "number") {
+        reapSupervisorProcessGroup(supervisorPid);
+        const stillAlive = await waitForPgrepGroupMembers(
+          supervisorPid,
+          (members) => members.length === 0,
+          3000
+        );
+        if (stillAlive.length > 0) {
+          console.error(
+            `reapSupervisorProcessGroup test cleanup: pgid ${supervisorPid} still has member(s) after the guaranteed finally-block reap: ${JSON.stringify(stillAlive)}`
+          );
         }
-      };
-      supervisor.stdout?.on("data", onData);
-    });
-
-    // BASELINE: signal only the supervisor's own pid - exactly what
-    // spawnSync's `timeout` option does internally (`child.kill(killSignal)`,
-    // never the group) - and confirm the grandchild survives, reproducing
-    // the orphan nodejs/node#43704 documents.
-    process.kill(supervisorPid, "SIGTERM");
-    await waitForPgrepGroupMembers(
-      supervisorPid,
-      (members) => !members.includes(supervisorPid),
-      3000
-    );
-    const survivorsAfterDirectKill = pgrepGroupMembers(supervisorPid);
-    assert.ok(
-      survivorsAfterDirectKill.includes(grandchildPid),
-      `setup check: the grandchild (pid ${grandchildPid}) must survive a signal sent only to the supervisor - if it does not, this environment does not reproduce the orphan this test exists to close, and the assertion below would prove nothing. Survivors observed: ${JSON.stringify(survivorsAfterDirectKill)}`
-    );
-
-    // Reap: spawns detached and signals the whole group.
-    reapSupervisorProcessGroup(supervisorPid);
-    const survivorsAfterReap = await waitForPgrepGroupMembers(
-      supervisorPid,
-      (members) => members.length === 0,
-      3000
-    );
-    assert.deepEqual(
-      survivorsAfterReap,
-      [],
-      `reapSupervisorProcessGroup must reap every remaining member of the group, including the grandchild a direct signal to the supervisor alone could not reach; still alive: ${JSON.stringify(survivorsAfterReap)}`
-    );
+      }
+    }
   }
 );
 

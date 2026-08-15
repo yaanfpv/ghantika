@@ -103,8 +103,31 @@ async function main() {
   // would let a deliberately-hung fixture scenario write a real truncation
   // marker that a later, genuinely complete top-level `npm run coverage`
   // run, sharing the same process tree during one full test run, would
-  // then read it and wrongly refuse to certify.
-  const truncationMarkerPath = path.join(testDir, ".truncation-marker.json");
+  // then read it and wrongly refuse to certify. The FALLBACK location gets
+  // the identical treatment, and for the identical reason: leaving it at
+  // the shared default would let a fixture scenario whose PRIMARY marker
+  // write happens to fail (a caller pointing this harness at a fixture
+  // whose own marker subdirectory is unwritable would trigger exactly
+  // that) fall through to writing the real repo's own REPO_ROOT-level
+  // fallback marker instead - poisoning the exact same later real run this
+  // primary-path redirect already protects. The primary marker lives in
+  // its OWN subdirectory of testDir, deliberately distinct from the
+  // fallback's - the same "different directory than the one that can
+  // plausibly go unwritable" shape TRUNCATION_MARKER_FALLBACK_PATH's own
+  // production doc comment describes, and the shape a caller needs to lock
+  // down only the primary marker's directory while leaving the fallback's
+  // writable.
+  const truncationMarkerPath = path.join(testDir, ".truncation-marker-dir", "run-truncated.json");
+  const truncationMarkerFallbackPath = path.join(testDir, ".truncation-marker-fallback.json");
+
+  // Same isolation reasoning as the two truncation-marker paths above,
+  // applied to the completion marker scripts/run-tests.mjs writes on a
+  // genuinely COMPLETE run (see that module's own COMPLETION_MARKER_PATH
+  // doc comment): a fixture scenario driven through this harness that
+  // reaches normal completion - not every scenario forces a watchdog fire -
+  // must never write into the real repo's own coverage/run-completed.json
+  // as a side effect of testing something unrelated.
+  const completionMarkerPath = path.join(testDir, ".completion-marker.json");
 
   // tracked: null - see the module doc comment above for why this harness
   // never checks tracked-file parity against a fixture tree.
@@ -116,6 +139,8 @@ async function main() {
     skipBaseline,
     criticalTests,
     truncationMarkerPath,
+    truncationMarkerFallbackPath,
+    completionMarkerPath,
   });
 }
 

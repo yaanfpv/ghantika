@@ -25,6 +25,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { isMainModule } from "./lib/is-main.mjs";
+import { readGitHeadSha } from "./check-sha-parity.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
@@ -84,15 +85,18 @@ export function loadCoverageSummary(filePath = COVERAGE_SUMMARY_PATH) {
  * writeTruncationMarkerSync tries the primary path first and only ever
  * falls back to the second when the primary write itself failed, so
  * checking both here is what actually closes that failure mode: a caller
- * that read only the primary path would read "absent" for exactly the run
- * QA's own negative control reproduces (the primary marker directory made
- * unwritable), and report the truncated run's partial coverage numbers as
- * an ordinary verdict. Absence of BOTH is the common case, and read as "the
- * run completed" - never as an error: that is the expected state after
- * every ordinary, complete run (run-tests.mjs's own main() clears both
- * locations unconditionally at the START of every invocation, so a stale
- * marker from a PRIOR truncated run - at either path - can never survive
- * into reading a fresh, complete one's summary).
+ * that read only the primary path would read "absent" for exactly the
+ * scenario where the primary marker directory cannot be written to (e.g.
+ * read-only permissions), and report the truncated run's partial coverage
+ * numbers as an ordinary verdict. Absence of BOTH is the common case, and
+ * read as "the run completed" - never as an error: that is the expected
+ * state after every ordinary, complete run (run-tests.mjs's own main()
+ * clears both locations unconditionally at the START of every invocation,
+ * so a stale marker from a PRIOR truncated run - at either path - can never
+ * survive into reading a fresh, complete one's summary). Absence of BOTH is
+ * also what a run whose OWN write of both markers failed looks like -
+ * loadCompletionMarker below, and main()'s own use of it, is what closes
+ * that remaining gap.
  *
  * @param {string} [filePath]
  * @param {string} [fallbackPath]
@@ -109,6 +113,35 @@ export function loadTruncationMarker(
   }
   try {
     return JSON.parse(readFileSync(fallbackPath, "utf8"));
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+// Same override pattern as the two constants above, read from the same
+// location scripts/run-tests.mjs's own COMPLETION_MARKER_PATH writes to -
+// see that constant's own doc comment for the fail-open this closes and
+// loadCompletionMarker's own doc comment below for how it is used here.
+export const COMPLETION_MARKER_PATH =
+  process.env.GHANTIKA_COMPLETION_MARKER_PATH ??
+  path.join(REPO_ROOT, "coverage", "run-completed.json");
+
+/**
+ * Reads the completion marker scripts/run-tests.mjs writes immediately
+ * before a genuinely complete run sets its own exit code - see that
+ * constant's own doc comment. Returns null (not a throw) when the file is
+ * genuinely absent, mirroring loadTruncationMarker's own ENOENT handling
+ * above: a run that never reached its own completion point looks exactly
+ * like one whose completion-marker write itself failed, and main()'s own
+ * use of this treats both the same way.
+ *
+ * @param {string} [filePath]
+ * @returns {{ headSha: string, at: string } | null}
+ */
+export function loadCompletionMarker(filePath = COMPLETION_MARKER_PATH) {
+  try {
+    return JSON.parse(readFileSync(filePath, "utf8"));
   } catch (err) {
     if (err.code === "ENOENT") return null;
     throw err;
@@ -176,6 +209,52 @@ function main() {
         `location could not be written to). Fix whatever made the run hang (see the run's own console ` +
         `output / :error: diagnostics for which file never completed) and re-run "npm run coverage" to ` +
         `produce a trustworthy summary.`
+    );
+    process.exitCode = VOID_EXIT_CODE;
+    return;
+  }
+
+  // The other half of the same signal the truncation-marker check above
+  // reads: proof a run actually reached its own completion point, bound to
+  // the exact commit it ran against - see COMPLETION_MARKER_PATH's own doc
+  // comment for the fail-open this closes (if BOTH of
+  // writeTruncationMarkerSync's own writes fail on a genuinely truncated
+  // run, the check above finds nothing and falls through to here). A
+  // distinct reason from "idle-watchdog"/"wall-cap" - "no-completion-record"
+  // - so a reader (and a test) can tell the two VOID causes apart.
+  //
+  // KNOWN, DISCLOSED RESIDUAL LIMIT: this SHA-binding defends against a
+  // completion marker left over from a DIFFERENT commit. It does not, and
+  // cannot, defend against the narrower three-way conjunction where (1) a
+  // previous run at THIS SAME commit already completed successfully and
+  // left a valid completion marker, (2) this run is truncated, and (3)
+  // both of this run's own truncation-marker writes also fail. The
+  // truncation-marker check above runs FIRST, so if either of those two
+  // writes had succeeded, that alone would VOID regardless of whatever
+  // completion marker is sitting underneath it - this gap is reachable
+  // only when truncation-marker persistence has ALSO failed. A
+  // per-invocation run id supplied by the CI/gate manifest to both this
+  // script and run-tests.mjs would close it, at the cost of coupling this
+  // mechanism's own lockstep-parity obligation to .github/workflows/ and
+  // that manifest for a narrow, already-disclosed gap; the SHA-binding
+  // here closes the originally-reported fail-open (an absent truncation
+  // marker read as an ordinary complete run) on its own, and is the
+  // accepted trade for now. See test/check-coverage-floor.test.js's own
+  // "KNOWN LIMIT" test, which proves and documents this exact scenario
+  // rather than leaving it unproven.
+  const completion = loadCompletionMarker();
+  const currentHeadSha = readGitHeadSha();
+  if (!completion || completion.headSha !== currentHeadSha) {
+    console.error(
+      `coverage floor check: REFUSED - no valid completion record for the current checkout ` +
+        `(head ${currentHeadSha}). Either the run never reached its own completion point (it may ` +
+        `have been truncated and both the truncation-marker writes also failed), or the completion ` +
+        `record on disk belongs to a different commit.`
+    );
+    console.error(
+      `  this is VOID, not a pass and not a fail [no-completion-record] - see ` +
+        `${path.relative(REPO_ROOT, COMPLETION_MARKER_PATH)}. Re-run "npm run coverage" to produce a ` +
+        `trustworthy, current completion record.`
     );
     process.exitCode = VOID_EXIT_CODE;
     return;
