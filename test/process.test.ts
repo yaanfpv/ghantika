@@ -39,6 +39,7 @@ import {
   killProcessTreeWindows,
   parseEtime,
   parseLinuxStatStartTimeTicks,
+  parseLstartBatchOutput,
   parsePidLstartRow,
   readLinuxStartTimeTicksAsync,
   readPidStartTimesBatchPosix,
@@ -4135,6 +4136,30 @@ test(
   }
 );
 
+// --- parseLstartBatchOutput: the pure row-parsing-and-discard logic,
+// isolated from the spawn/observe/timeout machinery entirely ---
+
+test("parseLstartBatchOutput: a mix of one well-formed row and one malformed row keeps the well-formed one - a malformed row is discarded, never poisoning the others (PURE - no spawn, no real ps, no PATH manipulation, no timeout at all; this is what actually makes the assertion timing-independent, not the widened-timeout integration test below)", () => {
+  const pid = 12345;
+  // The exact literal row-text shapes the integration test below feeds a
+  // real fake `ps` - reused verbatim here so both tests exercise the same
+  // input shape, just through different doors. The malformed row is
+  // missing its year token (five tokens instead of six), the same defect
+  // `parsePidLstartRow`'s own dedicated test above already names.
+  const stdout = "12345 Sat Jul 25 13:39:12 2026\n999999 Sat Jul 25 13:39:12\n";
+  const rows = parseLstartBatchOutput(stdout);
+  assert.equal(rows.length, 1, "expected only the well-formed row to survive");
+  assert.equal(rows[0]!.pid, pid);
+  assert.equal(rows[0]!.startTimeMs, Date.UTC(2026, 6, 25, 13, 39, 12));
+  assert.ok(
+    !rows.some((row) => row.pid === 999_999),
+    "the malformed row must never contribute an entry, under its own pid or any other"
+  );
+});
+
+// --- readPidStartTimesBatchPosix: the full spawn -> observe -> parse
+// pipeline, still a real timeout racing real host latency ---
+
 test(
   "readPidStartTimesBatchPosix: a mix of one well-formed row and one malformed row keeps the well-formed one - a malformed row is discarded, never poisoning the others",
   { skip: POSIX_PROCESS_GROUP_SKIP },
@@ -4164,24 +4189,37 @@ test(
     let result: Awaited<ReturnType<typeof readPidStartTimesBatchPosix>>;
     try {
       process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
-      // A generous explicit timeoutMs, well past this repo's own
-      // PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS (2000ms) default. This
-      // test's actual subject is the malformed-row-discard behavior in
-      // parseLstartBatchOutput, not the observer's own timing - the fake
-      // `ps` here does nothing but echo two lines, so its real cost is the
-      // host's fork/exec scheduling latency, not any work of substance.
-      // A large fixed bound keeps the assertion tied to row-parsing
-      // correctness rather than to how fast the host happens to be,
-      // without touching the parsing assertions below at all.
+      // A real, finite, generous 30_000ms observer timeout - unchanged. This
+      // test's own subject is the full spawn -> observe -> parse PIPELINE:
+      // that a real readPidStartTimesBatchPosix call correctly wires a
+      // malformed row through to being discarded, not just that the parser
+      // itself works in isolation. The fake `ps` here does nothing but echo
+      // two lines, so its real cost is the host's fork/exec scheduling
+      // latency, not any work of substance.
       //
-      // Four other call sites in this file share this test's exact shape -
-      // a real `readPidStartTimesBatchPosix` call with no explicit
-      // timeoutMs, riding the implicit PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS
-      // default instead: the single-pid read at :3966, the "reads MULTIPLE
-      // real pids in ONE batched call" test at :3982, the alive/already-gone
-      // mix at :4067, and the all-nonexistent-pids read at :4078. This
-      // change repairs only the test above; those four are named here
-      // rather than left implicit, and are not repaired by this change.
+      // This bound does NOT make the row-parsing assertion itself
+      // timing-independent - it is still a real execFile timeout racing
+      // real host latency, and a sufficiently slow host CAN in principle
+      // still resolve to `observer-failure` before parsing ever runs, just
+      // far less often than under the previous 2000ms default. This test
+      // was never rewritten to remove that dependence; it was only widened
+      // to make it rarer. What genuinely makes the parsing assertion
+      // timing-independent is the pure `parseLstartBatchOutput` test
+      // immediately above, which calls the row-parsing-and-discard logic
+      // directly on a hand-crafted string with zero spawn, zero real `ps`,
+      // and zero timeout of any kind. This integration test's real-pipeline
+      // behavior is layered ON TOP of that pure logic, not a substitute
+      // for proving it deterministically.
+      //
+      // Four other call sites in this file share this test's exact
+      // implicit-timeout shape - a real `readPidStartTimesBatchPosix` call
+      // with no explicit timeoutMs, riding the implicit
+      // PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS default instead: the
+      // single-pid read at :3967, the "reads MULTIPLE real pids in ONE
+      // batched call" test at :4016, the alive/already-gone mix at :4068,
+      // and the all-nonexistent-pids read at :4079. This change repairs
+      // only the test above; those four are named here rather than left
+      // implicit, and are not repaired by this change.
       result = await readPidStartTimesBatchPosix([pid, 999_999], 30_000);
     } finally {
       process.env.PATH = realPath;

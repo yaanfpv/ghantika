@@ -2525,7 +2525,7 @@ export function parsePidLstartRow(rawLine: string): RecordedGroupMember | undefi
   return { pid, startTimeMs };
 }
 
-function parseLstartBatchOutput(stdout: string): RecordedGroupMember[] {
+export function parseLstartBatchOutput(stdout: string): RecordedGroupMember[] {
   const rows: RecordedGroupMember[] = [];
   for (const line of stdout.split("\n")) {
     const trimmed = line.trim();
