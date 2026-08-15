@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { before, describe, test } from "node:test";
 import type { TestContext } from "node:test";
 
 // See test/e2e-server.test.ts's import comment for why this is ".ts", not ".js".
@@ -11,6 +11,21 @@ import { type SpawnedServer, completeHandshake, spawnServer } from "./helpers/sp
 // The shared marker-file poll and its pgid predicate - one implementation
 // for every suite that observes a job's real filesystem side effects.
 import { parsesAsPgid, waitForFile } from "./harness.ts";
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// Only the "orphan-proof teardown" section far below - the real
+// process-group-reap tests, the green/root-exits-first controls, the
+// terminal-state-poll proof, and the identity-mismatch/aggregate-cap
+// owners - spawns a real job through the real `run` tool (via a real
+// spawned server subprocess or a real in-memory transport) - see
+// test/helpers/requireSpawnPolicy.ts for what this checks and why. The
+// three plain-signal tests right below (SIGTERM/SIGINT/stdin EOF reaching
+// the cleanup path), the mutation control just after them, and the guard
+// proof just after that (an unrecognized JSON-RPC method, which never
+// reaches `tools/call` dispatch at all) only spawn a bare process/server
+// and never dispatch `run` - a file-level before() would fail them too
+// under an unset policy variable. That section owns its own
+// before(requireSpawnPolicy) inside a describe() block instead.
 
 // Real client, real IN-PROCESS transport, real server - only the one test
 // below (the identity-mismatch fail-closed proof) needs this, rather than a
@@ -134,6 +149,46 @@ test("mutation control: without any handler, SIGTERM tears a process down via th
     "a process with no SIGTERM handler is torn down BY the signal, not exited with a code"
   );
   assert.notEqual(code, 0);
+});
+
+// --- guard proof: a real protocol error carries a defined `error` and no
+// `result` at all - the exact shape the green control test far below now
+// checks for on every `run` call before trusting its response, so a
+// regression that dropped that check back to a bare `isError` read (which
+// a protocol error also happens to satisfy, since `undefined` is
+// `!= true`) would not be caught by anything else in this file. ---
+
+test("guard proof: an unrecognized JSON-RPC method never reaches run() at all - a defined protocol error, no result, no job ever created", async (t) => {
+  const server = spawnServer();
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
+  await completeHandshake(server);
+  // Same params a real `run` call would send - only the top-level
+  // JSON-RPC method itself is wrong, so this never reaches `tools/call`
+  // dispatch (and therefore never reaches run()'s own policy gate, or
+  // creates a job) at all: the SDK's base Protocol class replies
+  // MethodNotFound for any method with no registered handler, before
+  // params are ever inspected - see src/server.ts's own "Error-class
+  // behavior" docs.
+  server.send({
+    jsonrpc: "2.0",
+    id: 160,
+    method: "tools/call-negative-control",
+    params: { name: "run", arguments: { command: ["true"] } },
+  });
+  const line = await server.nextLine();
+  const body = line.parsed as { error?: unknown; result?: unknown };
+  assert.notEqual(
+    body.error,
+    undefined,
+    "an unrecognized JSON-RPC method must produce a real, defined protocol error"
+  );
+  assert.equal(
+    body.result,
+    undefined,
+    "run() was never dispatched for this request - there is no result, no structuredContent, and no job_id at all"
+  );
 });
 
 // =============================================================================
@@ -265,471 +320,623 @@ async function spawnServerWithLiveTree(
   return { server, pgid };
 }
 
-test(
-  "stdin EOF reaps a REAL live job's WHOLE process group - zero survivors confirmed by a real external pgrep",
-  { skip: PGREP_ORACLE_SKIP },
-  async (t) => {
-    const { server, pgid } = await spawnServerWithLiveTree(t);
+/**
+ * The three terminal `state` values a job record is ever assigned once its
+ * lifecycle ends (`JobState` in src/jobStore.ts - "starting" and "running"
+ * are the only non-terminal values). `status`'s own handler
+ * (src/tools/status.ts) reports this straight from the store on every
+ * call, never a cached snapshot.
+ */
+const TERMINAL_JOB_STATES: ReadonlySet<string> = new Set(["exited", "killed", "failed"]);
 
-    server.child.stdin.end(); // closes stdin -> the server observes EOF and runs its real shutdown path
-    const { code, signal } = await server.waitForExit();
-    assert.equal(code, 0, "the server's own shutdown handler must exit cleanly");
-    assert.equal(signal, null);
-
-    // THE proof: a REAL, independent `pgrep -g <pgid>` call AFTER shutdown -
-    // never trusting this codebase's own bookkeeping - must show ZERO
-    // survivors across the WHOLE process group (the shell AND both sleep
-    // descendants), not merely the one direct tracked child.
-    const afterMembers = await waitForPgrepGroupMembers(
-      pgid,
-      (members) => members.length === 0,
-      3000
-    );
-    assert.deepEqual(
-      afterMembers,
-      [],
-      `expected zero surviving process-group members after stdin-EOF shutdown, pgrep still saw: ${JSON.stringify(afterMembers)} (server stderr: ${server.stderrText()})`
-    );
-  }
-);
-
-test(
-  "SIGTERM reaps a REAL live job's WHOLE process group - zero survivors confirmed by a real external pgrep",
-  { skip: PGREP_ORACLE_SKIP },
-  async (t) => {
-    const { server, pgid } = await spawnServerWithLiveTree(t);
-
-    server.child.kill("SIGTERM");
-    const { code, signal } = await server.waitForExit();
-    assert.equal(code, 0, "the server's own SIGTERM shutdown handler must exit cleanly");
-    assert.equal(signal, null);
-
-    const afterMembers = await waitForPgrepGroupMembers(
-      pgid,
-      (members) => members.length === 0,
-      3000
-    );
-    assert.deepEqual(
-      afterMembers,
-      [],
-      `expected zero surviving process-group members after SIGTERM shutdown, pgrep still saw: ${JSON.stringify(afterMembers)} (server stderr: ${server.stderrText()})`
-    );
-  }
-);
-
-test(
-  "SIGINT reaps a REAL live job's WHOLE process group - zero survivors confirmed by a real external pgrep",
-  { skip: PGREP_ORACLE_SKIP },
-  async (t) => {
-    const { server, pgid } = await spawnServerWithLiveTree(t);
-
-    server.child.kill("SIGINT");
-    const { code, signal } = await server.waitForExit();
-    assert.equal(code, 0, "the server's own SIGINT shutdown handler must exit cleanly");
-    assert.equal(signal, null);
-
-    const afterMembers = await waitForPgrepGroupMembers(
-      pgid,
-      (members) => members.length === 0,
-      3000
-    );
-    assert.deepEqual(
-      afterMembers,
-      [],
-      `expected zero surviving process-group members after SIGINT shutdown, pgrep still saw: ${JSON.stringify(afterMembers)} (server stderr: ${server.stderrText()})`
-    );
-  }
-);
-
-test("green control: a job that has already exited BEFORE shutdown is simply left alone - shutdown never errors or hangs on an already-terminal job", async (t) => {
-  const server = spawnServer();
-  t.after(() => {
-    if (!server.child.killed) server.child.kill("SIGKILL");
-  });
-  await completeHandshake(server);
+/**
+ * One raw `status` round trip over this file's own send()/nextLine() wire -
+ * never the MCP `Client` wrapper other suites (e.g.
+ * test/wake-integration.test.ts) use. Returns just the reported `state`,
+ * for a caller that wants a single real snapshot rather than a poll to
+ * terminal (see `pollStatusUntilTerminal` below, built on this).
+ */
+async function getJobState(
+  server: SpawnedServer,
+  jobId: string,
+  id: number
+): Promise<string | undefined> {
   server.send({
     jsonrpc: "2.0",
-    id: 701,
+    id,
     method: "tools/call",
-    params: { name: "run", arguments: { command: ["true"] } },
+    params: { name: "status", arguments: { job_id: jobId } },
   });
-  const runLine = await server.nextLine();
-  const runBody = runLine.parsed as RunResponseBody;
-  assert.notEqual(runBody.result?.isError, true);
+  const line = await server.nextLine();
+  const body = line.parsed as RunResponseBody;
+  assert.equal(
+    body.error,
+    undefined,
+    `status() must not itself protocol-error while polling: ${JSON.stringify(body)}`
+  );
+  return body.result?.structuredContent?.state as string | undefined;
+}
 
-  // Give the (near-instant) `true` child a real moment to actually exit
-  // before shutdown ever runs, so this exercises the "nothing left to
-  // reap" path, not a race against a still-live job.
-  await new Promise((resolve) => setTimeout(resolve, 200));
+/**
+ * Polls the real `status` tool - via `getJobState` above - until the given
+ * job's reported `state` is one of the three values a job record is ever
+ * assigned once terminal (`TERMINAL_JOB_STATES`), or `maxWaitMs` has
+ * elapsed with none reached. Returns the terminal state string.
+ *
+ * A real poll against the job's actual reported state, never a fixed
+ * sleep: this is what lets a caller prove a job genuinely REACHED a
+ * terminal state before proceeding, rather than merely having waited
+ * "probably long enough" for one near-instant command on a shared,
+ * possibly-loaded host.
+ *
+ * `startId` seeds the JSON-RPC id for each poll's own `status` call - each
+ * poll sends and fully awaits its own response before the next is ever
+ * sent, so nothing here depends on these ids being globally unique; the
+ * parameter exists only so a caller's own literal ids for its other
+ * requests in the same test stay visually distinct from a poll's.
+ */
+async function pollStatusUntilTerminal(
+  server: SpawnedServer,
+  jobId: string,
+  startId: number,
+  maxWaitMs = 5000,
+  intervalMs = 20
+): Promise<string> {
+  const deadline = Date.now() + maxWaitMs;
+  let attempt = 0;
+  for (;;) {
+    const state = await getJobState(server, jobId, startId + attempt);
+    if (state !== undefined && TERMINAL_JOB_STATES.has(state)) return state;
+    if (Date.now() > deadline) {
+      throw new Error(
+        `job ${jobId} never reached a terminal state within ${maxWaitMs}ms (last observed state: ${JSON.stringify(state)})`
+      );
+    }
+    attempt += 1;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
 
-  server.child.kill("SIGTERM");
-  const { code, signal } = await server.waitForExit();
-  assert.equal(code, 0, "shutdown must still exit cleanly when there is nothing live left to reap");
-  assert.equal(signal, null);
-});
+describe("shutdown: real job dispatch through the run tool (process-group reap, green/root-exits-first controls, identity-mismatch and aggregate-cap owners)", () => {
+  // Each test below dispatches a real job through the real `run` tool -
+  // scoped here per this file's own top-of-file comment.
+  before(requireSpawnPolicy);
 
-test(
-  "root-exits-first, shutdown side: the eager reap already collects a job's real, live descendants automatically at leader-exit - well before shutdown ever runs - and shutdown still exits cleanly against that already-reaped, terminal record",
-  { skip: PGREP_ORACLE_SKIP },
-  async (t) => {
+  test(
+    "stdin EOF reaps a REAL live job's WHOLE process group - zero survivors confirmed by a real external pgrep",
+    { skip: PGREP_ORACLE_SKIP },
+    async (t) => {
+      const { server, pgid } = await spawnServerWithLiveTree(t);
+
+      server.child.stdin.end(); // closes stdin -> the server observes EOF and runs its real shutdown path
+      const { code, signal } = await server.waitForExit();
+      assert.equal(code, 0, "the server's own shutdown handler must exit cleanly");
+      assert.equal(signal, null);
+
+      // THE proof: a REAL, independent `pgrep -g <pgid>` call AFTER shutdown -
+      // never trusting this codebase's own bookkeeping - must show ZERO
+      // survivors across the WHOLE process group (the shell AND both sleep
+      // descendants), not merely the one direct tracked child.
+      const afterMembers = await waitForPgrepGroupMembers(
+        pgid,
+        (members) => members.length === 0,
+        3000
+      );
+      assert.deepEqual(
+        afterMembers,
+        [],
+        `expected zero surviving process-group members after stdin-EOF shutdown, pgrep still saw: ${JSON.stringify(afterMembers)} (server stderr: ${server.stderrText()})`
+      );
+    }
+  );
+
+  test(
+    "SIGTERM reaps a REAL live job's WHOLE process group - zero survivors confirmed by a real external pgrep",
+    { skip: PGREP_ORACLE_SKIP },
+    async (t) => {
+      const { server, pgid } = await spawnServerWithLiveTree(t);
+
+      server.child.kill("SIGTERM");
+      const { code, signal } = await server.waitForExit();
+      assert.equal(code, 0, "the server's own SIGTERM shutdown handler must exit cleanly");
+      assert.equal(signal, null);
+
+      const afterMembers = await waitForPgrepGroupMembers(
+        pgid,
+        (members) => members.length === 0,
+        3000
+      );
+      assert.deepEqual(
+        afterMembers,
+        [],
+        `expected zero surviving process-group members after SIGTERM shutdown, pgrep still saw: ${JSON.stringify(afterMembers)} (server stderr: ${server.stderrText()})`
+      );
+    }
+  );
+
+  test(
+    "SIGINT reaps a REAL live job's WHOLE process group - zero survivors confirmed by a real external pgrep",
+    { skip: PGREP_ORACLE_SKIP },
+    async (t) => {
+      const { server, pgid } = await spawnServerWithLiveTree(t);
+
+      server.child.kill("SIGINT");
+      const { code, signal } = await server.waitForExit();
+      assert.equal(code, 0, "the server's own SIGINT shutdown handler must exit cleanly");
+      assert.equal(signal, null);
+
+      const afterMembers = await waitForPgrepGroupMembers(
+        pgid,
+        (members) => members.length === 0,
+        3000
+      );
+      assert.deepEqual(
+        afterMembers,
+        [],
+        `expected zero surviving process-group members after SIGINT shutdown, pgrep still saw: ${JSON.stringify(afterMembers)} (server stderr: ${server.stderrText()})`
+      );
+    }
+  );
+
+  test("green control: a job that has already exited BEFORE shutdown is simply left alone - shutdown never errors or hangs on an already-terminal job", async (t) => {
     const server = spawnServer();
-    // Guaranteed cleanup for any path that never reaches this test's own
-    // explicit server.child.stdin.end() far below - this test's own setup
-    // (spawning the job, witnessing the two live descendants via a real
-    // pgrep, releasing the barrier) runs many assertions first. See the
-    // guaranteed-cleanup fix in test/modern-handshake.test.ts for the
-    // full rationale.
     t.after(() => {
       if (!server.child.killed) server.child.kill("SIGKILL");
     });
     await completeHandshake(server);
-
-    const dir = makeTempDir();
-    const marker = path.join(dir, "pgid.txt");
-    const child1Marker = path.join(dir, "child1-pid.txt");
-    const child2Marker = path.join(dir, "child2-pid.txt");
-    const releaseMarker = path.join(dir, "release.txt");
-    // The leader writes its own pid (== pgid), forks two real `sleep`
-    // descendants, busy-waits on a release marker the test controls, then
-    // reaches the end of its own script WITHOUT ever `wait`-ing on them -
-    // it exits naturally while the descendants stay alive, orphaned, in
-    // the SAME pgid (the opposite of `spawnServerWithLiveTree`'s own
-    // fixture above, which trails a `wait` to keep the leader alive). The
-    // leader captures each descendant's own real pid via `$!` itself, the
-    // instant it backgrounds it - still useful for knowing which pids to
-    // look for, but the liveness proof itself is witnessed by the TEST via
-    // a real external pgrep call while the leader is held, not trusted
-    // from the fixture (see test/kill.test.ts's own matching fixture docs
-    // for why a marker the fixture writes about itself cannot survive a
-    // mutation that fakes it, and why a bare pgrep count is not enough
-    // either - the busy-wait loop's own polling spawns a real, transient
-    // process of its own).
-    const shellCommand = `echo $$ > '${marker}'; sleep 60 & echo $! > '${child1Marker}'; sleep 60 & echo $! > '${child2Marker}'; while [ ! -f '${releaseMarker}' ]; do sleep 0.05; done`;
-
     server.send({
       jsonrpc: "2.0",
-      id: 720,
+      id: 701,
       method: "tools/call",
-      params: { name: "run", arguments: { command: shellCommand, shell: true } },
+      params: { name: "run", arguments: { command: ["true"] } },
     });
     const runLine = await server.nextLine();
     const runBody = runLine.parsed as RunResponseBody;
+    assert.equal(runBody.error, undefined);
     assert.notEqual(
       runBody.result?.isError,
       true,
       `run() must succeed: ${JSON.stringify(runBody)}`
     );
+    const jobId = runBody.result?.structuredContent?.job_id as string;
+    assert.equal(typeof jobId, "string");
+    assert.ok(jobId, `expected a real, truthy job id, got: ${JSON.stringify(jobId)}`);
 
-    const pgidText = await waitForFile(marker, { until: parsesAsPgid });
-    const pgid = Number(pgidText.trim());
-    assert.ok(Number.isInteger(pgid) && pgid > 0);
-
-    const child1PidText = await waitForFile(child1Marker, { until: parsesAsPgid });
-    const child1Pid = Number(child1PidText.trim());
-    const child2PidText = await waitForFile(child2Marker, { until: parsesAsPgid });
-    const child2Pid = Number(child2PidText.trim());
-    assert.notEqual(
-      child1Pid,
-      child2Pid,
-      "expected the two descendants to be genuinely distinct real processes"
+    // Wait for the job to genuinely REACH a terminal state, never a fixed
+    // delay this codebase has no way to confirm was long enough - see
+    // pollStatusUntilTerminal's own docs. This is what makes the test
+    // actually exercise the "nothing left to reap" path, rather than
+    // racing a still-live job against an arbitrary sleep.
+    const terminalState = await pollStatusUntilTerminal(server, jobId, 705);
+    assert.equal(
+      terminalState,
+      "exited",
+      `expected the \`true\` job to have exited cleanly, got state: ${terminalState}`
     );
 
-    // THE FIXTURE-VALIDITY PROOF, witnessed by the TEST: a real, external
-    // pgrep call while the leader is still held confirms BOTH specific
-    // witnessed pids are alive.
-    const beforeRelease = await waitForPgrepGroupMembers(
-      pgid,
-      (members) => members.includes(child1Pid) && members.includes(child2Pid),
-      3000
-    );
-    assert.ok(
-      beforeRelease.includes(child1Pid) && beforeRelease.includes(child2Pid),
-      `expected both witnessed descendant pids alive while the leader is held, pgrep saw: ${JSON.stringify(beforeRelease)}, expected to include ${child1Pid} and ${child2Pid}`
-    );
-
-    // Release the barrier: the leader exits naturally without ever
-    // `wait`-ing on the two descendants just witnessed alive above.
-    fs.writeFileSync(releaseMarker, "go\n");
-
-    // THE proof that actually changed: the eager reap already collects
-    // the just-witnessed descendants automatically at leader-exit - well
-    // BEFORE shutdown is ever triggered below, with no kill() call and no
-    // shutdown reap having run yet.
-    const beforeShutdown = await waitForPgrepGroupMembers(
-      pgid,
-      (members) => members.length === 0,
-      3000
-    );
-    assert.deepEqual(
-      beforeShutdown,
-      [],
-      `expected the eager reap to have already collected both descendants before shutdown ever ran, pgrep still saw: ${JSON.stringify(beforeShutdown)}`
-    );
-
-    server.child.stdin.end(); // trigger the real shutdown path
+    server.child.kill("SIGTERM");
     const { code, signal } = await server.waitForExit();
-    assert.equal(code, 0, "shutdown must exit cleanly against an already-reaped terminal record");
+    assert.equal(
+      code,
+      0,
+      "shutdown must still exit cleanly when there is nothing live left to reap"
+    );
     assert.equal(signal, null);
+  });
 
-    // THE independent proof: a REAL pgrep -g <pgid> call AFTER shutdown
-    // still shows ZERO survivors - shutdown's own reap path is a safe
-    // no-op here, not a second attempt that could re-signal a recycled id.
-    const afterMembers = await waitForPgrepGroupMembers(
-      pgid,
-      (members) => members.length === 0,
-      3000
-    );
-    assert.deepEqual(
-      afterMembers,
-      [],
-      `expected zero surviving orphaned descendants after shutdown, pgrep still saw: ${JSON.stringify(afterMembers)}`
-    );
-  }
-);
-
-test(
-  "shutdown: a PRE-SIGNAL identity mismatch refuses to signal at all during the shutdown reap too - the fail-closed gate applies at BOTH real callers - the real tracked process survives shutdown, never falsely reaped",
-  {
-    // Real POSIX identity check + real process-group cleanup - no Windows
-    // equivalent path here, matching every other identity-check test in
-    // this codebase. Windows has no identity check or process-group verification
-    // at all today - a test-harness gap this skip closes, not a product
-    // scope decision.
-    skip: process.platform === "win32" ? "POSIX-only identity check" : false,
-  },
-  async () => {
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    const instance = createServer(serverTransport);
-    await instance.server.connect(instance.transport);
-
-    const client = new Client({
-      name: "ghantika-shutdown-identity-mismatch-test",
-      version: "0.0.0",
+  test("the terminal-state poll above genuinely reads real job state: not yet terminal immediately after a still-running job starts, terminal once it actually finishes", async (t) => {
+    const server = spawnServer();
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
     });
-    await client.connect(clientTransport);
+    await completeHandshake(server);
+    server.send({
+      jsonrpc: "2.0",
+      id: 740,
+      method: "tools/call",
+      params: { name: "run", arguments: { command: ["sleep", "1"] } },
+    });
+    const runLine = await server.nextLine();
+    const runBody = runLine.parsed as RunResponseBody;
+    assert.equal(runBody.error, undefined);
+    assert.notEqual(
+      runBody.result?.isError,
+      true,
+      `run() must succeed: ${JSON.stringify(runBody)}`
+    );
+    const jobId = runBody.result?.structuredContent?.job_id as string;
+    assert.equal(typeof jobId, "string");
 
-    let realPid: number | undefined;
-    try {
-      const callResult = (await client.callTool({
-        name: "run",
-        arguments: { command: ["sleep", "30"], label: "shutdown-identity-mismatch-check" },
-      })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
-      assert.notEqual(
-        callResult.isError,
-        true,
-        `run() must succeed: ${JSON.stringify(callResult)}`
-      );
-      const jobId = callResult.structuredContent?.job_id as string;
-      assert.equal(typeof jobId, "string");
+    // Immediately after the run() response - well before a real 1-second
+    // sleep can plausibly have finished - a real status() read must
+    // report a genuinely non-terminal state. If a poll to terminal
+    // simply returned right away regardless of what the job actually
+    // reported, this direct check alone would already fail: that is
+    // exactly what proves pollStatusUntilTerminal is reading real state,
+    // not sleeping blindly.
+    const immediateState = await getJobState(server, jobId, 741);
+    assert.notEqual(
+      immediateState,
+      undefined,
+      "expected a real state field back from status() for a job that was just created"
+    );
+    assert.equal(
+      TERMINAL_JOB_STATES.has(immediateState as string),
+      false,
+      `expected a non-terminal state immediately after starting a 1s job, got: ${JSON.stringify(immediateState)}`
+    );
 
-      // Awaits the same real settlement `resolveBirthIdentityForKill`'s own
-      // production callers already await, rather than racing a fixed
-      // wall-clock delay against the async capture - see test/run.test.ts's
-      // waitForIdentityCaptureSettled for the full rationale.
-      await jobStore.resolveBirthIdentityForKill(jobId);
+    const terminalState = await pollStatusUntilTerminal(server, jobId, 750);
+    assert.equal(
+      terminalState,
+      "exited",
+      `expected the sleep job to eventually exit cleanly, got state: ${terminalState}`
+    );
+  });
 
-      const handle = jobStore.getChildHandle(jobId);
-      assert.notEqual(handle, undefined, "expected a real attached child for this job");
-      realPid = handle!.pid;
-      assert.notEqual(
-        handle!.birthIdentity,
-        undefined,
-        "expected a real captured birth identity - this job was created via the real run() handler, which captures one at spawn time"
-      );
-
-      // Directly overwrite the internal bookkeeping's captured birth
-      // identity to simulate the exact scenario a real pid-reuse would
-      // produce - see test/kill.test.ts's identical simulation for the
-      // OTHER real identity-check caller (the explicit kill() handler),
-      // and test/process.test.ts's own pure-function version of the same
-      // simulation, for the full rationale. There is no public API to
-      // override an already-attached child's recorded birth identity, so
-      // this reaches into JobStore's own private `children` map directly -
-      // the only way to test THIS caller's wiring (does server.ts's
-      // shutdown reaper actually consult and honor a mismatch), which the
-      // pure-function coverage in test/process.test.ts does not exercise
-      // on its own.
-      const internals = jobStore as unknown as {
-        children: Map<
-          string,
-          {
-            child: unknown;
-            pid: number;
-            spawnedAtMs: number;
-            birthIdentity: ProcessBirthIdentity | undefined;
-          }
-        >;
-      };
-      const tracked = internals.children.get(jobId)!;
-      assert.notEqual(tracked, undefined);
-      // Platform-specific corruption technique - see test/kill.test.ts's
-      // identical comment for the full rationale: the two
-      // ProcessBirthIdentity variants are compared completely differently
-      // (checkProcessIdentity's own docs), so there is no single mutation
-      // that produces a mismatch on both.
-      const corruptedIdentity: ProcessBirthIdentity =
-        tracked.birthIdentity!.platform === "linux-starttime-ticks"
-          ? {
-              platform: "linux-starttime-ticks",
-              startTimeTicks: `${tracked.birthIdentity!.startTimeTicks}0`,
-            }
-          : {
-              platform: "posix-elapsed",
-              capturedAtMs: tracked.birthIdentity!.capturedAtMs - 10 * 60 * 1000, // 10 minutes "ago" - impossible for a process that just started
-              elapsedSecondsAtCapture: tracked.birthIdentity!.elapsedSecondsAtCapture,
-            };
-      internals.children.set(jobId, {
-        ...tracked,
-        birthIdentity: corruptedIdentity,
+  test(
+    "root-exits-first, shutdown side: the eager reap already collects a job's real, live descendants automatically at leader-exit - well before shutdown ever runs - and shutdown still exits cleanly against that already-reaped, terminal record",
+    { skip: PGREP_ORACLE_SKIP },
+    async (t) => {
+      const server = spawnServer();
+      // Guaranteed cleanup for any path that never reaches this test's own
+      // explicit server.child.stdin.end() far below - this test's own setup
+      // (spawning the job, witnessing the two live descendants via a real
+      // pgrep, releasing the barrier) runs many assertions first. See the
+      // guaranteed-cleanup fix in test/modern-handshake.test.ts for the
+      // full rationale.
+      t.after(() => {
+        if (!server.child.killed) server.child.kill("SIGKILL");
       });
+      await completeHandshake(server);
 
-      await client.close();
-      await instance.shutdown("test cleanup - identity mismatch");
+      const dir = makeTempDir();
+      const marker = path.join(dir, "pgid.txt");
+      const child1Marker = path.join(dir, "child1-pid.txt");
+      const child2Marker = path.join(dir, "child2-pid.txt");
+      const releaseMarker = path.join(dir, "release.txt");
+      // The leader writes its own pid (== pgid), forks two real `sleep`
+      // descendants, busy-waits on a release marker the test controls, then
+      // reaches the end of its own script WITHOUT ever `wait`-ing on them -
+      // it exits naturally while the descendants stay alive, orphaned, in
+      // the SAME pgid (the opposite of `spawnServerWithLiveTree`'s own
+      // fixture above, which trails a `wait` to keep the leader alive). The
+      // leader captures each descendant's own real pid via `$!` itself, the
+      // instant it backgrounds it - still useful for knowing which pids to
+      // look for, but the liveness proof itself is witnessed by the TEST via
+      // a real external pgrep call while the leader is held, not trusted
+      // from the fixture (see test/kill.test.ts's own matching fixture docs
+      // for why a marker the fixture writes about itself cannot survive a
+      // mutation that fakes it, and why a bare pgrep count is not enough
+      // either - the busy-wait loop's own polling spawns a real, transient
+      // process of its own).
+      const shellCommand = `echo $$ > '${marker}'; sleep 60 & echo $! > '${child1Marker}'; sleep 60 & echo $! > '${child2Marker}'; while [ ! -f '${releaseMarker}' ]; do sleep 0.05; done`;
 
-      // THE proof: the shutdown reaper's identity check must have refused
-      // to signal a mismatched pid, so the real process is STILL ALIVE
-      // after "shutdown" - proven via a real, external,
-      // independent-of-this-codebase's-own-bookkeeping `ps`-based check
-      // (isProcessAlive), never our own internal state.
-      assert.equal(
-        isProcessAlive(realPid),
-        true,
-        "the real tracked process must have survived shutdown's identity-mismatch refusal"
-      );
-
-      // Real cleanup - the server's shutdown reaper never got the chance
-      // to reap this for real (that's the whole point of this test), so it
-      // does it directly now.
-      process.kill(-realPid, "SIGKILL");
-      realPid = undefined; // already reaped - the finally block below must not double-signal it
-    } finally {
-      // Belt-and-braces: if an assertion above threw before the explicit
-      // cleanup ran, still make sure nothing from this test leaks onto the
-      // shared host - process.kill on an already-dead group throws ESRCH,
-      // never left uncaught here.
-      if (realPid !== undefined) {
-        try {
-          process.kill(-realPid, "SIGKILL");
-        } catch {
-          // already gone - nothing to do
-        }
-      }
-    }
-  }
-);
-
-test(
-  "OWNER 8 - shutdown's real caller (resolveBirthIdentityForKill) settles a genuinely still-pending capture by the aggregate cap, never hanging past it",
-  { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
-  async () => {
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    const instance = createServer(serverTransport);
-    await instance.server.connect(instance.transport);
-
-    const client = new Client({
-      name: "ghantika-shutdown-aggregate-cap-test",
-      version: "0.0.0",
-    });
-    await client.connect(clientTransport);
-
-    const realPath = process.env.PATH;
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-shutdown-aggregate-cap-ps-"));
-    const invocationMarker = path.join(dir, "invocations.txt");
-    const psPath = path.join(dir, "ps");
-    // First invocation: fast not-found. Second invocation (the retry): a
-    // real, SIGTERM-resistant ps that sleeps far longer than the real
-    // aggregate cap `run()`'s own default-configured capture is given -
-    // proving shutdown's own real caller (resolveBirthIdentityForKill) does
-    // not hang past that cap, even though shutdown may have MANY jobs to
-    // reap.
-    fs.writeFileSync(
-      psPath,
-      `#!/bin/sh\ntrap '' TERM\ncount=$(wc -l < '${invocationMarker}' 2>/dev/null || echo 0)\necho x >> '${invocationMarker}'\nif [ "$count" -eq 0 ]; then\n  exit 1\nfi\nsleep 10\necho '00:01'\n`
-    );
-    fs.chmodSync(psPath, 0o755);
-
-    const realDegrade = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
-    const realDegradeMarker = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
-    let realPid: number | undefined;
-    try {
-      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
-      // Engages the Linux-only degrade hatch (src/process.ts's
-      // GHANTIKA_TEST_DEGRADE_PROC_READ) to the same not-found-then-hang
-      // shape as the fake ps script above, writing to the SAME
-      // invocationMarker so the assertion below reads one real external
-      // artifact regardless of which platform actually ran - see the
-      // sibling OWNER 7 test in test/jobStore.test.ts for the full
-      // rationale.
-      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "not-found-then-hang";
-      process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = invocationMarker;
-
-      // The real `run()` handler fires its own captureBirthIdentityPosixAsync
-      // call with the shipped defaults - our fake ps on PATH (or, on Linux,
-      // the degrade hatch above) is what forces that real, unmodified
-      // production call toward its own aggregate cap.
-      const callResult = (await client.callTool({
-        name: "run",
-        arguments: { command: ["sleep", "30"], label: "shutdown-aggregate-cap-check" },
-      })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
+      server.send({
+        jsonrpc: "2.0",
+        id: 720,
+        method: "tools/call",
+        params: { name: "run", arguments: { command: shellCommand, shell: true } },
+      });
+      const runLine = await server.nextLine();
+      const runBody = runLine.parsed as RunResponseBody;
       assert.notEqual(
-        callResult.isError,
+        runBody.result?.isError,
         true,
-        `run() must succeed: ${JSON.stringify(callResult)}`
+        `run() must succeed: ${JSON.stringify(runBody)}`
       );
-      const jobId = callResult.structuredContent?.job_id as string;
-      assert.equal(typeof jobId, "string");
 
-      const handle = jobStore.getChildHandle(jobId);
-      assert.notEqual(handle, undefined, "expected a real attached child for this job");
-      realPid = handle!.pid;
+      const pgidText = await waitForFile(marker, { until: parsesAsPgid });
+      const pgid = Number(pgidText.trim());
+      assert.ok(Number.isInteger(pgid) && pgid > 0);
 
-      await client.close();
-      const before = Date.now();
-      await instance.shutdown("test cleanup - aggregate cap");
-      const elapsedMs = Date.now() - before;
+      const child1PidText = await waitForFile(child1Marker, { until: parsesAsPgid });
+      const child1Pid = Number(child1PidText.trim());
+      const child2PidText = await waitForFile(child2Marker, { until: parsesAsPgid });
+      const child2Pid = Number(child2PidText.trim());
+      assert.notEqual(
+        child1Pid,
+        child2Pid,
+        "expected the two descendants to be genuinely distinct real processes"
+      );
 
-      // At least 2: the capture's own not-found-then-retry pair. This real
-      // end-to-end path may add more (shutdown's own pre-signal identity
-      // re-check also shells out to ps against the same shadowed PATH), so
-      // this only asserts the retry itself genuinely started - it does not
-      // pin the exact incidental total the way the isolated jobStore-level
-      // owner does.
-      const invocationCount = fs
-        .readFileSync(invocationMarker, "utf8")
-        .split("\n")
-        .filter((line) => line.trim().length > 0).length;
-      assert.ok(
-        invocationCount >= 2,
-        `expected the retry to genuinely start (at least 2 attempts observed) before the aggregate cap force-reaps it - saw ${invocationCount} invocations`
+      // THE FIXTURE-VALIDITY PROOF, witnessed by the TEST: a real, external
+      // pgrep call while the leader is still held confirms BOTH specific
+      // witnessed pids are alive.
+      const beforeRelease = await waitForPgrepGroupMembers(
+        pgid,
+        (members) => members.includes(child1Pid) && members.includes(child2Pid),
+        3000
       );
       assert.ok(
-        elapsedMs < 6000,
-        `expected shutdown's own reap (which awaits resolveBirthIdentityForKill) to settle well before the resistant observer's own 10s sleep - took ${elapsedMs}ms`
+        beforeRelease.includes(child1Pid) && beforeRelease.includes(child2Pid),
+        `expected both witnessed descendant pids alive while the leader is held, pgrep saw: ${JSON.stringify(beforeRelease)}, expected to include ${child1Pid} and ${child2Pid}`
       );
-      // The proof that "the job... reaped" (not just that shutdown
-      // returned): a real, external isProcessAlive check, never our own
-      // internal bookkeeping. A genuinely successful reap already killed
-      // this job as part of shutdown, so no explicit cleanup kill follows.
-      assert.equal(
-        isProcessAlive(realPid),
-        false,
-        "shutdown's own reap must have actually killed the job's real process, not merely settled the capture and moved on"
+
+      // Release the barrier: the leader exits naturally without ever
+      // `wait`-ing on the two descendants just witnessed alive above.
+      fs.writeFileSync(releaseMarker, "go\n");
+
+      // THE proof that actually changed: the eager reap already collects
+      // the just-witnessed descendants automatically at leader-exit - well
+      // BEFORE shutdown is ever triggered below, with no kill() call and no
+      // shutdown reap having run yet.
+      const beforeShutdown = await waitForPgrepGroupMembers(
+        pgid,
+        (members) => members.length === 0,
+        3000
       );
-      realPid = undefined;
-    } finally {
-      process.env.PATH = realPath;
-      if (realDegrade === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
-      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegrade;
-      if (realDegradeMarker === undefined)
-        delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
-      else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = realDegradeMarker;
-      if (realPid !== undefined) {
-        try {
-          process.kill(-realPid, "SIGKILL");
-        } catch {
-          // already gone - nothing to do
+      assert.deepEqual(
+        beforeShutdown,
+        [],
+        `expected the eager reap to have already collected both descendants before shutdown ever ran, pgrep still saw: ${JSON.stringify(beforeShutdown)}`
+      );
+
+      server.child.stdin.end(); // trigger the real shutdown path
+      const { code, signal } = await server.waitForExit();
+      assert.equal(code, 0, "shutdown must exit cleanly against an already-reaped terminal record");
+      assert.equal(signal, null);
+
+      // THE independent proof: a REAL pgrep -g <pgid> call AFTER shutdown
+      // still shows ZERO survivors - shutdown's own reap path is a safe
+      // no-op here, not a second attempt that could re-signal a recycled id.
+      const afterMembers = await waitForPgrepGroupMembers(
+        pgid,
+        (members) => members.length === 0,
+        3000
+      );
+      assert.deepEqual(
+        afterMembers,
+        [],
+        `expected zero surviving orphaned descendants after shutdown, pgrep still saw: ${JSON.stringify(afterMembers)}`
+      );
+    }
+  );
+
+  test(
+    "shutdown: a PRE-SIGNAL identity mismatch refuses to signal at all during the shutdown reap too - the fail-closed gate applies at BOTH real callers - the real tracked process survives shutdown, never falsely reaped",
+    {
+      // Real POSIX identity check + real process-group cleanup - no Windows
+      // equivalent path here, matching every other identity-check test in
+      // this codebase. Windows has no identity check or process-group verification
+      // at all today - a test-harness gap this skip closes, not a product
+      // scope decision.
+      skip: process.platform === "win32" ? "POSIX-only identity check" : false,
+    },
+    async () => {
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const instance = createServer(serverTransport);
+      await instance.server.connect(instance.transport);
+
+      const client = new Client({
+        name: "ghantika-shutdown-identity-mismatch-test",
+        version: "0.0.0",
+      });
+      await client.connect(clientTransport);
+
+      let realPid: number | undefined;
+      try {
+        const callResult = (await client.callTool({
+          name: "run",
+          arguments: { command: ["sleep", "30"], label: "shutdown-identity-mismatch-check" },
+        })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
+        assert.notEqual(
+          callResult.isError,
+          true,
+          `run() must succeed: ${JSON.stringify(callResult)}`
+        );
+        const jobId = callResult.structuredContent?.job_id as string;
+        assert.equal(typeof jobId, "string");
+
+        // Awaits the same real settlement `resolveBirthIdentityForKill`'s own
+        // production callers already await, rather than racing a fixed
+        // wall-clock delay against the async capture - see test/run.test.ts's
+        // waitForIdentityCaptureSettled for the full rationale.
+        await jobStore.resolveBirthIdentityForKill(jobId);
+
+        const handle = jobStore.getChildHandle(jobId);
+        assert.notEqual(handle, undefined, "expected a real attached child for this job");
+        realPid = handle!.pid;
+        assert.notEqual(
+          handle!.birthIdentity,
+          undefined,
+          "expected a real captured birth identity - this job was created via the real run() handler, which captures one at spawn time"
+        );
+
+        // Directly overwrite the internal bookkeeping's captured birth
+        // identity to simulate the exact scenario a real pid-reuse would
+        // produce - see test/kill.test.ts's identical simulation for the
+        // OTHER real identity-check caller (the explicit kill() handler),
+        // and test/process.test.ts's own pure-function version of the same
+        // simulation, for the full rationale. There is no public API to
+        // override an already-attached child's recorded birth identity, so
+        // this reaches into JobStore's own private `children` map directly -
+        // the only way to test THIS caller's wiring (does server.ts's
+        // shutdown reaper actually consult and honor a mismatch), which the
+        // pure-function coverage in test/process.test.ts does not exercise
+        // on its own.
+        const internals = jobStore as unknown as {
+          children: Map<
+            string,
+            {
+              child: unknown;
+              pid: number;
+              spawnedAtMs: number;
+              birthIdentity: ProcessBirthIdentity | undefined;
+            }
+          >;
+        };
+        const tracked = internals.children.get(jobId)!;
+        assert.notEqual(tracked, undefined);
+        // Platform-specific corruption technique - see test/kill.test.ts's
+        // identical comment for the full rationale: the two
+        // ProcessBirthIdentity variants are compared completely differently
+        // (checkProcessIdentity's own docs), so there is no single mutation
+        // that produces a mismatch on both.
+        const corruptedIdentity: ProcessBirthIdentity =
+          tracked.birthIdentity!.platform === "linux-starttime-ticks"
+            ? {
+                platform: "linux-starttime-ticks",
+                startTimeTicks: `${tracked.birthIdentity!.startTimeTicks}0`,
+              }
+            : {
+                platform: "posix-elapsed",
+                capturedAtMs: tracked.birthIdentity!.capturedAtMs - 10 * 60 * 1000, // 10 minutes "ago" - impossible for a process that just started
+                elapsedSecondsAtCapture: tracked.birthIdentity!.elapsedSecondsAtCapture,
+              };
+        internals.children.set(jobId, {
+          ...tracked,
+          birthIdentity: corruptedIdentity,
+        });
+
+        await client.close();
+        await instance.shutdown("test cleanup - identity mismatch");
+
+        // THE proof: the shutdown reaper's identity check must have refused
+        // to signal a mismatched pid, so the real process is STILL ALIVE
+        // after "shutdown" - proven via a real, external,
+        // independent-of-this-codebase's-own-bookkeeping `ps`-based check
+        // (isProcessAlive), never our own internal state.
+        assert.equal(
+          isProcessAlive(realPid),
+          true,
+          "the real tracked process must have survived shutdown's identity-mismatch refusal"
+        );
+
+        // Real cleanup - the server's shutdown reaper never got the chance
+        // to reap this for real (that's the whole point of this test), so it
+        // does it directly now.
+        process.kill(-realPid, "SIGKILL");
+        realPid = undefined; // already reaped - the finally block below must not double-signal it
+      } finally {
+        // Belt-and-braces: if an assertion above threw before the explicit
+        // cleanup ran, still make sure nothing from this test leaks onto the
+        // shared host - process.kill on an already-dead group throws ESRCH,
+        // never left uncaught here.
+        if (realPid !== undefined) {
+          try {
+            process.kill(-realPid, "SIGKILL");
+          } catch {
+            // already gone - nothing to do
+          }
         }
       }
     }
-  }
-);
+  );
+
+  test(
+    "OWNER 8 - shutdown's real caller (resolveBirthIdentityForKill) settles a genuinely still-pending capture by the aggregate cap, never hanging past it",
+    { skip: process.platform === "win32" ? "shadows ps on PATH, POSIX-only" : false },
+    async () => {
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      const instance = createServer(serverTransport);
+      await instance.server.connect(instance.transport);
+
+      const client = new Client({
+        name: "ghantika-shutdown-aggregate-cap-test",
+        version: "0.0.0",
+      });
+      await client.connect(clientTransport);
+
+      const realPath = process.env.PATH;
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-shutdown-aggregate-cap-ps-"));
+      const invocationMarker = path.join(dir, "invocations.txt");
+      const psPath = path.join(dir, "ps");
+      // First invocation: fast not-found. Second invocation (the retry): a
+      // real, SIGTERM-resistant ps that sleeps far longer than the real
+      // aggregate cap `run()`'s own default-configured capture is given -
+      // proving shutdown's own real caller (resolveBirthIdentityForKill) does
+      // not hang past that cap, even though shutdown may have MANY jobs to
+      // reap.
+      fs.writeFileSync(
+        psPath,
+        `#!/bin/sh\ntrap '' TERM\ncount=$(wc -l < '${invocationMarker}' 2>/dev/null || echo 0)\necho x >> '${invocationMarker}'\nif [ "$count" -eq 0 ]; then\n  exit 1\nfi\nsleep 10\necho '00:01'\n`
+      );
+      fs.chmodSync(psPath, 0o755);
+
+      const realDegrade = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+      const realDegradeMarker = process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
+      let realPid: number | undefined;
+      try {
+        process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+        // Engages the Linux-only degrade hatch (src/process.ts's
+        // GHANTIKA_TEST_DEGRADE_PROC_READ) to the same not-found-then-hang
+        // shape as the fake ps script above, writing to the SAME
+        // invocationMarker so the assertion below reads one real external
+        // artifact regardless of which platform actually ran - see the
+        // sibling OWNER 7 test in test/jobStore.test.ts for the full
+        // rationale.
+        process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = "not-found-then-hang";
+        process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = invocationMarker;
+
+        // The real `run()` handler fires its own captureBirthIdentityPosixAsync
+        // call with the shipped defaults - our fake ps on PATH (or, on Linux,
+        // the degrade hatch above) is what forces that real, unmodified
+        // production call toward its own aggregate cap.
+        const callResult = (await client.callTool({
+          name: "run",
+          arguments: { command: ["sleep", "30"], label: "shutdown-aggregate-cap-check" },
+        })) as { isError?: boolean; structuredContent?: Record<string, unknown> };
+        assert.notEqual(
+          callResult.isError,
+          true,
+          `run() must succeed: ${JSON.stringify(callResult)}`
+        );
+        const jobId = callResult.structuredContent?.job_id as string;
+        assert.equal(typeof jobId, "string");
+
+        const handle = jobStore.getChildHandle(jobId);
+        assert.notEqual(handle, undefined, "expected a real attached child for this job");
+        realPid = handle!.pid;
+
+        await client.close();
+        const before = Date.now();
+        await instance.shutdown("test cleanup - aggregate cap");
+        const elapsedMs = Date.now() - before;
+
+        // At least 2: the capture's own not-found-then-retry pair. This real
+        // end-to-end path may add more (shutdown's own pre-signal identity
+        // re-check also shells out to ps against the same shadowed PATH), so
+        // this only asserts the retry itself genuinely started - it does not
+        // pin the exact incidental total the way the isolated jobStore-level
+        // owner does.
+        const invocationCount = fs
+          .readFileSync(invocationMarker, "utf8")
+          .split("\n")
+          .filter((line) => line.trim().length > 0).length;
+        assert.ok(
+          invocationCount >= 2,
+          `expected the retry to genuinely start (at least 2 attempts observed) before the aggregate cap force-reaps it - saw ${invocationCount} invocations`
+        );
+        assert.ok(
+          elapsedMs < 6000,
+          `expected shutdown's own reap (which awaits resolveBirthIdentityForKill) to settle well before the resistant observer's own 10s sleep - took ${elapsedMs}ms`
+        );
+        // The proof that "the job... reaped" (not just that shutdown
+        // returned): a real, external isProcessAlive check, never our own
+        // internal bookkeeping. A genuinely successful reap already killed
+        // this job as part of shutdown, so no explicit cleanup kill follows.
+        assert.equal(
+          isProcessAlive(realPid),
+          false,
+          "shutdown's own reap must have actually killed the job's real process, not merely settled the capture and moved on"
+        );
+        realPid = undefined;
+      } finally {
+        process.env.PATH = realPath;
+        if (realDegrade === undefined) delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ;
+        else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ = realDegrade;
+        if (realDegradeMarker === undefined)
+          delete process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER;
+        else process.env.GHANTIKA_TEST_DEGRADE_PROC_READ_MARKER = realDegradeMarker;
+        if (realPid !== undefined) {
+          try {
+            process.kill(-realPid, "SIGKILL");
+          } catch {
+            // already gone - nothing to do
+          }
+        }
+      }
+    }
+  );
+});

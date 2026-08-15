@@ -12,6 +12,23 @@ import { ProtocolError } from "@modelcontextprotocol/server";
 // `npm run build` first for exactly this reason (see package.json).
 import { TOOL_NAMES, dispatchToolCall, listToolDefinitions } from "../dist/registry.js";
 
+// No test in this file needs requireSpawnPolicy. The "mutation control"
+// test below dispatches "run" for real through dispatchToolCall(), which
+// does reach src/policy.ts's
+// decideRunPolicy/decideShellPolicy - but its own assertion is
+// `assert.doesNotReject`, and src/tools/run.ts's handler resolves a policy
+// denial as an ordinary failed-job tool result rather than throwing, so
+// that assertion holds identically whether the policy allows or denies the
+// command. Guarding this test bought nothing: what it actually proves
+// (dispatching each of the seven real tool names never throws, unlike an
+// unregistered name) is true under either policy state. Every other test in
+// this file only inspects TOOL_NAMES / listToolDefinitions(), or dispatches
+// "list" (dist/tools/list.js never touches policy.ts) or an unregistered
+// name (dispatchToolCall throws before ever reaching a handler), so none of
+// them ever needed it either. See test/helpers/requireSpawnPolicy.ts for
+// the actual predicate: guard a test only when its own assertion needs a
+// policy-ALLOWED command to pass, not merely when it reaches the gate.
+
 const EXPECTED_TOOL_NAMES = ["run", "status", "list", "output", "tail", "kill", "follow"];
 
 test("exactly the seven frozen tools are registered, by name", () => {
@@ -81,6 +98,10 @@ test("dispatching an unknown tool name throws ProtocolError with code -32602 (In
 });
 
 test("mutation control: the SAME unknown-tool-name check, applied to each of the seven real tool names, never throws", async () => {
+  // No requireSpawnPolicy: dispatching "run" here reaches the real policy
+  // gate, but the assertion below is doesNotReject, and a policy denial
+  // resolves as an ordinary failed-job result rather than throwing - see
+  // this file's own top-of-file comment.
   for (const name of EXPECTED_TOOL_NAMES) {
     // Every real name must dispatch successfully (resolve, not reject) -
     // proves the -32602 path is reached only for names NOT in the

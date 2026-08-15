@@ -32,7 +32,7 @@
  */
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
-import { test } from "node:test";
+import { before, describe, test } from "node:test";
 
 import {
   type SpawnedServer,
@@ -44,8 +44,25 @@ import {
   spawnServer,
   withModernEnvelope,
 } from "./helpers/spawnServer.ts";
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 import { isProcessAlive } from "../dist/process.js";
 import { TASKS_CAPABILITY_DESCRIPTOR, TASKS_EXTENSION_URI } from "../dist/tasksAdapter.js";
+
+// Many tests in this file spawn a real job through the real "run" tool -
+// see test/helpers/requireSpawnPolicy.ts for what this checks and why.
+// The protocol-negotiation and wire-plumbing tests (discover, handshake,
+// the gate, malformed input), the unknown-taskId error-path test, and the
+// three negative controls below (a standalone comparison server, never
+// this codebase's own "run" tool) never call "run" and mint nothing, so
+// the guard is scoped locally to just the describe() blocks below whose
+// tests genuinely spawn one, instead of running once file-wide:
+// node:test scopes a describe()-level before() hook to only the tests
+// nested inside that describe(), so an unset or empty policy variable -
+// the only two conditions requireSpawnPolicy() itself preflights; a
+// malformed, unreadable, or non-allowlisting policy file is a different
+// failure, denied later inside the real spawn path by loadPolicy() rather
+// than caught here - fails ONLY the tests that genuinely spawn a real job,
+// leaving every test named above unaffected.
 
 const NEGATIVE_CONTROL_FIXTURE = fileURLToPath(
   new URL("./fixtures/negative-control-server.ts", import.meta.url)
@@ -216,6 +233,26 @@ test("legacy handshake, under serveStdio: tools/call sent before the initialize/
   );
   server.child.kill("SIGKILL");
 });
+
+// The NINE tests below (this section's own last test ends at the "modern
+// wire: tasks/update" test; the guarded describe further down, "run-
+// dispatching tests: legacy task-method proof needs a real still-running
+// job", starts the next, genuinely-guarded section) each drive at least
+// one real tools/call dispatch to the real "run" tool - see this file's
+// own top-of-file comment for the shared rationale on why the guard lives
+// here rather than file-wide. The pre-handshake-rejection test just above
+// sends a tools/call naming "run" too, but is rejected by the gate before
+// ever reaching the real run() handler (see that test's own inline
+// comment), so it never actually spawns anything and is unaffected by
+// the guard regardless.
+// Every one of these nine reads only wire-shape/protocol-negotiation state
+// - which resultType a mint takes, whether a method routes at all,
+// capability-independence - and each such property is decided by the
+// negotiation layer BEFORE and INDEPENDENTLY of whether the underlying
+// job's spawn is policy-allowed or denied, so a real defect in any of them
+// would be caught on either outcome; none of it needs a real spawn to be
+// genuine, and none of it is merely true-because-nothing-happened the way
+// an assertion about a spawn's OWN content would be under denial.
 
 test("legacy handshake, under serveStdio: a real initialize + notifications/initialized still opens the gate normally - the observer chaining does not break the legitimate handshake either", async (t) => {
   const server = tracked();
@@ -966,102 +1003,111 @@ test("modern wire: tasks/update - the one task method the legacy vocabulary neve
   server.child.kill("SIGKILL");
 });
 
-test("legacy wire: tasks/get, tasks/update, and tasks/cancel all succeed with NO Tasks capability declared on their own connection - the legacy era's own capability model is connection-level (see resolveRunClientCapabilities's own docs), and the three task methods are unaffected by it either way since none of them reads capability at all; also confirms the real kill-and-reap effect on a still-running task, and demonstrates tasks/get's and tasks/cancel's own capability-independence directly, since the modern wire's own dispatch refusal prevents observing it there", async (t) => {
-  const server = tracked();
-  // Guaranteed cleanup for every path that never reaches this test's own
-  // explicit server.child.kill() below - a thrown assertion, in
-  // particular, must never leave a spawned server process alive for a
-  // later test to trip over. A backstop only: server.child.killed is
-  // already true by the time this runs on every normal green pass, since
-  // the explicit kill below fires first in the test's own synchronous
-  // flow.
-  t.after(() => {
-    if (!server.child.killed) server.child.kill("SIGKILL");
-  });
-  await completeHandshake(server); // a plain legacy handshake, declaring no capabilities at all
+// The describe() block below is one of two in this file that genuinely
+// need a real spawn (the other is the wake-target hand-off block further
+// down): this one asserts the job's real status field reads "working" on
+// a still-running job, which a policy-denied job (immediately terminal)
+// can never satisfy.
+describe('run-dispatching tests: legacy task-method proof needs a real still-running job (spawn a real job through the real "run" tool)', () => {
+  before(requireSpawnPolicy);
 
-  server.send({
-    jsonrpc: "2.0",
-    id: 2,
-    method: "tools/call",
-    params: {
-      name: "run",
-      arguments: {
-        command: [process.execPath, "-e", "setTimeout(() => {}, 600000);"],
-        label: "legacywire-task-methods",
+  test("legacy wire: tasks/get, tasks/update, and tasks/cancel all succeed with NO Tasks capability declared on their own connection - the legacy era's own capability model is connection-level (see resolveRunClientCapabilities's own docs), and the three task methods are unaffected by it either way since none of them reads capability at all; also confirms the real kill-and-reap effect on a still-running task, and demonstrates tasks/get's and tasks/cancel's own capability-independence directly, since the modern wire's own dispatch refusal prevents observing it there", async (t) => {
+    const server = tracked();
+    // Guaranteed cleanup for every path that never reaches this test's own
+    // explicit server.child.kill() below - a thrown assertion, in
+    // particular, must never leave a spawned server process alive for a
+    // later test to trip over. A backstop only: server.child.killed is
+    // already true by the time this runs on every normal green pass, since
+    // the explicit kill below fires first in the test's own synchronous
+    // flow.
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    });
+    await completeHandshake(server); // a plain legacy handshake, declaring no capabilities at all
+
+    server.send({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "run",
+        arguments: {
+          command: [process.execPath, "-e", "setTimeout(() => {}, 600000);"],
+          label: "legacywire-task-methods",
+        },
       },
-    },
+    });
+    // Every bare nextLine() in this test - this one and the tasks/get,
+    // tasks/update, tasks/cancel, and polling-loop reads below - is safe:
+    // this connection never declares Tasks capability (see
+    // completeHandshake's own fixed empty capabilities:{}), so run() never
+    // mints and startTaskStatusNotifier is never registered for this job,
+    // however long it runs or however it is later cancelled.
+    const runLine = await server.nextLine();
+    const runBody = runLine.parsed as { result?: { structuredContent?: { job_id?: unknown } } };
+    const taskId = runBody.result?.structuredContent?.job_id;
+    assert.equal(
+      typeof taskId,
+      "string",
+      `setup: a legacy-era, no-capability run() must still mint a real job_id to target below - got: ${JSON.stringify(runBody.result)}`
+    );
+
+    server.send({ jsonrpc: "2.0", id: 3, method: "tasks/get", params: { taskId } });
+    const getLine = await server.nextLine();
+    const getBody = getLine.parsed as {
+      error?: unknown;
+      result?: { taskId?: unknown; status?: unknown; resultType?: unknown };
+    };
+    assert.equal(
+      getBody.error,
+      undefined,
+      `tasks/get must succeed on the legacy era with no Tasks capability ever declared on this connection, got: ${JSON.stringify(getBody)}`
+    );
+    assert.equal(getBody.result?.taskId, taskId);
+    assert.equal(
+      getBody.result?.status,
+      "working",
+      "expected the idle backing job to still be working"
+    );
+    assert.equal(getBody.result?.resultType, "complete");
+
+    server.send({ jsonrpc: "2.0", id: 4, method: "tasks/update", params: { taskId } });
+    const updateLine = await server.nextLine();
+    const updateBody = updateLine.parsed as { error?: unknown; result?: Record<string, unknown> };
+    assert.equal(updateBody.error, undefined);
+    assert.deepEqual(updateBody.result, { resultType: "complete" });
+
+    server.send({ jsonrpc: "2.0", id: 5, method: "tasks/cancel", params: { taskId } });
+    const cancelLine = await server.nextLine();
+    const cancelBody = cancelLine.parsed as { error?: unknown; result?: Record<string, unknown> };
+    assert.equal(
+      cancelBody.error,
+      undefined,
+      `tasks/cancel must succeed on the legacy era with no Tasks capability ever declared, got: ${JSON.stringify(cancelBody)}`
+    );
+    assert.deepEqual(
+      cancelBody.result,
+      { resultType: "complete" },
+      "tasks/cancel must return exactly the fixed empty acknowledgement, matching tasks/update's own ack"
+    );
+
+    let finalStatus: unknown;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      server.send({ jsonrpc: "2.0", id: 6 + attempt, method: "tasks/get", params: { taskId } });
+      const pollLine = await server.nextLine();
+      const pollBody = pollLine.parsed as { result?: { status?: unknown } };
+      finalStatus = pollBody.result?.status;
+      if (finalStatus !== "working") break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(
+      finalStatus,
+      "cancelled",
+      `expected tasks/cancel to actually terminate the job, got final status ${JSON.stringify(finalStatus)}`
+    );
+
+    server.child.kill("SIGKILL");
   });
-  // Every bare nextLine() in this test - this one and the tasks/get,
-  // tasks/update, tasks/cancel, and polling-loop reads below - is safe:
-  // this connection never declares Tasks capability (see
-  // completeHandshake's own fixed empty capabilities:{}), so run() never
-  // mints and startTaskStatusNotifier is never registered for this job,
-  // however long it runs or however it is later cancelled.
-  const runLine = await server.nextLine();
-  const runBody = runLine.parsed as { result?: { structuredContent?: { job_id?: unknown } } };
-  const taskId = runBody.result?.structuredContent?.job_id;
-  assert.equal(
-    typeof taskId,
-    "string",
-    `setup: a legacy-era, no-capability run() must still mint a real job_id to target below - got: ${JSON.stringify(runBody.result)}`
-  );
-
-  server.send({ jsonrpc: "2.0", id: 3, method: "tasks/get", params: { taskId } });
-  const getLine = await server.nextLine();
-  const getBody = getLine.parsed as {
-    error?: unknown;
-    result?: { taskId?: unknown; status?: unknown; resultType?: unknown };
-  };
-  assert.equal(
-    getBody.error,
-    undefined,
-    `tasks/get must succeed on the legacy era with no Tasks capability ever declared on this connection, got: ${JSON.stringify(getBody)}`
-  );
-  assert.equal(getBody.result?.taskId, taskId);
-  assert.equal(
-    getBody.result?.status,
-    "working",
-    "expected the idle backing job to still be working"
-  );
-  assert.equal(getBody.result?.resultType, "complete");
-
-  server.send({ jsonrpc: "2.0", id: 4, method: "tasks/update", params: { taskId } });
-  const updateLine = await server.nextLine();
-  const updateBody = updateLine.parsed as { error?: unknown; result?: Record<string, unknown> };
-  assert.equal(updateBody.error, undefined);
-  assert.deepEqual(updateBody.result, { resultType: "complete" });
-
-  server.send({ jsonrpc: "2.0", id: 5, method: "tasks/cancel", params: { taskId } });
-  const cancelLine = await server.nextLine();
-  const cancelBody = cancelLine.parsed as { error?: unknown; result?: Record<string, unknown> };
-  assert.equal(
-    cancelBody.error,
-    undefined,
-    `tasks/cancel must succeed on the legacy era with no Tasks capability ever declared, got: ${JSON.stringify(cancelBody)}`
-  );
-  assert.deepEqual(
-    cancelBody.result,
-    { resultType: "complete" },
-    "tasks/cancel must return exactly the fixed empty acknowledgement, matching tasks/update's own ack"
-  );
-
-  let finalStatus: unknown;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    server.send({ jsonrpc: "2.0", id: 6 + attempt, method: "tasks/get", params: { taskId } });
-    const pollLine = await server.nextLine();
-    const pollBody = pollLine.parsed as { result?: { status?: unknown } };
-    finalStatus = pollBody.result?.status;
-    if (finalStatus !== "working") break;
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  assert.equal(
-    finalStatus,
-    "cancelled",
-    `expected tasks/cancel to actually terminate the job, got final status ${JSON.stringify(finalStatus)}`
-  );
-
-  server.child.kill("SIGKILL");
 });
 
 test("an unknown taskId on tasks/get, tasks/update, and tasks/cancel each fail closed with -32602 on the legacy era, matching the released spec's shared error code for both an unknown and an expired-and-purged id (the modern era cannot exercise tasks/get/tasks/cancel at all - see the unroutable-methods test above - so this is legacy-only, deliberately, rather than parameterized across both eras)", async (t) => {
@@ -1673,117 +1719,124 @@ async function pollStderrFor(server: SpawnedServer, substring: string): Promise<
   return false;
 }
 
-test("wake-target hand-off, malformed: a real modern tools/call whose own request _meta carries threadId:'' alongside the required envelope keys logs the malformed-target skip diagnostic once the job reaches terminal", async (t) => {
-  const originalGate = process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED;
-  process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED = "1";
-  const server = tracked();
-  t.after(() => {
-    if (!server.child.killed) server.child.kill("SIGKILL");
-    if (originalGate === undefined) delete process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED;
-    else process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED = originalGate;
-  });
+// Both tests below drive a real tools/call dispatch to the real "run"
+// tool (see this file's own top-of-file comment for the shared
+// rationale), so the guard is scoped to just this describe() block.
+describe('wake-target hand-off tests (spawn a real job through the real "run" tool)', () => {
+  before(requireSpawnPolicy);
 
-  server.send(discoverRequest(1));
-  const discoverBody = (await server.nextLine()).parsed as DiscoverResultBody;
-  assert.ok(discoverBody.result, "server/discover must succeed first");
+  test("wake-target hand-off, malformed: a real modern tools/call whose own request _meta carries threadId:'' alongside the required envelope keys logs the malformed-target skip diagnostic once the job reaches terminal", async (t) => {
+    const originalGate = process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED;
+    process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED = "1";
+    const server = tracked();
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+      if (originalGate === undefined) delete process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED;
+      else process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED = originalGate;
+    });
 
-  server.send({
-    jsonrpc: "2.0",
-    id: 2,
-    method: "tools/call",
-    params: {
-      name: "run",
-      arguments: { command: ["true"] },
-      _meta: {
-        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
-        "io.modelcontextprotocol/clientCapabilities": {},
-        threadId: "",
+    server.send(discoverRequest(1));
+    const discoverBody = (await server.nextLine()).parsed as DiscoverResultBody;
+    assert.ok(discoverBody.result, "server/discover must succeed first");
+
+    server.send({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "run",
+        arguments: { command: ["true"] },
+        _meta: {
+          "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+          "io.modelcontextprotocol/clientCapabilities": {},
+          threadId: "",
+        },
       },
-    },
-  });
-  const mintLine = await server.nextLine();
-  const mintBody = mintLine.parsed as {
-    error?: unknown;
-    result?: { structuredContent?: { job_id?: unknown } };
-  };
-  assert.equal(mintBody.error, undefined, `run must succeed, got: ${JSON.stringify(mintBody)}`);
-  const jobId = mintBody.result?.structuredContent?.job_id;
-  assert.equal(typeof jobId, "string", "expected a real job_id on the run response");
+    });
+    const mintLine = await server.nextLine();
+    const mintBody = mintLine.parsed as {
+      error?: unknown;
+      result?: { structuredContent?: { job_id?: unknown } };
+    };
+    assert.equal(mintBody.error, undefined, `run must succeed, got: ${JSON.stringify(mintBody)}`);
+    const jobId = mintBody.result?.structuredContent?.job_id;
+    assert.equal(typeof jobId, "string", "expected a real job_id on the run response");
 
-  const found = await pollStderrFor(
-    server,
-    `transport wake skipped for task ${jobId as string}: wake target threadId present but is an empty string, expected non-empty string`
-  );
-  assert.ok(
-    found,
-    `expected the malformed-threadId skip diagnostic on stderr once the job terminalized; got stderr: ${server.stderrText()}`
-  );
-});
-
-test("wake-target hand-off, resolved: a real modern tools/call whose own request _meta carries a non-empty threadId alongside the required envelope keys reaches selectAndWake (an attempted-wake diagnostic, not silence) once the job reaches terminal", async (t) => {
-  const originalGate = process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED;
-  process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED = "1";
-  const server = tracked();
-  t.after(() => {
-    if (!server.child.killed) server.child.kill("SIGKILL");
-    if (originalGate === undefined) delete process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED;
-    else process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED = originalGate;
+    const found = await pollStderrFor(
+      server,
+      `transport wake skipped for task ${jobId as string}: wake target threadId present but is an empty string, expected non-empty string`
+    );
+    assert.ok(
+      found,
+      `expected the malformed-threadId skip diagnostic on stderr once the job terminalized; got stderr: ${server.stderrText()}`
+    );
   });
 
-  server.send(discoverRequest(1));
-  const discoverBody = (await server.nextLine()).parsed as DiscoverResultBody;
-  assert.ok(discoverBody.result, "server/discover must succeed first");
+  test("wake-target hand-off, resolved: a real modern tools/call whose own request _meta carries a non-empty threadId alongside the required envelope keys reaches selectAndWake (an attempted-wake diagnostic, not silence) once the job reaches terminal", async (t) => {
+    const originalGate = process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED;
+    process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED = "1";
+    const server = tracked();
+    t.after(() => {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+      if (originalGate === undefined) delete process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED;
+      else process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED = originalGate;
+    });
 
-  server.send({
-    jsonrpc: "2.0",
-    id: 2,
-    method: "tools/call",
-    params: {
-      name: "run",
-      arguments: { command: ["true"] },
-      _meta: {
-        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
-        "io.modelcontextprotocol/clientCapabilities": {},
-        threadId: "thread-real-wire-resolved",
+    server.send(discoverRequest(1));
+    const discoverBody = (await server.nextLine()).parsed as DiscoverResultBody;
+    assert.ok(discoverBody.result, "server/discover must succeed first");
+
+    server.send({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "run",
+        arguments: { command: ["true"] },
+        _meta: {
+          "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+          "io.modelcontextprotocol/clientCapabilities": {},
+          threadId: "thread-real-wire-resolved",
+        },
       },
-    },
-  });
-  const mintLine = await server.nextLine();
-  const mintBody = mintLine.parsed as {
-    error?: unknown;
-    result?: { structuredContent?: { job_id?: unknown } };
-  };
-  assert.equal(mintBody.error, undefined, `run must succeed, got: ${JSON.stringify(mintBody)}`);
-  const jobId = mintBody.result?.structuredContent?.job_id;
-  assert.equal(typeof jobId, "string", "expected a real job_id on the run response");
+    });
+    const mintLine = await server.nextLine();
+    const mintBody = mintLine.parsed as {
+      error?: unknown;
+      result?: { structuredContent?: { job_id?: unknown } };
+    };
+    assert.equal(mintBody.error, undefined, `run must succeed, got: ${JSON.stringify(mintBody)}`);
+    const jobId = mintBody.result?.structuredContent?.job_id;
+    assert.equal(typeof jobId, "string", "expected a real job_id on the run response");
 
-  // Which of the three non-"delivered" outcomes (refused/unavailable/threw
-  // - `startTransportWakeOnTerminal`'s own WakeResult union, see its doc
-  // comment) a real environment produces is not fixed: on a runner with
-  // neither a real Codex app-server nor a real ChatGPT desktop IPC socket,
-  // both DEFAULT_TRANSPORTS probes report unavailable. A host with a real
-  // `codex app-server` reachable can instead have the app-server respond
-  // and refuse this non-UUID-shaped threadId - a real protocol-level
-  // validation error from a real transport, not a probe failure. Both are
-  // "an attempt reached selectAndWake"; neither is "delivered" - this test
-  // asserts only that request metadata reaches a gated wake attempt, never
-  // that a real recipient session is actually resumed. What distinguishes
-  // this from the sibling malformed test above is that some attempted-wake
-  // diagnostic fires at all: that only happens when resolveWakeTarget
-  // answered "resolved", never "absent".
-  const found = await pollStderrFor(server, `transport wake `);
-  assert.ok(
-    found,
-    `expected some attempted-wake diagnostic on stderr once the job terminalized; got stderr: ${server.stderrText()}`
-  );
-  const stderrText = server.stderrText();
-  assert.match(
-    stderrText,
-    new RegExp(`transport wake (refused|unavailable|threw) for task ${jobId as string}`),
-    `expected one of the three non-"delivered" outcome diagnostics naming this exact job, got: ${stderrText}`
-  );
-  assert.ok(
-    !stderrText.includes("transport wake skipped for task"),
-    "a resolved, non-empty threadId must never produce the malformed-skip diagnostic"
-  );
+    // Which of the three non-"delivered" outcomes (refused/unavailable/threw
+    // - `startTransportWakeOnTerminal`'s own WakeResult union, see its doc
+    // comment) a real environment produces is not fixed: on a runner with
+    // neither a real Codex app-server nor a real ChatGPT desktop IPC socket,
+    // both DEFAULT_TRANSPORTS probes report unavailable. A host with a real
+    // `codex app-server` reachable can instead have the app-server respond
+    // and refuse this non-UUID-shaped threadId - a real protocol-level
+    // validation error from a real transport, not a probe failure. Both are
+    // "an attempt reached selectAndWake"; neither is "delivered" - this test
+    // asserts only that request metadata reaches a gated wake attempt, never
+    // that a real recipient session is actually resumed. What distinguishes
+    // this from the sibling malformed test above is that some attempted-wake
+    // diagnostic fires at all: that only happens when resolveWakeTarget
+    // answered "resolved", never "absent".
+    const found = await pollStderrFor(server, `transport wake `);
+    assert.ok(
+      found,
+      `expected some attempted-wake diagnostic on stderr once the job terminalized; got stderr: ${server.stderrText()}`
+    );
+    const stderrText = server.stderrText();
+    assert.match(
+      stderrText,
+      new RegExp(`transport wake (refused|unavailable|threw) for task ${jobId as string}`),
+      `expected one of the three non-"delivered" outcome diagnostics naming this exact job, got: ${stderrText}`
+    );
+    assert.ok(
+      !stderrText.includes("transport wake skipped for task"),
+      "a resolved, non-empty threadId must never produce the malformed-skip diagnostic"
+    );
+  });
 });

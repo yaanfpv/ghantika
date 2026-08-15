@@ -59,7 +59,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { mock, test } from "node:test";
+import { before, describe, mock, test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/client";
 import { InMemoryTransport } from "@modelcontextprotocol/server";
@@ -83,6 +83,20 @@ import {
   WATCH_STOP_REASON_FIREHOSE,
   getTask,
 } from "../dist/tasksAdapter.js";
+
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// Most tests in this file mint a real job through the real `run` tool -
+// see test/helpers/requireSpawnPolicy.ts for what this checks and why. The
+// TTL-stranded-slot test below, and the output-arrival seam's own low-
+// level mechanics tests (multi-line/split-chunk/stream-end/unsubscribe/
+// isolation), drive jobStore directly against a synthetic record instead -
+// no real backing process at all, and must keep passing with no policy
+// configured. So requireSpawnPolicy() is called from a LOCAL
+// before() inside each describe() block below that actually spawns,
+// never once at file level: node:test fails EVERY test in a file when a
+// top-level before() hook throws, which would fail even those
+// non-spawning tests too, the moment GHANTIKA_POLICY_FILE is unset.
 
 // ---------------------------------------------------------------------------
 // Harness - mirrors test/tasks.test.ts's own startPair/tasksRequest/mintJob
@@ -393,109 +407,116 @@ function line(text: string): Buffer {
   return Buffer.from(`${text}\n`);
 }
 
-// ---------------------------------------------------------------------------
-// Keepalive: a real, deterministic never-completing job stays
-// status:'working' (exact-equality) across repeated tasks/get reads; ONLY
-// a real terminal event, a tool error, or a cancel is terminal. Explicit
-// cleanup: the fixture job is killed+reaped at teardown, verified by a
-// real-liveness observation.
-// ---------------------------------------------------------------------------
+describe("spawning tests: keepalive and TTL frozen-separation sweep", () => {
+  before(requireSpawnPolicy);
 
-test("a real never-completing job keeps tasks/get status EXACTLY 'working' across repeated reads, and is killed+reaped at teardown with zero real survivors", async () => {
-  const pair = await startPair(true);
-  let jobId: string | undefined;
-  try {
-    const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "keepalive" });
-    jobId = minted.taskId as string;
-    assert.equal(typeof jobId, "string");
+  // ---------------------------------------------------------------------------
+  // Keepalive: a real, deterministic never-completing job stays
+  // status:'working' (exact-equality) across repeated tasks/get reads; ONLY
+  // a real terminal event, a tool error, or a cancel is terminal. Explicit
+  // cleanup: the fixture job is killed+reaped at teardown, verified by a
+  // real-liveness observation.
+  // ---------------------------------------------------------------------------
 
-    for (let i = 0; i < 5; i += 1) {
-      const taskGet = await tasksGet(pair.client, jobId);
-      assert.equal(
-        taskGet.status,
-        "working",
-        `read #${i}: keepalive task must read EXACTLY 'working', got ${JSON.stringify(taskGet.status)}`
-      );
-      assert.equal(taskGet.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS);
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-
-    const handle = jobStore.getChildHandle(jobId);
-    assert.ok(handle, "expected the keepalive job to have a real tracked child");
-    assert.ok(isProcessAlive(handle.pid), "expected the keepalive job's real process to be alive");
-  } finally {
-    if (jobId !== undefined) await killAndReapRealChild(jobId);
-    await pair.close();
-  }
-});
-
-// ---------------------------------------------------------------------------
-// TTL purge, frozen separation. TTL purge REMOVES a completed
-// record after TASK_TTL_MS; a still-'working' task of the SAME age
-// SURVIVES regardless (the terminal-only guard). `Date` is mocked
-// (`setTimeout` stays real, so real polling below is unaffected) so the
-// test never waits out TASK_TTL_MS in real wall-clock time.
-// ---------------------------------------------------------------------------
-
-test("TTL purge removes a completed record past TASK_TTL_MS while a still-working task of the SAME age survives untouched - one sweep, both directions", async () => {
-  const pair = await startPair(true);
-  let workingJobId: string | undefined;
-  try {
-    // A quick, real command that completes almost immediately.
-    const completedMinted = await mintJob(pair.client, {
-      command: ["true"],
-      label: "ttl-completed-fixture",
-    });
-    const completedJobId = completedMinted.taskId as string;
-    await pollUntilTerminal(pair.client, completedJobId);
-    const completedBefore = await tasksGet(pair.client, completedJobId);
-    assert.equal(completedBefore.status, "completed");
-
-    // A real, still-working job started at the SAME rough age.
-    const workingMinted = await mintJob(pair.client, {
-      command: IDLE_COMMAND,
-      label: "ttl-working-fixture",
-    });
-    workingJobId = workingMinted.taskId as string;
-    const workingBefore = await tasksGet(pair.client, workingJobId);
-    assert.equal(workingBefore.status, "working");
-
-    const realNow = Date.now();
-    mock.timers.enable({ apis: ["Date"], now: realNow });
+  test("a real never-completing job keeps tasks/get status EXACTLY 'working' across repeated reads, and is killed+reaped at teardown with zero real survivors", async () => {
+    const pair = await startPair(true);
+    let jobId: string | undefined;
     try {
-      // Not yet past TTL - both must read exactly as they did before.
-      mock.timers.tick(TASK_TTL_MS - 1000);
-      assert.equal((await tasksGet(pair.client, completedJobId)).status, "completed");
-      assert.equal((await tasksGet(pair.client, workingJobId)).status, "working");
+      const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "keepalive" });
+      jobId = minted.taskId as string;
+      assert.equal(typeof jobId, "string");
 
-      // Past TTL now - the SAME sweep of reads must disagree: the
-      // completed one is purged (throws task_not_found - the released
-      // contract's own -32602 error, never a tagged success value), the
-      // still-working one is untouched (still 'working', never an
-      // 'expired' status of any kind - the closed four-value TASK_STATUSES
-      // set has no such member).
-      mock.timers.tick(2000); // TASK_TTL_MS - 1000 + 2000 > TASK_TTL_MS
-      await assert.rejects(
-        () => tasksGet(pair.client, completedJobId),
-        (error: unknown) => {
-          const message = String((error as { message?: unknown })?.message ?? error);
-          return /-32602|not found|task_not_found/i.test(message);
-        },
-        "expected the completed record to be purged past TTL, throwing task_not_found"
-      );
-      const workingAfter = await tasksGet(pair.client, workingJobId);
-      assert.equal(
-        workingAfter.status,
-        "working",
-        "a still-working task of the SAME age must NEVER be purged, regardless of age - the terminal-only guard"
+      for (let i = 0; i < 5; i += 1) {
+        const taskGet = await tasksGet(pair.client, jobId);
+        assert.equal(
+          taskGet.status,
+          "working",
+          `read #${i}: keepalive task must read EXACTLY 'working', got ${JSON.stringify(taskGet.status)}`
+        );
+        assert.equal(taskGet.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+
+      const handle = jobStore.getChildHandle(jobId);
+      assert.ok(handle, "expected the keepalive job to have a real tracked child");
+      assert.ok(
+        isProcessAlive(handle.pid),
+        "expected the keepalive job's real process to be alive"
       );
     } finally {
-      mock.timers.reset();
+      if (jobId !== undefined) await killAndReapRealChild(jobId);
+      await pair.close();
     }
-  } finally {
-    if (workingJobId !== undefined) await killAndReapRealChild(workingJobId);
-    await pair.close();
-  }
+  });
+
+  // ---------------------------------------------------------------------------
+  // TTL purge, frozen separation. TTL purge REMOVES a completed
+  // record after TASK_TTL_MS; a still-'working' task of the SAME age
+  // SURVIVES regardless (the terminal-only guard). `Date` is mocked
+  // (`setTimeout` stays real, so real polling below is unaffected) so the
+  // test never waits out TASK_TTL_MS in real wall-clock time.
+  // ---------------------------------------------------------------------------
+
+  test("TTL purge removes a completed record past TASK_TTL_MS while a still-working task of the SAME age survives untouched - one sweep, both directions", async () => {
+    const pair = await startPair(true);
+    let workingJobId: string | undefined;
+    try {
+      // A quick, real command that completes almost immediately.
+      const completedMinted = await mintJob(pair.client, {
+        command: ["true"],
+        label: "ttl-completed-fixture",
+      });
+      const completedJobId = completedMinted.taskId as string;
+      await pollUntilTerminal(pair.client, completedJobId);
+      const completedBefore = await tasksGet(pair.client, completedJobId);
+      assert.equal(completedBefore.status, "completed");
+
+      // A real, still-working job started at the SAME rough age.
+      const workingMinted = await mintJob(pair.client, {
+        command: IDLE_COMMAND,
+        label: "ttl-working-fixture",
+      });
+      workingJobId = workingMinted.taskId as string;
+      const workingBefore = await tasksGet(pair.client, workingJobId);
+      assert.equal(workingBefore.status, "working");
+
+      const realNow = Date.now();
+      mock.timers.enable({ apis: ["Date"], now: realNow });
+      try {
+        // Not yet past TTL - both must read exactly as they did before.
+        mock.timers.tick(TASK_TTL_MS - 1000);
+        assert.equal((await tasksGet(pair.client, completedJobId)).status, "completed");
+        assert.equal((await tasksGet(pair.client, workingJobId)).status, "working");
+
+        // Past TTL now - the SAME sweep of reads must disagree: the
+        // completed one is purged (throws task_not_found - the released
+        // contract's own -32602 error, never a tagged success value), the
+        // still-working one is untouched (still 'working', never an
+        // 'expired' status of any kind - the closed four-value TASK_STATUSES
+        // set has no such member).
+        mock.timers.tick(2000); // TASK_TTL_MS - 1000 + 2000 > TASK_TTL_MS
+        await assert.rejects(
+          () => tasksGet(pair.client, completedJobId),
+          (error: unknown) => {
+            const message = String((error as { message?: unknown })?.message ?? error);
+            return /-32602|not found|task_not_found/i.test(message);
+          },
+          "expected the completed record to be purged past TTL, throwing task_not_found"
+        );
+        const workingAfter = await tasksGet(pair.client, workingJobId);
+        assert.equal(
+          workingAfter.status,
+          "working",
+          "a still-working task of the SAME age must NEVER be purged, regardless of age - the terminal-only guard"
+        );
+      } finally {
+        mock.timers.reset();
+      }
+    } finally {
+      if (workingJobId !== undefined) await killAndReapRealChild(workingJobId);
+      await pair.close();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -598,741 +619,759 @@ test("TTL purge REFUSES a job whose concurrency slot is still stranded, however 
   }
 });
 
-// ---------------------------------------------------------------------------
-// The output-driven wake: exact notification method name,
-// output-driven per-batch delta on either stream, time-window batching.
-// All driven via DIRECT jobStore.appendOutput calls on a real, minted,
-// idle-backed task - deterministic content and timing, never real process
-// scheduling jitter.
-// ---------------------------------------------------------------------------
+describe("spawning tests: output-driven wake, firehose auto-stop, exit reporting, terminal-flush ordering, and the seam's real run() path", () => {
+  before(requireSpawnPolicy);
 
-test("the output-delta wake's notification method is the EXACT string 'notifications/ghantika/outputWake' - a mistyped/near-miss method would route to the fallback handler instead, which is asserted to never fire", async () => {
-  const pair = await startPair(true);
-  let jobId: string | undefined;
-  try {
-    const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "exact-method" });
-    jobId = minted.taskId as string;
-    const received = registerWakeSpy(pair.client);
+  // ---------------------------------------------------------------------------
+  // The output-driven wake: exact notification method name,
+  // output-driven per-batch delta on either stream, time-window batching.
+  // All driven via DIRECT jobStore.appendOutput calls on a real, minted,
+  // idle-backed task - deterministic content and timing, never real process
+  // scheduling jitter.
+  // ---------------------------------------------------------------------------
 
-    mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+  test("the output-delta wake's notification method is the EXACT string 'notifications/ghantika/outputWake' - a mistyped/near-miss method would route to the fallback handler instead, which is asserted to never fire", async () => {
+    const pair = await startPair(true);
+    let jobId: string | undefined;
     try {
-      jobStore.appendOutput(jobId, "stdout", line("exact-method-line"));
-      mock.timers.tick(WAKE_COALESCE_WINDOW_MS);
-    } finally {
-      mock.timers.reset();
-    }
+      const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "exact-method" });
+      jobId = minted.taskId as string;
+      const received = registerWakeSpy(pair.client);
 
-    // Give the notification microtask a chance to run - `server.notification`
-    // resolves asynchronously even though the mocked timer fired
-    // synchronously.
-    await new Promise((resolve) => setImmediate(resolve));
-
-    assert.equal(received.length, 1, `expected exactly one wake, got ${JSON.stringify(received)}`);
-
-    // Suppressed-notification case: a SEPARATE, non-subscribing
-    // client must still observe everything via the poll floor. Registering
-    // NEITHER a handler NOR a fallback for a method means the SDK's own
-    // dispatch silently drops it client-side - the terminal must still be
-    // observable via tasks/get and output regardless.
-    const quiet = await startPair(true);
-    try {
-      const quietMinted = await mintJob(quiet.client, {
-        command: [process.execPath, "-e", "process.stdout.write('suppressed-poll-floor\\n');"],
-        label: "suppressed-notifications",
-      });
-      const quietJobId = quietMinted.taskId as string;
-      await pollUntilTerminal(quiet.client, quietJobId);
-      const quietGet = await tasksGet(quiet.client, quietJobId);
-      assert.equal(quietGet.status, "completed");
-      const outputResult = (await quiet.client.callTool({
-        name: "output",
-        arguments: { job_id: quietJobId },
-      })) as { structuredContent?: { events?: Array<{ text: string }> } };
-      const texts = (outputResult.structuredContent?.events ?? []).map((event) => event.text);
-      assert.ok(
-        texts.includes("suppressed-poll-floor"),
-        `expected the poll floor to surface the real line even with no notification handler registered, got ${JSON.stringify(texts)}`
-      );
-    } finally {
-      await quiet.close();
-    }
-  } finally {
-    if (jobId !== undefined) await killAndReapRealChild(jobId);
-    await pair.close();
-  }
-});
-
-test("one stdout batch fires one wake carrying EXACTLY that batch's new stdout delta, deepEqual against the poll floor's own view of the same lines - never the cumulative buffer", async () => {
-  const pair = await startPair(true);
-  let jobId: string | undefined;
-  try {
-    const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "batch-delta" });
-    jobId = minted.taskId as string;
-    const received = registerWakeSpy(pair.client);
-
-    mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    try {
-      jobStore.appendOutput(
-        jobId,
-        "stdout",
-        Buffer.concat([line("alpha"), line("beta"), line("gamma")])
-      );
-      mock.timers.tick(WAKE_COALESCE_WINDOW_MS);
-    } finally {
-      mock.timers.reset();
-    }
-    await new Promise((resolve) => setImmediate(resolve));
-
-    assert.equal(received.length, 1);
-    const wake = received[0]!.params;
-    assert.equal(wake.extension, TASKS_EXTENSION_URI);
-    assert.equal(wake.taskId, jobId);
-    const wakeStdout = wake.stdout as Array<{ seq: number; text: string; partial?: true }>;
-    assert.deepEqual(
-      wakeStdout.map((entry) => entry.text),
-      ["alpha", "beta", "gamma"],
-      "the wake's stdout delta must contain EXACTLY this batch's lines, in order"
-    );
-    for (const entry of wakeStdout) assert.equal(entry.partial, undefined);
-
-    // Cross-check against the poll floor's own canonical view of the SAME
-    // lines - proves the wake never carries state the poll floor can't
-    // independently surface.
-    const outputResult = (await pair.client.callTool({
-      name: "output",
-      arguments: { job_id: jobId, stream: "stdout" },
-    })) as {
-      structuredContent?: { events?: Array<{ seq: number; text: string; partial?: true }> };
-    };
-    const polledEvents = (outputResult.structuredContent?.events ?? []).map((event) => ({
-      seq: event.seq,
-      text: event.text,
-      ...(event.partial ? { partial: event.partial } : {}),
-    }));
-    assert.deepEqual(
-      wakeStdout,
-      polledEvents,
-      "the wake's stdout delta must deepEqual the poll floor's own view of the same lines"
-    );
-  } finally {
-    if (jobId !== undefined) await killAndReapRealChild(jobId);
-    await pair.close();
-  }
-});
-
-test("with the wake handler entirely unregistered on a capable connection, tasks/get + output/tail still surface every line and the terminal identically to pre-Tasks (Phase 1) behavior", async () => {
-  const pair = await startPair(true); // capable connection, but no wake handler ever registered
-  let jobId: string | undefined;
-  try {
-    const minted = await mintJob(pair.client, {
-      command: [process.execPath, "-e", "process.stdout.write('phase1-a\\nphase1-b\\n');"],
-      label: "poll-floor-parity",
-    });
-    jobId = minted.taskId as string;
-    await pollUntilTerminal(pair.client, jobId);
-
-    const taskGet = await tasksGet(pair.client, jobId);
-    assert.equal(taskGet.status, "completed");
-
-    const tailResult = (await pair.client.callTool({
-      name: "tail",
-      arguments: { job_id: jobId, lines: 5 },
-    })) as { structuredContent?: { events?: Array<{ text: string }> } };
-    const tailTexts = (tailResult.structuredContent?.events ?? []).map((entry) => entry.text);
-    assert.deepEqual(tailTexts, ["phase1-a", "phase1-b"]);
-  } finally {
-    if (jobId !== undefined) await killAndReapRealChild(jobId);
-    await pair.close();
-  }
-});
-
-test("a stderr-only batch wakes on its own carrying ONLY the stderr key; a batch mixing both streams in the SAME window wakes once carrying BOTH keys", async () => {
-  const pair = await startPair(true);
-  let jobId: string | undefined;
-  try {
-    const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "stderr-wakes" });
-    jobId = minted.taskId as string;
-    const received = registerWakeSpy(pair.client);
-
-    mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    try {
-      jobStore.appendOutput(jobId, "stderr", line("stderr-only-line"));
-      mock.timers.tick(WAKE_COALESCE_WINDOW_MS);
-    } finally {
-      mock.timers.reset();
-    }
-    await new Promise((resolve) => setImmediate(resolve));
-
-    assert.equal(received.length, 1, "a stderr-only batch must wake exactly once, on its own");
-    assert.equal(
-      received[0]!.params.stdout,
-      undefined,
-      "a stderr-only wake must not carry a stdout key at all"
-    );
-    const wakeStderr = received[0]!.params.stderr as Array<{ text: string }>;
-    assert.deepEqual(
-      wakeStderr.map((entry) => entry.text),
-      ["stderr-only-line"]
-    );
-
-    // stderr is ALSO observable via the poll floor - the wake is additive,
-    // never a substitute for it.
-    const outputResult = (await pair.client.callTool({
-      name: "output",
-      arguments: { job_id: jobId, stream: "stderr" },
-    })) as { structuredContent?: { events?: Array<{ text: string }> } };
-    const stderrTexts = (outputResult.structuredContent?.events ?? []).map((event) => event.text);
-    assert.deepEqual(stderrTexts, ["stderr-only-line"]);
-
-    // A batch mixing both streams within the SAME open window collapses
-    // into ONE wake carrying both keys, not two separate wakes.
-    mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    try {
-      jobStore.appendOutput(jobId, "stdout", line("mixed-stdout-line"));
-      jobStore.appendOutput(jobId, "stderr", line("mixed-stderr-line"));
-      mock.timers.tick(WAKE_COALESCE_WINDOW_MS);
-    } finally {
-      mock.timers.reset();
-    }
-    await new Promise((resolve) => setImmediate(resolve));
-
-    assert.equal(received.length, 2, "the mixed batch must add exactly one more wake");
-    const mixedWake = received[1]!.params;
-    assert.deepEqual(
-      (mixedWake.stdout as Array<{ text: string }>).map((entry) => entry.text),
-      ["mixed-stdout-line"]
-    );
-    assert.deepEqual(
-      (mixedWake.stderr as Array<{ text: string }>).map((entry) => entry.text),
-      ["mixed-stderr-line"]
-    );
-  } finally {
-    if (jobId !== undefined) await killAndReapRealChild(jobId);
-    await pair.close();
-  }
-});
-
-test("lines within one WAKE_COALESCE_WINDOW_MS window collapse into ONE wake; two batches more than the window apart fire TWO wakes - deterministic injected clock, never a real sleep", async () => {
-  const pair = await startPair(true);
-  let jobId: string | undefined;
-  try {
-    const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "coalesce-window" });
-    jobId = minted.taskId as string;
-    const received = registerWakeSpy(pair.client);
-
-    mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    try {
-      jobStore.appendOutput(jobId, "stdout", line("w1-a"));
-      mock.timers.tick(WAKE_COALESCE_WINDOW_MS - 10);
-      jobStore.appendOutput(jobId, "stdout", line("w1-b"));
-      mock.timers.tick(10); // exactly closes window 1 (w1-a's own scheduled timer)
-    } finally {
-      mock.timers.reset();
-    }
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(received.length, 1, "both lines within one window must collapse into ONE wake");
-    assert.deepEqual(
-      (received[0]!.params.stdout as Array<{ text: string }>).map((entry) => entry.text),
-      ["w1-a", "w1-b"]
-    );
-
-    mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    try {
-      jobStore.appendOutput(jobId, "stdout", line("w2"));
-      mock.timers.tick(WAKE_COALESCE_WINDOW_MS + 1); // opens and closes a SECOND, later window
-    } finally {
-      mock.timers.reset();
-    }
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(
-      received.length,
-      2,
-      "a batch more than one window later must fire a SECOND, distinct wake"
-    );
-    assert.deepEqual(
-      (received[1]!.params.stdout as Array<{ text: string }>).map((entry) => entry.text),
-      ["w2"]
-    );
-  } finally {
-    if (jobId !== undefined) await killAndReapRealChild(jobId);
-    await pair.close();
-  }
-});
-
-// ---------------------------------------------------------------------------
-// Firehose rate-limit + auto-stop, and its required green control
-// (a bounded stream stays completely untouched).
-// ---------------------------------------------------------------------------
-
-/** One synthetic stdout line's worth of bytes for the firehose fixtures below - short and cheap to materialize many thousands of times per test. */
-function firehoseLine(i: number): Buffer {
-  return Buffer.from(`f${i}\n`);
-}
-
-function manyFirehoseLines(count: number): Buffer {
-  const parts: Buffer[] = [];
-  for (let i = 0; i < count; i += 1) parts.push(firehoseLine(i));
-  return Buffer.concat(parts);
-}
-
-test("a sustained firehose rate rate-limits wakes and auto-stops ONLY the notification watch - the job stays alive/pollable, the terminal is later observable, and zero wakes fire after the stop", async () => {
-  const pair = await startPair(true);
-  let jobId: string | undefined;
-  try {
-    const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "firehose-trigger" });
-    jobId = minted.taskId as string;
-    const received = registerWakeSpy(pair.client);
-
-    // Derived directly from the exported constants (never magic literals):
-    // TICK_MS ticks, each carrying LINES_PER_TICK synthetic lines - a
-    // sustained rate of LINES_PER_TICK/TICK_MS*1000 (a 20% margin over
-    // FIREHOSE_LINES_PER_SEC), sustained for TICKS_NEEDED ticks so the
-    // cumulative elapsed span reaches (and this ticks one further, to
-    // cross) FIREHOSE_SUSTAINED_MS. With the window anchored on the very
-    // first line and never resetting (every subsequent line's own
-    // computed rate stays above threshold throughout), the auto-stop
-    // triggers deterministically on the FIRST line of the LAST call below
-    // - at real-elapsed TICKS_NEEDED * TICK_MS, i.e. the first tick count
-    // whose cumulative span is >= FIREHOSE_SUSTAINED_MS.
-    const TICK_MS = 1000;
-    const LINES_PER_TICK = Math.ceil(((FIREHOSE_LINES_PER_SEC * TICK_MS) / 1000) * 1.2);
-    const TICKS_NEEDED = Math.ceil(FIREHOSE_SUSTAINED_MS / TICK_MS);
-
-    const realStart = Date.now();
-    mock.timers.enable({ apis: ["setTimeout", "Date"], now: realStart });
-    let stoppedAtBeforeReset: string | undefined;
-    try {
-      jobStore.appendOutput(jobId, "stdout", manyFirehoseLines(LINES_PER_TICK));
-      for (let i = 0; i < TICKS_NEEDED; i += 1) {
-        mock.timers.tick(TICK_MS);
-        jobStore.appendOutput(jobId, "stdout", manyFirehoseLines(LINES_PER_TICK));
+      mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+      try {
+        jobStore.appendOutput(jobId, "stdout", line("exact-method-line"));
+        mock.timers.tick(WAKE_COALESCE_WINDOW_MS);
+      } finally {
+        mock.timers.reset();
       }
 
-      const taskGet = await tasksGet(pair.client, jobId);
-      assert.equal(
-        taskGet.status,
-        "working",
-        "the JOB must still be 'working' - only the watch stopped"
-      );
-      // A still-WORKING task carries the watch-stop fact rendered as TEXT
-      // into statusMessage, per the released contract - see
-      // src/tasksAdapter.ts's own renderWatchStoppedStatusMessage docs (a
-      // working task has no result/error container the way a terminal task
-      // does, so there is no structured watchStopped field to read here at
-      // all anymore).
-      const statusMessage = taskGet.statusMessage as string | undefined;
-      assert.ok(
-        statusMessage,
-        `expected statusMessage to be present, got ${JSON.stringify(taskGet)}`
-      );
-      const rendered = statusMessage!.match(/^output watch auto-stopped \(([^)]+)\) at (.+)$/);
-      assert.ok(
-        rendered,
-        `expected statusMessage to match the rendered watch-stop format, got ${JSON.stringify(statusMessage)}`
-      );
-      const [, renderedReason, renderedStoppedAt] = rendered!;
-      assert.equal(renderedReason, WATCH_STOP_REASON_FIREHOSE);
-      assert.match(renderedStoppedAt!, ISO_TIMESTAMP_PATTERN);
-      const expectedStoppedAt = new Date(realStart + TICKS_NEEDED * TICK_MS).toISOString();
-      assert.equal(
-        renderedStoppedAt,
-        expectedStoppedAt,
-        "the rendered stoppedAt must equal the EXACT injected-clock stop instant"
-      );
-      stoppedAtBeforeReset = renderedStoppedAt;
+      // Give the notification microtask a chance to run - `server.notification`
+      // resolves asynchronously even though the mocked timer fired
+      // synchronously.
+      await new Promise((resolve) => setImmediate(resolve));
 
-      const wakeCountAtStop = received.length;
-      const totalSpanSec = (TICKS_NEEDED * TICK_MS) / 1000;
-      assert.ok(
-        wakeCountAtStop <= WAKE_MAX_RATE_PER_SEC * Math.ceil(totalSpanSec) + 1,
-        `expected the wake rate to stay bounded at <= ${WAKE_MAX_RATE_PER_SEC}/sec, got ${wakeCountAtStop} wakes over a ~${totalSpanSec}s window`
-      );
-
-      // Emitting further output after auto-stop must fire ZERO additional wakes.
-      jobStore.appendOutput(jobId, "stdout", line("after-firehose-stop"));
-      mock.timers.tick(WAKE_COALESCE_WINDOW_MS * 2);
       assert.equal(
         received.length,
-        wakeCountAtStop,
-        "no additional wake may fire once the watch has auto-stopped"
+        1,
+        `expected exactly one wake, got ${JSON.stringify(received)}`
       );
 
-      // The watch's own onJobTerminal subscription must already be gone at
-      // this point too - not merely inert, genuinely unsubscribed. A
-      // callback that merely goes inert via its own "if (stopped) return"
-      // guard, without ever calling its own unsubscribe, would stay
-      // registered until the job's eventual TTL purge; this assertion
-      // would not catch that as a leak by itself, since inert and
-      // unregistered look identical to any caller that never inspects the
-      // listener count directly.
-      //
-      // The count this asserts is 2: two genuinely SEPARATE, independent
-      // `onJobTerminal` subscribers share the same guard block in
-      // `maybeAugmentRunResult` alongside the watch under test here - the
-      // `notifications/tasks` per-transition status notifier
-      // (startTaskStatusNotifier, see its own docs) and the
-      // transport-layer wake subscriber (startTransportWakeOnTerminal, see
-      // its own docs - gated OFF by default via
-      // GHANTIKA_WAKE_TRANSPORT_ENABLED, but its SUBSCRIPTION is
-      // unconditional). Both must still be live here, since the job has
-      // not reached its real terminal transition yet - only the OTHER
-      // watch auto-stopped. If startTaskWatch's own listener were ever
-      // left registered instead of genuinely unsubscribed, this count
-      // would read 3 (the leaked one plus both siblings' own live ones),
-      // not 2.
-      assert.equal(
-        jobStore.getJobTerminalListenerCount(jobId),
-        2,
-        "expected exactly the two independent onJobTerminal subscribers (notifications/tasks status notifier + transport-layer wake) to remain - the auto-stopped watch's own listener must be genuinely unsubscribed, not merely left inert"
-      );
-    } finally {
-      mock.timers.reset();
-    }
-    await new Promise((resolve) => setImmediate(resolve));
-
-    // The job stays genuinely alive and pollable via output - the watch
-    // stopping never touches the backing process.
-    const handle = jobStore.getChildHandle(jobId);
-    assert.ok(
-      handle && isProcessAlive(handle.pid),
-      "the backing job must still be a live real process"
-    );
-    const outputResult = (await pair.client.callTool({
-      name: "output",
-      arguments: { job_id: jobId, stream: "stdout", limit: 1 },
-    })) as { isError?: boolean };
-    assert.notEqual(
-      outputResult.isError,
-      true,
-      "output must still work normally on the firehosed job"
-    );
-
-    // The real, later terminal is STILL observable through tasks/get once
-    // the job actually ends - the auto-stop never blinds tasks/get to the
-    // real terminal transition.
-    await killAndReapRealChild(jobId);
-    const finalGet = await tasksGet(pair.client, jobId);
-    assert.equal(finalGet.status, "cancelled");
-    assert.ok(stoppedAtBeforeReset, "sanity: the earlier stoppedAt capture must have happened");
-  } finally {
-    if (jobId !== undefined && jobStore.getChildHandle(jobId) !== undefined) {
-      await killAndReapRealChild(jobId);
-    }
-    await pair.close();
-  }
-});
-
-test("green control: a bounded stream UNDER FIREHOSE_LINES_PER_SEC runs to its normal terminal completely UNTOUCHED - the watch is never auto-stopped", async () => {
-  const pair = await startPair(true);
-  let jobId: string | undefined;
-  try {
-    const minted = await mintJob(pair.client, {
-      command: IDLE_COMMAND,
-      label: "firehose-green-control",
-    });
-    jobId = minted.taskId as string;
-    const received = registerWakeSpy(pair.client);
-
-    // Well under the threshold: 10 lines per 200ms tick == 50 lines/sec,
-    // for 12 ticks (2400ms) - comfortably longer than FIREHOSE_SUSTAINED_MS
-    // (2000ms), and FIREHOSE_LINES_PER_SEC (5000) is two orders of
-    // magnitude above this rate.
-    mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
-    try {
-      for (let tick = 0; tick < 12; tick += 1) {
-        const parts: Buffer[] = [];
-        for (let i = 0; i < 10; i += 1) parts.push(line(`slow-${tick}-${i}`));
-        jobStore.appendOutput(jobId, "stdout", Buffer.concat(parts));
-        mock.timers.tick(WAKE_COALESCE_WINDOW_MS);
+      // Suppressed-notification case: a SEPARATE, non-subscribing
+      // client must still observe everything via the poll floor. Registering
+      // NEITHER a handler NOR a fallback for a method means the SDK's own
+      // dispatch silently drops it client-side - the terminal must still be
+      // observable via tasks/get and output regardless.
+      const quiet = await startPair(true);
+      try {
+        const quietMinted = await mintJob(quiet.client, {
+          command: [process.execPath, "-e", "process.stdout.write('suppressed-poll-floor\\n');"],
+          label: "suppressed-notifications",
+        });
+        const quietJobId = quietMinted.taskId as string;
+        await pollUntilTerminal(quiet.client, quietJobId);
+        const quietGet = await tasksGet(quiet.client, quietJobId);
+        assert.equal(quietGet.status, "completed");
+        const outputResult = (await quiet.client.callTool({
+          name: "output",
+          arguments: { job_id: quietJobId },
+        })) as { structuredContent?: { events?: Array<{ text: string }> } };
+        const texts = (outputResult.structuredContent?.events ?? []).map((event) => event.text);
+        assert.ok(
+          texts.includes("suppressed-poll-floor"),
+          `expected the poll floor to surface the real line even with no notification handler registered, got ${JSON.stringify(texts)}`
+        );
+      } finally {
+        await quiet.close();
       }
     } finally {
-      mock.timers.reset();
+      if (jobId !== undefined) await killAndReapRealChild(jobId);
+      await pair.close();
     }
-    await new Promise((resolve) => setImmediate(resolve));
-
-    const taskGet = await tasksGet(pair.client, jobId);
-    assert.equal(taskGet.status, "working");
-    assert.equal(
-      taskGet.statusMessage,
-      undefined,
-      "a bounded, under-threshold stream must NEVER trigger the firehose auto-stop (no statusMessage rendered)"
-    );
-    assert.ok(received.length > 0, "the watch must still have delivered normal wakes throughout");
-
-    // Runs to its normal (here: killed) terminal, untouched by any
-    // firehose guard. A CancelledTaskResult carries no result/error
-    // container at all on the released contract, so there is no
-    // watchStopped field of any shape to check here anymore - the
-    // never-auto-stopped claim is already fully proven by the
-    // still-working check above.
-    await killAndReapRealChild(jobId);
-    const finalGet = await tasksGet(pair.client, jobId);
-    assert.equal(finalGet.status, "cancelled");
-    assert.equal(finalGet.result, undefined);
-    assert.equal(finalGet.error, undefined);
-  } finally {
-    if (jobId !== undefined && jobStore.getChildHandle(jobId) !== undefined) {
-      await killAndReapRealChild(jobId);
-    }
-    await pair.close();
-  }
-});
-
-// ---------------------------------------------------------------------------
-// Exit ends the watch: the terminal is reached, the exit code is
-// reported (both 0 and non-zero), and the job/process is genuinely reaped.
-// ---------------------------------------------------------------------------
-
-test("a REAL exit-0 job reports exitCode 0 and is genuinely reaped, and further synthetic output after exit fires ZERO wakes (the watch really stopped)", async () => {
-  const pair = await startPair(true);
-  const minted = await mintJob(pair.client, {
-    command: [process.execPath, "-e", "process.exit(0);"],
-    label: "exit-zero",
   });
-  const jobId = minted.taskId as string;
-  const received = registerWakeSpy(pair.client);
-  const handle = jobStore.getChildHandle(jobId);
-  assert.ok(handle, "expected a real tracked child before exit");
 
-  try {
-    await pollUntilTerminal(pair.client, jobId);
-    await waitForRealDeath(handle!.pid);
-
-    const taskGet = await tasksGet(pair.client, jobId);
-    assert.equal(taskGet.status, "completed");
-    assert.equal((taskGet.result as Record<string, unknown> | undefined)?.exitCode, 0);
-
-    const beforeCount = received.length;
-    jobStore.appendOutput(jobId, "stdout", line("after-exit-should-not-wake"));
-    await new Promise((resolve) => setTimeout(resolve, WAKE_COALESCE_WINDOW_MS + 50));
-    assert.equal(
-      received.length,
-      beforeCount,
-      "no wake may fire once the job's own exit has ended the watch"
-    );
-  } finally {
-    await pair.close();
-  }
-});
-
-test("a REAL non-zero exit job reports its exact exit code and is genuinely reaped", async () => {
-  const pair = await startPair(true);
-  const minted = await mintJob(pair.client, {
-    command: [process.execPath, "-e", "process.exit(7);"],
-    label: "exit-nonzero",
-  });
-  const jobId = minted.taskId as string;
-  const handle = jobStore.getChildHandle(jobId);
-  assert.ok(handle, "expected a real tracked child before exit");
-
-  try {
-    await pollUntilTerminal(pair.client, jobId);
-    await waitForRealDeath(handle!.pid);
-
-    const taskGet = await tasksGet(pair.client, jobId);
-    assert.equal(taskGet.status, "completed");
-    assert.equal((taskGet.result as Record<string, unknown> | undefined)?.exitCode, 7);
-  } finally {
-    await pair.close();
-  }
-});
-
-// ---------------------------------------------------------------------------
-// Terminal flush ordering: stdout buffered inside an OPEN window at
-// the moment of terminal is flushed as a final wake BEFORE the terminal
-// close completes; NO wake fires for the terminal transition itself, and
-// NO wake fires after. The terminal transition here is forced
-// DIRECTLY via jobStore.markKilled (bypassing the real kill sequence
-// entirely) so the mocked clock never has to interact with process.ts's
-// own real-timer-driven wait - the real underlying process is separately,
-// genuinely killed+reaped afterward, with real timers restored first.
-// ---------------------------------------------------------------------------
-
-test("lines emitted inside an open coalescing window, then terminal forced before WAKE_COALESCE_WINDOW_MS elapses - the pending batch arrives as ONE final pre-close wake, and ZERO wakes fire after", async () => {
-  const pair = await startPair(true);
-  let jobId: string | undefined;
-  try {
-    const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "flush-ordering" });
-    jobId = minted.taskId as string;
-    const received = registerWakeSpy(pair.client);
-
-    mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+  test("one stdout batch fires one wake carrying EXACTLY that batch's new stdout delta, deepEqual against the poll floor's own view of the same lines - never the cumulative buffer", async () => {
+    const pair = await startPair(true);
+    let jobId: string | undefined;
     try {
-      jobStore.appendOutput(jobId, "stdout", Buffer.concat([line("pending-1"), line("pending-2")]));
-      // The window is open (WAKE_COALESCE_WINDOW_MS hasn't elapsed) -
-      // force the terminal transition NOW, directly, before ever ticking.
-      jobStore.markKilled(jobId, "SIGTERM-test-forced");
-      // The flush call itself runs synchronously inside markKilled's own
-      // fireJobTerminal dispatch, but actual DELIVERY to the mock client
-      // (server.notification -> InMemoryTransport.send -> the client's
-      // own Promise.resolve().then(...)-deferred dispatch) is
-      // asynchronous - settle that before asserting on `received`.
+      const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "batch-delta" });
+      jobId = minted.taskId as string;
+      const received = registerWakeSpy(pair.client);
+
+      mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+      try {
+        jobStore.appendOutput(
+          jobId,
+          "stdout",
+          Buffer.concat([line("alpha"), line("beta"), line("gamma")])
+        );
+        mock.timers.tick(WAKE_COALESCE_WINDOW_MS);
+      } finally {
+        mock.timers.reset();
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.equal(received.length, 1);
+      const wake = received[0]!.params;
+      assert.equal(wake.extension, TASKS_EXTENSION_URI);
+      assert.equal(wake.taskId, jobId);
+      const wakeStdout = wake.stdout as Array<{ seq: number; text: string; partial?: true }>;
+      assert.deepEqual(
+        wakeStdout.map((entry) => entry.text),
+        ["alpha", "beta", "gamma"],
+        "the wake's stdout delta must contain EXACTLY this batch's lines, in order"
+      );
+      for (const entry of wakeStdout) assert.equal(entry.partial, undefined);
+
+      // Cross-check against the poll floor's own canonical view of the SAME
+      // lines - proves the wake never carries state the poll floor can't
+      // independently surface.
+      const outputResult = (await pair.client.callTool({
+        name: "output",
+        arguments: { job_id: jobId, stream: "stdout" },
+      })) as {
+        structuredContent?: { events?: Array<{ seq: number; text: string; partial?: true }> };
+      };
+      const polledEvents = (outputResult.structuredContent?.events ?? []).map((event) => ({
+        seq: event.seq,
+        text: event.text,
+        ...(event.partial ? { partial: event.partial } : {}),
+      }));
+      assert.deepEqual(
+        wakeStdout,
+        polledEvents,
+        "the wake's stdout delta must deepEqual the poll floor's own view of the same lines"
+      );
+    } finally {
+      if (jobId !== undefined) await killAndReapRealChild(jobId);
+      await pair.close();
+    }
+  });
+
+  test("with the wake handler entirely unregistered on a capable connection, tasks/get + output/tail still surface every line and the terminal identically to pre-Tasks (Phase 1) behavior", async () => {
+    const pair = await startPair(true); // capable connection, but no wake handler ever registered
+    let jobId: string | undefined;
+    try {
+      const minted = await mintJob(pair.client, {
+        command: [process.execPath, "-e", "process.stdout.write('phase1-a\\nphase1-b\\n');"],
+        label: "poll-floor-parity",
+      });
+      jobId = minted.taskId as string;
+      await pollUntilTerminal(pair.client, jobId);
+
+      const taskGet = await tasksGet(pair.client, jobId);
+      assert.equal(taskGet.status, "completed");
+
+      const tailResult = (await pair.client.callTool({
+        name: "tail",
+        arguments: { job_id: jobId, lines: 5 },
+      })) as { structuredContent?: { events?: Array<{ text: string }> } };
+      const tailTexts = (tailResult.structuredContent?.events ?? []).map((entry) => entry.text);
+      assert.deepEqual(tailTexts, ["phase1-a", "phase1-b"]);
+    } finally {
+      if (jobId !== undefined) await killAndReapRealChild(jobId);
+      await pair.close();
+    }
+  });
+
+  test("a stderr-only batch wakes on its own carrying ONLY the stderr key; a batch mixing both streams in the SAME window wakes once carrying BOTH keys", async () => {
+    const pair = await startPair(true);
+    let jobId: string | undefined;
+    try {
+      const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "stderr-wakes" });
+      jobId = minted.taskId as string;
+      const received = registerWakeSpy(pair.client);
+
+      mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+      try {
+        jobStore.appendOutput(jobId, "stderr", line("stderr-only-line"));
+        mock.timers.tick(WAKE_COALESCE_WINDOW_MS);
+      } finally {
+        mock.timers.reset();
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.equal(received.length, 1, "a stderr-only batch must wake exactly once, on its own");
+      assert.equal(
+        received[0]!.params.stdout,
+        undefined,
+        "a stderr-only wake must not carry a stdout key at all"
+      );
+      const wakeStderr = received[0]!.params.stderr as Array<{ text: string }>;
+      assert.deepEqual(
+        wakeStderr.map((entry) => entry.text),
+        ["stderr-only-line"]
+      );
+
+      // stderr is ALSO observable via the poll floor - the wake is additive,
+      // never a substitute for it.
+      const outputResult = (await pair.client.callTool({
+        name: "output",
+        arguments: { job_id: jobId, stream: "stderr" },
+      })) as { structuredContent?: { events?: Array<{ text: string }> } };
+      const stderrTexts = (outputResult.structuredContent?.events ?? []).map((event) => event.text);
+      assert.deepEqual(stderrTexts, ["stderr-only-line"]);
+
+      // A batch mixing both streams within the SAME open window collapses
+      // into ONE wake carrying both keys, not two separate wakes.
+      mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+      try {
+        jobStore.appendOutput(jobId, "stdout", line("mixed-stdout-line"));
+        jobStore.appendOutput(jobId, "stderr", line("mixed-stderr-line"));
+        mock.timers.tick(WAKE_COALESCE_WINDOW_MS);
+      } finally {
+        mock.timers.reset();
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.equal(received.length, 2, "the mixed batch must add exactly one more wake");
+      const mixedWake = received[1]!.params;
+      assert.deepEqual(
+        (mixedWake.stdout as Array<{ text: string }>).map((entry) => entry.text),
+        ["mixed-stdout-line"]
+      );
+      assert.deepEqual(
+        (mixedWake.stderr as Array<{ text: string }>).map((entry) => entry.text),
+        ["mixed-stderr-line"]
+      );
+    } finally {
+      if (jobId !== undefined) await killAndReapRealChild(jobId);
+      await pair.close();
+    }
+  });
+
+  test("lines within one WAKE_COALESCE_WINDOW_MS window collapse into ONE wake; two batches more than the window apart fire TWO wakes - deterministic injected clock, never a real sleep", async () => {
+    const pair = await startPair(true);
+    let jobId: string | undefined;
+    try {
+      const minted = await mintJob(pair.client, {
+        command: IDLE_COMMAND,
+        label: "coalesce-window",
+      });
+      jobId = minted.taskId as string;
+      const received = registerWakeSpy(pair.client);
+
+      mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+      try {
+        jobStore.appendOutput(jobId, "stdout", line("w1-a"));
+        mock.timers.tick(WAKE_COALESCE_WINDOW_MS - 10);
+        jobStore.appendOutput(jobId, "stdout", line("w1-b"));
+        mock.timers.tick(10); // exactly closes window 1 (w1-a's own scheduled timer)
+      } finally {
+        mock.timers.reset();
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(received.length, 1, "both lines within one window must collapse into ONE wake");
+      assert.deepEqual(
+        (received[0]!.params.stdout as Array<{ text: string }>).map((entry) => entry.text),
+        ["w1-a", "w1-b"]
+      );
+
+      mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+      try {
+        jobStore.appendOutput(jobId, "stdout", line("w2"));
+        mock.timers.tick(WAKE_COALESCE_WINDOW_MS + 1); // opens and closes a SECOND, later window
+      } finally {
+        mock.timers.reset();
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(
+        received.length,
+        2,
+        "a batch more than one window later must fire a SECOND, distinct wake"
+      );
+      assert.deepEqual(
+        (received[1]!.params.stdout as Array<{ text: string }>).map((entry) => entry.text),
+        ["w2"]
+      );
+    } finally {
+      if (jobId !== undefined) await killAndReapRealChild(jobId);
+      await pair.close();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Firehose rate-limit + auto-stop, and its required green control
+  // (a bounded stream stays completely untouched).
+  // ---------------------------------------------------------------------------
+
+  /** One synthetic stdout line's worth of bytes for the firehose fixtures below - short and cheap to materialize many thousands of times per test. */
+  function firehoseLine(i: number): Buffer {
+    return Buffer.from(`f${i}\n`);
+  }
+
+  function manyFirehoseLines(count: number): Buffer {
+    const parts: Buffer[] = [];
+    for (let i = 0; i < count; i += 1) parts.push(firehoseLine(i));
+    return Buffer.concat(parts);
+  }
+
+  test("a sustained firehose rate rate-limits wakes and auto-stops ONLY the notification watch - the job stays alive/pollable, the terminal is later observable, and zero wakes fire after the stop", async () => {
+    const pair = await startPair(true);
+    let jobId: string | undefined;
+    try {
+      const minted = await mintJob(pair.client, {
+        command: IDLE_COMMAND,
+        label: "firehose-trigger",
+      });
+      jobId = minted.taskId as string;
+      const received = registerWakeSpy(pair.client);
+
+      // Derived directly from the exported constants (never magic literals):
+      // TICK_MS ticks, each carrying LINES_PER_TICK synthetic lines - a
+      // sustained rate of LINES_PER_TICK/TICK_MS*1000 (a 20% margin over
+      // FIREHOSE_LINES_PER_SEC), sustained for TICKS_NEEDED ticks so the
+      // cumulative elapsed span reaches (and this ticks one further, to
+      // cross) FIREHOSE_SUSTAINED_MS. With the window anchored on the very
+      // first line and never resetting (every subsequent line's own
+      // computed rate stays above threshold throughout), the auto-stop
+      // triggers deterministically on the FIRST line of the LAST call below
+      // - at real-elapsed TICKS_NEEDED * TICK_MS, i.e. the first tick count
+      // whose cumulative span is >= FIREHOSE_SUSTAINED_MS.
+      const TICK_MS = 1000;
+      const LINES_PER_TICK = Math.ceil(((FIREHOSE_LINES_PER_SEC * TICK_MS) / 1000) * 1.2);
+      const TICKS_NEEDED = Math.ceil(FIREHOSE_SUSTAINED_MS / TICK_MS);
+
+      const realStart = Date.now();
+      mock.timers.enable({ apis: ["setTimeout", "Date"], now: realStart });
+      let stoppedAtBeforeReset: string | undefined;
+      try {
+        jobStore.appendOutput(jobId, "stdout", manyFirehoseLines(LINES_PER_TICK));
+        for (let i = 0; i < TICKS_NEEDED; i += 1) {
+          mock.timers.tick(TICK_MS);
+          jobStore.appendOutput(jobId, "stdout", manyFirehoseLines(LINES_PER_TICK));
+        }
+
+        const taskGet = await tasksGet(pair.client, jobId);
+        assert.equal(
+          taskGet.status,
+          "working",
+          "the JOB must still be 'working' - only the watch stopped"
+        );
+        // A still-WORKING task carries the watch-stop fact rendered as TEXT
+        // into statusMessage, per the released contract - see
+        // src/tasksAdapter.ts's own renderWatchStoppedStatusMessage docs (a
+        // working task has no result/error container the way a terminal task
+        // does, so there is no structured watchStopped field to read here at
+        // all anymore).
+        const statusMessage = taskGet.statusMessage as string | undefined;
+        assert.ok(
+          statusMessage,
+          `expected statusMessage to be present, got ${JSON.stringify(taskGet)}`
+        );
+        const rendered = statusMessage!.match(/^output watch auto-stopped \(([^)]+)\) at (.+)$/);
+        assert.ok(
+          rendered,
+          `expected statusMessage to match the rendered watch-stop format, got ${JSON.stringify(statusMessage)}`
+        );
+        const [, renderedReason, renderedStoppedAt] = rendered!;
+        assert.equal(renderedReason, WATCH_STOP_REASON_FIREHOSE);
+        assert.match(renderedStoppedAt!, ISO_TIMESTAMP_PATTERN);
+        const expectedStoppedAt = new Date(realStart + TICKS_NEEDED * TICK_MS).toISOString();
+        assert.equal(
+          renderedStoppedAt,
+          expectedStoppedAt,
+          "the rendered stoppedAt must equal the EXACT injected-clock stop instant"
+        );
+        stoppedAtBeforeReset = renderedStoppedAt;
+
+        const wakeCountAtStop = received.length;
+        const totalSpanSec = (TICKS_NEEDED * TICK_MS) / 1000;
+        assert.ok(
+          wakeCountAtStop <= WAKE_MAX_RATE_PER_SEC * Math.ceil(totalSpanSec) + 1,
+          `expected the wake rate to stay bounded at <= ${WAKE_MAX_RATE_PER_SEC}/sec, got ${wakeCountAtStop} wakes over a ~${totalSpanSec}s window`
+        );
+
+        // Emitting further output after auto-stop must fire ZERO additional wakes.
+        jobStore.appendOutput(jobId, "stdout", line("after-firehose-stop"));
+        mock.timers.tick(WAKE_COALESCE_WINDOW_MS * 2);
+        assert.equal(
+          received.length,
+          wakeCountAtStop,
+          "no additional wake may fire once the watch has auto-stopped"
+        );
+
+        // The watch's own onJobTerminal subscription must already be gone at
+        // this point too - not merely inert, genuinely unsubscribed. A
+        // callback that merely goes inert via its own "if (stopped) return"
+        // guard, without ever calling its own unsubscribe, would stay
+        // registered until the job's eventual TTL purge; this assertion
+        // would not catch that as a leak by itself, since inert and
+        // unregistered look identical to any caller that never inspects the
+        // listener count directly.
+        //
+        // The count this asserts is 2: two genuinely SEPARATE, independent
+        // `onJobTerminal` subscribers share the same guard block in
+        // `maybeAugmentRunResult` alongside the watch under test here - the
+        // `notifications/tasks` per-transition status notifier
+        // (startTaskStatusNotifier, see its own docs) and the
+        // transport-layer wake subscriber (startTransportWakeOnTerminal, see
+        // its own docs - gated OFF by default via
+        // GHANTIKA_WAKE_TRANSPORT_ENABLED, but its SUBSCRIPTION is
+        // unconditional). Both must still be live here, since the job has
+        // not reached its real terminal transition yet - only the OTHER
+        // watch auto-stopped. If startTaskWatch's own listener were ever
+        // left registered instead of genuinely unsubscribed, this count
+        // would read 3 (the leaked one plus both siblings' own live ones),
+        // not 2.
+        assert.equal(
+          jobStore.getJobTerminalListenerCount(jobId),
+          2,
+          "expected exactly the two independent onJobTerminal subscribers (notifications/tasks status notifier + transport-layer wake) to remain - the auto-stopped watch's own listener must be genuinely unsubscribed, not merely left inert"
+        );
+      } finally {
+        mock.timers.reset();
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+
+      // The job stays genuinely alive and pollable via output - the watch
+      // stopping never touches the backing process.
+      const handle = jobStore.getChildHandle(jobId);
+      assert.ok(
+        handle && isProcessAlive(handle.pid),
+        "the backing job must still be a live real process"
+      );
+      const outputResult = (await pair.client.callTool({
+        name: "output",
+        arguments: { job_id: jobId, stream: "stdout", limit: 1 },
+      })) as { isError?: boolean };
+      assert.notEqual(
+        outputResult.isError,
+        true,
+        "output must still work normally on the firehosed job"
+      );
+
+      // The real, later terminal is STILL observable through tasks/get once
+      // the job actually ends - the auto-stop never blinds tasks/get to the
+      // real terminal transition.
+      await killAndReapRealChild(jobId);
+      const finalGet = await tasksGet(pair.client, jobId);
+      assert.equal(finalGet.status, "cancelled");
+      assert.ok(stoppedAtBeforeReset, "sanity: the earlier stoppedAt capture must have happened");
+    } finally {
+      if (jobId !== undefined && jobStore.getChildHandle(jobId) !== undefined) {
+        await killAndReapRealChild(jobId);
+      }
+      await pair.close();
+    }
+  });
+
+  test("green control: a bounded stream UNDER FIREHOSE_LINES_PER_SEC runs to its normal terminal completely UNTOUCHED - the watch is never auto-stopped", async () => {
+    const pair = await startPair(true);
+    let jobId: string | undefined;
+    try {
+      const minted = await mintJob(pair.client, {
+        command: IDLE_COMMAND,
+        label: "firehose-green-control",
+      });
+      jobId = minted.taskId as string;
+      const received = registerWakeSpy(pair.client);
+
+      // Well under the threshold: 10 lines per 200ms tick == 50 lines/sec,
+      // for 12 ticks (2400ms) - comfortably longer than FIREHOSE_SUSTAINED_MS
+      // (2000ms), and FIREHOSE_LINES_PER_SEC (5000) is two orders of
+      // magnitude above this rate.
+      mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+      try {
+        for (let tick = 0; tick < 12; tick += 1) {
+          const parts: Buffer[] = [];
+          for (let i = 0; i < 10; i += 1) parts.push(line(`slow-${tick}-${i}`));
+          jobStore.appendOutput(jobId, "stdout", Buffer.concat(parts));
+          mock.timers.tick(WAKE_COALESCE_WINDOW_MS);
+        }
+      } finally {
+        mock.timers.reset();
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const taskGet = await tasksGet(pair.client, jobId);
+      assert.equal(taskGet.status, "working");
+      assert.equal(
+        taskGet.statusMessage,
+        undefined,
+        "a bounded, under-threshold stream must NEVER trigger the firehose auto-stop (no statusMessage rendered)"
+      );
+      assert.ok(received.length > 0, "the watch must still have delivered normal wakes throughout");
+
+      // Runs to its normal (here: killed) terminal, untouched by any
+      // firehose guard. A CancelledTaskResult carries no result/error
+      // container at all on the released contract, so there is no
+      // watchStopped field of any shape to check here anymore - the
+      // never-auto-stopped claim is already fully proven by the
+      // still-working check above.
+      await killAndReapRealChild(jobId);
+      const finalGet = await tasksGet(pair.client, jobId);
+      assert.equal(finalGet.status, "cancelled");
+      assert.equal(finalGet.result, undefined);
+      assert.equal(finalGet.error, undefined);
+    } finally {
+      if (jobId !== undefined && jobStore.getChildHandle(jobId) !== undefined) {
+        await killAndReapRealChild(jobId);
+      }
+      await pair.close();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Exit ends the watch: the terminal is reached, the exit code is
+  // reported (both 0 and non-zero), and the job/process is genuinely reaped.
+  // ---------------------------------------------------------------------------
+
+  test("a REAL exit-0 job reports exitCode 0 and is genuinely reaped, and further synthetic output after exit fires ZERO wakes (the watch really stopped)", async () => {
+    const pair = await startPair(true);
+    const minted = await mintJob(pair.client, {
+      command: [process.execPath, "-e", "process.exit(0);"],
+      label: "exit-zero",
+    });
+    const jobId = minted.taskId as string;
+    const received = registerWakeSpy(pair.client);
+    const handle = jobStore.getChildHandle(jobId);
+    assert.ok(handle, "expected a real tracked child before exit");
+
+    try {
+      await pollUntilTerminal(pair.client, jobId);
+      await waitForRealDeath(handle!.pid);
+
+      const taskGet = await tasksGet(pair.client, jobId);
+      assert.equal(taskGet.status, "completed");
+      assert.equal((taskGet.result as Record<string, unknown> | undefined)?.exitCode, 0);
+
+      const beforeCount = received.length;
+      jobStore.appendOutput(jobId, "stdout", line("after-exit-should-not-wake"));
+      await new Promise((resolve) => setTimeout(resolve, WAKE_COALESCE_WINDOW_MS + 50));
+      assert.equal(
+        received.length,
+        beforeCount,
+        "no wake may fire once the job's own exit has ended the watch"
+      );
+    } finally {
+      await pair.close();
+    }
+  });
+
+  test("a REAL non-zero exit job reports its exact exit code and is genuinely reaped", async () => {
+    const pair = await startPair(true);
+    const minted = await mintJob(pair.client, {
+      command: [process.execPath, "-e", "process.exit(7);"],
+      label: "exit-nonzero",
+    });
+    const jobId = minted.taskId as string;
+    const handle = jobStore.getChildHandle(jobId);
+    assert.ok(handle, "expected a real tracked child before exit");
+
+    try {
+      await pollUntilTerminal(pair.client, jobId);
+      await waitForRealDeath(handle!.pid);
+
+      const taskGet = await tasksGet(pair.client, jobId);
+      assert.equal(taskGet.status, "completed");
+      assert.equal((taskGet.result as Record<string, unknown> | undefined)?.exitCode, 7);
+    } finally {
+      await pair.close();
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Terminal flush ordering: stdout buffered inside an OPEN window at
+  // the moment of terminal is flushed as a final wake BEFORE the terminal
+  // close completes; NO wake fires for the terminal transition itself, and
+  // NO wake fires after. The terminal transition here is forced
+  // DIRECTLY via jobStore.markKilled (bypassing the real kill sequence
+  // entirely) so the mocked clock never has to interact with process.ts's
+  // own real-timer-driven wait - the real underlying process is separately,
+  // genuinely killed+reaped afterward, with real timers restored first.
+  // ---------------------------------------------------------------------------
+
+  test("lines emitted inside an open coalescing window, then terminal forced before WAKE_COALESCE_WINDOW_MS elapses - the pending batch arrives as ONE final pre-close wake, and ZERO wakes fire after", async () => {
+    const pair = await startPair(true);
+    let jobId: string | undefined;
+    try {
+      const minted = await mintJob(pair.client, { command: IDLE_COMMAND, label: "flush-ordering" });
+      jobId = minted.taskId as string;
+      const received = registerWakeSpy(pair.client);
+
+      mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+      try {
+        jobStore.appendOutput(
+          jobId,
+          "stdout",
+          Buffer.concat([line("pending-1"), line("pending-2")])
+        );
+        // The window is open (WAKE_COALESCE_WINDOW_MS hasn't elapsed) -
+        // force the terminal transition NOW, directly, before ever ticking.
+        jobStore.markKilled(jobId, "SIGTERM-test-forced");
+        // The flush call itself runs synchronously inside markKilled's own
+        // fireJobTerminal dispatch, but actual DELIVERY to the mock client
+        // (server.notification -> InMemoryTransport.send -> the client's
+        // own Promise.resolve().then(...)-deferred dispatch) is
+        // asynchronous - settle that before asserting on `received`.
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(
+          received.length,
+          1,
+          "the pending open-window lines must flush as ONE wake, at the moment of terminal"
+        );
+        assert.deepEqual(
+          (received[0]!.params.stdout as Array<{ text: string }>).map((entry) => entry.text),
+          ["pending-1", "pending-2"]
+        );
+
+        // Advancing time past the window's own original deadline must fire
+        // NOTHING further - the watch was stopped synchronously above.
+        mock.timers.tick(WAKE_COALESCE_WINDOW_MS * 3);
+        assert.equal(received.length, 1, "no wake may fire after the terminal close");
+      } finally {
+        mock.timers.reset();
+      }
       await new Promise((resolve) => setImmediate(resolve));
       assert.equal(
         received.length,
         1,
-        "the pending open-window lines must flush as ONE wake, at the moment of terminal"
-      );
-      assert.deepEqual(
-        (received[0]!.params.stdout as Array<{ text: string }>).map((entry) => entry.text),
-        ["pending-1", "pending-2"]
+        "still exactly one wake after settling any pending microtasks"
       );
 
-      // Advancing time past the window's own original deadline must fire
-      // NOTHING further - the watch was stopped synchronously above.
-      mock.timers.tick(WAKE_COALESCE_WINDOW_MS * 3);
-      assert.equal(received.length, 1, "no wake may fire after the terminal close");
+      const taskGet = await tasksGet(pair.client, jobId);
+      assert.equal(taskGet.status, "cancelled");
     } finally {
-      mock.timers.reset();
+      // markKilled only touched the STATE record - the real underlying
+      // process is still alive and must be genuinely killed+reaped
+      // separately, with real timers (mock.timers is already reset above).
+      if (jobId !== undefined) await killAndReapRealChild(jobId);
+      await pair.close();
     }
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(
-      received.length,
-      1,
-      "still exactly one wake after settling any pending microtasks"
-    );
+  });
 
-    const taskGet = await tasksGet(pair.client, jobId);
-    assert.equal(taskGet.status, "cancelled");
-  } finally {
-    // markKilled only touched the STATE record - the real underlying
-    // process is still alive and must be genuinely killed+reaped
-    // separately, with real timers (mock.timers is already reset above).
-    if (jobId !== undefined) await killAndReapRealChild(jobId);
-    await pair.close();
-  }
-});
+  // ---------------------------------------------------------------------------
+  // The notification is optional; proof here is via a SIMULATED/mock
+  // capable client + the poll floor. Real-host auto-resume (a genuine
+  // installed Tasks-capable GUI host observing the notification and
+  // resuming on its own) is explicitly DISCLOSED-PENDING - launch-gated on
+  // the maintainer's own machine, never asserted here.
+  // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// The notification is optional; proof here is via a SIMULATED/mock
-// capable client + the poll floor. Real-host auto-resume (a genuine
-// installed Tasks-capable GUI host observing the notification and
-// resuming on its own) is explicitly DISCLOSED-PENDING - launch-gated on
-// the maintainer's own machine, never asserted here.
-// ---------------------------------------------------------------------------
-
-test("the wake path is proven here via a SIMULATED/mock capable client and the poll floor only - real-host auto-resume is explicitly disclosed-pending, not asserted from this suite", async () => {
-  // This test asserts nothing new; it exists to carry, in the test
-  // suite itself, the explicit label that
-  // separates what THIS suite proves from what remains disclosed-pending:
-  //
-  //   PROVEN HERE (simulated/mock):
-  //     - a mock @modelcontextprotocol/client, driven entirely by this
-  //       test file, receives notifications/ghantika/outputWake wakes with
-  //       the exact delta on either stream (stdout, stderr, or both
-  //       together in one window), respects the coalescing window,
-  //       rate-limits and auto-stops under a firehose,
-  //       and the poll floor (tasks/get + output/tail) surfaces
-  //       everything regardless of whether the wake handler is
-  //       registered at all.
-  //
-  //   DISCLOSED-PENDING (launch-gated, NOT proven by this suite):
-  //     - that a REAL, installed Tasks-capable GUI host (an actual MCP
-  //       client application, not this test's hand-rolled mock) is
-  //       genuinely auto-resumed by the optional notification when it
-  //       arrives. That claim can only be verified by hand, on the
-  //       maintainer's own machine, against a real such host once one
-  //       exists to test against - never inferred from this suite's own
-  //       mock/poll proof, however thorough.
-  const pair = await startPair(true);
-  let jobId: string | undefined;
-  try {
-    const minted = await mintJob(pair.client, {
-      command: IDLE_COMMAND,
-      label: "wake-path-label-only",
-    });
-    jobId = minted.taskId as string;
-    const received = registerWakeSpy(pair.client);
-
-    mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+  test("the wake path is proven here via a SIMULATED/mock capable client and the poll floor only - real-host auto-resume is explicitly disclosed-pending, not asserted from this suite", async () => {
+    // This test asserts nothing new; it exists to carry, in the test
+    // suite itself, the explicit label that
+    // separates what THIS suite proves from what remains disclosed-pending:
+    //
+    //   PROVEN HERE (simulated/mock):
+    //     - a mock @modelcontextprotocol/client, driven entirely by this
+    //       test file, receives notifications/ghantika/outputWake wakes with
+    //       the exact delta on either stream (stdout, stderr, or both
+    //       together in one window), respects the coalescing window,
+    //       rate-limits and auto-stops under a firehose,
+    //       and the poll floor (tasks/get + output/tail) surfaces
+    //       everything regardless of whether the wake handler is
+    //       registered at all.
+    //
+    //   DISCLOSED-PENDING (launch-gated, NOT proven by this suite):
+    //     - that a REAL, installed Tasks-capable GUI host (an actual MCP
+    //       client application, not this test's hand-rolled mock) is
+    //       genuinely auto-resumed by the optional notification when it
+    //       arrives. That claim can only be verified by hand, on the
+    //       maintainer's own machine, against a real such host once one
+    //       exists to test against - never inferred from this suite's own
+    //       mock/poll proof, however thorough.
+    const pair = await startPair(true);
+    let jobId: string | undefined;
     try {
-      jobStore.appendOutput(jobId, "stdout", line("wake-path-simulated-line"));
-      mock.timers.tick(WAKE_COALESCE_WINDOW_MS);
-    } finally {
-      mock.timers.reset();
-    }
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(received.length, 1, "the simulated/mock client path must observe the wake");
+      const minted = await mintJob(pair.client, {
+        command: IDLE_COMMAND,
+        label: "wake-path-label-only",
+      });
+      jobId = minted.taskId as string;
+      const received = registerWakeSpy(pair.client);
 
-    const outputResult = (await pair.client.callTool({
-      name: "output",
-      arguments: { job_id: jobId, stream: "stdout" },
-    })) as { structuredContent?: { events?: Array<{ text: string }> } };
-    const texts = (outputResult.structuredContent?.events ?? []).map((event) => event.text);
-    assert.ok(
-      texts.includes("wake-path-simulated-line"),
-      "the poll floor must independently surface the same line"
-    );
-  } finally {
-    if (jobId !== undefined) await killAndReapRealChild(jobId);
-    await pair.close();
-  }
-});
+      mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+      try {
+        jobStore.appendOutput(jobId, "stdout", line("wake-path-simulated-line"));
+        mock.timers.tick(WAKE_COALESCE_WINDOW_MS);
+      } finally {
+        mock.timers.reset();
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(received.length, 1, "the simulated/mock client path must observe the wake");
 
-// ---------------------------------------------------------------------------
-// The output-arrival seam itself: a generic, core-decoupled
-// subscribe/listener mechanism on src/jobStore.ts's JobStore.appendOutput.
-// The first two tests below drive a real run() path with a real spawned
-// process, proving multi-line, in-order delivery; the remaining tests use
-// a synthetic job (jobStore.createJob - no real child at all, matching
-// this file's own established low-level-mechanics convention) for byte-
-// exact control over split-chunk/stream-end/unsubscribe/isolation, none of
-// which need real process timing.
-// ---------------------------------------------------------------------------
-
-test("a registered listener receives each REAL stdout line, in order, as the REAL run.ts -> jobStore.appendOutput path materializes them", async () => {
-  const pair = await startPair(false); // non-capable: no tasksAdapter watch competes for the same listener slot
-  const scratchDir = mkdtempSync(path.join(tmpdir(), "ghantika-seam-real-path-"));
-  const goMarker = path.join(scratchDir, "go");
-  try {
-    // The child spins on `goMarker`'s existence before writing anything, so
-    // its real output can only arrive AFTER this test has subscribed - a
-    // real process race, closed deterministically rather than papered over
-    // with an `if (received.length > 0)` guard that would pass vacuously on
-    // zero observed lines.
-    // Inlined rather than routed through the shared runJob/mintJob helpers
-    // below: this is the ONE genuinely PLAIN (non-minting) run() call in
-    // this whole file (startPair(false) above), so it reads the ordinary
-    // structuredContent-nested job_id directly.
-    const runResult = await pair.client.callTool({
-      name: "run",
-      arguments: {
-        command: [
-          process.execPath,
-          "-e",
-          `const fs=require('fs');const m=${JSON.stringify(goMarker)};while(!fs.existsSync(m)){}process.stdout.write('seam-1\\nseam-2\\nseam-3\\n');`,
-        ],
-        label: "seam-real-path",
-      },
-    });
-    assert.notEqual((runResult as { isError?: boolean }).isError, true);
-    const minted = runResultStructured(runResult);
-    const jobId = minted.job_id as string;
-
-    const received: OutputArrivalEvent[] = [];
-    const unsubscribe = jobStore.onOutputArrival(jobId, (event) => {
-      received.push(event);
-    });
-    try {
-      writeFileSync(goMarker, "go");
-      await pollUntilTerminal(pair.client, jobId);
+      const outputResult = (await pair.client.callTool({
+        name: "output",
+        arguments: { job_id: jobId, stream: "stdout" },
+      })) as { structuredContent?: { events?: Array<{ text: string }> } };
+      const texts = (outputResult.structuredContent?.events ?? []).map((event) => event.text);
       assert.ok(
-        received.length > 0,
-        "expected at least one real stdout line via the real path - zero observed lines is a failure, not a vacuous pass"
+        texts.includes("wake-path-simulated-line"),
+        "the poll floor must independently surface the same line"
       );
-      assert.deepEqual(
-        received.map((event) => event.line.text),
-        ["seam-1", "seam-2", "seam-3"],
-        "lines received via the real path must arrive in exact materialization order"
-      );
-      for (const event of received) assert.equal(event.stream, "stdout");
     } finally {
-      unsubscribe();
+      if (jobId !== undefined) await killAndReapRealChild(jobId);
+      await pair.close();
     }
-  } finally {
-    rmSync(scratchDir, { recursive: true, force: true });
-    await pair.close();
-  }
+  });
+
+  // ---------------------------------------------------------------------------
+  // The output-arrival seam itself: a generic, core-decoupled
+  // subscribe/listener mechanism on src/jobStore.ts's JobStore.appendOutput.
+  // The first test below drives a real run() path with a real spawned
+  // process, proving multi-line, in-order delivery; the remaining tests use
+  // a synthetic job (jobStore.createJob - no real child at all, matching
+  // this file's own established low-level-mechanics convention) for byte-
+  // exact control over multi-line/split-chunk/stream-end/unsubscribe/
+  // isolation, none of which need real process timing.
+  // ---------------------------------------------------------------------------
+
+  test("a registered listener receives each REAL stdout line, in order, as the REAL run.ts -> jobStore.appendOutput path materializes them", async () => {
+    const pair = await startPair(false); // non-capable: no tasksAdapter watch competes for the same listener slot
+    const scratchDir = mkdtempSync(path.join(tmpdir(), "ghantika-seam-real-path-"));
+    const goMarker = path.join(scratchDir, "go");
+    try {
+      // The child spins on `goMarker`'s existence before writing anything, so
+      // its real output can only arrive AFTER this test has subscribed - a
+      // real process race, closed deterministically rather than papered over
+      // with an `if (received.length > 0)` guard that would pass vacuously on
+      // zero observed lines.
+      // Inlined rather than routed through the shared runJob/mintJob helpers
+      // below: this is the ONE genuinely PLAIN (non-minting) run() call in
+      // this whole file (startPair(false) above), so it reads the ordinary
+      // structuredContent-nested job_id directly.
+      const runResult = await pair.client.callTool({
+        name: "run",
+        arguments: {
+          command: [
+            process.execPath,
+            "-e",
+            `const fs=require('fs');const m=${JSON.stringify(goMarker)};while(!fs.existsSync(m)){}process.stdout.write('seam-1\\nseam-2\\nseam-3\\n');`,
+          ],
+          label: "seam-real-path",
+        },
+      });
+      assert.notEqual((runResult as { isError?: boolean }).isError, true);
+      const minted = runResultStructured(runResult);
+      const jobId = minted.job_id as string;
+
+      const received: OutputArrivalEvent[] = [];
+      const unsubscribe = jobStore.onOutputArrival(jobId, (event) => {
+        received.push(event);
+      });
+      try {
+        writeFileSync(goMarker, "go");
+        await pollUntilTerminal(pair.client, jobId);
+        assert.ok(
+          received.length > 0,
+          "expected at least one real stdout line via the real path - zero observed lines is a failure, not a vacuous pass"
+        );
+        assert.deepEqual(
+          received.map((event) => event.line.text),
+          ["seam-1", "seam-2", "seam-3"],
+          "lines received via the real path must arrive in exact materialization order"
+        );
+        for (const event of received) assert.equal(event.stream, "stdout");
+      } finally {
+        unsubscribe();
+      }
+    } finally {
+      rmSync(scratchDir, { recursive: true, force: true });
+      await pair.close();
+    }
+  });
 });
 
 test("a synthetic MULTI-LINE chunk delivers one event per line, IN ORDER, via jobStore.appendOutput directly", () => {
@@ -1457,294 +1496,298 @@ test("ISOLATION: a listener registered on job A never receives job B's lines, an
   }
 });
 
-// ---------------------------------------------------------------------------
-// tasks/cancel: REAL kill-and-reap of the job's ORIGINAL process group,
-// reusing src/tools/kill.ts's own POSIX-process-group containment (never
-// reimplementing it) - proven end to end through the Tasks adapter surface
-// itself (tasks/cancel, never the raw "kill" tool), non-vacuously, with the
-// cancel acknowledgement and a later, separate tasks/get terminal
-// observation asserted as two distinct steps.
-// ---------------------------------------------------------------------------
+describe("spawning tests: tasks/cancel real kill-and-reap and terminal-shape mapping", () => {
+  before(requireSpawnPolicy);
 
-test("tasks/cancel kills and reaps a real grandchild-deep process tree bound to the job's original process group: the direct child and grandchild are observed live and RECORDED before any cancel is issued, the grandchild confirmed a member of the job's original pgid; the cancel acknowledgement is asserted independently; the recorded pids are confirmed gone afterward via a real external process-group observer, never the cancel call's own return value alone; and a LATER, separate tasks/get call independently confirms the cancelled terminal", async () => {
-  const pair = await startPair(true);
-  const dir = mkdtempSync(path.join(tmpdir(), "ghantika-cancel-tree-"));
-  let jobId: string | undefined;
-  try {
-    const pgidMarker = path.join(dir, "pgid.txt");
-    const childMarker = path.join(dir, "child.txt");
-    const grandchildMarker = path.join(dir, "grandchild.txt");
-    // A real shell tree three levels deep. The top-level shell is the
-    // job's own leader (and, since spawnManaged always spawns detached,
-    // the process group's own pgid). It backgrounds a subshell - the
-    // CHILD, a real, distinct forked process - and captures that
-    // subshell's own real pid via `$!` in THIS outer shell, immediately
-    // after backgrounding it: `$$` INSIDE a backgrounded subshell reports
-    // the PARENT shell's pid in every POSIX shell (bash and dash both), so
-    // `$!` in the parent is the only portable way to capture the
-    // subshell's own real identity. The subshell in turn backgrounds a
-    // real `sleep` - the GRANDCHILD - capturing ITS pid via its OWN `$!`,
-    // then `wait`s on it, which is what keeps the whole three-level tree
-    // (leader -> child -> grandchild), all sharing the leader's original
-    // process group (none of them ever call setsid()), genuinely alive
-    // until cancelled.
-    const shellCommand =
-      `echo $$ > '${pgidMarker}'; ` +
-      `( sleep 300 & echo $! > '${grandchildMarker}'; wait ) & ` +
-      `echo $! > '${childMarker}'; ` +
-      `wait`;
+  // ---------------------------------------------------------------------------
+  // tasks/cancel: REAL kill-and-reap of the job's ORIGINAL process group,
+  // reusing src/tools/kill.ts's own POSIX-process-group containment (never
+  // reimplementing it) - proven end to end through the Tasks adapter surface
+  // itself (tasks/cancel, never the raw "kill" tool), non-vacuously, with the
+  // cancel acknowledgement and a later, separate tasks/get terminal
+  // observation asserted as two distinct steps.
+  // ---------------------------------------------------------------------------
 
-    const minted = await mintJob(pair.client, {
-      command: shellCommand,
-      shell: true,
-      label: "cancel-grandchild-tree",
-    });
-    jobId = minted.taskId as string;
-    assert.equal(typeof jobId, "string");
+  test("tasks/cancel kills and reaps a real grandchild-deep process tree bound to the job's original process group: the direct child and grandchild are observed live and RECORDED before any cancel is issued, the grandchild confirmed a member of the job's original pgid; the cancel acknowledgement is asserted independently; the recorded pids are confirmed gone afterward via a real external process-group observer, never the cancel call's own return value alone; and a LATER, separate tasks/get call independently confirms the cancelled terminal", async () => {
+    const pair = await startPair(true);
+    const dir = mkdtempSync(path.join(tmpdir(), "ghantika-cancel-tree-"));
+    let jobId: string | undefined;
+    try {
+      const pgidMarker = path.join(dir, "pgid.txt");
+      const childMarker = path.join(dir, "child.txt");
+      const grandchildMarker = path.join(dir, "grandchild.txt");
+      // A real shell tree three levels deep. The top-level shell is the
+      // job's own leader (and, since spawnManaged always spawns detached,
+      // the process group's own pgid). It backgrounds a subshell - the
+      // CHILD, a real, distinct forked process - and captures that
+      // subshell's own real pid via `$!` in THIS outer shell, immediately
+      // after backgrounding it: `$$` INSIDE a backgrounded subshell reports
+      // the PARENT shell's pid in every POSIX shell (bash and dash both), so
+      // `$!` in the parent is the only portable way to capture the
+      // subshell's own real identity. The subshell in turn backgrounds a
+      // real `sleep` - the GRANDCHILD - capturing ITS pid via its OWN `$!`,
+      // then `wait`s on it, which is what keeps the whole three-level tree
+      // (leader -> child -> grandchild), all sharing the leader's original
+      // process group (none of them ever call setsid()), genuinely alive
+      // until cancelled.
+      const shellCommand =
+        `echo $$ > '${pgidMarker}'; ` +
+        `( sleep 300 & echo $! > '${grandchildMarker}'; wait ) & ` +
+        `echo $! > '${childMarker}'; ` +
+        `wait`;
 
-    // -------------------------------------------------------------------
-    // PRE-CANCEL LIVENESS, anti-vacuity: the direct child AND the
-    // grandchild are observed live and RECORDED, the grandchild confirmed
-    // a member of the job's ORIGINAL process group, BEFORE any cancel is
-    // issued. Synchronizing on this real, external state - never a fixed
-    // sleep, never merely "the fixture was launched" - is what rules out
-    // cancel winning a race against the grandchild's own fork: if cancel
-    // could ever run before the grandchild genuinely exists in this group,
-    // this wait is exactly what would time out rather than silently
-    // passing having proven nothing.
-    // -------------------------------------------------------------------
-    const pgid = await waitForPidMarker(pgidMarker);
-    const childPid = await waitForPidMarker(childMarker);
-    const grandchildPid = await waitForPidMarker(grandchildMarker);
-    assert.notEqual(
-      childPid,
-      grandchildPid,
-      "the child and grandchild must be genuinely distinct real processes"
-    );
-    assert.notEqual(childPid, pgid, "the child must be distinct from the leader/pgid");
-    assert.notEqual(grandchildPid, pgid, "the grandchild must be distinct from the leader/pgid");
+      const minted = await mintJob(pair.client, {
+        command: shellCommand,
+        shell: true,
+        label: "cancel-grandchild-tree",
+      });
+      jobId = minted.taskId as string;
+      assert.equal(typeof jobId, "string");
 
-    const beforeMembers = await waitForPgrepGroupMembers(
-      pgid,
-      (members) => members.includes(childPid) && members.includes(grandchildPid),
-      8000
-    );
-    assert.ok(
-      beforeMembers.includes(childPid),
-      `expected the direct child (pid ${childPid}) to be a live member of the original pgid ${pgid} BEFORE cancel, pgrep saw: ${JSON.stringify(beforeMembers)}`
-    );
-    assert.ok(
-      beforeMembers.includes(grandchildPid),
-      `expected the grandchild (pid ${grandchildPid}) to be a live member of the SAME original pgid ${pgid} BEFORE cancel - the non-vacuity proof this test exists for - pgrep saw: ${JSON.stringify(beforeMembers)}`
-    );
-    assert.ok(isProcessAlive(childPid), "expected the direct child to be alive before cancel");
-    assert.ok(isProcessAlive(grandchildPid), "expected the grandchild to be alive before cancel");
+      // -------------------------------------------------------------------
+      // PRE-CANCEL LIVENESS, anti-vacuity: the direct child AND the
+      // grandchild are observed live and RECORDED, the grandchild confirmed
+      // a member of the job's ORIGINAL process group, BEFORE any cancel is
+      // issued. Synchronizing on this real, external state - never a fixed
+      // sleep, never merely "the fixture was launched" - is what rules out
+      // cancel winning a race against the grandchild's own fork: if cancel
+      // could ever run before the grandchild genuinely exists in this group,
+      // this wait is exactly what would time out rather than silently
+      // passing having proven nothing.
+      // -------------------------------------------------------------------
+      const pgid = await waitForPidMarker(pgidMarker);
+      const childPid = await waitForPidMarker(childMarker);
+      const grandchildPid = await waitForPidMarker(grandchildMarker);
+      assert.notEqual(
+        childPid,
+        grandchildPid,
+        "the child and grandchild must be genuinely distinct real processes"
+      );
+      assert.notEqual(childPid, pgid, "the child must be distinct from the leader/pgid");
+      assert.notEqual(grandchildPid, pgid, "the grandchild must be distinct from the leader/pgid");
 
-    // -------------------------------------------------------------------
-    // CANCEL ACK: tasks/cancel returns the released spec's own fixed,
-    // empty acknowledgement (`{resultType: "complete"}`) - eventually
-    // consistent by design, so it deliberately carries NO status/taskId/
-    // extension field of any kind (see src/tasksAdapter.ts's own
-    // cancelTask docs; previously the ack WAS a fresh snapshot and this
-    // section asserted its status already
-    // reflected the kill). The client-decoded value is genuinely EMPTY
-    // (the SDK strips the wire-level resultType before this test ever sees
-    // it - see this file's own WireTap docs), so the real ack shape is
-    // read via the wire tap instead. Confirmation that the kill actually
-    // took effect is now what the LATER, separate tasks/get read below
-    // proves - never inferred from this ack.
-    // -------------------------------------------------------------------
-    const cancelAck = await tasksCancel(pair.client, jobId);
-    assert.deepEqual(
-      cancelAck,
-      {},
-      `expected tasks/cancel's client-decoded ack to be genuinely empty (only resultType, which the SDK strips), got ${JSON.stringify(cancelAck)}`
-    );
-    const rawCancelAck = pair.wireTap.latestResultFor("tasks/cancel");
-    assert.deepEqual(
-      rawCancelAck,
-      { resultType: "complete" },
-      `expected tasks/cancel's real wire ack to be exactly the fixed emittedAckResult shape, got ${JSON.stringify(rawCancelAck)}`
-    );
+      const beforeMembers = await waitForPgrepGroupMembers(
+        pgid,
+        (members) => members.includes(childPid) && members.includes(grandchildPid),
+        8000
+      );
+      assert.ok(
+        beforeMembers.includes(childPid),
+        `expected the direct child (pid ${childPid}) to be a live member of the original pgid ${pgid} BEFORE cancel, pgrep saw: ${JSON.stringify(beforeMembers)}`
+      );
+      assert.ok(
+        beforeMembers.includes(grandchildPid),
+        `expected the grandchild (pid ${grandchildPid}) to be a live member of the SAME original pgid ${pgid} BEFORE cancel - the non-vacuity proof this test exists for - pgrep saw: ${JSON.stringify(beforeMembers)}`
+      );
+      assert.ok(isProcessAlive(childPid), "expected the direct child to be alive before cancel");
+      assert.ok(isProcessAlive(grandchildPid), "expected the grandchild to be alive before cancel");
 
-    // -------------------------------------------------------------------
-    // POST-CANCEL DEATH: the pids RECORDED above are genuinely gone - an
-    // observer bound to the ORIGINAL pgid finds no surviving member, and
-    // the direct child (and the grandchild) are genuinely reaped. Real,
-    // external process-state checks (pgrep + isProcessAlive), never a
-    // trust in the cancel call's own return value alone.
-    // -------------------------------------------------------------------
-    const afterMembers = await waitForPgrepGroupMembers(
-      pgid,
-      (members) => members.length === 0,
-      8000
-    );
-    assert.deepEqual(
-      afterMembers,
-      [],
-      `expected zero surviving members of the ORIGINAL process group ${pgid} after tasks/cancel, pgrep still saw: ${JSON.stringify(afterMembers)}`
-    );
-    assert.equal(
-      isProcessAlive(childPid),
-      false,
-      "expected the direct child to be genuinely gone after cancel"
-    );
-    assert.equal(
-      isProcessAlive(grandchildPid),
-      false,
-      "expected the grandchild to be genuinely gone after cancel"
-    );
+      // -------------------------------------------------------------------
+      // CANCEL ACK: tasks/cancel returns the released spec's own fixed,
+      // empty acknowledgement (`{resultType: "complete"}`) - eventually
+      // consistent by design, so it deliberately carries NO status/taskId/
+      // extension field of any kind (see src/tasksAdapter.ts's own
+      // cancelTask docs; previously the ack WAS a fresh snapshot and this
+      // section asserted its status already
+      // reflected the kill). The client-decoded value is genuinely EMPTY
+      // (the SDK strips the wire-level resultType before this test ever sees
+      // it - see this file's own WireTap docs), so the real ack shape is
+      // read via the wire tap instead. Confirmation that the kill actually
+      // took effect is now what the LATER, separate tasks/get read below
+      // proves - never inferred from this ack.
+      // -------------------------------------------------------------------
+      const cancelAck = await tasksCancel(pair.client, jobId);
+      assert.deepEqual(
+        cancelAck,
+        {},
+        `expected tasks/cancel's client-decoded ack to be genuinely empty (only resultType, which the SDK strips), got ${JSON.stringify(cancelAck)}`
+      );
+      const rawCancelAck = pair.wireTap.latestResultFor("tasks/cancel");
+      assert.deepEqual(
+        rawCancelAck,
+        { resultType: "complete" },
+        `expected tasks/cancel's real wire ack to be exactly the fixed emittedAckResult shape, got ${JSON.stringify(rawCancelAck)}`
+      );
 
-    // -------------------------------------------------------------------
-    // LATER TERMINAL: a LATER, SEPARATE tasks/get call - never inferred
-    // from the cancel acknowledgement above - independently observes the
-    // cancelled terminal status.
-    // -------------------------------------------------------------------
-    const laterGet = await tasksGet(pair.client, jobId);
-    assert.equal(
-      laterGet.status,
-      "cancelled",
-      `expected a LATER, separate tasks/get to report the cancelled terminal status, got ${JSON.stringify(laterGet)}`
-    );
-  } finally {
-    // Best-effort safety net: if an earlier assertion above threw before
-    // tasks/cancel ever ran (or before it could complete), this still
-    // reaps the real backing process rather than leaking it - a no-op
-    // when tasks/cancel already succeeded (see killAndReapRealChild's own
-    // docs; every other test in this file follows the identical pattern).
-    if (jobId !== undefined) await killAndReapRealChild(jobId);
-    rmSync(dir, { recursive: true, force: true });
-    await pair.close();
-  }
-});
+      // -------------------------------------------------------------------
+      // POST-CANCEL DEATH: the pids RECORDED above are genuinely gone - an
+      // observer bound to the ORIGINAL pgid finds no surviving member, and
+      // the direct child (and the grandchild) are genuinely reaped. Real,
+      // external process-state checks (pgrep + isProcessAlive), never a
+      // trust in the cancel call's own return value alone.
+      // -------------------------------------------------------------------
+      const afterMembers = await waitForPgrepGroupMembers(
+        pgid,
+        (members) => members.length === 0,
+        8000
+      );
+      assert.deepEqual(
+        afterMembers,
+        [],
+        `expected zero surviving members of the ORIGINAL process group ${pgid} after tasks/cancel, pgrep still saw: ${JSON.stringify(afterMembers)}`
+      );
+      assert.equal(
+        isProcessAlive(childPid),
+        false,
+        "expected the direct child to be genuinely gone after cancel"
+      );
+      assert.equal(
+        isProcessAlive(grandchildPid),
+        false,
+        "expected the grandchild to be genuinely gone after cancel"
+      );
 
-// ---------------------------------------------------------------------------
-// TERMINAL SHAPES vs PROTOCOL ERROR: tasks/cancel on an already-terminal
-// job never errors and never varies its ack by the job's own outcome - the
-// released contract's cancelTask (src/tasksAdapter.ts) always returns the
-// same fixed, empty acknowledgement (see the CANCEL ACK section above),
-// whether the job exited non-zero or never spawned at all. What DOES still
-// vary by outcome is the job's own real terminal shape, which this test
-// reads through a SEPARATE tasks/get call made after the cancel (never
-// through cancel's own return value, which the released contract emptied
-// out). A job that ran and exited non-zero reads as a normal "completed"
-// taskResult, with the real exit code carried separately from status; a
-// job that never spawned at all (a genuine spawn error) reads as a normal
-// "failed" taskResult, a materially different case from a completed job
-// whose command happened to fail. Neither of those is ever a JSON-RPC
-// protocol error - only a genuinely malformed request (an empty taskId) is.
-// ---------------------------------------------------------------------------
+      // -------------------------------------------------------------------
+      // LATER TERMINAL: a LATER, SEPARATE tasks/get call - never inferred
+      // from the cancel acknowledgement above - independently observes the
+      // cancelled terminal status.
+      // -------------------------------------------------------------------
+      const laterGet = await tasksGet(pair.client, jobId);
+      assert.equal(
+        laterGet.status,
+        "cancelled",
+        `expected a LATER, separate tasks/get to report the cancelled terminal status, got ${JSON.stringify(laterGet)}`
+      );
+    } finally {
+      // Best-effort safety net: if an earlier assertion above threw before
+      // tasks/cancel ever ran (or before it could complete), this still
+      // reaps the real backing process rather than leaking it - a no-op
+      // when tasks/cancel already succeeded (see killAndReapRealChild's own
+      // docs; every other test in this file follows the identical pattern).
+      if (jobId !== undefined) await killAndReapRealChild(jobId);
+      rmSync(dir, { recursive: true, force: true });
+      await pair.close();
+    }
+  });
 
-test("through tasks/cancel: the ack never varies by outcome, and a subsequent tasks/get shows a job that ran and exited non-zero as a normal completed taskResult (exit code carried separately from status), a job that never spawned at all as a normal failed taskResult, neither is ever a JSON-RPC protocol error, and only a genuinely malformed request (an empty taskId) is", async () => {
-  const pair = await startPair(true);
-  try {
-    // Case 1: a job that RAN and exited non-zero. mapJobStateToTaskStatus
-    // (src/tasksAdapter.ts) folds an "exited" job state to task status
-    // "completed" REGARDLESS of its real exit code - the exit code travels
-    // separately in the result, never folded into the status itself.
-    const exitedJob = await mintJob(pair.client, {
-      command: [process.execPath, "-e", "process.exitCode = 3;"],
-      label: "cancel-completed-mapping",
-    });
-    const exitedJobId = exitedJob.taskId as string;
-    await pollUntilTerminal(pair.client, exitedJobId);
+  // ---------------------------------------------------------------------------
+  // TERMINAL SHAPES vs PROTOCOL ERROR: tasks/cancel on an already-terminal
+  // job never errors and never varies its ack by the job's own outcome - the
+  // released contract's cancelTask (src/tasksAdapter.ts) always returns the
+  // same fixed, empty acknowledgement (see the CANCEL ACK section above),
+  // whether the job exited non-zero or never spawned at all. What DOES still
+  // vary by outcome is the job's own real terminal shape, which this test
+  // reads through a SEPARATE tasks/get call made after the cancel (never
+  // through cancel's own return value, which the released contract emptied
+  // out). A job that ran and exited non-zero reads as a normal "completed"
+  // taskResult, with the real exit code carried separately from status; a
+  // job that never spawned at all (a genuine spawn error) reads as a normal
+  // "failed" taskResult, a materially different case from a completed job
+  // whose command happened to fail. Neither of those is ever a JSON-RPC
+  // protocol error - only a genuinely malformed request (an empty taskId) is.
+  // ---------------------------------------------------------------------------
 
-    // tasks/cancel on this already-terminal job still succeeds (kills
-    // nothing - see cancelTask's own docs on ignoring killTool's isError
-    // outcomes) and returns the SAME fixed, empty ack as every other
-    // cancel call, never a snapshot of the job it was just asked to kill.
-    const exitedAck = await tasksCancel(pair.client, exitedJobId);
-    assert.deepEqual(
-      exitedAck,
-      {},
-      `expected tasks/cancel's client-decoded ack to be genuinely empty regardless of the job's own outcome, got ${JSON.stringify(exitedAck)}`
-    );
-    assert.deepEqual(
-      pair.wireTap.latestResultFor("tasks/cancel"),
-      { resultType: "complete" },
-      "expected the real wire ack for an already-completed job's cancel to still be exactly the fixed emittedAckResult shape"
-    );
+  test("through tasks/cancel: the ack never varies by outcome, and a subsequent tasks/get shows a job that ran and exited non-zero as a normal completed taskResult (exit code carried separately from status), a job that never spawned at all as a normal failed taskResult, neither is ever a JSON-RPC protocol error, and only a genuinely malformed request (an empty taskId) is", async () => {
+    const pair = await startPair(true);
+    try {
+      // Case 1: a job that RAN and exited non-zero. mapJobStateToTaskStatus
+      // (src/tasksAdapter.ts) folds an "exited" job state to task status
+      // "completed" REGARDLESS of its real exit code - the exit code travels
+      // separately in the result, never folded into the status itself.
+      const exitedJob = await mintJob(pair.client, {
+        command: [process.execPath, "-e", "process.exitCode = 3;"],
+        label: "cancel-completed-mapping",
+      });
+      const exitedJobId = exitedJob.taskId as string;
+      await pollUntilTerminal(pair.client, exitedJobId);
 
-    // The job's real terminal shape is read through a fresh, separate
-    // tasks/get call - never inferred from the cancel ack above, which the
-    // released contract emptied out.
-    const exitedResult = await tasksGet(pair.client, exitedJobId);
-    assert.equal(
-      exitedResult.status,
-      "completed",
-      `expected a job that exited non-zero to read as task status 'completed' through a post-cancel tasks/get, got ${JSON.stringify(exitedResult)}`
-    );
-    assert.equal(
-      (exitedResult.result as Record<string, unknown> | undefined)?.exitCode,
-      3,
-      "the real non-zero exit code must be reflected separately from status, not folded into it"
-    );
-    assert.equal(
-      exitedResult.error,
-      undefined,
-      "a completed taskResult carries no error field at all - error belongs only to the separate taskNotFound shape"
-    );
+      // tasks/cancel on this already-terminal job still succeeds (kills
+      // nothing - see cancelTask's own docs on ignoring killTool's isError
+      // outcomes) and returns the SAME fixed, empty ack as every other
+      // cancel call, never a snapshot of the job it was just asked to kill.
+      const exitedAck = await tasksCancel(pair.client, exitedJobId);
+      assert.deepEqual(
+        exitedAck,
+        {},
+        `expected tasks/cancel's client-decoded ack to be genuinely empty regardless of the job's own outcome, got ${JSON.stringify(exitedAck)}`
+      );
+      assert.deepEqual(
+        pair.wireTap.latestResultFor("tasks/cancel"),
+        { resultType: "complete" },
+        "expected the real wire ack for an already-completed job's cancel to still be exactly the fixed emittedAckResult shape"
+      );
 
-    // Case 2: a job that NEVER RAN - a genuine spawn-error (an executable
-    // that doesn't resolve at all). mapJobStateToTaskStatus folds this
-    // job-store "failed" state to task status "failed" - a DIFFERENT
-    // status from case 1's "completed", since this task itself never ran,
-    // distinct from a completed task whose command happened to exit
-    // non-zero.
-    const neverRanJob = await mintJob(pair.client, {
-      command: ["this-command-definitely-does-not-exist-ghantika-cancel-test"],
-      label: "cancel-failed-mapping",
-    });
-    const neverRanJobId = neverRanJob.taskId as string;
-    await pollUntilTerminal(pair.client, neverRanJobId);
+      // The job's real terminal shape is read through a fresh, separate
+      // tasks/get call - never inferred from the cancel ack above, which the
+      // released contract emptied out.
+      const exitedResult = await tasksGet(pair.client, exitedJobId);
+      assert.equal(
+        exitedResult.status,
+        "completed",
+        `expected a job that exited non-zero to read as task status 'completed' through a post-cancel tasks/get, got ${JSON.stringify(exitedResult)}`
+      );
+      assert.equal(
+        (exitedResult.result as Record<string, unknown> | undefined)?.exitCode,
+        3,
+        "the real non-zero exit code must be reflected separately from status, not folded into it"
+      );
+      assert.equal(
+        exitedResult.error,
+        undefined,
+        "a completed taskResult carries no error field at all - error belongs only to the separate taskNotFound shape"
+      );
 
-    // Same fixed ack again, this time for a job that never spawned at all
-    // - proving the ack's shape truly does not vary by outcome.
-    const neverRanAck = await tasksCancel(pair.client, neverRanJobId);
-    assert.deepEqual(
-      neverRanAck,
-      {},
-      `expected tasks/cancel's client-decoded ack to be genuinely empty for a never-spawned job too, got ${JSON.stringify(neverRanAck)}`
-    );
-    assert.deepEqual(
-      pair.wireTap.latestResultFor("tasks/cancel"),
-      { resultType: "complete" },
-      "expected the real wire ack for a never-spawned job's cancel to still be exactly the fixed emittedAckResult shape"
-    );
+      // Case 2: a job that NEVER RAN - a genuine spawn-error (an executable
+      // that doesn't resolve at all). mapJobStateToTaskStatus folds this
+      // job-store "failed" state to task status "failed" - a DIFFERENT
+      // status from case 1's "completed", since this task itself never ran,
+      // distinct from a completed task whose command happened to exit
+      // non-zero.
+      const neverRanJob = await mintJob(pair.client, {
+        command: ["this-command-definitely-does-not-exist-ghantika-cancel-test"],
+        label: "cancel-failed-mapping",
+      });
+      const neverRanJobId = neverRanJob.taskId as string;
+      await pollUntilTerminal(pair.client, neverRanJobId);
 
-    const neverRanResult = await tasksGet(pair.client, neverRanJobId);
-    assert.equal(
-      neverRanResult.status,
-      "failed",
-      `expected a job that never spawned to read as task status 'failed' through a post-cancel tasks/get, got ${JSON.stringify(neverRanResult)}`
-    );
+      // Same fixed ack again, this time for a job that never spawned at all
+      // - proving the ack's shape truly does not vary by outcome.
+      const neverRanAck = await tasksCancel(pair.client, neverRanJobId);
+      assert.deepEqual(
+        neverRanAck,
+        {},
+        `expected tasks/cancel's client-decoded ack to be genuinely empty for a never-spawned job too, got ${JSON.stringify(neverRanAck)}`
+      );
+      assert.deepEqual(
+        pair.wireTap.latestResultFor("tasks/cancel"),
+        { resultType: "complete" },
+        "expected the real wire ack for a never-spawned job's cancel to still be exactly the fixed emittedAckResult shape"
+      );
 
-    // Neither cancel call above ever threw, and neither of the two
-    // tasks/get reads above did either - all resolved as normal,
-    // successful RPC results (a JSON-RPC protocol error would have made
-    // the `await` itself reject). That IS the "never a JSON-RPC error"
-    // half of this criterion, asserted by the calls above having already
-    // returned rather than a separate check.
+      const neverRanResult = await tasksGet(pair.client, neverRanJobId);
+      assert.equal(
+        neverRanResult.status,
+        "failed",
+        `expected a job that never spawned to read as task status 'failed' through a post-cancel tasks/get, got ${JSON.stringify(neverRanResult)}`
+      );
 
-    // Case 3: a genuinely malformed tasks/cancel request (an empty-string
-    // taskId, failing this adapter's own request-validation schema - the
-    // same request-validation boundary test/tasks.test.ts's own
-    // completeness sweep already proves for all three tasks/* methods
-    // generically) IS a real JSON-RPC protocol error - never silently
-    // accepted, never converted into a normal task result of any shape.
-    await assert.rejects(
-      () =>
-        pair.client.request(
-          { method: "tasks/cancel", params: { taskId: "" } },
-          passthroughSchema()
-        ),
-      (error: unknown) => {
-        const message = String((error as { message?: unknown })?.message ?? error);
-        return /-32602|invalid|taskId/i.test(message);
-      },
-      "expected tasks/cancel to reject an empty-string taskId as a genuine JSON-RPC protocol error, never as a normal (possibly isError) result"
-    );
-  } finally {
-    await pair.close();
-  }
+      // Neither cancel call above ever threw, and neither of the two
+      // tasks/get reads above did either - all resolved as normal,
+      // successful RPC results (a JSON-RPC protocol error would have made
+      // the `await` itself reject). That IS the "never a JSON-RPC error"
+      // half of this criterion, asserted by the calls above having already
+      // returned rather than a separate check.
+
+      // Case 3: a genuinely malformed tasks/cancel request (an empty-string
+      // taskId, failing this adapter's own request-validation schema - the
+      // same request-validation boundary test/tasks.test.ts's own
+      // completeness sweep already proves for all three tasks/* methods
+      // generically) IS a real JSON-RPC protocol error - never silently
+      // accepted, never converted into a normal task result of any shape.
+      await assert.rejects(
+        () =>
+          pair.client.request(
+            { method: "tasks/cancel", params: { taskId: "" } },
+            passthroughSchema()
+          ),
+        (error: unknown) => {
+          const message = String((error as { message?: unknown })?.message ?? error);
+          return /-32602|invalid|taskId/i.test(message);
+        },
+        "expected tasks/cancel to reject an empty-string taskId as a genuine JSON-RPC protocol error, never as a normal (possibly isError) result"
+      );
+    } finally {
+      await pair.close();
+    }
+  });
 });
