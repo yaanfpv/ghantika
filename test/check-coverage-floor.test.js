@@ -195,6 +195,13 @@ test("a custom floor set is honored instead of the exported default", () => {
   assert.deepEqual(checkCoverageFloors(summary, { statements: 40 }), []);
 });
 
+// The token every DEFAULT completion marker below embeds, matched by the
+// DEFAULT run-token file runCliAgainstFixture also writes - see that
+// function's own doc comment for why both defaults have to agree now that
+// check-coverage-floor.mjs requires a matching token alongside a
+// SHA-matching completion marker.
+const DEFAULT_FIXTURE_RUN_TOKEN = "fixture-run-token";
+
 /**
  * Runs the script's actual CLI entry point (not just checkCoverageFloors
  * above) as a real child process, pointed at a throwaway fixture file via
@@ -213,16 +220,23 @@ test("a custom floor set is honored instead of the exported default", () => {
  *   real-end-to-end test further down via its own explicit cleanup.
  *
  *   By DEFAULT (neither completionMarkerContent nor omitCompletionMarker
- *   given), a valid completion marker bound to the REAL current HEAD SHA is
- *   written and pointed at via GHANTIKA_COMPLETION_MARKER_PATH - matching
- *   the ordinary production state (scripts/run-tests.mjs already wrote a
- *   real one before this script ever runs) so every test below NOT
- *   specifically exercising the completion-marker mechanism itself keeps
- *   testing whatever it actually tests (a floor comparison, a missing
- *   summary file, the truncation-marker VOID path) instead of universally
- *   VOIDing on no-completion-record now that the marker is required.
- *   `completionMarkerContent` overrides this default with an explicit,
- *   custom marker (a stale-commit scenario, for example);
+ *   given), a valid completion marker bound to the REAL current HEAD SHA,
+ *   embedding DEFAULT_FIXTURE_RUN_TOKEN, is written and pointed at via
+ *   GHANTIKA_COMPLETION_MARKER_PATH - and a matching run-token file,
+ *   holding that SAME token, is written and pointed at via
+ *   GHANTIKA_RUN_TOKEN_PATH - matching the ordinary production state
+ *   (scripts/run-tests.mjs already wrote a real, matching pair before this
+ *   script ever runs) so every test below NOT specifically exercising the
+ *   completion-marker or run-token mechanism itself keeps testing whatever
+ *   it actually tests (a floor comparison, a missing summary file, the
+ *   truncation-marker VOID path) instead of universally VOIDing on
+ *   no-completion-record or stale-completion-token now that both a
+ *   SHA-matching marker AND a matching token are required.
+ *   `completionMarkerContent` overrides the completion-marker default with
+ *   an explicit, custom marker (a stale-commit scenario, for example) -
+ *   the run-token file is still written with DEFAULT_FIXTURE_RUN_TOKEN
+ *   regardless, since every existing caller of this override is exercising
+ *   the headSha check, which VOIDs before the token check is ever reached;
  *   `omitCompletionMarker: true` points GHANTIKA_COMPLETION_MARKER_PATH at
  *   a path that does not exist, so no completion marker is present at all
  *   - both used by the completion-marker-specific tests further down.
@@ -245,6 +259,17 @@ function runCliAgainstFixture(summaryContent, opts = {}) {
       env.GHANTIKA_TRUNCATION_MARKER_PATH = markerPath;
     }
 
+    // Always written, regardless of which completion-marker branch below
+    // runs: every completion-marker override in this file's own tests
+    // (a different-commit headSha, an omitted marker entirely) VOIDs on
+    // the headSha check BEFORE the token check is ever reached, so this
+    // default token file is harmless to those cases and load-bearing for
+    // every other test that relies on an ordinary, SHA-matching marker
+    // proceeding to a real verdict.
+    const runTokenPath = path.join(dir, "run-token.json");
+    writeFileSync(runTokenPath, JSON.stringify({ token: DEFAULT_FIXTURE_RUN_TOKEN }, null, 2));
+    env.GHANTIKA_RUN_TOKEN_PATH = runTokenPath;
+
     const completionMarkerPath = path.join(dir, "run-completed.json");
     if (opts.completionMarkerContent !== undefined) {
       writeFileSync(completionMarkerPath, opts.completionMarkerContent);
@@ -254,7 +279,15 @@ function runCliAgainstFixture(summaryContent, opts = {}) {
     } else {
       writeFileSync(
         completionMarkerPath,
-        JSON.stringify({ headSha: gitHeadSha(), at: new Date().toISOString() }, null, 2)
+        JSON.stringify(
+          {
+            headSha: gitHeadSha(),
+            at: new Date().toISOString(),
+            runToken: DEFAULT_FIXTURE_RUN_TOKEN,
+          },
+          null,
+          2
+        )
       );
       env.GHANTIKA_COMPLETION_MARKER_PATH = completionMarkerPath;
     }
@@ -782,10 +815,10 @@ test("green control: a writable primary marker location never touches the fallba
 // verdict proceed (the GREEN control every OTHER test in this file already
 // depends on, by default, via runCliAgainstFixture); a completion marker
 // left over from a DIFFERENT commit is treated as absent and VOIDs with a
-// distinct reason; and the narrow, disclosed residual this SHA-binding does
-// not close - see the KNOWN LIMIT test's own block comment below for
-// exactly what that residual is and why it is accepted rather than closed
-// here.
+// distinct reason; and the narrower, same-commit residual the SHA-binding
+// alone cannot close - see the run-token test's own block comment further
+// below for exactly what that residual was and how the run-token mechanism
+// closes it.
 // =============================================================================
 
 test("a fresh completion marker matching the current commit lets the ordinary verdict proceed", () => {
@@ -856,26 +889,30 @@ test("VOID [no-completion-record]: no completion marker at all is treated the sa
 });
 
 // =============================================================================
-// KNOWN LIMIT: the SHA-binding above defends against a completion marker
-// left over from a DIFFERENT commit. It does not, and cannot, defend
+// THE RUN-TOKEN CLOSURE: the SHA-binding above defends against a completion
+// marker left over from a DIFFERENT commit. On its own it could not defend
 // against the narrower three-way conjunction where (1) a previous run at
 // THIS SAME commit already completed and left a valid completion marker,
-// (2) this run is truncated, and (3) both of this run's own
-// truncation-marker writes also fail. check-coverage-floor.mjs checks the
-// truncation marker FIRST - if either write had succeeded, that alone would
-// VOID regardless of the completion marker underneath it - so this gap is
-// reachable only when truncation-marker persistence has ALSO failed,
-// exactly the fail-open double-write-failure scenario already exercised
-// above (see the "fail-open: an unwritable primary marker directory..."
-// test). A per-invocation run id supplied by the CI/gate manifest to both
-// scripts would close it, at the cost of pulling .github/workflows/ and the
-// gate manifest into this candidate's own lockstep-parity obligation for
-// marginal benefit; the SHA-binding closes the originally-reported case on
-// its own and is the accepted trade for now. This control exists to PROVE
-// the residual is real and keep it documented, not to make it pass.
+// (2) a LATER run at that identical commit is truncated, and (3) both of
+// THAT run's own truncation-marker writes also fail. check-coverage-floor.mjs
+// checks the truncation marker FIRST - if either write had succeeded, that
+// alone would VOID regardless of the completion marker underneath it - so
+// this gap was reachable only when truncation-marker persistence had ALSO
+// failed, exactly the fail-open double-write-failure scenario already
+// exercised above (see the "fail-open: an unwritable primary marker
+// directory..." test). A truncated run must never produce a coverage
+// verdict, however narrow the path to it. scripts/run-tests.mjs now
+// generates a fresh token, independent of git HEAD, before test
+// discovery and execution, and embeds it in the completion marker only
+// on that run's genuine completion. A stale, same-commit completion
+// marker necessarily embeds an EARLIER invocation's token, which can never
+// match the fresh one the CURRENT invocation of check-coverage-floor.mjs
+// finds on disk. Under this design, that setup VOIDs with the distinct
+// [stale-completion-token] reason rather than falling through to an
+// ordinary PASS.
 // =============================================================================
 
-test("KNOWN LIMIT: a stale completion marker from a prior same-commit run survives when both truncation-marker writes also fail on the current run", async () => {
+test("the run-token mechanism closes the residual: a stale completion marker from a prior same-commit run no longer survives when both truncation-marker writes also fail on the current run", async () => {
   const scratchDir = mkdtempSync(path.join(tmpdir(), "ghantika-completion-residual-"));
   const unwritablePrimaryDir = path.join(scratchDir, "locked-coverage");
   const unwritableFallbackDir = path.join(scratchDir, "locked-fallback");
@@ -884,20 +921,35 @@ test("KNOWN LIMIT: a stale completion marker from a prior same-commit run surviv
   const primaryMarkerPath = path.join(unwritablePrimaryDir, "run-truncated.json");
   const fallbackMarkerPath = path.join(unwritableFallbackDir, "fallback-marker.json");
   const completionMarkerPath = path.join(scratchDir, "run-completed.json");
+  // Deliberately NOT inside either locked directory above - lives at
+  // REPO_ROOT-equivalent for this fixture, exactly as RUN_TOKEN_PATH's own
+  // doc comment in scripts/run-tests.mjs describes for the real production
+  // path: the whole point of the token is to detect that a completion
+  // marker (which lives under coverage/, the two locked directories here)
+  // is stale, so the token itself must not share a failure mode with
+  // coverage/ becoming unwritable.
+  const runTokenPath = path.join(scratchDir, "run-token.json");
   let driverPid;
   try {
     // The prior, successfully-completed run's own leftover marker, bound to
     // the REAL current HEAD - exactly what a genuine earlier
-    // `npm run coverage` at this same commit would have written.
+    // `npm run coverage` at this same commit would have written - carrying
+    // ITS OWN, now-stale run token, distinct from the fresh token the
+    // CURRENT invocation below generates.
+    const staleRunToken = "stale-prior-run-token";
     writeFileSync(
       completionMarkerPath,
-      JSON.stringify({ headSha: gitHeadSha(), at: "2026-01-01T00:00:00.000Z" }, null, 2)
+      JSON.stringify(
+        { headSha: gitHeadSha(), at: "2026-01-01T00:00:00.000Z", runToken: staleRunToken },
+        null,
+        2
+      )
     );
 
     // Lock BOTH marker directories down - reproducing the "fail-open"
     // test's own double-write-failure scenario above, but for both the
     // primary AND the fallback this time, since only their joint failure
-    // reaches the completion-marker check at all.
+    // reaches the completion-marker (and now the run-token) check at all.
     chmodSync(unwritablePrimaryDir, 0o500);
     chmodSync(unwritableFallbackDir, 0o500);
 
@@ -907,6 +959,18 @@ test("KNOWN LIMIT: a stale completion marker from a prior same-commit run surviv
       `import { test } from "node:test";\n` +
         `test("never resolves", () => new Promise(() => { setInterval(() => {}, 1_000_000); }));\n`
     );
+
+    // The CURRENT invocation's own fresh token - what main() would have
+    // generated and written to RUN_TOKEN_PATH before ever calling
+    // runOnce(), see that function's own doc comment. Written to the
+    // isolated, writable runTokenPath BEFORE the watchdog fires, and handed
+    // to the driver below as its own in-memory runToken exactly as main()
+    // hands it to runOnce() - the idle watchdog fires before this run ever
+    // reaches its own completion, so this value is never actually embedded
+    // anywhere by THIS run, but it is what the CLI compares the stale,
+    // leftover completion marker against.
+    const currentRunToken = "fresh-current-run-token";
+    writeFileSync(runTokenPath, JSON.stringify({ token: currentRunToken }, null, 2));
 
     const driverPath = path.join(scratchDir, "drive.mjs");
     writeFileSync(
@@ -922,6 +986,7 @@ test("KNOWN LIMIT: a stale completion marker from a prior same-commit run surviv
         `  truncationMarkerPath: ${JSON.stringify(primaryMarkerPath)},\n` +
         `  truncationMarkerFallbackPath: ${JSON.stringify(fallbackMarkerPath)},\n` +
         `  completionMarkerPath: ${JSON.stringify(path.join(scratchDir, "unused-completion-marker.json"))},\n` +
+        `  runToken: ${JSON.stringify(currentRunToken)},\n` +
         `});\n`
     );
 
@@ -963,6 +1028,7 @@ test("KNOWN LIMIT: a stale completion marker from a prior same-commit run surviv
       GHANTIKA_TRUNCATION_MARKER_PATH: primaryMarkerPath,
       GHANTIKA_TRUNCATION_MARKER_FALLBACK_PATH: fallbackMarkerPath,
       GHANTIKA_COMPLETION_MARKER_PATH: completionMarkerPath,
+      GHANTIKA_RUN_TOKEN_PATH: runTokenPath,
     };
     let floorStatus = null;
     let floorOutput = "";
@@ -978,21 +1044,26 @@ test("KNOWN LIMIT: a stale completion marker from a prior same-commit run surviv
       floorOutput = (err.stdout ?? "") + (err.stderr ?? "");
     }
 
-    // THE DOCUMENTED RESIDUAL: this is the accepted, disclosed gap, not a
-    // bug this test is failing to catch - see the block comment above.
+    // A same-commit completion marker left over from a prior successful run,
+    // combined with both of THIS run's truncation-marker writes failing, is
+    // not certified as an ordinary verdict: the stale marker's own embedded
+    // runToken ("stale-prior-run-token") does not match the fresh token this
+    // invocation finds on disk ("fresh-current-run-token"), so it VOIDs
+    // rather than falling through.
     assert.equal(
       floorStatus,
-      0,
-      `KNOWN LIMIT (documented, accepted): a same-commit completion marker left over from a prior ` +
-        `successful run, combined with both of THIS run's truncation-marker writes failing, is not ` +
-        `distinguishable from a genuine completion - check-coverage-floor.mjs falls through to an ` +
-        `ordinary verdict here. If this assertion starts failing, the residual has been closed and this ` +
-        `test (and its documenting comment, and the matching comment in check-coverage-floor.mjs) should ` +
-        `be updated, not the assertion loosened; output:\n${floorOutput}`
+      VOID_EXIT_CODE,
+      `A same-commit completion marker left over from a prior successful run, combined with both of ` +
+        `THIS run's truncation-marker writes failing, must not produce a coverage verdict - the run-token ` +
+        `mismatch must VOID it; output:\n${floorOutput}`
     );
     assert.ok(
-      !floorOutput.includes("REFUSED"),
-      `expected the documented residual (falls through to an ordinary verdict, does not VOID); output: ${floorOutput}`
+      floorOutput.includes("[stale-completion-token]"),
+      `expected the distinct stale-completion-token VOID reason; output: ${floorOutput}`
+    );
+    assert.ok(
+      floorOutput.includes("REFUSED"),
+      `expected the run to REFUSE a verdict now that the fix is in place; output: ${floorOutput}`
     );
   } finally {
     try {

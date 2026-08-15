@@ -91,12 +91,15 @@ export function loadCoverageSummary(filePath = COVERAGE_SUMMARY_PATH) {
  * numbers as an ordinary verdict. Absence of BOTH is the common case, and
  * read as "the run completed" - never as an error: that is the expected
  * state after every ordinary, complete run (run-tests.mjs's own main()
- * clears both locations unconditionally at the START of every invocation,
- * so a stale marker from a PRIOR truncated run - at either path - can never
- * survive into reading a fresh, complete one's summary). Absence of BOTH is
- * also what a run whose OWN write of both markers failed looks like -
- * loadCompletionMarker below, and main()'s own use of it, is what closes
- * that remaining gap.
+ * ATTEMPTS TO CLEAR both locations on every successfully parsed run, before
+ * test discovery and execution - a best-effort delete that swallows any
+ * error, not only ENOENT. A run whose own delete failed can leave a stale
+ * marker behind, which this function reads exactly like a fresh truncation
+ * and REFUSES on - the safe direction for this particular gap to fail in,
+ * since it costs a spurious VOID rather than ever letting a truncated
+ * run's numbers read as a real verdict). Absence of BOTH is also what a run
+ * whose OWN write of both markers failed looks like - loadCompletionMarker
+ * below, and main()'s own use of it, is what closes that remaining gap.
  *
  * @param {string} [filePath]
  * @param {string} [fallbackPath]
@@ -140,6 +143,38 @@ export const COMPLETION_MARKER_PATH =
  * @returns {{ headSha: string, at: string } | null}
  */
 export function loadCompletionMarker(filePath = COMPLETION_MARKER_PATH) {
+  try {
+    return JSON.parse(readFileSync(filePath, "utf8"));
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+// Same override pattern as the constants above, read from the same
+// REPO_ROOT-level location scripts/run-tests.mjs's own RUN_TOKEN_PATH
+// writes to - see that constant's own doc comment for the residual gap
+// this closes (a stale, same-commit completion marker surviving a later
+// run whose own truncation-marker writes also failed) and loadRunToken's
+// own doc comment below for how it is used here.
+export const RUN_TOKEN_PATH =
+  process.env.GHANTIKA_RUN_TOKEN_PATH ?? path.join(REPO_ROOT, ".run-token.json");
+
+/**
+ * Reads the per-invocation run token scripts/run-tests.mjs ATTEMPTS TO
+ * WRITE, unconditionally, before test discovery and execution on a
+ * successfully parsed run of its own main() - see RUN_TOKEN_PATH's own doc
+ * comment there for the full mechanism. Returns null (not a throw) when the
+ * file is genuinely absent, mirroring loadCompletionMarker's own ENOENT
+ * handling immediately above:
+ * a token that was never written (main() reached, its own write failed)
+ * looks exactly like one that is simply missing, and this script's own
+ * main() treats both the same way - VOID.
+ *
+ * @param {string} [filePath]
+ * @returns {{ token: string, at: string } | null}
+ */
+export function loadRunToken(filePath = RUN_TOKEN_PATH) {
   try {
     return JSON.parse(readFileSync(filePath, "utf8"));
   } catch (err) {
@@ -223,25 +258,22 @@ function main() {
   // distinct reason from "idle-watchdog"/"wall-cap" - "no-completion-record"
   // - so a reader (and a test) can tell the two VOID causes apart.
   //
-  // KNOWN, DISCLOSED RESIDUAL LIMIT: this SHA-binding defends against a
-  // completion marker left over from a DIFFERENT commit. It does not, and
-  // cannot, defend against the narrower three-way conjunction where (1) a
+  // THIS SHA-BINDING ALONE IS NOT SUFFICIENT: it defends against a
+  // completion marker left over from a DIFFERENT commit, but on its own it
+  // cannot defend against the narrower three-way conjunction where (1) a
   // previous run at THIS SAME commit already completed successfully and
-  // left a valid completion marker, (2) this run is truncated, and (3)
-  // both of this run's own truncation-marker writes also fail. The
-  // truncation-marker check above runs FIRST, so if either of those two
-  // writes had succeeded, that alone would VOID regardless of whatever
-  // completion marker is sitting underneath it - this gap is reachable
-  // only when truncation-marker persistence has ALSO failed. A
-  // per-invocation run id supplied by the CI/gate manifest to both this
-  // script and run-tests.mjs would close it, at the cost of coupling this
-  // mechanism's own lockstep-parity obligation to .github/workflows/ and
-  // that manifest for a narrow, already-disclosed gap; the SHA-binding
-  // here closes the originally-reported fail-open (an absent truncation
-  // marker read as an ordinary complete run) on its own, and is the
-  // accepted trade for now. See test/check-coverage-floor.test.js's own
-  // "KNOWN LIMIT" test, which proves and documents this exact scenario
-  // rather than leaving it unproven.
+  // left a valid completion marker, (2) a LATER run at that identical
+  // commit is truncated, and (3) both of THAT run's own truncation-marker
+  // writes also fail. The truncation-marker check above runs FIRST, so if
+  // either of those two writes had succeeded, that alone would VOID
+  // regardless of whatever completion marker is sitting underneath it -
+  // this gap is reachable only when truncation-marker persistence has also
+  // failed. A truncated run must never produce a coverage verdict, however
+  // narrow the path to it: the run-token check immediately below adds a
+  // SECOND, wholly independent binding - not to the commit, which a stale
+  // same-commit marker trivially satisfies, but to the exact INVOCATION of
+  // run-tests.mjs that produced the completion marker. See RUN_TOKEN_PATH's
+  // own doc comment in scripts/run-tests.mjs for the full mechanism.
   const completion = loadCompletionMarker();
   const currentHeadSha = readGitHeadSha();
   if (!completion || completion.headSha !== currentHeadSha) {
@@ -255,6 +287,43 @@ function main() {
       `  this is VOID, not a pass and not a fail [no-completion-record] - see ` +
         `${path.relative(REPO_ROOT, COMPLETION_MARKER_PATH)}. Re-run "npm run coverage" to produce a ` +
         `trustworthy, current completion record.`
+    );
+    process.exitCode = VOID_EXIT_CODE;
+    return;
+  }
+
+  // Closes the residual the headSha check above cannot on its own: a
+  // completion marker whose headSha DOES match the current checkout can
+  // still be a STALE record from a PRIOR successful run at this exact same
+  // commit, surviving because a LATER run's own truncation-marker writes
+  // (both the primary and its fallback) also failed. scripts/run-tests.mjs
+  // generates a fresh, per-invocation token, independent of git HEAD
+  // entirely, before test discovery and execution on a successfully parsed
+  // run of its own main(), and ATTEMPTS to write it to RUN_TOKEN_PATH -
+  // embedding the exact in-memory value into the completion marker only if
+  // THAT SAME invocation reaches genuine completion. Closure here does not
+  // rest on that write succeeding: a completion marker whose embedded
+  // runToken does not match the token found on disk RIGHT NOW cannot be
+  // trusted as evidence that the CURRENT invocation of run-tests.mjs
+  // completed, for either of two reasons - it is a stale record embedding
+  // an earlier invocation's token, or this invocation's own token write
+  // failed and nothing legitimate is on disk to compare against - and both
+  // are VOID, never a silent fall-through to an ordinary verdict. The
+  // guarantee is in the CHECK being fail-closed on a mismatch or an
+  // absence, not in any assumption that the write always lands.
+  const currentToken = loadRunToken();
+  if (!currentToken || completion.runToken !== currentToken.token) {
+    console.error(
+      `coverage floor check: REFUSED - the completion record's embedded run token does not match this ` +
+        `invocation's own current token (head ${currentHeadSha}). The completion record cannot be trusted ` +
+        `as evidence that THIS invocation of "npm run coverage" completed - it may be a stale record left ` +
+        `over from an earlier, genuinely successful run at this same commit, surviving because a later ` +
+        `run's own truncation-marker writes also failed, or the run-token write itself may have failed.`
+    );
+    console.error(
+      `  this is VOID, not a pass and not a fail [stale-completion-token] - see ` +
+        `${path.relative(REPO_ROOT, RUN_TOKEN_PATH)}. Re-run "npm run coverage" to produce a trustworthy, ` +
+        `current completion record.`
     );
     process.exitCode = VOID_EXIT_CODE;
     return;

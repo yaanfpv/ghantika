@@ -156,6 +156,7 @@ import { run } from "node:test";
 import { spec, junit } from "node:test/reporters";
 import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Writable } from "node:stream";
@@ -190,9 +191,8 @@ export const TRUNCATION_MARKER_PATH = path.join(REPO_ROOT, "coverage", "run-trun
 // never under coverage/: coverage/ is exactly the directory a real run
 // could plausibly find unwritable (it is c8's own output directory,
 // gitignored, and the directory an unwritable-coverage-directory scenario
-// locks down), while REPO_ROOT is where dist/, node_modules/, and this
-// file's own junit output already have to be writable for the run to have
-// gotten this far at all.
+// locks down). The write here is a best-effort attempt in its own right,
+// exactly like the primary path above.
 export const TRUNCATION_MARKER_FALLBACK_PATH = path.join(REPO_ROOT, ".run-truncated-fallback.json");
 
 // Where a genuinely COMPLETE run (never idle-watchdog-truncated, never
@@ -209,6 +209,36 @@ export const TRUNCATION_MARKER_FALLBACK_PATH = path.join(REPO_ROOT, ".run-trunca
 // SEEN to be truncated. Lives under coverage/, the same directory c8 and
 // TRUNCATION_MARKER_PATH already write into.
 export const COMPLETION_MARKER_PATH = path.join(REPO_ROOT, "coverage", "run-completed.json");
+
+// Closes a residual gap COMPLETION_MARKER_PATH's own headSha binding
+// cannot: a completion marker whose headSha matches the CURRENT checkout
+// can still be a STALE record left over from an earlier, genuinely
+// successful run at this exact same commit - surviving because a LATER
+// run at that same commit got truncated and BOTH of its own
+// writeTruncationMarkerSync attempts (primary and fallback - see that
+// function's own doc comment) also failed. In that narrow conjunction, an
+// absent truncation marker plus a headSha-matching completion marker reads
+// as an ordinary complete run, and the truncated run's own partial
+// coverage numbers would be certified as a real verdict. A fresh,
+// per-invocation token closes it: main() generates it, independent of git
+// HEAD entirely, before test discovery and execution (see that function's
+// own token-write block), so two different invocations of main() at the
+// IDENTICAL commit still produce two different tokens.
+// scripts/check-coverage-floor.mjs's own loadRunToken()
+// reads this file and refuses (VOID) unless the completion marker's own
+// embedded runToken matches what is on disk RIGHT NOW - a stale
+// same-commit completion marker embeds a PRIOR invocation's token, which
+// can never match the CURRENT invocation's fresh one. Lives at REPO_ROOT
+// itself, never under coverage/, for the identical reason
+// TRUNCATION_MARKER_FALLBACK_PATH's own doc comment gives: coverage/ is
+// exactly the directory a real run could plausibly find unwritable, and
+// putting the token somewhere else keeps its own write attempt from
+// sharing that specific failure mode. This is not a claim that REPO_ROOT
+// itself is guaranteed writable - the write below is a best-effort
+// attempt, caught and logged on failure like every other write in this
+// file - it is closed regardless: an absent token, from ANY cause,
+// reads downstream as untrustworthy and VOIDs rather than passing.
+export const RUN_TOKEN_PATH = path.join(REPO_ROOT, ".run-token.json");
 
 // The `.test.` infix, not merely a directory, is what makes something a
 // suite. `test/harness.ts` and `test/helpers/spawnServer.ts` sit under
@@ -916,6 +946,16 @@ function writeTruncationMarkerSync(markerPath, reason, message, fallbackPath) {
  * repo's own coverage/run-completed.json as a side effect of testing
  * something unrelated.
  *
+ * `runToken` carries no such redirect obligation - it is not a path, it is
+ * the in-memory value main() generated (see RUN_TOKEN_PATH's own doc
+ * comment) and hands down so onNormalCompletion() below can embed it into
+ * the completion marker it writes. A caller that omits it (every existing
+ * test driver that never reaches normal completion, and
+ * scripts/run-tests-fixture-harness.mjs, whose own completion marker is
+ * never read by the real check-coverage-floor.mjs) simply embeds
+ * `undefined`, which JSON.stringify drops from the written marker
+ * entirely - harmless, since nothing reads that isolated marker's token.
+ *
  * @param {{
  *   discovered: string[],
  *   tracked: string[] | null,
@@ -926,6 +966,7 @@ function writeTruncationMarkerSync(markerPath, reason, message, fallbackPath) {
  *   truncationMarkerPath?: string,
  *   truncationMarkerFallbackPath?: string,
  *   completionMarkerPath?: string,
+ *   runToken?: string,
  * }} args
  */
 export function runOnce({
@@ -938,6 +979,7 @@ export function runOnce({
   truncationMarkerPath = TRUNCATION_MARKER_PATH,
   truncationMarkerFallbackPath = TRUNCATION_MARKER_FALLBACK_PATH,
   completionMarkerPath = COMPLETION_MARKER_PATH,
+  runToken,
 }) {
   return new Promise((resolve) => {
     // Computed ONCE per invocation of this function - never per-test-file,
@@ -1075,27 +1117,44 @@ export function runOnce({
       const ok = !didFail && missingFloor.length === 0 && skipErrors.length === 0;
 
       // Proof this run reached ITS OWN completion point, bound to the exact
-      // commit it ran against - see COMPLETION_MARKER_PATH's own doc
-      // comment for the fail-open this closes. This write intentionally has
-      // NO rescue path, unlike writeTruncationMarkerSync's own primary-then-
-      // fallback attempt: a failed write here means the completion marker
-      // will be absent, and an absent (or SHA-mismatched) completion marker
-      // is exactly what makes check-coverage-floor.mjs refuse to produce a
-      // verdict (see that script's own main()). Adding a fallback here
-      // would defeat the whole point - a real failure to write (disk full,
-      // permissions) must never silently read as an ordinary complete run.
-      // Do not add rescue logic to this write. onIdleTimeout and
-      // onWallTimeout above both call process.exit(1) BEFORE this point can
-      // ever be reached: tryFinalizeNormal() (the only caller of this
-      // function) refuses to run once `terminationFired` is set, and both
-      // watchdog paths set it before doing anything else - so a
-      // watchdog-triggered exit provably never writes this marker, whether
-      // the run passed or failed (`ok` above is irrelevant here: this marks
-      // that the run COMPLETED, never that it succeeded).
+      // commit it ran against AND to the exact invocation of main() that
+      // reached it (via the embedded runToken - see RUN_TOKEN_PATH's own
+      // doc comment for why headSha binding alone is not sufficient) - see
+      // COMPLETION_MARKER_PATH's own doc comment for the fail-open this
+      // closes. This write intentionally has NO rescue path, unlike
+      // writeTruncationMarkerSync's own primary-then-fallback attempt: a
+      // failed write here means the completion marker will be absent, and
+      // an absent (or SHA-mismatched, or token-mismatched) completion
+      // marker is exactly what makes check-coverage-floor.mjs refuse to
+      // produce a verdict (see that script's own main()). Adding a
+      // fallback here would defeat the whole point - a real failure to
+      // write (disk full, permissions) must never silently read as an
+      // ordinary complete run. Do not add rescue logic to this write.
+      // onIdleTimeout and onWallTimeout above both call process.exit(1)
+      // BEFORE this point can ever be reached: tryFinalizeNormal() (the
+      // only caller of this function) refuses to run once
+      // `terminationFired` is set, and both watchdog paths set it before
+      // doing anything else - so a watchdog-triggered exit provably never
+      // writes this marker, whether the run passed or failed (`ok` above
+      // is irrelevant here: this marks that the run COMPLETED, never that
+      // it succeeded). `runToken` here is always the caller's own in-memory
+      // value (main()'s own successful-or-not RUN_TOKEN_PATH write is
+      // irrelevant to what gets embedded - see runOnce's own doc comment
+      // above), never re-read off disk, so a completing invocation always
+      // embeds the token IT ITSELF generated.
       try {
+        // Best-effort, matching this file's own established pattern
+        // (flushJunitSync, writeTruncationMarkerSync): under a plain,
+        // non-c8 test run (`npm test`, not `npm run coverage`) coverage/
+        // has no other reason to exist yet - c8 itself creates
+        // coverage/tmp/ as a side effect under the coverage script, which
+        // is what masks this gap there. Without this, a missing coverage/
+        // reaches a caught ENOENT that logs as an error even though
+        // nothing is actually wrong.
+        mkdirSync(path.dirname(completionMarkerPath), { recursive: true });
         writeFileSync(
           completionMarkerPath,
-          JSON.stringify({ headSha, at: new Date().toISOString() }, null, 2)
+          JSON.stringify({ headSha, at: new Date().toISOString(), runToken }, null, 2)
         );
       } catch (err) {
         console.error(
@@ -1195,15 +1254,10 @@ async function main() {
     return;
   }
 
-  // A stale marker from a PREVIOUS truncated run must never be read as
-  // belonging to THIS one - clear both the primary and fallback locations
-  // unconditionally before anything else runs, so a normal completion
-  // always starts (and, if it completes normally, ends) with neither marker
-  // on disk. Only the two watchdog termination paths in runOnce() ever
-  // write either back (via writeTruncationMarkerSync's own primary-then-
-  // fallback attempt), and only one of the two markers is ever written per
-  // run. Absence is not an error (the common case, and the very first run
-  // ever).
+  // Clear both marker paths on a successfully parsed run, before test
+  // discovery. Best-effort: a failed delete leaves a stale marker, which
+  // check-coverage-floor.mjs reads as a fresh truncation and REFUSES on -
+  // a spurious VOID rather than a truncated run's numbers read as real.
   for (const marker of [TRUNCATION_MARKER_PATH, TRUNCATION_MARKER_FALLBACK_PATH]) {
     try {
       unlinkSync(marker);
@@ -1212,6 +1266,43 @@ async function main() {
       // there is nothing actionable here, and a failed best-effort delete
       // must never block the run it is merely tidying up before.
     }
+  }
+
+  // A fresh, per-invocation identity - see RUN_TOKEN_PATH's own doc
+  // comment above for the residual gap this closes (a stale, same-commit
+  // completion marker surviving because a later run's own truncation-
+  // marker writes also failed). Generation happens unconditionally, right
+  // alongside the truncation-marker clearing above, before test discovery
+  // and execution: every invocation that successfully parses its
+  // arguments - whether it goes on to pass, fail, hang, or get
+  // watchdog-terminated - reaches that point having ATTEMPTED to persist
+  // its own fresh token. The attempt can fail (an unwritable REPO_ROOT is
+  // not assumed away here any more than it is for the truncation marker),
+  // and that is fine: mirrors onNormalCompletion()'s own completion-
+  // marker write's "no rescue path" philosophy - ONE attempt, logged and
+  // never retried at a fallback location on failure, because the closure
+  // this buys does not depend on the write succeeding. A caller reading
+  // RUN_TOKEN_PATH downstream (check-coverage-floor.mjs's own
+  // loadRunToken()) and finding it absent must read that as untrustworthy,
+  // the same way an absent completion marker already does - never as "no
+  // token was ever generated, so skip this check."
+  const runToken = randomUUID();
+  try {
+    // Best-effort, matching this file's own established pattern
+    // (flushJunitSync, writeTruncationMarkerSync): under a plain, non-c8
+    // test run the parent directory has no other reason to exist yet (c8
+    // itself creates coverage/tmp/ as a side effect under `npm run
+    // coverage`, which is what masks the equivalent gap on
+    // completionMarkerPath - see that write's own mkdirSync below). A
+    // missing parent here would otherwise reach a caught ENOENT that logs
+    // as an error even though nothing is actually wrong.
+    mkdirSync(path.dirname(RUN_TOKEN_PATH), { recursive: true });
+    writeFileSync(
+      RUN_TOKEN_PATH,
+      JSON.stringify({ token: runToken, at: new Date().toISOString() }, null, 2)
+    );
+  } catch (err) {
+    console.error(`run-tests: failed to write run token to ${RUN_TOKEN_PATH}: ${err.message}`);
   }
 
   const discovered = discoverTestFiles(TEST_DIR);
@@ -1280,7 +1371,7 @@ async function main() {
   // TEST_POLICY_ALLOW_PATH's own doc comment above for why.
   process.env.GHANTIKA_POLICY_FILE = TEST_POLICY_ALLOW_PATH;
 
-  await runOnce({ discovered, tracked, junitPath, options, skipBaseline, criticalTests });
+  await runOnce({ discovered, tracked, junitPath, options, skipBaseline, criticalTests, runToken });
 }
 
 if (isMainModule(import.meta.url)) {

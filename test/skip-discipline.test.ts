@@ -1229,6 +1229,25 @@ test("the fixture harness's own truncation-marker fallback stays inside the fixt
       // best-effort; the recursive rm below will surface anything real
     }
     rmSync(dir, { recursive: true, force: true });
+    // Restore the REAL, REPO_ROOT-level fallback marker to its snapshotted
+    // prior state regardless of whether the isolation assertions above
+    // passed or threw. Without this, a FAILING isolation control (the real
+    // fallback marker was unexpectedly touched or created) throws out of
+    // the try block above and leaves that stray write behind - present
+    // when it should be absent, or holding this run's content instead of
+    // whatever a real prior run had left there - for whichever test
+    // (inside this file or another) next depends on that path's state.
+    try {
+      if (hadPriorRealFallback) {
+        writeFileSync(TRUNCATION_MARKER_FALLBACK_PATH, priorRealFallbackContent);
+      } else {
+        rmSync(TRUNCATION_MARKER_FALLBACK_PATH, { force: true });
+      }
+    } catch (err) {
+      console.error(
+        `failed to restore the real fallback marker's prior state at ${TRUNCATION_MARKER_FALLBACK_PATH}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   }
 });
 
