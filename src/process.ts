@@ -2564,10 +2564,15 @@ export function parseLstartBatchOutput(stdout: string): RecordedGroupMember[] {
  *
  * An empty `pids` array is a defensive no-op (`{status: "ok", rows: <empty>}`
  * without ever shelling out) - there is nothing to ask `ps` about.
+ *
+ * This is the SINGLE, ONE-SHOT observer `readPidStartTimesBatchPosix` below
+ * builds its own not-found retry on top of - kept as a private helper
+ * rather than exported, so every caller goes through the retrying wrapper
+ * and no call site can accidentally bypass it.
  */
-export function readPidStartTimesBatchPosix(
+function readPidStartTimesBatchPosixOnce(
   pids: readonly number[],
-  timeoutMs: number = PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS
+  timeoutMs: number
 ): Promise<PidBatchReadResult> {
   if (pids.length === 0) return Promise.resolve({ status: "ok", rows: [] });
   return new Promise((resolve) => {
@@ -2629,6 +2634,131 @@ export function readPidStartTimesBatchPosix(
       resolve({ status: "observer-failure", reason });
     }, timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS);
   });
+}
+
+/**
+ * `readPidStartTimesBatchPosix`'s not-found retry. A newly-spawned process's
+ * `ps` row can be transiently absent for a brief window after the process
+ * exists - the same fork-visibility race `captureBirthIdentityPosixAsync`
+ * already absorbs for a single pid. This function now retries a transient
+ * not-found the same way, so a busy host cannot make a batched read's whole
+ * result look permanently unavailable over a gap that resolves on its own.
+ *
+ * ONE retry policy, reused rather than duplicated: this shares
+ * `BIRTH_IDENTITY_NOT_FOUND_RETRY_BOUND_MS` and
+ * `BIRTH_IDENTITY_NOT_FOUND_RETRY_POLL_INTERVAL_MS` with the single-pid
+ * function directly - no separate batch-specific constants exist to drift
+ * out of sync with them - and accepts the identical injectable
+ * `CaptureRetryClock` shape for the identical reason (deterministic,
+ * non-wall-clock-bound tests).
+ *
+ * Only the pids STILL MISSING after an attempt are re-asked-about on a
+ * retry - a pid already found in an earlier attempt is never re-queried.
+ * Bounded by TWO budgets, exactly mirroring `captureBirthIdentityPosixAsync`'s
+ * own two-bound model:
+ * - The AGGREGATE cap, `timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS`
+ *   from function entry, moved by nothing below it - the SAME overall
+ *   settlement bound this function has always promised its callers (the
+ *   pre-SIGTERM escalation snapshot's leader/descendant reads, and the
+ *   escalation gate's own later re-read - see their own docs on the timeout
+ *   budgets they pass in). This fix can never make the whole call take
+ *   longer than it already promised to; it only spends that existing
+ *   budget more usefully. Each individual `ps` sub-call (first attempt AND
+ *   every retry) gets an effective timeout capped to whatever remains of
+ *   this budget, exactly like the single-pid version's own arithmetic.
+ * - The RETRY-SCHEDULING budget, `BIRTH_IDENTITY_NOT_FOUND_RETRY_BOUND_MS`
+ *   starting from the FIRST attempt that leaves any pid still missing
+ *   (never reset by a later miss), governs only whether ANOTHER retry is
+ *   allowed to START.
+ *
+ * A genuine `observer-failure` on the FIRST attempt (nothing found yet)
+ * propagates immediately, exactly as before this fix existed - it has
+ * already spent its own timeout once, the identical reasoning
+ * `captureBirthIdentityPosixAsync`'s own docs give for never retrying that
+ * status. A genuine `observer-failure` on a LATER retry attempt (after at
+ * least one pid was already legitimately found) does NOT discard that
+ * earlier real progress: it stops retrying and returns `ok` with whatever
+ * rows were already found, exactly as if no retry had been attempted at
+ * all - adding a retry must never make an already-partially-successful call
+ * WORSE than making no retry attempt would have.
+ *
+ * A pid that is genuinely, permanently gone (rather than merely
+ * not-yet-visible) simply keeps missing on every retry and is still,
+ * correctly, reported as absent once the retry window closes - the SAME
+ * final answer this function has always given for a gone pid (`ps -p
+ * <list>`'s own documented behavior when a pid never matches), just
+ * arrived at after giving a transient one every chance the single-pid path
+ * already gives its own equivalent race.
+ */
+export async function readPidStartTimesBatchPosix(
+  pids: readonly number[],
+  timeoutMs: number = PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS,
+  clock: CaptureRetryClock = REAL_CAPTURE_RETRY_CLOCK
+): Promise<PidBatchReadResult> {
+  if (pids.length === 0) return { status: "ok", rows: [] };
+
+  const aggregateDeadline = clock.now() + timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS;
+  let retryDeadline: number | undefined;
+  let remainingPids: readonly number[] = pids;
+  const foundRows: RecordedGroupMember[] = [];
+
+  for (;;) {
+    const remainingAggregate = aggregateDeadline - clock.now();
+    if (remainingAggregate <= ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS) {
+      // Aggregate budget exhausted: settle with whatever was legitimately
+      // found so far - the same "ok with a possibly-partial rows set" shape
+      // this function has always returned for a pid it never found.
+      return { status: "ok", rows: foundRows };
+    }
+    if (retryDeadline !== undefined && clock.now() >= retryDeadline) {
+      return { status: "ok", rows: foundRows };
+    }
+
+    const effectiveTimeoutMs = Math.min(
+      timeoutMs,
+      remainingAggregate - ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS
+    );
+    const attempt = await readPidStartTimesBatchPosixOnce(remainingPids, effectiveTimeoutMs);
+
+    if (attempt.status === "observer-failure") {
+      if (foundRows.length === 0) return attempt;
+      return { status: "ok", rows: foundRows };
+    }
+
+    // Defensively scoped to `remainingPids` (the exact set THIS sub-call
+    // queried), never trusted as-is: an observer that ever echoed a row
+    // for a pid outside that set (never true of a real `ps -p <list>`,
+    // which only answers for pids in its own argument) would otherwise
+    // get re-added on every later retry, since each retry's own rows are
+    // ACCUMULATED into foundRows across sub-calls.
+    const newlyFound = attempt.rows.filter((row) => remainingPids.includes(row.pid));
+    foundRows.push(...newlyFound);
+    const stillMissing = remainingPids.filter((pid) => !newlyFound.some((row) => row.pid === pid));
+    if (stillMissing.length === 0) {
+      return { status: "ok", rows: foundRows };
+    }
+    remainingPids = stillMissing;
+
+    if (retryDeadline === undefined) {
+      retryDeadline = clock.now() + BIRTH_IDENTITY_NOT_FOUND_RETRY_BOUND_MS;
+    }
+    const remainingRetry = retryDeadline - clock.now();
+    if (remainingRetry <= 0) {
+      return { status: "ok", rows: foundRows };
+    }
+    const remainingAggregateForSleep = aggregateDeadline - clock.now();
+    if (remainingAggregateForSleep <= 0) {
+      return { status: "ok", rows: foundRows };
+    }
+
+    await clock.sleep(
+      Math.min(
+        BIRTH_IDENTITY_NOT_FOUND_RETRY_POLL_INTERVAL_MS,
+        remainingRetry,
+        remainingAggregateForSleep
+      )
+    );
+  }
 }
 
 /** The real outcome of enumerating a process group's current membership via `pgrep -g <pgid>`. */
