@@ -1,6 +1,6 @@
 /**
  * Proves `src/tasksAdapter.ts`'s `startTransportWakeOnTerminal` subscriber:
- * its internal-only `GHANTIKA_WAKE_TRANSPORT_ENABLED` opt-in gate, its
+ * its server-operator-only `GHANTIKA_WAKE_TRANSPORT_ENABLED` opt-in gate, its
  * fail-closed behavior on every `WakeTargetResolution` state other than
  * `"resolved"`, and its dispatch through the real transport selector.
  *
