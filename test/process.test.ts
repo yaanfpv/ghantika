@@ -3956,6 +3956,24 @@ test("parsePidLstartRow REFUSES an empty string", () => {
 
 // --- readPidStartTimesBatchPosix: the batched, bounded, force-reaped observer ---
 
+/**
+ * A virtual retry clock for `readPidStartTimesBatchPosix`'s own not-found
+ * retry: `now()` only advances by exactly what `sleep()` was asked to wait,
+ * with no real wall-clock component, so a case where the retry budget
+ * genuinely exhausts runs through the same number of iterations production
+ * would without spending that time for real.
+ */
+function fastForwardRetryClock() {
+  let virtualNow = 0;
+  return {
+    now: () => virtualNow,
+    sleep: async (ms: number) => {
+      virtualNow += ms;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(ms, 5)));
+    },
+  };
+}
+
 test("readPidStartTimesBatchPosix: an empty pids array is a defensive no-op, never shelling out at all", async () => {
   const result = await readPidStartTimesBatchPosix([]);
   assert.deepEqual(result, { status: "ok", rows: [] });
@@ -4075,7 +4093,15 @@ test(
     await waitFor(() => shortRec.exits.length > 0);
     const deadPid = shortChild!.pid!;
 
-    const result = await readPidStartTimesBatchPosix([pid, deadPid]);
+    // The dead pid is genuinely, permanently absent, so it exhausts the
+    // full not-found retry window on every real attempt - a virtual clock
+    // keeps this deterministic-but-fast rather than adding a real ~1s wait
+    // for a result that was never going to change.
+    const result = await readPidStartTimesBatchPosix(
+      [pid, deadPid],
+      undefined,
+      fastForwardRetryClock()
+    );
     assert.equal(result.status, "ok");
     if (result.status === "ok") {
       assert.equal(result.rows.length, 1);
@@ -4086,7 +4112,13 @@ test(
 );
 
 test("readPidStartTimesBatchPosix: when NONE of the requested pids exist, resolves ok with genuinely empty rows (ps's own exit-1 'nothing matched' code), never an observer failure", async () => {
-  const result = await readPidStartTimesBatchPosix([88_888_881, 88_888_882]);
+  // Neither pid will ever be found, so this exhausts the full retry window -
+  // a virtual clock avoids a real ~1s wait for that.
+  const result = await readPidStartTimesBatchPosix(
+    [88_888_881, 88_888_882],
+    undefined,
+    fastForwardRetryClock()
+  );
   assert.deepEqual(result, { status: "ok", rows: [] });
 });
 
@@ -4220,15 +4252,13 @@ test(
       // kind. This integration test's real-pipeline behavior is layered ON
       // TOP of that pure logic, not a substitute for it.
       //
-      // Four other call sites in this file share this test's exact
-      // implicit-timeout shape - a real `readPidStartTimesBatchPosix` call
-      // with no explicit timeoutMs, riding the implicit
-      // PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS default instead: the
-      // single-pid read at :3967, the "reads MULTIPLE real pids in ONE
-      // batched call" test at :4016, the alive/already-gone mix at :4068,
-      // and the all-nonexistent-pids read at :4079. They are unchanged by
-      // this commit.
-      result = await readPidStartTimesBatchPosix([pid, 999_999], 30_000);
+      // 999_999's row is malformed and therefore discarded by
+      // parseLstartBatchOutput on EVERY attempt - it never resolves, so
+      // this exhausts the not-found retry window same as the alive/
+      // already-gone and all-nonexistent-pids tests above; a virtual clock
+      // avoids the real ~1s wait for a result that was never going to
+      // change.
+      result = await readPidStartTimesBatchPosix([pid, 999_999], 30_000, fastForwardRetryClock());
     } finally {
       process.env.PATH = realPath;
     }
@@ -4241,6 +4271,136 @@ test(
     process.kill(-pid, "SIGKILL");
   }
 );
+
+// --- readPidStartTimesBatchPosix's own not-found retry: a transient miss
+// on the whole batch is retried the same way the single-pid capture's own
+// not-found retry already is. ---
+
+test(
+  "readPidStartTimesBatchPosix: a transient not-found observation for the whole batch retries and recovers once ps starts answering",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-batch-notfound-then-found-ps-"));
+    const invocationMarker = path.join(dir, "invocations.txt");
+    const psPath = path.join(dir, "ps");
+    // Mirrors the SAME first-not-found-then-found idiom the single-pid
+    // retry's own tests above use, adapted to the batch invocation shape.
+    fs.writeFileSync(
+      psPath,
+      `#!/bin/sh\ncount=$(wc -l < '${invocationMarker}' 2>/dev/null || echo 0)\necho x >> '${invocationMarker}'\nif [ "$count" -eq 0 ]; then\n  exit 1\nfi\necho '${pid} Sat Jul 25 13:39:12 2026'\n`
+    );
+    fs.chmodSync(psPath, 0o755);
+
+    let result: Awaited<ReturnType<typeof readPidStartTimesBatchPosix>>;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      result = await readPidStartTimesBatchPosix([pid], undefined, fastForwardRetryClock());
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    const invocationCount = fs
+      .readFileSync(invocationMarker, "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0).length;
+
+    assert.equal(result.status, "ok", "a transient miss must never settle as observer-failure");
+    if (result.status === "ok") {
+      assert.equal(result.rows.length, 1, "the retry must recover the requested pid's row");
+      assert.equal(result.rows[0]!.pid, pid);
+    }
+    assert.ok(
+      invocationCount >= 2,
+      `expected at least 2 real ps invocations (the initial not-found plus the retry that found it), saw ${invocationCount}`
+    );
+
+    process.kill(-pid, "SIGKILL");
+  }
+);
+
+test("readPidStartTimesBatchPosix: the not-found retry is capped by the caller's OWN aggregate timeoutMs+grace when that is smaller than the shared retry-scheduling bound", async () => {
+  const realPath = process.env.PATH;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-batch-aggregate-cap-ps-"));
+  const invocationMarker = path.join(dir, "invocations.txt");
+  const psPath = path.join(dir, "ps");
+  // Never finds anything - the point is to prove the loop stops on the
+  // AGGREGATE cap alone, before the much larger shared not-found
+  // retry-scheduling bound (1000ms) would ever end it.
+  fs.writeFileSync(psPath, `#!/bin/sh\necho x >> '${invocationMarker}'\nexit 1\n`);
+  fs.chmodSync(psPath, 0o755);
+
+  // timeoutMs is the LARGEST value that still keeps the aggregate
+  // deadline (timeoutMs + grace) strictly below the shared
+  // BIRTH_IDENTITY_NOT_FOUND_RETRY_BOUND_MS (1000ms) - the exact
+  // "smaller than the shared retry-scheduling bound" case this test's
+  // own title claims - while leaving headroom for the one real `ps`
+  // spawn this test performs, since a freshly-written script pays real
+  // one-time exec overhead on its first invocation. The injected clock
+  // steps through fixed values on each sleep() call rather than
+  // advancing in real time, so the aggregate boundary itself is landed
+  // on deterministically.
+  const timeoutMs = 749;
+  const aggregateMs = timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS; // 999ms
+  // aggregateMs - 49 trips the aggregate deadline (its own 250ms
+  // settlement grace makes 749ms the threshold) while sitting below the
+  // shared 1000ms retry-scheduling bound - the one clock value where the
+  // two guards can disagree, which is what makes this test discriminate
+  // between them rather than merely landing after both have expired.
+  const clockValues = [0, aggregateMs - 49, aggregateMs];
+  let callCount = 0;
+  const steppedClock = {
+    now: () => clockValues[Math.min(callCount, clockValues.length - 1)]!,
+    sleep: async (ms: number) => {
+      callCount++;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(ms, 5)));
+    },
+  };
+
+  let result: Awaited<ReturnType<typeof readPidStartTimesBatchPosix>>;
+  try {
+    process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+    result = await readPidStartTimesBatchPosix([99_999_991], timeoutMs, steppedClock);
+  } finally {
+    process.env.PATH = realPath;
+  }
+
+  assert.deepEqual(
+    result,
+    { status: "ok", rows: [] },
+    "a persistently-missing pid still settles ok with empty rows, exactly as before this fix - the aggregate cap only bounds HOW LONG retrying continues, never the final answer's shape"
+  );
+
+  const invocationCount = fs
+    .readFileSync(invocationMarker, "utf8")
+    .split("\n")
+    .filter((line) => line.trim().length > 0).length;
+  // Exactly ONE real `ps` invocation: the first attempt's not-found
+  // result starts the retry window (deadline at 1000ms), the injected
+  // clock then steps to 950ms - past the 999ms aggregate deadline's own
+  // 749ms threshold, but still short of that 1000ms retry-scheduling
+  // deadline - and the SECOND iteration's own aggregate check ends the
+  // loop before a second real `ps` call is ever attempted. Because the
+  // retry-scheduling bound has NOT yet been reached at that same clock
+  // value, only the aggregate guard can be responsible for stopping
+  // this: without it, the second iteration would fall through to
+  // computing its own effective per-call timeout from a negative
+  // remaining-aggregate budget, which throws rather than settling `ok`.
+  assert.equal(
+    invocationCount,
+    1,
+    `expected exactly ONE real ps invocation - the 999ms aggregate deadline (749ms timeoutMs + 250ms grace, below the shared 1000ms not-found bound) must end retrying before a second real call, saw ${invocationCount}`
+  );
+});
 
 // --- captureEscalationIdentitySnapshot: the pre-SIGTERM membership snapshot ---
 

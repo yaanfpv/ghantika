@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+- Fixed the batched process-identity read treating a single transient not-found observation as a final, confident result instead of retrying, closing an asymmetry with the single-pid read, which already retried.
+
 ### Added
 
 - **`follow`, a seventh tool for a bounded wait on a job's next event**: new output on a chosen stream, the job reaching a terminal state, or an explicit `timeout_ms` (default 45000ms, capped at one hour), whichever comes first. A timeout is a normal, non-error result; `status`, `output`, and `tail` remain the way to check a job regardless of whether `follow` is ever called. The server caps outstanding `follow` calls at 128 across every connection it serves; a call made once that cap is reached is rejected immediately rather than queued. Cancelling the underlying MCP call tears down its subscription and any held slot right away, including for a client whose `tools/call` request carries an id of `0` or an empty string, a case the installed SDK's own cancellation dispatch otherwise misses.
