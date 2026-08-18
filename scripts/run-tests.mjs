@@ -88,6 +88,25 @@
  * file/handle so a human can go kill it by hand if the OS does not reap it
  * on its own.
  *
+ * Why the known limitation above is not narrowed at this layer: this file
+ * never calls child_process.spawn/spawnSync itself for the per-test-file
+ * children above - node:test's own run() spawns and reaps them internally
+ * (isolation:'process' is its default), with no documented option to
+ * spawn them detached. So on a watchdog fire, whatever run() was still
+ * running is still left to the OS exactly as described.
+ *
+ * A spawn-detached-and-signal-the-group approach is applied one level
+ * down instead, where it is actually reachable: runPermanentGuardSuite()
+ * in test/loader-escape-matrix.test.ts - itself one of the test files
+ * this script discovers and runs - spawns its OWN nested `node --test`
+ * process over three other test files, whose own timeout's SIGTERM
+ * reaches only its immediate child, never a grandchild, per
+ * nodejs/node#43704 (cited above). That spawnSync call spawns detached
+ * (POSIX only) and a SIGKILL sweep of the whole process group runs after
+ * every invocation, so a SIGTERM-surviving grandchild is still reached.
+ * See that function's own doc comment for the mechanism and its
+ * remaining disclosed limits (win32, the PGID-reuse race).
+ *
  * One environment variable this script consults at all: GHANTIKA_JUNIT,
  * additive-only - setting it adds a junit XML file at that path; leaving it
  * unset means no junit file is written at all, and it cannot narrow the
@@ -135,13 +154,15 @@
  */
 import { run } from "node:test";
 import { spec, junit } from "node:test/reporters";
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Writable } from "node:stream";
 
 import { isMainModule } from "./lib/is-main.mjs";
+import { readGitHeadSha } from "./check-sha-parity.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
@@ -151,6 +172,73 @@ const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 // scripts/run-tests-fixture-harness.mjs for how a fixture tree is
 // exercised instead.
 const TEST_DIR = path.join(REPO_ROOT, "test");
+
+// Where a truncation is recorded so scripts/check-coverage-floor.mjs (a
+// SEPARATE process, run after `npm run coverage` - see that script's own
+// header) can tell a genuinely partial run apart from a complete one.
+// c8's own coverage-summary.json carries no such signal: it honestly
+// reports whatever coverage it collected up to whatever point this
+// process exited, and that table is indistinguishable from a real,
+// complete run's - so a run truncated by the idle watchdog can otherwise
+// read as an ordinary coverage regression. Lives under coverage/
+// (gitignored, same directory c8 itself writes into) rather than test/ or
+// scripts/, so it is never mistaken for a tracked, checked-in artifact.
+export const TRUNCATION_MARKER_PATH = path.join(REPO_ROOT, "coverage", "run-truncated.json");
+
+// Fallback write location, used only when the primary path above cannot be
+// written to - see writeTruncationMarkerSync's own doc comment for why this
+// exists and what happens if this ALSO fails. Lives at REPO_ROOT itself,
+// never under coverage/: coverage/ is exactly the directory a real run
+// could plausibly find unwritable (it is c8's own output directory,
+// gitignored, and the directory an unwritable-coverage-directory scenario
+// locks down). The write here is a best-effort attempt in its own right,
+// exactly like the primary path above.
+export const TRUNCATION_MARKER_FALLBACK_PATH = path.join(REPO_ROOT, ".run-truncated-fallback.json");
+
+// Where a genuinely COMPLETE run (never idle-watchdog-truncated, never
+// wall-cap-truncated - see onNormalCompletion below, the only call site
+// that ever writes this) records that fact, bound to the exact commit it
+// ran against. scripts/check-coverage-floor.mjs reads this and REFUSES
+// (VOID, not an ordinary pass/fail) unless it finds a record here whose
+// headSha matches the CURRENT checkout - closing the fail-open the
+// truncation marker alone cannot: if BOTH of writeTruncationMarkerSync's
+// own writes fail (see that function's own doc comment), no truncation
+// marker lands anywhere, and an absent truncation marker alone reads as
+// "the run completed." This is the other half of that same signal - proof
+// a run actually reached its own completion, not merely proof it was never
+// SEEN to be truncated. Lives under coverage/, the same directory c8 and
+// TRUNCATION_MARKER_PATH already write into.
+export const COMPLETION_MARKER_PATH = path.join(REPO_ROOT, "coverage", "run-completed.json");
+
+// Closes a residual gap COMPLETION_MARKER_PATH's own headSha binding
+// cannot: a completion marker whose headSha matches the CURRENT checkout
+// can still be a STALE record left over from an earlier, genuinely
+// successful run at this exact same commit - surviving because a LATER
+// run at that same commit got truncated and BOTH of its own
+// writeTruncationMarkerSync attempts (primary and fallback - see that
+// function's own doc comment) also failed. In that narrow conjunction, an
+// absent truncation marker plus a headSha-matching completion marker reads
+// as an ordinary complete run, and the truncated run's own partial
+// coverage numbers would be certified as a real verdict. A fresh,
+// per-invocation token closes it: main() generates it, independent of git
+// HEAD entirely, before test discovery and execution (see that function's
+// own token-write block), so two different invocations of main() at the
+// IDENTICAL commit still produce two different tokens.
+// scripts/check-coverage-floor.mjs's own loadRunToken()
+// reads this file and refuses (VOID) unless the completion marker's own
+// embedded runToken matches what is on disk RIGHT NOW - a stale
+// same-commit completion marker embeds a PRIOR invocation's token, which
+// can never match the CURRENT invocation's fresh one. Lives at REPO_ROOT
+// itself, never under coverage/, for the identical reason
+// TRUNCATION_MARKER_FALLBACK_PATH's own doc comment gives: coverage/ is
+// exactly the directory a real run could plausibly find unwritable, and
+// putting the token somewhere else keeps its own write attempt from
+// sharing that specific failure mode. This is not a claim that REPO_ROOT
+// itself is guaranteed writable - the write below is a best-effort
+// attempt, caught and logged on failure like every other write in this
+// file - it is closed regardless: an absent token, from ANY cause,
+// reads downstream as untrustworthy and VOIDs rather than passing.
+export const RUN_TOKEN_PATH = path.join(REPO_ROOT, ".run-token.json");
 
 // The `.test.` infix, not merely a directory, is what makes something a
 // suite. `test/harness.ts` and `test/helpers/spawnServer.ts` sit under
@@ -833,11 +921,118 @@ function flushJunitSync(junitPath, buffer) {
 }
 
 /**
+ * Records that this run terminated via one of the two hang-recovery paths
+ * that write a marker at all (idle-watchdog, wall-cap - never
+ * post-completion-leak, whose own call site never invokes this function;
+ * see onPostCompletionLeak's own comment for why), BEFORE the matching
+ * process.exit(1) call - synchronous, same write-then-hard-exit shape as
+ * flushJunitSync above, for the same reason: a hard exit drops anything not
+ * already durably on disk. Read by scripts/check-coverage-floor.mjs, run
+ * afterward as a separate process, so it can refuse to compare whatever
+ * coverage numbers this run's own partial execution produced rather than
+ * reporting them as a real verdict. Overwrites unconditionally - only ONE of
+ * the three termination paths can ever fire per run (each sets
+ * `terminationFired` before doing anything else), so there is never a
+ * stale-vs-fresh marker to reconcile within a single invocation.
+ *
+ * FAIL-CLOSED ON THE WRITE ITSELF: a caller of loadTruncationMarker
+ * (check-coverage-floor.mjs) treats an ABSENT marker as proof the run
+ * completed - so if THIS write silently failed (the marker's own directory
+ * turned read-only, a full disk, anything else writeFileSync can throw) and
+ * this function only logged and returned, a genuinely truncated run would
+ * read as an ordinary complete one and its partial coverage numbers would be
+ * compared against the floor as if real. That is the exact fail-open an
+ * unwritable marker directory produces: chmod the marker's parent directory
+ * unwritable, force a real idle-watchdog fire, and the primary write throws
+ * a real EACCES while the reader still finds nothing and reports PASS. So on
+ * a primary-write failure this makes ONE more attempt, at `fallbackPath` -
+ * REPO_ROOT itself by default (see TRUNCATION_MARKER_FALLBACK_PATH's own
+ * comment for why that location), independent of whatever made the primary
+ * path unwritable. If BOTH writes fail, that is disclosed as its own loud,
+ * distinct error rather than silently swallowed: a run cannot write ANYWHERE
+ * under its own checkout, which is a considerably more catastrophic
+ * environment than "coverage/ specifically is locked down" and is not
+ * something this function can recover from - but it must never look like
+ * ordinary silence. COMPLETION_MARKER_PATH's own doc comment covers the
+ * remaining, narrower gap this leaves: what happens when BOTH writes fail
+ * here AND a stale completion marker from an earlier, genuinely successful
+ * run at this same commit is still sitting on disk.
+ *
+ * @param {string} markerPath where to write it first - the real production
+ *   path by default, but see runOnce's own `truncationMarkerPath` parameter
+ *   for why a caller driving this against a throwaway fixture tree must
+ *   redirect it elsewhere.
+ * @param {"idle-watchdog" | "wall-cap"} reason
+ * @param {string} message human-readable - the same text already printed
+ *   via printDiagnosticHeader, so a reader of the marker sees the identical
+ *   explanation a reader of the console output would.
+ * @param {string} fallbackPath where to retry if the primary write throws -
+ *   TRUNCATION_MARKER_FALLBACK_PATH by default; see runOnce's own
+ *   `truncationMarkerFallbackPath` parameter for the fixture-redirect case.
+ */
+function writeTruncationMarkerSync(markerPath, reason, message, fallbackPath) {
+  const payload = JSON.stringify({ reason, message, at: new Date().toISOString() }, null, 2);
+  try {
+    mkdirSync(path.dirname(markerPath), { recursive: true });
+    writeFileSync(markerPath, payload);
+    return;
+  } catch (err) {
+    console.error(`run-tests: failed to write truncation marker to ${markerPath}: ${err.message}`);
+  }
+  try {
+    mkdirSync(path.dirname(fallbackPath), { recursive: true });
+    writeFileSync(fallbackPath, payload);
+    console.error(
+      `run-tests: wrote the truncation marker to its fallback location instead: ${fallbackPath}`
+    );
+  } catch (fallbackErr) {
+    console.error(
+      `run-tests: the FALLBACK truncation-marker write to ${fallbackPath} ALSO failed: ` +
+        `${fallbackErr.message} - this run's truncation cannot be recorded on disk at all. ` +
+        `A downstream check reading for a marker and finding neither file present has no way ` +
+        `to distinguish this from a genuinely complete run; treat any coverage verdict following ` +
+        `an idle-watchdog or wall-cap diagnostic in this run's own console output as untrustworthy ` +
+        `regardless of what it reports.`
+    );
+  }
+}
+
+/**
  * Runs the discovered suite once. Resolves once the process's own decision
  * about its exit code has been made (either by setting process.exitCode
  * for a clean run, or by calling process.exit(1) directly on one of the
  * three termination paths). Exported for tests to drive against a
  * throwaway fixture directory instead of this repo's real test/.
+ *
+ * `truncationMarkerPath` defaults to the real, shared TRUNCATION_MARKER_PATH
+ * - correct for the production CLI entrypoint (main(), below), which never
+ * overrides it. Any OTHER caller driving this function directly against a
+ * throwaway fixture tree - scripts/run-tests-fixture-harness.mjs, or a test
+ * deliberately forcing a watchdog fire to prove the mechanism itself - MUST
+ * redirect it to a path scoped to that caller's own fixture directory.
+ * Leaving it at the shared default in that case writes a truncation marker
+ * into the real repo's own coverage/ directory as a side effect of testing
+ * something unrelated, where it then sits until the next real `main()`
+ * invocation clears it at its own start - meaning a later, genuinely
+ * complete top-level `npm run coverage` run occurring in the SAME process
+ * tree before that clearing happens would find the stale marker and wrongly
+ * refuse to certify its own honest result. `completionMarkerPath` carries
+ * the identical redirect obligation for the same reason: any caller driving
+ * this against a fixture tree that reaches a genuine normal completion
+ * (not every fixture scenario does - a deliberately hanging fixture never
+ * does) must redirect it too, or that completion writes into the real
+ * repo's own coverage/run-completed.json as a side effect of testing
+ * something unrelated.
+ *
+ * `runToken` carries no such redirect obligation - it is not a path, it is
+ * the in-memory value main() generated (see RUN_TOKEN_PATH's own doc
+ * comment) and hands down so onNormalCompletion() below can embed it into
+ * the completion marker it writes. A caller that omits it (every existing
+ * test driver that never reaches normal completion, and
+ * scripts/run-tests-fixture-harness.mjs, whose own completion marker is
+ * never read by the real check-coverage-floor.mjs) simply embeds
+ * `undefined`, which JSON.stringify drops from the written marker
+ * entirely - harmless, since nothing reads that isolated marker's token.
  *
  * @param {{
  *   discovered: string[],
@@ -846,10 +1041,34 @@ function flushJunitSync(junitPath, buffer) {
  *   options: { testTimeoutMs: number, idleTimeoutMs: number, wallTimeoutMs: number, leakWindowMs: number, concurrency?: number },
  *   skipBaseline: Record<string, string[]>,
  *   criticalTests: string[],
+ *   truncationMarkerPath?: string,
+ *   truncationMarkerFallbackPath?: string,
+ *   completionMarkerPath?: string,
+ *   runToken?: string,
  * }} args
  */
-export function runOnce({ discovered, tracked, junitPath, options, skipBaseline, criticalTests }) {
+export function runOnce({
+  discovered,
+  tracked,
+  junitPath,
+  options,
+  skipBaseline,
+  criticalTests,
+  truncationMarkerPath = TRUNCATION_MARKER_PATH,
+  truncationMarkerFallbackPath = TRUNCATION_MARKER_FALLBACK_PATH,
+  completionMarkerPath = COMPLETION_MARKER_PATH,
+  runToken,
+}) {
   return new Promise((resolve) => {
+    // Computed ONCE per invocation of this function - never per-test-file,
+    // never per-event - and read live via git, the exact pattern
+    // scripts/check-sha-parity.mjs's own readGitHeadSha already establishes:
+    // never trusted from an env var or derived any other way, so the
+    // eventual completion marker (see onNormalCompletion below) is bound to
+    // what git ACTUALLY has checked out right now, not to any caller's
+    // claim about it.
+    const headSha = readGitHeadSha();
+
     // No `concurrency` key at all unless --test-concurrency was actually
     // passed (options.concurrency stays undefined otherwise - see
     // parseArgs's own doc comment on this option above). This keeps the
@@ -985,6 +1204,53 @@ export function runOnce({ discovered, tracked, junitPath, options, skipBaseline,
 
       flushJunitSync(junitPath, junitBuffer);
       const ok = !didFail && missingFloor.length === 0 && skipErrors.length === 0;
+
+      // Proof this run reached ITS OWN completion point, bound to the exact
+      // commit it ran against AND to the exact invocation of main() that
+      // reached it (via the embedded runToken - see RUN_TOKEN_PATH's own
+      // doc comment for why headSha binding alone is not sufficient) - see
+      // COMPLETION_MARKER_PATH's own doc comment for the fail-open this
+      // closes. This write intentionally has NO rescue path, unlike
+      // writeTruncationMarkerSync's own primary-then-fallback attempt: a
+      // failed write here means the completion marker will be absent, and
+      // an absent (or SHA-mismatched, or token-mismatched) completion
+      // marker is exactly what makes check-coverage-floor.mjs refuse to
+      // produce a verdict (see that script's own main()). Adding a
+      // fallback here would defeat the whole point - a real failure to
+      // write (disk full, permissions) must never silently read as an
+      // ordinary complete run. Do not add rescue logic to this write.
+      // onIdleTimeout and onWallTimeout above both call process.exit(1)
+      // BEFORE this point can ever be reached: tryFinalizeNormal() (the
+      // only caller of this function) refuses to run once
+      // `terminationFired` is set, and both watchdog paths set it before
+      // doing anything else - so a watchdog-triggered exit provably never
+      // writes this marker, whether the run passed or failed (`ok` above
+      // is irrelevant here: this marks that the run COMPLETED, never that
+      // it succeeded). `runToken` here is always the caller's own in-memory
+      // value (main()'s own successful-or-not RUN_TOKEN_PATH write is
+      // irrelevant to what gets embedded - see runOnce's own doc comment
+      // above), never re-read off disk, so a completing invocation always
+      // embeds the token IT ITSELF generated.
+      try {
+        // Best-effort, matching this file's own established pattern
+        // (flushJunitSync, writeTruncationMarkerSync): under a plain,
+        // non-c8 test run (`npm test`, not `npm run coverage`) coverage/
+        // has no other reason to exist yet - c8 itself creates
+        // coverage/tmp/ as a side effect under the coverage script, which
+        // is what masks this gap there. Without this, a missing coverage/
+        // reaches a caught ENOENT that logs as an error even though
+        // nothing is actually wrong.
+        mkdirSync(path.dirname(completionMarkerPath), { recursive: true });
+        writeFileSync(
+          completionMarkerPath,
+          JSON.stringify({ headSha, at: new Date().toISOString(), runToken }, null, 2)
+        );
+      } catch (err) {
+        console.error(
+          `run-tests: failed to write completion marker to ${completionMarkerPath}: ${err.message}`
+        );
+      }
+
       process.exitCode = ok ? 0 : 1;
 
       // The post-completion leak check. This timer is .unref()'d on
@@ -1007,6 +1273,7 @@ export function runOnce({ discovered, tracked, junitPath, options, skipBaseline,
       terminationFired = true;
       clearTimeout(wallTimer);
       const incomplete = discovered.filter((f) => !filesWithOwnCompletion.has(f));
+      const idleMessage = `IDLE WATCHDOG: no test-runner event for ${options.idleTimeoutMs}ms - ${incomplete.length} input file(s) never reported their own completion (last event: ${JSON.stringify(lastEvent)})`;
       printDiagnosticHeader(`IDLE WATCHDOG: no test-runner event for ${options.idleTimeoutMs}ms`, [
         `last event received: ${JSON.stringify(lastEvent)}`,
         "input files with no completion event of their own yet " +
@@ -1014,6 +1281,12 @@ export function runOnce({ discovered, tracked, junitPath, options, skipBaseline,
           "without ever reporting completion - e.g. an import-time hang):",
         ...incomplete.map((f) => `  - ${rel(f)}`),
       ]);
+      writeTruncationMarkerSync(
+        truncationMarkerPath,
+        "idle-watchdog",
+        idleMessage,
+        truncationMarkerFallbackPath
+      );
       flushJunitSync(junitPath, junitBuffer);
       process.exit(1);
     }
@@ -1022,9 +1295,16 @@ export function runOnce({ discovered, tracked, junitPath, options, skipBaseline,
       if (terminationFired || streamEnded) return;
       terminationFired = true;
       clearTimeout(idleTimer);
+      const wallMessage = `WALL CAP: total run time exceeded ${options.wallTimeoutMs}ms (last event: ${JSON.stringify(lastEvent)})`;
       printDiagnosticHeader(`WALL CAP: total run time exceeded ${options.wallTimeoutMs}ms`, [
         `last event received: ${JSON.stringify(lastEvent)}`,
       ]);
+      writeTruncationMarkerSync(
+        truncationMarkerPath,
+        "wall-cap",
+        wallMessage,
+        truncationMarkerFallbackPath
+      );
       flushJunitSync(junitPath, junitBuffer);
       process.exit(1);
     }
@@ -1039,6 +1319,14 @@ export function runOnce({ discovered, tracked, junitPath, options, skipBaseline,
           `--test-force-exit: the process is being forced to exit anyway, ` +
           `but only after naming that it should not have needed to be.`,
       ]);
+      // NOT a truncation in the same sense as the other two paths: every
+      // file's own test:complete DID fire (streamEnded is true by the time
+      // this can run - see tryFinalizeNormal/onNormalCompletion above), so
+      // whatever coverage c8 collected reflects a run that node:test itself
+      // considers finished. What is stuck is a lingering handle, not an
+      // unfinished test file - c8's own numbers here are not the same kind
+      // of untrustworthy the idle/wall paths produce, so this path
+      // deliberately does NOT write the truncation marker.
       flushJunitSync(junitPath, junitBuffer);
       process.exit(1);
     }
@@ -1053,6 +1341,57 @@ async function main() {
     console.error(`run-tests: ${err.message}`);
     process.exitCode = 1;
     return;
+  }
+
+  // Clear both marker paths on a successfully parsed run, before test
+  // discovery. Best-effort: a failed delete leaves a stale marker, which
+  // check-coverage-floor.mjs reads as a fresh truncation and REFUSES on -
+  // a spurious VOID rather than a truncated run's numbers read as real.
+  for (const marker of [TRUNCATION_MARKER_PATH, TRUNCATION_MARKER_FALLBACK_PATH]) {
+    try {
+      unlinkSync(marker);
+    } catch {
+      // ENOENT (nothing to clear - normal) or any other error; either way
+      // there is nothing actionable here, and a failed best-effort delete
+      // must never block the run it is merely tidying up before.
+    }
+  }
+
+  // A fresh, per-invocation identity - see RUN_TOKEN_PATH's own doc
+  // comment above for the residual gap this closes (a stale, same-commit
+  // completion marker surviving because a later run's own truncation-
+  // marker writes also failed). Generation happens unconditionally, right
+  // alongside the truncation-marker clearing above, before test discovery
+  // and execution: every invocation that successfully parses its
+  // arguments - whether it goes on to pass, fail, hang, or get
+  // watchdog-terminated - reaches that point having ATTEMPTED to persist
+  // its own fresh token. The attempt can fail (an unwritable REPO_ROOT is
+  // not assumed away here any more than it is for the truncation marker),
+  // and that is fine: mirrors onNormalCompletion()'s own completion-
+  // marker write's "no rescue path" philosophy - ONE attempt, logged and
+  // never retried at a fallback location on failure, because the closure
+  // this buys does not depend on the write succeeding. A caller reading
+  // RUN_TOKEN_PATH downstream (check-coverage-floor.mjs's own
+  // loadRunToken()) and finding it absent must read that as untrustworthy,
+  // the same way an absent completion marker already does - never as "no
+  // token was ever generated, so skip this check."
+  const runToken = randomUUID();
+  try {
+    // Best-effort, matching this file's own established pattern
+    // (flushJunitSync, writeTruncationMarkerSync): under a plain, non-c8
+    // test run the parent directory has no other reason to exist yet (c8
+    // itself creates coverage/tmp/ as a side effect under `npm run
+    // coverage`, which is what masks the equivalent gap on
+    // completionMarkerPath - see that write's own mkdirSync below). A
+    // missing parent here would otherwise reach a caught ENOENT that logs
+    // as an error even though nothing is actually wrong.
+    mkdirSync(path.dirname(RUN_TOKEN_PATH), { recursive: true });
+    writeFileSync(
+      RUN_TOKEN_PATH,
+      JSON.stringify({ token: runToken, at: new Date().toISOString() }, null, 2)
+    );
+  } catch (err) {
+    console.error(`run-tests: failed to write run token to ${RUN_TOKEN_PATH}: ${err.message}`);
   }
 
   const discovered = discoverTestFiles(TEST_DIR);
@@ -1121,7 +1460,7 @@ async function main() {
   // TEST_POLICY_ALLOW_PATH's own doc comment above for why.
   process.env.GHANTIKA_POLICY_FILE = TEST_POLICY_ALLOW_PATH;
 
-  await runOnce({ discovered, tracked, junitPath, options, skipBaseline, criticalTests });
+  await runOnce({ discovered, tracked, junitPath, options, skipBaseline, criticalTests, runToken });
 }
 
 if (isMainModule(import.meta.url)) {
