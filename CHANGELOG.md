@@ -4,6 +4,7 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+- Corrected a comment in the CI configuration that understated which checks branch protection actually requires.
 - Fixed the batched process-identity read treating a single transient not-found observation as a final, confident result instead of retrying, closing an asymmetry with the single-pid read, which already retried.
 
 ### Added
