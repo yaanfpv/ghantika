@@ -47,14 +47,28 @@
  *   {"type":"user","message":{"role":"user","content":"<payload>"}}
  *
  * - reproduced verbatim in `AUTH_MESSAGE_TYPE`/`USER_MESSAGE_TYPE` and
- * `buildAuthLine`/`buildUserMessageLine` below. Also measured, from the
- * binary's own server-side logic: an unauthenticated connection is DROPPED
- * (the binary's own diagnostic reads "Dropped ... from a connection that did
- * not authenticate; closing it") rather than silently accepted with the
- * auth line ignored - see this file's `probe()` for how that drop is the
- * actual signal this transport uses to distinguish a working token from a
- * missing or wrong one, settling AC3 from the server's own observed
- * behavior rather than by guessing a bad credential at it.
+ * `buildAuthLine`/`buildUserMessageLine` below.
+ *
+ * ## AC3 - auth is CHECKED, not merely ignored, without ever guessing a
+ * credential
+ *
+ * Two independent pieces of evidence, neither of which required sending a
+ * wrong token (which stays off-limits - a deliberately bad credential reads
+ * as credential guessing and this transport never does it):
+ *
+ * 1. The binary's own server-side logic DROPS an unauthenticated connection
+ *    (its own diagnostic reads "Dropped ... from a connection that did not
+ *    authenticate; closing it") rather than silently accepting it with the
+ *    auth line ignored.
+ * 2. This transport's actual `probe()` - the real code below, not a
+ *    standalone script - was run against a real inherited socket with the
+ *    real inherited token on 2026-08-18 and returned `available: true`
+ *    (the connection was accepted and not dropped within the grace window).
+ *
+ * Together: the server enforces auth (1) and this transport's own real
+ * request with the real credential passes that enforcement (2). That is
+ * AC3 settled from observed behavior on both sides of the boundary, with
+ * no negative-control probe attempted or needed.
  *
  * NOT measured, and therefore this transport's own reasoned design: there is
  * no `id`/acknowledgement field anywhere in the measured two-line example,
@@ -67,7 +81,7 @@
  * ack, and named explicitly in every "delivered" `WakeResult.detail` this
  * transport returns.
  *
- * ## AC4 - the child path, never the peer path
+ * ## AC4 - the child path structurally, but NOT YET PROVEN not-held
  *
  * The binary's own logic distinguishes a `childToken` (this transport's
  * whole path - the credential this session's own parent already handed it)
@@ -78,6 +92,22 @@
  * and has no code path that could - it sends exactly the token it inherited,
  * which is the child token by construction of how that token reached this
  * process in the first place.
+ *
+ * THAT IS THE STRUCTURAL ARGUMENT ALONE, and AC4 explicitly forbids
+ * shipping on it: "do not ship on 'the gate reads origin.kind === peer so
+ * we should be fine.'" A structural argument for why the hold SHOULD not
+ * apply is not a demonstration that a real `wake()` call is NOT held. That
+ * demonstration requires a real delivered `wake()` against a real socket -
+ * which, unlike `probe()`'s auth-only line, DOES write the user-message
+ * line and therefore DOES inject a real turn into whatever session owns
+ * the socket. The two prior live proofs in this exact investigation
+ * (story-0263's AC2 cross-session wake, and this file's own AC3 `probe()`
+ * evidence above) were both run only with explicit Soham-level
+ * authorization for exactly that reason - an action with a real,
+ * observable side effect on a live session is not something this
+ * transport's own build work self-authorizes. AC4 (and AC7's "prove the
+ * wake end to end... on an idle session") therefore stay OPEN pending that
+ * same authorization, disclosed here rather than closed by inference.
  */
 import net from "node:net";
 
