@@ -435,8 +435,23 @@ test("isLockCurrentlyHeld: ownerPid confirmed alive -> held, names the owner pid
 
 test("isLockCurrentlyHeld: ownerPid not-found, phase 'working' -> not held (nothing else to check for that phase)", async () => {
   const result = await isLockCurrentlyHeld(
-    { phase: "working", ownerPid: 42 },
-    { identityCheck: async () => ({ status: "not-found" }) as never }
+    {
+      phase: "working",
+      ownerPid: 42,
+      ownerBirthIdentity: {
+        platform: "posix-elapsed",
+        capturedAtMs: 0,
+        elapsedSecondsAtCapture: 0,
+      },
+    },
+    // ownerBirthIdentity above is what routes checkPidLiveness through this
+    // mock at all - without it, checkPidLiveness falls back to a REAL,
+    // unmocked isProcessAlive(42) syscall (see its own "no birthIdentity"
+    // branch), which is nondeterministic across CI hosts depending on
+    // whether pid 42 happens to be a live process on that runner. plainCheck
+    // is stubbed too so this stays deterministic even if that fallback path
+    // is ever reached by a future edit.
+    { identityCheck: async () => ({ status: "not-found" }) as never, plainCheck: () => false }
   );
   assert.equal(result.held, false);
 });
