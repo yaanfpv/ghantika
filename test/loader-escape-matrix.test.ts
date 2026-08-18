@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { FROZEN_MODULES, checkModuleBoundaries } from "../scripts/check-module-boundaries.mjs";
 import { checkNoTasksImport } from "../scripts/check-no-tasks-import.mjs";
 import { checkStdioPurity } from "../scripts/check-stdio-purity.mjs";
+import { pgrepGroupMembers, waitForPgrepGroupMembers } from "./harness.ts";
 
 /**
  * Executes 45 physical mutation-test cases covering the module-loader
@@ -234,6 +235,67 @@ function classifyTerminatedSpawnSync(
 }
 
 /**
+ * Best-effort cleanup for runPermanentGuardSuite()'s nested supervisor. A
+ * child_process timeout's SIGTERM reaches only the immediate child, never
+ * a grandchild it spawned (nodejs/node#43704, cited in
+ * scripts/run-tests.mjs's idleTimeoutMs comment, documents the
+ * mechanism), so a nested `node --test` supervisor whose OWN timeout
+ * fires can still leave its own per-file test children (each
+ * isolation:'process' spawns one) running after the supervisor itself is
+ * gone.
+ *
+ * Spawning the supervisor with `detached: true` (POSIX only - see below)
+ * makes it the leader of its own process group, so `-supervisorPid`
+ * addresses that whole group rather than the single process - the same
+ * `pgrep -g <pgid>` / `process.kill(-pgid, ...)` shape
+ * test/helpers/hostileGroupKillProbe.ts already establishes for this
+ * repo's own production kill() containment, reused here rather than
+ * re-derived. Calling this unconditionally after every spawnSync call -
+ * success, timeout, or any other exit - rather than only after a detected
+ * timeout, keeps the call site branch-free: on a normal completion the
+ * supervisor and every process it spawned have already exited on their
+ * own, so this call hits ESRCH (nothing left to signal) and is a no-op;
+ * on a hang, it is what actually reaps the SIGTERM-surviving grandchild
+ * spawnSync's own timeout could not reach.
+ *
+ * SIGKILL, not SIGTERM: this call runs only as a cleanup sweep AFTER
+ * spawnSync's own timeout has already attempted the graceful signal, so
+ * there is no remaining reason to give a straggler a chance to shut down
+ * cleanly - and SIGKILL, unlike SIGTERM, cannot be trapped or ignored, so
+ * a nested child that explicitly traps and ignores SIGTERM is still
+ * reached (see runPermanentGuardSuite's own doc comment below).
+ *
+ * Two remaining residuals, disclosed rather than hidden:
+ *
+ *  - Windows has no POSIX process-group semantics, and `detached` means
+ *    something unrelated there (a new console) rather than group
+ *    leadership, so this whole mechanism is POSIX-only; on win32 nothing
+ *    is attempted here, and the pre-existing single-child-only reach
+ *    (spawnSync's own timeout, signalling the supervisor alone) remains
+ *    exactly as it was for every prior version of this file.
+ *  - Between spawnSync reaping its direct child and this call issuing
+ *    the group signal, the OS is, in principle, free to recycle that
+ *    now-exited PID for an unrelated process; sending SIGKILL to `-pid`
+ *    in that vanishingly narrow window would signal the WRONG group.
+ *    This is the same PGID-reuse residual this repo has already
+ *    disclosed elsewhere (kill.ts) rather than a new one, and it is not
+ *    re-derived or re-solved here.
+ *
+ * @param supervisorPid - `spawnSync`'s own returned `.pid` for the nested
+ *   supervisor process, valid whether or not the process is still
+ *   believed to be running.
+ */
+function reapSupervisorProcessGroup(supervisorPid: number | undefined): void {
+  if (process.platform === "win32" || typeof supervisorPid !== "number") return;
+  try {
+    process.kill(-supervisorPid, "SIGKILL");
+  } catch {
+    // ESRCH (nothing left - the common, healthy case) or EPERM; either
+    // way there is nothing further this cleanup sweep can do.
+  }
+}
+
+/**
  * Spawns a FRESH `node --test` process over the three permanent guard test
  * files, and parses the real, current pass/fail/tests counts off its
  * summary lines - never a hardcoded historical figure. Node's default
@@ -250,11 +312,15 @@ function classifyTerminatedSpawnSync(
  * observed, in one manual, single-host (macOS) reproduction, to also
  * terminate an already-hung nested child with no orphan left behind - a
  * manual observation, not a tracked, repeatable check, and not confirmed
- * across every platform this guard runs on. A nested child that explicitly
- * traps and ignores `SIGTERM` would not be reaped by this path (none of
- * the three files here do that); that is a known residual, disclosed
- * rather than assumed, and this single observation does not establish it
- * is the only one.
+ * across every platform this guard runs on.
+ *
+ * A nested child that explicitly traps and ignores `SIGTERM` (none of the
+ * three files here do that) is still reached: the supervisor spawns
+ * detached and reapSupervisorProcessGroup() (see its own doc comment
+ * above) sweeps the whole process group with SIGKILL, unconditionally,
+ * after every call - SIGKILL cannot be trapped or ignored. What remains
+ * open is POSIX-only reach (win32 has no process-group signalling) and
+ * the PGID-reuse race reapSupervisorProcessGroup's own comment discloses.
  */
 function runPermanentGuardSuite(): { tests: number; pass: number; fail: number; raw: string } {
   // NODE_TEST_CONTEXT / NODE_TEST_WORKER_ID are set by the OUTER `node
@@ -284,8 +350,19 @@ function runPermanentGuardSuite(): { tests: number; pass: number; fail: number; 
       maxBuffer: 1024 * 1024 * 64,
       env: childEnv,
       timeout: 45_000,
+      // POSIX only (see reapSupervisorProcessGroup's own doc comment) -
+      // makes this supervisor the leader of its own process group, so the
+      // SIGKILL sweep below reaches every grandchild it spawned, not just
+      // itself. Omitted on win32: `detached` means something unrelated
+      // there (a new console), never process-group leadership.
+      ...(process.platform === "win32" ? {} : { detached: true }),
     }
   );
+  // Spawns detached and signals the whole group; runs unconditionally,
+  // before the classify-and-maybe-throw call below, so cleanup happens
+  // regardless of outcome - see reapSupervisorProcessGroup's own doc
+  // comment.
+  reapSupervisorProcessGroup(result.pid);
   classifyTerminatedSpawnSync(
     result,
     'the nested "node --test" run (guard-mutation-coverage/module-boundaries/no-tasks-import)'
@@ -1543,16 +1620,19 @@ test("the three permanent guard test files pass at a literal, self-consistent, r
 });
 
 // =============================================================================
-// CLASSIFIER SELF-TESTS (4 executions). NOT part of the 45 physical
+// CLASSIFIER SELF-TESTS (5 executions). NOT part of the 45 physical
 // mutation-test cases above, and not module-loader escape-route cases at
-// all: these test this file's OWN spawnSync-termination-classification
-// helper (`classifyTerminatedSpawnSync`), used by `runPermanentGuardSuite`'s
-// nested-process timeout handling. Three of the four deliberately throw and
-// are asserted for their thrown message, not green pass/fail behavior; the
-// fourth is the green control proving the other three are a real
-// discriminating signal rather than a function that always throws. Each is
-// driven with a real, short-lived child process and a real classifier call
-// against that child's actual result - never a synthetic result object.
+// all: these test this file's OWN spawnSync-termination-classification and
+// orphan-cleanup helpers (`classifyTerminatedSpawnSync`,
+// `reapSupervisorProcessGroup`), used by `runPermanentGuardSuite`'s
+// nested-process timeout handling. Of the first four, three deliberately
+// throw and are asserted for their thrown message, not green pass/fail
+// behavior; the fourth is the green control proving the other three are a
+// real discriminating signal rather than a function that always throws.
+// The fifth proves `reapSupervisorProcessGroup` genuinely reaches a
+// grandchild a direct signal to its parent cannot. Each is driven with a
+// real, short-lived child process and a real classifier/cleanup call
+// against real process state - never a synthetic result object.
 // =============================================================================
 
 test("classifyTerminatedSpawnSync throws the timeout-specific message when spawnSync's OWN timeout genuinely fires - driven with a real hung child and a short injected timeout, never a synthetic result object", () => {
@@ -1628,6 +1708,110 @@ test("classifyTerminatedSpawnSync classifies a maxBuffer overflow (ENOBUFS) the 
     "a maxBuffer overflow must be classified as a non-timeout termination, distinctly naming ENOBUFS, never conflated with the ETIMEDOUT case"
   );
 });
+
+test(
+  "reapSupervisorProcessGroup reaps a grandchild that survives a signal sent only to its immediate parent - the exact orphan shape nodejs/node#43704 documents (cited in scripts/run-tests.mjs's idleTimeoutMs comment)",
+  {
+    skip:
+      process.platform === "win32"
+        ? "POSIX process-group signalling only - see reapSupervisorProcessGroup's own doc comment"
+        : false,
+  },
+  async () => {
+    const supervisor = spawn(
+      process.execPath,
+      [
+        "-e",
+        "const { spawn } = require('node:child_process');" +
+          "const g = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)']);" +
+          "process.stdout.write(JSON.stringify({ grandchildPid: g.pid }) + '\\n');" +
+          "setTimeout(() => {}, 60000);",
+      ],
+      { detached: true, stdio: ["ignore", "pipe", "ignore"] }
+    );
+    const supervisorPid = supervisor.pid;
+    try {
+      assert.ok(typeof supervisorPid === "number", "setup check: supervisor must have a real pid");
+      supervisor.on("error", (err) => {
+        throw new Error(`setup check: supervisor failed to spawn: ${err.message}`);
+      });
+
+      let stdoutBuffer = "";
+      const grandchildPid = await new Promise<number>((resolve, reject) => {
+        const timeoutHandle = setTimeout(
+          () => reject(new Error("setup check: supervisor never reported its grandchild's pid")),
+          5000
+        );
+        const onData = (chunk: Buffer) => {
+          stdoutBuffer += chunk.toString("utf8");
+          const newlineIndex = stdoutBuffer.indexOf("\n");
+          if (newlineIndex === -1) return;
+          supervisor.stdout?.off("data", onData);
+          clearTimeout(timeoutHandle);
+          try {
+            const parsed = JSON.parse(stdoutBuffer.slice(0, newlineIndex)) as {
+              grandchildPid: number;
+            };
+            resolve(parsed.grandchildPid);
+          } catch (err) {
+            reject(err);
+          }
+        };
+        supervisor.stdout?.on("data", onData);
+      });
+
+      // BASELINE: signal only the supervisor's own pid - exactly what
+      // spawnSync's `timeout` option does internally (`child.kill(killSignal)`,
+      // never the group) - and confirm the grandchild survives, reproducing
+      // the orphan nodejs/node#43704 documents.
+      process.kill(supervisorPid, "SIGTERM");
+      await waitForPgrepGroupMembers(
+        supervisorPid,
+        (members) => !members.includes(supervisorPid),
+        3000
+      );
+      const survivorsAfterDirectKill = pgrepGroupMembers(supervisorPid);
+      assert.ok(
+        survivorsAfterDirectKill.includes(grandchildPid),
+        `setup check: the grandchild (pid ${grandchildPid}) must survive a signal sent only to the supervisor - if it does not, this environment does not reproduce the orphan this test exists to close, and the assertion below would prove nothing. Survivors observed: ${JSON.stringify(survivorsAfterDirectKill)}`
+      );
+
+      // Reap: spawns detached and signals the whole group.
+      reapSupervisorProcessGroup(supervisorPid);
+      const survivorsAfterReap = await waitForPgrepGroupMembers(
+        supervisorPid,
+        (members) => members.length === 0,
+        3000
+      );
+      assert.deepEqual(
+        survivorsAfterReap,
+        [],
+        `reapSupervisorProcessGroup must reap every remaining member of the group, including the grandchild a direct signal to the supervisor alone could not reach; still alive: ${JSON.stringify(survivorsAfterReap)}`
+      );
+    } finally {
+      // Guaranteed cleanup, on every path: reapSupervisorProcessGroup is
+      // idempotent (it catches ESRCH/EPERM internally and never throws), so
+      // a thrown setup check or assertion above - before the try body's own
+      // reap ever ran - can never leave the supervisor or its grandchild
+      // running. Deliberately never throws or asserts here: a throw inside
+      // `finally` would replace whatever real assertion failure sent
+      // execution here in the first place, masking it.
+      if (typeof supervisorPid === "number") {
+        reapSupervisorProcessGroup(supervisorPid);
+        const stillAlive = await waitForPgrepGroupMembers(
+          supervisorPid,
+          (members) => members.length === 0,
+          3000
+        );
+        if (stillAlive.length > 0) {
+          console.error(
+            `reapSupervisorProcessGroup test cleanup: pgid ${supervisorPid} still has member(s) after the guaranteed finally-block reap: ${JSON.stringify(stillAlive)}`
+          );
+        }
+      }
+    }
+  }
+);
 
 // =============================================================================
 // FINAL RESTORATION CHECK - not one of the 45 physical executions above,

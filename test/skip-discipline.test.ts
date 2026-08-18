@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -23,6 +25,7 @@ import {
   loadCriticalTests,
   loadSkipBaseline,
   parseArgs,
+  TRUNCATION_MARKER_FALLBACK_PATH,
 } from "../scripts/run-tests.mjs";
 import { pgrepGroupMembers } from "./harness.ts";
 
@@ -1127,6 +1130,129 @@ test("the real supervisor still fails a genuinely hung run fast, at whatever --i
 });
 
 // ---------------------------------------------------------------------------
+// Fixture isolation: this harness's own truncation-marker FALLBACK location
+// must stay scoped to the fixture directory, exactly like its primary
+// location already was before this scenario existed to prove it. Without
+// this, a fixture scenario whose own primary marker write fails (its own
+// marker subdirectory made unwritable below - the same directory-lockdown
+// technique test/check-coverage-floor.test.js's own double-write-failure
+// control already uses) would fall through to scripts/run-tests.mjs's REAL,
+// REPO_ROOT-level TRUNCATION_MARKER_FALLBACK_PATH - poisoning exactly the
+// later real `npm run coverage` run the primary-path redirect above already
+// protects, just through the other of the two write attempts instead of the
+// first.
+// ---------------------------------------------------------------------------
+
+test("the fixture harness's own truncation-marker fallback stays inside the fixture directory - a locked-down primary marker subdirectory never falls through to the real repo's fallback location", () => {
+  const dir = realpathSync(
+    mkdtempSync(path.join(tmpdir(), "ghantika-skip-discipline-fallback-iso-"))
+  );
+  const primaryMarkerDir = path.join(dir, ".truncation-marker-dir");
+  const primaryMarkerPath = path.join(primaryMarkerDir, "run-truncated.json");
+  const fixtureFallbackMarkerPath = path.join(dir, ".truncation-marker-fallback.json");
+  const hadPriorRealFallback = existsSync(TRUNCATION_MARKER_FALLBACK_PATH);
+  const priorRealFallbackContent = hadPriorRealFallback
+    ? readFileSync(TRUNCATION_MARKER_FALLBACK_PATH, "utf8")
+    : null;
+  try {
+    for (const [relPath, content] of Object.entries(buildHungTestFixtureFiles())) {
+      const abs = path.join(dir, relPath);
+      mkdirSync(path.dirname(abs), { recursive: true });
+      writeFileSync(abs, content);
+    }
+    const baselinePath = path.join(dir, "skip-baseline.json");
+    const criticalPath = path.join(dir, "critical-tests.json");
+    writeFileSync(baselinePath, JSON.stringify({}));
+    writeFileSync(criticalPath, JSON.stringify([]));
+
+    // Created BEFORE the chmod, matching this repo's own established
+    // double-write-failure technique (test/check-coverage-floor.test.js's
+    // "fail-open" test): locking down a directory that never existed would
+    // exercise mkdirSync's own ENOENT/EACCES on the parent instead of
+    // writeFileSync's on the file itself. 0500 = read + execute (list +
+    // traverse) but not write.
+    mkdirSync(primaryMarkerDir, { recursive: true });
+    chmodSync(primaryMarkerDir, 0o500);
+
+    const env = { ...process.env };
+    delete env.GHANTIKA_JUNIT;
+    // Same recursion-guard strip runSupervisorAgainstFixture's own comment
+    // explains above - this file's own established reason, unchanged here.
+    delete env.NODE_TEST_CONTEXT;
+
+    const result = collectChildResult(
+      HARNESS_PATH,
+      [dir, baselinePath, criticalPath, "--idle-timeout=300", "--test-timeout=60000"],
+      env
+    );
+
+    assert.notEqual(
+      result.status,
+      0,
+      `expected the hung fixture to fail the run via the idle watchdog, got exit ${result.status}. stdout: ${result.stdout}`
+    );
+
+    // Setup check: the primary write must have genuinely failed - this
+    // control proves nothing if the locked directory turned out writable
+    // after all.
+    assert.ok(
+      !existsSync(primaryMarkerPath),
+      "setup check: the primary marker must genuinely not exist - the locked directory must have refused the write"
+    );
+
+    // THE FIX: rescued to the FIXTURE-LOCAL fallback, never to the real
+    // repo's own fallback location.
+    assert.ok(
+      existsSync(fixtureFallbackMarkerPath),
+      `expected the fixture-local fallback marker to exist once the primary write failed; stderr:\n${result.stderr}`
+    );
+
+    // THE ISOLATION THIS CONTROL EXISTS TO PROVE: the real repo's own
+    // REPO_ROOT-level fallback marker must be untouched by this fixture
+    // run - present or absent exactly as it was before this test started,
+    // and byte-identical if it was already present.
+    assert.equal(
+      existsSync(TRUNCATION_MARKER_FALLBACK_PATH),
+      hadPriorRealFallback,
+      `the real fallback marker's presence must be unchanged by this fixture-scoped run (was present before: ${hadPriorRealFallback})`
+    );
+    if (hadPriorRealFallback) {
+      assert.equal(
+        readFileSync(TRUNCATION_MARKER_FALLBACK_PATH, "utf8"),
+        priorRealFallbackContent,
+        "the real fallback marker's own content must be unchanged by this fixture-scoped run"
+      );
+    }
+  } finally {
+    try {
+      chmodSync(primaryMarkerDir, 0o700);
+    } catch {
+      // best-effort; the recursive rm below will surface anything real
+    }
+    rmSync(dir, { recursive: true, force: true });
+    // Restore the REAL, REPO_ROOT-level fallback marker to its snapshotted
+    // prior state regardless of whether the isolation assertions above
+    // passed or threw. Without this, a FAILING isolation control (the real
+    // fallback marker was unexpectedly touched or created) throws out of
+    // the try block above and leaves that stray write behind - present
+    // when it should be absent, or holding this run's content instead of
+    // whatever a real prior run had left there - for whichever test
+    // (inside this file or another) next depends on that path's state.
+    try {
+      if (hadPriorRealFallback) {
+        writeFileSync(TRUNCATION_MARKER_FALLBACK_PATH, priorRealFallbackContent);
+      } else {
+        rmSync(TRUNCATION_MARKER_FALLBACK_PATH, { force: true });
+      }
+    } catch (err) {
+      console.error(
+        `failed to restore the real fallback marker's prior state at ${TRUNCATION_MARKER_FALLBACK_PATH}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
 // End to end: the duplicate-identity route and the TODO route, both
 // "wiring can silently defeat this" classes - a defect that only shows up
 // once the real collect->classify->exit path runs, not at the pure-
@@ -1266,13 +1392,18 @@ const RETIRED_FIXTURE_TOKEN = "ghantika-run-tests-fixture-mode-v1";
 
 /**
  * Copies the real, current scripts/run-tests.mjs and its
- * scripts/lib/is-main.mjs dependency, byte for byte, into `root`, which
- * becomes an entirely independent "repo root" the copy computes its own
- * REPO_ROOT from (derived from its own import.meta.url once invoked as
- * `root/scripts/run-tests.mjs`). Reading the real file's current bytes
- * rather than re-typing its logic is what keeps this test bound to actual
- * production behavior instead of a parallel copy that could quietly stop
- * matching it.
+ * scripts/lib/is-main.mjs and scripts/check-sha-parity.mjs dependencies,
+ * byte for byte, into `root`, which becomes an entirely independent "repo
+ * root" the copy computes its own REPO_ROOT from (derived from its own
+ * import.meta.url once invoked as `root/scripts/run-tests.mjs`). Reading
+ * the real files' current bytes rather than re-typing their logic is what
+ * keeps this test bound to actual production behavior instead of a
+ * parallel copy that could quietly stop matching it. check-sha-parity.mjs
+ * is copied here (and not merely referenced) for the same reason - since
+ * run-tests.mjs imports readGitHeadSha from it (see COMPLETION_MARKER_PATH
+ * and runOnce's own headSha computation), the isolated copy needs its own
+ * copy of that dependency to resolve at all, exactly like is-main.mjs
+ * already did before this dependency existed.
  */
 function copyProductionScriptIntoIsolatedRoot(root: string): void {
   const scriptsDir = path.join(root, "scripts");
@@ -1282,6 +1413,10 @@ function copyProductionScriptIntoIsolatedRoot(root: string): void {
   writeFileSync(
     path.join(libDir, "is-main.mjs"),
     readFileSync(path.join(REPO_ROOT, "scripts", "lib", "is-main.mjs"))
+  );
+  writeFileSync(
+    path.join(scriptsDir, "check-sha-parity.mjs"),
+    readFileSync(path.join(REPO_ROOT, "scripts", "check-sha-parity.mjs"))
   );
 }
 
