@@ -195,7 +195,11 @@ export function parseTriggerContent(content) {
 
 /** Default retry count for a cutover attempt. */
 export const DEFAULT_RETRY_COUNT = 3;
-/** Default wall-clock deadline, in milliseconds, for a whole cutover attempt. */
+/**
+ * Default wall-clock deadline, in milliseconds, past which cutover() stops
+ * STARTING new attempts. It does not bound how long an already-started
+ * attempt is allowed to run - see the doc comment on cutover() itself.
+ */
 export const DEFAULT_DEADLINE_MS = 30_000;
 /**
  * Default dedupe window, in milliseconds, frozen at 120s: must exceed
@@ -402,9 +406,20 @@ export class CutoverController {
    * best-effort disarmed before the next attempt so a retry always starts
    * from a clean slate rather than potentially compounding a partial arm.
    *
-   * Retried up to `retryCount` times (default 3), bounded by `deadlineMs`
-   * (default 30s) measured from the first attempt - whichever limit is
-   * reached first stops retrying and settles the outcome as failed.
+   * Retried up to `retryCount` times (default 3). `deadlineMs` (default
+   * 30s, measured from the first attempt) gates whether a NEW attempt may
+   * START, checked once at the top of each loop iteration - it does not
+   * bound how long an attempt already in flight is allowed to run.
+   * Whichever of the two limits is reached first stops the loop from
+   * starting another attempt and settles the outcome as failed.
+   *
+   * Per-operation bounding of an in-flight attempt (arm/probeArmed/disarm)
+   * is the Detector implementation's own responsibility, not something
+   * cutover() itself enforces. The two concrete detectors in
+   * doorbell-cutover-detectors.mjs (the bounded-interval poller and the
+   * fs.watch-based watcher) each bound their own arm()/disarm() calls; a
+   * future Detector implementation with an unbounded arm() would not be
+   * caught by deadlineMs.
    *
    * On exhaustion: rollback (disarm target, then re-arm source - see
    * this file's header for why this is the opposite order from the
