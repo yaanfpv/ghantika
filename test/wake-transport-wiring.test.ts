@@ -223,9 +223,18 @@ test("with the gate ON, resolution 'absent' never calls selectAndWake - the real
   });
 });
 
-test("with the gate ON, resolution 'malformed' never calls selectAndWake either - logged via console.error, but still zero transport calls", async (t) => {
+test("with the gate ON, resolution 'malformed' still never calls CODEX_GATED_TRANSPORTS - a malformed Codex threadId excludes them, logged via console.error, but CLAUDE_MESSAGING_WAKE_TRANSPORT is unaffected and is still attempted (see this file's own header on the two-gate design)", async (t) => {
   await withWakeTransportEnabled("1", async () => {
-    neutralizeClaudeMessagingTransport(t);
+    // Deliberately NOT neutralizeClaudeMessagingTransport(t) here - this
+    // test asserts on its own return value of t.mock.method instead
+    // (that helper discards it), and mocks probe() to actually report
+    // unavailable (never unreachableProbe, whose whole point is a probe
+    // that must NEVER be called - this one is deliberately called).
+    const probeClaude = t.mock.method(
+      DEFAULT_TRANSPORTS[0]!,
+      "probe",
+      unavailable("test fixture - simulating no inherited messaging socket")
+    );
     const probeA = t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unreachableProbe);
     const wakeA = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", unreachableWake);
     const probeB = t.mock.method(DEFAULT_TRANSPORTS[2]!, "probe", unreachableProbe);
@@ -242,22 +251,44 @@ test("with the gate ON, resolution 'malformed' never calls selectAndWake either 
     jobStore.markExited(job.job_id, 0, null);
     await settle();
 
+    // CODEX_GATED_TRANSPORTS stay excluded - a malformed Codex threadId
+    // never reaches them, gate on or off. This is the invariant this test
+    // exists to protect.
     assert.equal(probeA.mock.callCount(), 0);
     assert.equal(wakeA.mock.callCount(), 0);
     assert.equal(probeB.mock.callCount(), 0);
     assert.equal(wakeB.mock.callCount(), 0);
 
+    // CLAUDE_MESSAGING_WAKE_TRANSPORT IS attempted - it needs no target,
+    // so a malformed Codex-specific field has nothing to do with it.
+    assert.equal(
+      probeClaude.mock.callCount(),
+      1,
+      "CLAUDE_MESSAGING_WAKE_TRANSPORT.probe() must still be attempted for a malformed Codex target - it needs no target at all"
+    );
+
+    // Two console.error calls: the malformed-target diagnostic (logged
+    // unconditionally before the transport list is even built), then the
+    // non-"delivered" outcome diagnostic from selectAndWake's own
+    // exhausted-attempts result (unreachableProbe reports unavailable, so
+    // selectAndWake never reaches wake() and resolves "unavailable").
     assert.equal(
       errorSpy.mock.callCount(),
-      1,
-      `expected exactly one console.error call for a malformed target, got ${errorSpy.mock.callCount()}`
+      2,
+      `expected exactly two console.error calls (malformed-target diagnostic + exhaustion diagnostic), got ${errorSpy.mock.callCount()}`
     );
-    const loggedArgs = errorSpy.mock.calls[0]!.arguments;
-    assert.equal(loggedArgs.length, 1);
+
+    const malformedArgs = errorSpy.mock.calls[0]!.arguments;
+    assert.equal(malformedArgs.length, 1);
     assert.equal(
-      loggedArgs[0],
-      `[ghantika] transport wake skipped for task ${job.job_id}: wake target ${resolution.reason}`
+      malformedArgs[0],
+      `[ghantika] transport wake target malformed for task ${job.job_id}: wake target ${resolution.reason}`
     );
+
+    const exhaustionArgs = errorSpy.mock.calls[1]!.arguments;
+    assert.equal(exhaustionArgs[0], "[ghantika] transport wake unavailable for task");
+    assert.equal(exhaustionArgs[1], job.job_id);
+    assert.equal(exhaustionArgs[2], "-");
   });
 });
 

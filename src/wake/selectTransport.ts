@@ -82,10 +82,31 @@ export const SELECTOR_TRANSPORT_NAME = "wake-transport-selector";
  * plain parameter specifically so this default is a convenience, never the
  * only path.
  */
-export const DEFAULT_TRANSPORTS: readonly WakeTransport[] = [
-  new ClaudeMessagingWakeTransport(),
+/**
+ * The one transport whose reach `GHANTIKA_WAKE_TRANSPORT_ENABLED` does NOT
+ * govern - see `tasksAdapter.ts`'s own header comment on that gate for why:
+ * this transport's destination is fixed by AC2's env-only chokepoint, not a
+ * runtime address the gate exists to guard. Exported as its own singleton,
+ * never folded into `CODEX_GATED_TRANSPORTS` below, so the two populations
+ * stay structurally distinct - a future change to what the gate means has
+ * no way to reach this one by accident.
+ */
+export const CLAUDE_MESSAGING_WAKE_TRANSPORT: WakeTransport = new ClaudeMessagingWakeTransport();
+
+/**
+ * The transports `GHANTIKA_WAKE_TRANSPORT_ENABLED` governs - both address a
+ * runtime-resolved Codex thread id over a channel whose reach is genuinely
+ * uncertain (a shared app-server, an IPC bus with ambiguous session
+ * ownership), which is exactly the case that gate exists for.
+ */
+export const CODEX_GATED_TRANSPORTS: readonly WakeTransport[] = [
   new AppServerGoalWakeTransport(),
   new DesktopIpcWakeTransport(),
+];
+
+export const DEFAULT_TRANSPORTS: readonly WakeTransport[] = [
+  CLAUDE_MESSAGING_WAKE_TRANSPORT,
+  ...CODEX_GATED_TRANSPORTS,
 ];
 
 /** Turns a caught value of unknown shape (per `catch`'s own typing under `strict`) into a readable message - for a transport that violates its own contract by throwing or rejecting instead of resolving a `WakeResult`. */

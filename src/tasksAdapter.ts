@@ -209,7 +209,12 @@ import * as killTool from "./tools/kill.js";
 // this adapter needs, exactly as `src/server.ts` never needs anything
 // Tasks-shaped from this file beyond what it explicitly exports.
 import type { WakeTargetResolution } from "./wake/resolveWakeTarget.js";
-import { DEFAULT_TRANSPORTS, selectAndWake } from "./wake/selectTransport.js";
+import {
+  CLAUDE_MESSAGING_WAKE_TRANSPORT,
+  CODEX_GATED_TRANSPORTS,
+  selectAndWake,
+} from "./wake/selectTransport.js";
+import type { WakeTransport } from "./wake/wakeTransport.js";
 
 // ---------------------------------------------------------------------------
 // The extension identity and the vendored, digest-verified schema
@@ -1342,30 +1347,52 @@ function startTaskStatusNotifier(taskId: string, notifier: TaskWakeNotifier): vo
 
 // ---------------------------------------------------------------------------
 // The transport-layer wake - a mechanism for eventually resuming an idle
-// AGENT SESSION on the host machine (a Codex thread, a backgrounded
-// Claude Code turn) via `src/wake/selectTransport.ts`'s `selectAndWake`,
-// rather than pushing an MCP notification down THIS connection the way
-// both mechanisms above do (see `src/wake/wakeTransport.ts`'s own header
-// for that same distinction, stated from the transport side). This
-// section wires that layer so a resolved target can reach a gated wake
-// attempt. `isTransportWakeEnabled` is the one gate every path below
-// passes through before a single transport call can happen, and it
-// defaults to off.
+// AGENT SESSION on the host machine (a Codex thread, a Claude Code session)
+// via `src/wake/selectTransport.ts`'s `selectAndWake`, rather than pushing
+// an MCP notification down THIS connection the way both mechanisms above
+// do (see `src/wake/wakeTransport.ts`'s own header for that same
+// distinction, stated from the transport side).
 //
-// This env var is real server-side configuration, documented for a human
-// operator in README.md's "The app-server wake (Codex)" section and
-// docs/wake-support-matrix.md's per-client matrix - but never a
-// tool-schema field, a capability, or anything an MCP client can discover
-// or set through the wire protocol itself. A client's own request can
-// resolve a wake TARGET (see `resolveWakeTarget.ts`) but never arms this
-// gate; only the server process's own environment can.
+// TWO GATES, DELIBERATELY NOT ONE, because they answer different
+// questions and must never be entangled - a future change to what either
+// one means must not silently change what the other governs.
+//
+// `GHANTIKA_WAKE_TRANSPORT_ENABLED` governs `CODEX_GATED_TRANSPORTS` only
+// (the app-server and desktop-IPC routes). Both address a runtime-resolved
+// Codex thread id over a channel whose reach is genuinely uncertain - a
+// shared app-server, an IPC bus with ambiguous session ownership - which is
+// exactly the case an operator opt-in exists for. Defaults to OFF. Real
+// server-side configuration, documented for a human operator in README.md's
+// "The app-server wake (Codex)" section and docs/wake-support-matrix.md's
+// per-client matrix - never a tool-schema field, a capability, or anything
+// an MCP client can discover or set through the wire protocol itself.
+//
+// `GHANTIKA_DISABLE_CLAUDE_MESSAGING_WAKE` governs `CLAUDE_MESSAGING_WAKE_
+// TRANSPORT` only, and it is an OPT-OUT, not an opt-in: that transport's
+// reach is fixed by AC2's own env-only chokepoint (this session's own
+// inherited socket, never constructed or guessed), so the uncertainty the
+// other gate exists for does not arise here, and the transport is attempted
+// by default. A user who does not want ghantika injecting a turn into
+// their session sets this variable to say so, in one place, documented in
+// README.md's "The inherited-messaging-channel wake (Claude Code)" section.
+// Defaults to OFF (the transport runs).
+//
+// A client's own request can resolve a wake TARGET (see
+// `resolveWakeTarget.ts`) but never arms either gate; only the server
+// process's own environment can.
 // ---------------------------------------------------------------------------
 
 const WAKE_TRANSPORT_ENABLED_ENV = "GHANTIKA_WAKE_TRANSPORT_ENABLED";
+const CLAUDE_MESSAGING_WAKE_DISABLE_ENV = "GHANTIKA_DISABLE_CLAUDE_MESSAGING_WAKE";
 
-/** True only when the wake-transport enablement toggle is set to the exact string `"1"` - never a truthy/falsy env-var check, matching this file's own `isRunningUnderClaudeCode`-style (in `selectTransport.ts`) exact-match convention. Read fresh on every call rather than cached at module load, so a test can flip it between calls within one process. */
+/** True only when the Codex-transports enablement toggle is set to the exact string `"1"` - never a truthy/falsy env-var check, matching this file's own `isRunningUnderClaudeCode`-style (in `selectTransport.ts`) exact-match convention. Read fresh on every call rather than cached at module load, so a test can flip it between calls within one process. Governs `CODEX_GATED_TRANSPORTS` only - see this section's own header. */
 function isTransportWakeEnabled(): boolean {
   return process.env[WAKE_TRANSPORT_ENABLED_ENV] === "1";
+}
+
+/** True only when the opt-out is set to the exact string `"1"` - same exact-match convention as its sibling gate above. Governs `CLAUDE_MESSAGING_WAKE_TRANSPORT` only, and only that one: this is an opt-OUT, so the transport runs by default and this function returning `true` is what suppresses it. */
+function isClaudeMessagingWakeDisabled(): boolean {
+  return process.env[CLAUDE_MESSAGING_WAKE_DISABLE_ENV] === "1";
 }
 
 /**
@@ -1415,22 +1442,35 @@ function buildTransportWakePayload(taskId: string, record: JobRecord): string {
  * guarantees the single-fire property (see that method's own docs), this
  * function does not need to track its own "already fired" state.
  *
- * `isTransportWakeEnabled()` is checked FIRST, before `resolution.state` is
- * even read - so this subscription is always created, regardless of the
- * env var's value, and its callback is a guaranteed no-op whenever the
- * gate is off: zero calls to `selectAndWake`, and therefore zero calls to
- * any transport's `probe()`/`wake()`. See this section's own header
- * comment for what the gate actually is and where it's documented.
+ * TWO INDEPENDENT GATES, never one - see this section's own header comment
+ * for the full reasoning. `resolution.state` on its own no longer decides
+ * whether ANYTHING is attempted: it decides only whether `CODEX_GATED_
+ * TRANSPORTS` participate, because those two need a real Codex thread id
+ * to address anything at all. `CLAUDE_MESSAGING_WAKE_TRANSPORT` needs no
+ * target - AC2's whole point - so it is attempted regardless of
+ * `resolution.state`, gated only by its own opt-out. A plain Claude Code
+ * client's request never carries the Codex-specific `_meta.threadId` this
+ * file's `resolveWakeTarget` reads, so `resolution.state` is `"absent"`
+ * for the exact zero-config audience this transport exists to serve - a
+ * gate keyed on `resolution.state === "resolved"` alone would silently
+ * never try it for that audience, which is the wiring bug this function's
+ * two-list construction below exists to avoid.
  *
- * Fail-closed on every resolution state OTHER than `"resolved"`, whether
- * the gate is on or off: `"absent"` (see `resolveWakeTarget.ts`'s own
- * doc comment for what makes a request resolve that way) stays entirely
- * silent - nothing to log, nothing attempted. `"malformed"` is logged (a
- * wrong target must be loud, never silently swallowed - matching
- * `sendTaskNotification`'s own `console.error` catch-pattern style) but
- * STILL makes zero calls to `selectAndWake` - a malformed `threadId` must
- * never reach anywhere near a real transport. Only `"resolved"`, with the
- * gate on, ever calls `selectAndWake`.
+ * `"malformed"` is still logged (a wrong target must be loud, never
+ * silently swallowed - matching `sendTaskNotification`'s own
+ * `console.error` catch-pattern style), but logging it no longer skips
+ * the rest of this callback - a malformed Codex-specific field must never
+ * suppress the DIFFERENT mechanism that has nothing to do with it.
+ * `CODEX_GATED_TRANSPORTS` are excluded from the attempted list either
+ * way, exactly as before: a malformed `threadId` never reaches them.
+ *
+ * The `target` argument `selectAndWake` receives is the real resolved
+ * target when one exists, and `taskId` otherwise (a placeholder,
+ * informational only - see `claudeMessagingTransport.ts`'s own header on
+ * why `target` plays no addressing role for that transport). Safe only
+ * because `CODEX_GATED_TRANSPORTS` are never included in the same call
+ * when `target` is a placeholder; passing that placeholder to a transport
+ * that DOES address by it would misaddress it.
  *
  * The whole path is fire-and-forget, exactly like `sendTaskNotification`
  * already is: `selectAndWake`'s own promise is `.then`/`.catch`-handled
@@ -1455,20 +1495,16 @@ function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetReso
     // call above, which does the same for its sibling subscription.
     unsubscribeTerminal();
 
-    if (!isTransportWakeEnabled()) return;
-
-    if (resolution.state === "absent") return; // no target resolved - silent, nothing to log, nothing attempted
-
     if (resolution.state === "malformed") {
       // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- taskId is this codebase's own randomUUID(), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
       console.error(
-        `[ghantika] transport wake skipped for task ${taskId}: wake target ${resolution.reason}`
+        `[ghantika] transport wake target malformed for task ${taskId}: wake target ${resolution.reason}`
       );
-      return; // a malformed threadId must never reach selectAndWake, gate on or off
+      // Fall through, deliberately - see this function's own doc comment.
+      // CODEX_GATED_TRANSPORTS are still excluded below (resolution.state
+      // is not "resolved"); CLAUDE_MESSAGING_WAKE_TRANSPORT is unaffected.
     }
 
-    // resolution.state === "resolved" from here - the ONLY branch that ever
-    // calls selectAndWake.
     const record = jobStore.get(taskId);
     // Defensive only - see startTaskStatusNotifier's own identical comment:
     // this listener runs as part of the SAME synchronous fireJobTerminal
@@ -1477,7 +1513,16 @@ function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetReso
     // code path in this codebase does.
     if (record === undefined) return;
 
-    selectAndWake(DEFAULT_TRANSPORTS, resolution.target, buildTransportWakePayload(taskId, record))
+    const transports: WakeTransport[] = [];
+    if (!isClaudeMessagingWakeDisabled()) transports.push(CLAUDE_MESSAGING_WAKE_TRANSPORT);
+    if (resolution.state === "resolved" && isTransportWakeEnabled()) {
+      transports.push(...CODEX_GATED_TRANSPORTS);
+    }
+    if (transports.length === 0) return; // nothing eligible - both gates say no
+
+    const target = resolution.state === "resolved" ? resolution.target : taskId;
+
+    selectAndWake(transports, target, buildTransportWakePayload(taskId, record))
       .then((wakeResult) => {
         if (wakeResult.outcome !== "delivered") {
           console.error(
