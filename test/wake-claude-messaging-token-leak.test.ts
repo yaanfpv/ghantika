@@ -1,8 +1,8 @@
-// AC5 for story-0264: the token is a credential and never appears anywhere
-// this transport can produce - not in a `Capability`, not in a
-// `WakeResult`, not in any `detail`/`reason` string. This is a public
-// repo with public CI logs, so a token surfacing in any of those is a
-// real leak, not a cosmetic one.
+// The token is a credential and never appears anywhere this transport
+// can produce - not in a `Capability`, not in a `WakeResult`, not in any
+// `detail`/`reason` string. This is a public repo with public CI logs,
+// so a token surfacing in any of those is a real leak, not a cosmetic
+// one.
 //
 // The assertion helper below is itself proven non-vacuous by a NEGATIVE
 // CONTROL (see "the leak-detector itself..." below): a fixture that

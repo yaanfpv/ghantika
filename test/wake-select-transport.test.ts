@@ -430,13 +430,13 @@ test("DEFAULT_TRANSPORTS contains exactly the three real transports, Claude-mess
 
 // --- 11. exhaustion detail has no harness-specific wording, on any CLAUDECODE value ---
 //
-// Superseded by story-0264: this section used to assert a Claude-Code-aware
-// summary in buildExhaustionDetail, on the premise that none of
-// DEFAULT_TRANSPORTS served that harness at all. Adding
-// ClaudeMessagingWakeTransport made that premise false, so the special-cased
-// wording was removed from selectTransport.ts (see that file's own
-// buildExhaustionDetail doc comment) rather than kept alive on a now-false
-// claim. What replaces the six tests that used to live here is the inverse
+// This section used to assert a Claude-Code-aware summary in
+// buildExhaustionDetail, on the premise that none of DEFAULT_TRANSPORTS
+// served that harness at all. Adding ClaudeMessagingWakeTransport made
+// that premise false, so the special-cased wording was removed from
+// selectTransport.ts (see that file's own buildExhaustionDetail doc
+// comment) rather than kept alive on a now-false claim. What replaces
+// the six tests that used to live here is the inverse
 // property: the exhaustion detail is the SAME bare per-transport
 // enumeration regardless of CLAUDECODE's value, proving no harness-specific
 // branch exists to regress back in later. withClaudeCodeEnv is kept for

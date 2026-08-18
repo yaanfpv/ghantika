@@ -29,9 +29,9 @@
  * module cache is what makes mutating a method on these instances here
  * visible to the adapter's own internal call.
  *
- * `DEFAULT_TRANSPORTS[0]` is `ClaudeMessagingWakeTransport`, added by
- * story-0264 - every test below neutralizes it first via
- * `neutralizeClaudeMessagingTransport` (see that function's own doc
+ * `DEFAULT_TRANSPORTS[0]` is `ClaudeMessagingWakeTransport`; every test
+ * below neutralizes it first via `neutralizeClaudeMessagingTransport`
+ * (see that function's own doc
  * comment for why this is required, not optional, in THIS process). The
  * app-server and desktop-IPC transports this file actually exercises sit
  * at indices 1 and 2.
