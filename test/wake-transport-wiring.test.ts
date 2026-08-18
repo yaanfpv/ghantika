@@ -1,6 +1,6 @@
 /**
  * Proves `src/tasksAdapter.ts`'s `startTransportWakeOnTerminal` subscriber:
- * its internal-only `GHANTIKA_WAKE_TRANSPORT_ENABLED` opt-in gate, its
+ * its server-operator-only `GHANTIKA_WAKE_TRANSPORT_ENABLED` opt-in gate, its
  * fail-closed behavior on every `WakeTargetResolution` state other than
  * `"resolved"`, and its dispatch through the real transport selector.
  *
@@ -485,11 +485,11 @@ test("the transport-wake subscriber fires AT MOST ONCE per task - a duplicate ma
 // 6. startTransportWakeOnTerminal is NOT gated by isCapableConnection - it
 //    subscribes on the real job run() already created, never on the
 //    minted task-shaped response. The README records, narrowly, that
-//    neither of the two tested hosts (Claude Code 2.1.220, Codex CLI
-//    0.144.0-alpha.4) advertised the extension at handshake - evidence
-//    about those tested versions, not a permanent property of either
-//    client, and the README itself says so ("Read this as evidence
-//    about today's hosts, not about the mechanism"). These four exercise
+//    neither of the two tested hosts (Claude Code, Codex CLI)
+//    advertised the extension at handshake - evidence about those
+//    tested hosts, not a permanent property of either client, and the
+//    README itself says so ("Read this as evidence about today's
+//    hosts, not about the mechanism"). These four exercise
 //    the isCapableConnection FALSE side of that boundary directly: #1
 //    shows the mechanism fires for a non-capable connection with the
 //    gate ON; #2 shows the default (gate OFF) code path, as run in this

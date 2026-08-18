@@ -27,7 +27,7 @@
  * platform-gated at all.
  */
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { before, describe, test } from "node:test";
 
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
 // import comment for why.
@@ -36,6 +36,42 @@ import * as killTool from "../dist/tools/kill.js";
 import * as listTool from "../dist/tools/list.js";
 import * as runTool from "../dist/tools/run.js";
 import * as statusTool from "../dist/tools/status.js";
+
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
+
+// Only SOME of the tests in this file actually dispatch a real command
+// through the real `run` tool's handler with a target that resolves to a
+// real executable, which is what's required to reach
+// src/policy.ts's decideRunPolicy - see test/helpers/requireSpawnPolicy.ts
+// for what this checks and why, and its own header for why the guard must
+// be scoped to the narrowest before() that covers only those tests rather
+// than registered file-level. This file mixes several different shapes,
+// so each gets its own local comment at its own site below rather than
+// one blanket rule here:
+//
+//   - The pure unit tests against buildBirthIdentityProjection never call
+//     runTool.handler at all - no spawn, no gate, nothing to guard.
+//   - The a1/a2/a7, a2/a7/a8, and a3 tests DO call runTool.handler with a
+//     real, resolvable command (process.execPath) - decideRunPolicy runs
+//     for each of them, and their own assertions depend on the job
+//     actually being admitted, so these are the ones that need the guard.
+//     They're grouped in their own describe() block below, scoped to just
+//     that block.
+//   - The "a1 negative case" test also calls runTool.handler, but with a
+//     command that never resolves to a real executable at all -
+//     resolveExecutable fails and run.ts's handler returns a
+//     "command not found" failed job BEFORE ever calling decideRunPolicy
+//     (see src/tools/run.ts's own handler), so that call reaches the
+//     policy gate no more than the pure unit tests above do.
+//   - The a4/a6 tests further down also call runTool.handler with a real,
+//     resolvable command, so decideRunPolicy genuinely does run for each
+//     of them - but what each one actually asserts is a structural
+//     property of run()'s/kill()'s/list()'s own response shape (no
+//     pid/birth_identity key on THAT tool's response), which holds
+//     identically whether the underlying job is admitted or denied by
+//     policy. An absent/empty policy file can never turn any of those
+//     three assertions into a failure, so there's no confusing
+//     policy-denied failure for the guard to preempt there.
 
 const POSIX_ONLY_SKIP =
   process.platform === "win32"
@@ -189,120 +225,144 @@ test("buildBirthIdentityProjection: STRUCTURAL exhaustiveness - every one of the
 // terminal, and the deterministic pending race.
 // ---------------------------------------------------------------------------
 
-test(
-  "a1/a2/a7: status() called synchronously right after run() (no await between them) observes birth_identity still pending, with a real pid already present alongside it - never the pid alone",
-  { skip: POSIX_ONLY_SKIP },
-  () => {
-    const runResult = runTool.handler({
-      command: [process.execPath, "-e", "setTimeout(() => {}, 2000)"],
-    });
-    const jobId = jobIdOf(runResult);
-    try {
-      // No `await` anywhere between run() and status() below - run()'s own
-      // handler is synchronous (never awaits anything - see its own
-      // docs), and the real async ps/proc-based capture it kicks off
-      // cannot settle without at least one real event-loop turn (forking
-      // an observer process is inherently asynchronous), so this is a
-      // deterministic, non-flaky way to observe "pending" via the real
-      // production code path rather than a mock.
-      const statusResult = structuredOf(statusTool.handler({ job_id: jobId }));
-      assert.equal(typeof statusResult.pid, "number");
-      assert.ok((statusResult.pid as number) > 0, "expected a real positive OS pid");
-      const handle = jobStore.getChildHandle(jobId);
-      assert.equal(
-        statusResult.pid,
-        handle?.pid,
-        "status()'s reported pid must be the SAME pid jobStore itself tracks for this job"
-      );
-      assert.deepEqual(
-        statusResult.birth_identity,
-        { state: "pending" },
-        "birth_identity must read exactly pending at this exact synchronous instant, never a fabricated captured/unavailable answer"
-      );
-    } finally {
-      killJobGroup(jobId);
-    }
+describe("status: the real end-to-end birth-identity race (against a real spawned job)", () => {
+  // Each test below dispatches a real command through the real `run`
+  // tool's handler with a resolvable executable (process.execPath), which
+  // is what actually reaches decideRunPolicy - see this file's own
+  // top-of-file comment for the full breakdown of which tests in this
+  // file do and don't, and test/helpers/requireSpawnPolicy.ts for what
+  // this guard checks and why. But every one of them is also marked
+  // POSIX_ONLY_SKIP below - on win32 that skips all three, so
+  // registering this hook unconditionally would still throw there under an
+  // unset policy variable with nothing left to run. Register it only
+  // where a child can actually reach it.
+  if (process.platform !== "win32") {
+    before(requireSpawnPolicy);
   }
-);
 
-test(
-  "a2/a7/a8: once settled, a live job's birth_identity is captured (or, rarely, honestly unavailable) - never fabricated - and a captured identity is platform-tagged matching this host",
-  { skip: POSIX_ONLY_SKIP },
-  async () => {
-    const runResult = runTool.handler({
-      command: [process.execPath, "-e", "setTimeout(() => {}, 3000)"],
-    });
-    const jobId = jobIdOf(runResult);
-    try {
-      const settled = await waitForBirthIdentitySettled(jobId);
-      assert.ok(
-        settled.state === "captured" || settled.state === "unavailable",
-        `expected birth_identity to settle to captured or unavailable, got: ${JSON.stringify(settled)}`
-      );
-      if (settled.state === "captured") {
-        const identity = settled.identity as { platform?: string };
-        if (process.platform === "linux") {
-          assert.equal(identity.platform, "linux-starttime-ticks");
-          assert.equal(
-            typeof (identity as { startTimeTicks?: unknown }).startTimeTicks,
-            "string",
-            `expected a Linux identity to carry a string startTimeTicks, got: ${JSON.stringify(identity)}`
-          );
-        } else {
-          assert.equal(identity.platform, "posix-elapsed");
-          assert.equal(
-            typeof (identity as { capturedAtMs?: unknown }).capturedAtMs,
-            "number",
-            `expected a posix-elapsed identity to carry a numeric capturedAtMs, got: ${JSON.stringify(identity)}`
-          );
-          assert.equal(
-            typeof (identity as { elapsedSecondsAtCapture?: unknown }).elapsedSecondsAtCapture,
-            "number",
-            `expected a posix-elapsed identity to carry a numeric elapsedSecondsAtCapture, got: ${JSON.stringify(identity)}`
-          );
-        }
+  test(
+    "a1/a2/a7: status() called synchronously right after run() (no await between them) observes birth_identity still pending, with a real pid already present alongside it - never the pid alone",
+    { skip: POSIX_ONLY_SKIP },
+    () => {
+      const runResult = runTool.handler({
+        command: [process.execPath, "-e", "setTimeout(() => {}, 2000)"],
+      });
+      const jobId = jobIdOf(runResult);
+      try {
+        // No `await` anywhere between run() and status() below - run()'s own
+        // handler is synchronous (never awaits anything - see its own
+        // docs), and the real async ps/proc-based capture it kicks off
+        // cannot settle without at least one real event-loop turn (forking
+        // an observer process is inherently asynchronous), so this is a
+        // deterministic, non-flaky way to observe "pending" via the real
+        // production code path rather than a mock.
+        const statusResult = structuredOf(statusTool.handler({ job_id: jobId }));
+        assert.equal(typeof statusResult.pid, "number");
+        assert.ok((statusResult.pid as number) > 0, "expected a real positive OS pid");
+        const handle = jobStore.getChildHandle(jobId);
+        assert.equal(
+          statusResult.pid,
+          handle?.pid,
+          "status()'s reported pid must be the SAME pid jobStore itself tracks for this job"
+        );
+        assert.deepEqual(
+          statusResult.birth_identity,
+          { state: "pending" },
+          "birth_identity must read exactly pending at this exact synchronous instant, never a fabricated captured/unavailable answer"
+        );
+      } finally {
+        killJobGroup(jobId);
       }
-      // pid is stable across the whole settlement race - status() at any
-      // point in time reports the SAME tracked pid.
-      const finalStatus = structuredOf(statusTool.handler({ job_id: jobId }));
-      assert.equal(finalStatus.pid, jobStore.getChildHandle(jobId)?.pid);
-    } finally {
+    }
+  );
+
+  test(
+    "a2/a7/a8: once settled, a live job's birth_identity is captured (or, rarely, honestly unavailable) - never fabricated - and a captured identity is platform-tagged matching this host",
+    { skip: POSIX_ONLY_SKIP },
+    async () => {
+      const runResult = runTool.handler({
+        command: [process.execPath, "-e", "setTimeout(() => {}, 3000)"],
+      });
+      const jobId = jobIdOf(runResult);
+      try {
+        const settled = await waitForBirthIdentitySettled(jobId);
+        assert.ok(
+          settled.state === "captured" || settled.state === "unavailable",
+          `expected birth_identity to settle to captured or unavailable, got: ${JSON.stringify(settled)}`
+        );
+        if (settled.state === "captured") {
+          const identity = settled.identity as { platform?: string };
+          if (process.platform === "linux") {
+            assert.equal(identity.platform, "linux-starttime-ticks");
+            assert.equal(
+              typeof (identity as { startTimeTicks?: unknown }).startTimeTicks,
+              "string",
+              `expected a Linux identity to carry a string startTimeTicks, got: ${JSON.stringify(identity)}`
+            );
+          } else {
+            assert.equal(identity.platform, "posix-elapsed");
+            assert.equal(
+              typeof (identity as { capturedAtMs?: unknown }).capturedAtMs,
+              "number",
+              `expected a posix-elapsed identity to carry a numeric capturedAtMs, got: ${JSON.stringify(identity)}`
+            );
+            assert.equal(
+              typeof (identity as { elapsedSecondsAtCapture?: unknown }).elapsedSecondsAtCapture,
+              "number",
+              `expected a posix-elapsed identity to carry a numeric elapsedSecondsAtCapture, got: ${JSON.stringify(identity)}`
+            );
+          }
+        }
+        // pid is stable across the whole settlement race - status() at any
+        // point in time reports the SAME tracked pid.
+        const finalStatus = structuredOf(statusTool.handler({ job_id: jobId }));
+        assert.equal(finalStatus.pid, jobStore.getChildHandle(jobId)?.pid);
+      } finally {
+        killJobGroup(jobId);
+      }
+    }
+  );
+
+  test(
+    "a3: a TERMINAL job retains the pid it HAD and reports whatever birth_identity capture state actually holds, including pending - never omits either just because the process is gone",
+    { skip: POSIX_ONLY_SKIP },
+    async () => {
+      const runResult = runTool.handler({ command: [process.execPath, "-e", "process.exit(0)"] });
+      const jobId = jobIdOf(runResult);
+      const beforePid = structuredOf(statusTool.handler({ job_id: jobId })).pid;
+      const terminalStatus = await waitForTerminal(jobId);
+      assert.equal(
+        terminalStatus.state,
+        "exited",
+        "expected this job to reach a real terminal state"
+      );
+      assert.equal(
+        terminalStatus.pid,
+        beforePid,
+        "the pid on a terminal job must be the exact SAME pid it had while live, never dropped or changed"
+      );
+      assert.equal(typeof terminalStatus.pid, "number");
+      const birthIdentity = terminalStatus.birth_identity as { state?: string };
+      assert.ok(
+        ["pending", "captured", "unavailable"].includes(birthIdentity.state as string),
+        `expected a real birth_identity.state on the terminal projection, got: ${JSON.stringify(terminalStatus.birth_identity)}`
+      );
+      // killJobGroup is a safe no-op here (the process already exited on its
+      // own via process.exit(0)) - called anyway for hygiene, matching this
+      // file's other tests.
       killJobGroup(jobId);
     }
-  }
-);
+  );
+});
 
-test(
-  "a3: a TERMINAL job retains the pid it HAD and reports whatever birth_identity capture state actually holds, including pending - never omits either just because the process is gone",
-  { skip: POSIX_ONLY_SKIP },
-  async () => {
-    const runResult = runTool.handler({ command: [process.execPath, "-e", "process.exit(0)"] });
-    const jobId = jobIdOf(runResult);
-    const beforePid = structuredOf(statusTool.handler({ job_id: jobId })).pid;
-    const terminalStatus = await waitForTerminal(jobId);
-    assert.equal(
-      terminalStatus.state,
-      "exited",
-      "expected this job to reach a real terminal state"
-    );
-    assert.equal(
-      terminalStatus.pid,
-      beforePid,
-      "the pid on a terminal job must be the exact SAME pid it had while live, never dropped or changed"
-    );
-    assert.equal(typeof terminalStatus.pid, "number");
-    const birthIdentity = terminalStatus.birth_identity as { state?: string };
-    assert.ok(
-      ["pending", "captured", "unavailable"].includes(birthIdentity.state as string),
-      `expected a real birth_identity.state on the terminal projection, got: ${JSON.stringify(terminalStatus.birth_identity)}`
-    );
-    // killJobGroup is a safe no-op here (the process already exited on its
-    // own via process.exit(0)) - called anyway for hygiene, matching this
-    // file's other tests.
-    killJobGroup(jobId);
-  }
-);
-
+// The negative case below also calls runTool.handler, but with a command
+// that never resolves to a real executable at all: resolveExecutable
+// fails and run.ts's own handler returns an already-`failed` job before
+// ever calling decideRunPolicy (see src/tools/run.ts's own handler docs
+// for this exact ordering) - so it reaches the policy gate no more than
+// the pure unit tests above do, and stays outside the describe() block
+// above on purpose. See this file's own top-of-file comment for the full
+// breakdown.
 test("a1 negative case: a job that never got a real OS process at all (spawn-error, before any spawn attempt) carries no pid and no birth_identity", () => {
   const runResult = runTool.handler({
     command: ["this-command-definitely-does-not-exist-ghantika-status-pid-test"],
@@ -344,6 +404,21 @@ test("a1 negative case: a job that never got a real OS process at all (spawn-err
 
 // ---------------------------------------------------------------------------
 // a4/a6: STATUS-ONLY - run/kill/list carry neither pid nor birth_identity.
+//
+// The three tests below each call runTool.handler with a real, resolvable
+// command ("true", or process.execPath below), so decideRunPolicy genuinely
+// runs for every one of them - but what each one actually asserts is a
+// structural property of run()'s/kill()'s/list()'s OWN response shape (no
+// pid/birth_identity key on that tool's response), which holds identically
+// whether the underlying job is admitted or denied by policy: a
+// policy-denied job is created via jobStore.createFailedJob exactly like a
+// bad-cwd or command-not-found job, and none of those three response
+// shapes ever gains a pid/birth_identity key regardless of why the job
+// failed (or didn't). An absent/empty policy file can never turn any of
+// these three assertions into a failure, so there's no confusing
+// policy-denied failure for the guard to preempt here - these stay
+// unguarded on purpose. See this file's own top-of-file comment for the
+// full breakdown.
 // ---------------------------------------------------------------------------
 
 test("a4/a6: run()'s own immediate response never carries pid or birth_identity - additive to status alone", () => {

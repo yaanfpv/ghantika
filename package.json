@@ -1,7 +1,7 @@
 {
   "name": "ghantika",
   "version": "0.1.0",
-  "description": "A background command-runner MCP server: start a command without blocking the calling agent, then poll it for status and output (a direct wake on completion is planned, not wired yet).",
+  "description": "A background command-runner MCP server: start a command without blocking the calling agent, then poll it for status and output, with a push notification on a client and configuration that support it.",
   "type": "module",
   "license": "MIT",
   "author": "Soham Patankar",
@@ -48,6 +48,7 @@
     "guard:typescript-tracking-signal": "node scripts/check-typescript-tracking-signal.mjs",
     "guard:wake-transport-boundaries": "node scripts/check-wake-transport-boundaries.mjs",
     "guard:no-bounded-kill-confirmed-wait": "node scripts/check-no-bounded-kill-confirmed-wait.mjs",
+    "guard:polling-claim": "node scripts/check-polling-claim.mjs",
     "verify:install-repro": "node scripts/verify-install-reproducibility.mjs",
     "verify:workflow-topology": "node scripts/verify-workflow-topology.mjs",
     "lint:workflow-jobs": "node scripts/lint-workflow-jobs.mjs",

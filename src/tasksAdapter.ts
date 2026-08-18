@@ -1352,16 +1352,18 @@ function startTaskStatusNotifier(taskId: string, notifier: TaskWakeNotifier): vo
 // passes through before a single transport call can happen, and it
 // defaults to off.
 //
-// This is deliberately an internal server-process environment variable
-// only, never a tool-schema field, a documented flag, or anything an MCP
-// client can discover or set through the wire protocol. Follows this
-// codebase's own house pattern for exactly that shape - see
-// `src/process.ts`'s `GHANTIKA_TEST_DEGRADE_PROC_READ`.
+// This env var is real server-side configuration, documented for a human
+// operator in README.md's "The app-server wake (Codex)" section and
+// docs/wake-support-matrix.md's per-client matrix - but never a
+// tool-schema field, a capability, or anything an MCP client can discover
+// or set through the wire protocol itself. A client's own request can
+// resolve a wake TARGET (see `resolveWakeTarget.ts`) but never arms this
+// gate; only the server process's own environment can.
 // ---------------------------------------------------------------------------
 
 const WAKE_TRANSPORT_ENABLED_ENV = "GHANTIKA_WAKE_TRANSPORT_ENABLED";
 
-/** True only when the internal reachability toggle is set to the exact string `"1"` - never a truthy/falsy env-var check, matching this file's own `isRunningUnderClaudeCode`-style (in `selectTransport.ts`) exact-match convention. Read fresh on every call rather than cached at module load, so a test can flip it between calls within one process. */
+/** True only when the wake-transport enablement toggle is set to the exact string `"1"` - never a truthy/falsy env-var check, matching this file's own `isRunningUnderClaudeCode`-style (in `selectTransport.ts`) exact-match convention. Read fresh on every call rather than cached at module load, so a test can flip it between calls within one process. */
 function isTransportWakeEnabled(): boolean {
   return process.env[WAKE_TRANSPORT_ENABLED_ENV] === "1";
 }
@@ -1417,8 +1419,8 @@ function buildTransportWakePayload(taskId: string, record: JobRecord): string {
  * even read - so this subscription is always created, regardless of the
  * env var's value, and its callback is a guaranteed no-op whenever the
  * gate is off: zero calls to `selectAndWake`, and therefore zero calls to
- * any transport's `probe()`/`wake()`. The gate is INTERNAL and
- * UNDOCUMENTED - see this section's own header comment for why.
+ * any transport's `probe()`/`wake()`. See this section's own header
+ * comment for what the gate actually is and where it's documented.
  *
  * Fail-closed on every resolution state OTHER than `"resolved"`, whether
  * the gate is on or off: `"absent"` (see `resolveWakeTarget.ts`'s own

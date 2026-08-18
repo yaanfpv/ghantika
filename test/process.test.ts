@@ -3,7 +3,17 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { before, describe, test } from "node:test";
+
+// Only the "Optional per-job execution deadline" section far below spawns a
+// real job through the real `run` tool's handler (`runTool.handler`,
+// imported locally there) - see test/helpers/requireSpawnPolicy.ts for what
+// this checks and why. That section owns its own `before(requireSpawnPolicy)`
+// inside a describe() block rather than registering the guard here at file
+// scope: this file has 193 tests and only that section's spawn, so a
+// file-level hook would fail every other test under an unset policy
+// variable too.
+import { requireSpawnPolicy } from "./helpers/requireSpawnPolicy.ts";
 
 // Imports the BUILT output, not src/ directly - see test/registry.test.ts's
 // import comment for why.
@@ -39,6 +49,7 @@ import {
   killProcessTreeWindows,
   parseEtime,
   parseLinuxStatStartTimeTicks,
+  parseLstartBatchOutput,
   parsePidLstartRow,
   readLinuxStartTimeTicksAsync,
   readPidStartTimesBatchPosix,
@@ -3945,6 +3956,24 @@ test("parsePidLstartRow REFUSES an empty string", () => {
 
 // --- readPidStartTimesBatchPosix: the batched, bounded, force-reaped observer ---
 
+/**
+ * A virtual retry clock for `readPidStartTimesBatchPosix`'s own not-found
+ * retry: `now()` only advances by exactly what `sleep()` was asked to wait,
+ * with no real wall-clock component, so a case where the retry budget
+ * genuinely exhausts runs through the same number of iterations production
+ * would without spending that time for real.
+ */
+function fastForwardRetryClock() {
+  let virtualNow = 0;
+  return {
+    now: () => virtualNow,
+    sleep: async (ms: number) => {
+      virtualNow += ms;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(ms, 5)));
+    },
+  };
+}
+
 test("readPidStartTimesBatchPosix: an empty pids array is a defensive no-op, never shelling out at all", async () => {
   const result = await readPidStartTimesBatchPosix([]);
   assert.deepEqual(result, { status: "ok", rows: [] });
@@ -4064,7 +4093,15 @@ test(
     await waitFor(() => shortRec.exits.length > 0);
     const deadPid = shortChild!.pid!;
 
-    const result = await readPidStartTimesBatchPosix([pid, deadPid]);
+    // The dead pid is genuinely, permanently absent, so it exhausts the
+    // full not-found retry window on every real attempt - a virtual clock
+    // keeps this deterministic-but-fast rather than adding a real ~1s wait
+    // for a result that was never going to change.
+    const result = await readPidStartTimesBatchPosix(
+      [pid, deadPid],
+      undefined,
+      fastForwardRetryClock()
+    );
     assert.equal(result.status, "ok");
     if (result.status === "ok") {
       assert.equal(result.rows.length, 1);
@@ -4075,7 +4112,13 @@ test(
 );
 
 test("readPidStartTimesBatchPosix: when NONE of the requested pids exist, resolves ok with genuinely empty rows (ps's own exit-1 'nothing matched' code), never an observer failure", async () => {
-  const result = await readPidStartTimesBatchPosix([88_888_881, 88_888_882]);
+  // Neither pid will ever be found, so this exhausts the full retry window -
+  // a virtual clock avoids a real ~1s wait for that.
+  const result = await readPidStartTimesBatchPosix(
+    [88_888_881, 88_888_882],
+    undefined,
+    fastForwardRetryClock()
+  );
   assert.deepEqual(result, { status: "ok", rows: [] });
 });
 
@@ -4135,6 +4178,30 @@ test(
   }
 );
 
+// --- parseLstartBatchOutput: the pure row-parsing-and-discard logic,
+// isolated from the spawn/observe/timeout machinery entirely ---
+
+test("parseLstartBatchOutput: a mix of one well-formed row and one malformed row keeps the well-formed one - a malformed row is discarded, never poisoning the others (PURE - no spawn, no real ps, no PATH manipulation, no timeout at all; this is what actually makes the assertion timing-independent, not the widened-timeout integration test below)", () => {
+  const pid = 12345;
+  // The exact literal row-text shapes the integration test below feeds a
+  // real fake `ps` - reused verbatim here so both tests exercise the same
+  // input shape, just through different doors. The malformed row is
+  // missing its year token (five tokens instead of six), the same defect
+  // `parsePidLstartRow`'s own dedicated test above already names.
+  const stdout = "12345 Sat Jul 25 13:39:12 2026\n999999 Sat Jul 25 13:39:12\n";
+  const rows = parseLstartBatchOutput(stdout);
+  assert.equal(rows.length, 1, "expected only the well-formed row to survive");
+  assert.equal(rows[0]!.pid, pid);
+  assert.equal(rows[0]!.startTimeMs, Date.UTC(2026, 6, 25, 13, 39, 12));
+  assert.ok(
+    !rows.some((row) => row.pid === 999_999),
+    "the malformed row must never contribute an entry, under its own pid or any other"
+  );
+});
+
+// --- readPidStartTimesBatchPosix: the full spawn -> observe -> parse
+// pipeline, still a real timeout racing real host latency ---
+
 test(
   "readPidStartTimesBatchPosix: a mix of one well-formed row and one malformed row keeps the well-formed one - a malformed row is discarded, never poisoning the others",
   { skip: POSIX_PROCESS_GROUP_SKIP },
@@ -4164,7 +4231,34 @@ test(
     let result: Awaited<ReturnType<typeof readPidStartTimesBatchPosix>>;
     try {
       process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
-      result = await readPidStartTimesBatchPosix([pid, 999_999]);
+      // A real, finite, generous 30_000ms observer timeout. This test's own
+      // subject is the full spawn -> observe -> parse PIPELINE: that a real
+      // readPidStartTimesBatchPosix call correctly wires a malformed row
+      // through to being discarded, not just that the parser itself works
+      // in isolation. The fake `ps` here does nothing but echo two lines,
+      // so its real cost is the host's fork/exec scheduling latency, not
+      // any work of substance.
+      //
+      // This bound does NOT make the row-parsing assertion itself
+      // timing-independent - it is still a real execFile timeout racing
+      // real host latency, and a sufficiently slow host CAN in principle
+      // still resolve to `observer-failure` before parsing ever runs, just
+      // far less often than under the previous 2000ms default. The
+      // row-parsing assertion in THIS test remains timing-dependent on
+      // that bound. What makes the parsing assertion timing-independent is
+      // the pure `parseLstartBatchOutput` test immediately above, which
+      // calls the row-parsing-and-discard logic directly on a hand-crafted
+      // string with zero spawn, zero real `ps`, and zero timeout of any
+      // kind. This integration test's real-pipeline behavior is layered ON
+      // TOP of that pure logic, not a substitute for it.
+      //
+      // 999_999's row is malformed and therefore discarded by
+      // parseLstartBatchOutput on EVERY attempt - it never resolves, so
+      // this exhausts the not-found retry window same as the alive/
+      // already-gone and all-nonexistent-pids tests above; a virtual clock
+      // avoids the real ~1s wait for a result that was never going to
+      // change.
+      result = await readPidStartTimesBatchPosix([pid, 999_999], 30_000, fastForwardRetryClock());
     } finally {
       process.env.PATH = realPath;
     }
@@ -4177,6 +4271,136 @@ test(
     process.kill(-pid, "SIGKILL");
   }
 );
+
+// --- readPidStartTimesBatchPosix's own not-found retry: a transient miss
+// on the whole batch is retried the same way the single-pid capture's own
+// not-found retry already is. ---
+
+test(
+  "readPidStartTimesBatchPosix: a transient not-found observation for the whole batch retries and recovers once ps starts answering",
+  { skip: POSIX_PROCESS_GROUP_SKIP },
+  async () => {
+    const rec = recorder();
+    const env = buildChildEnv("merge", {});
+    const child = spawnManaged(
+      { argv: ["sleep", "5"], cwd: process.cwd(), env },
+      callbacksFor(rec)
+    );
+    await waitFor(() => rec.spawned > 0);
+    const pid = child!.pid!;
+
+    const realPath = process.env.PATH;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-batch-notfound-then-found-ps-"));
+    const invocationMarker = path.join(dir, "invocations.txt");
+    const psPath = path.join(dir, "ps");
+    // Mirrors the SAME first-not-found-then-found idiom the single-pid
+    // retry's own tests above use, adapted to the batch invocation shape.
+    fs.writeFileSync(
+      psPath,
+      `#!/bin/sh\ncount=$(wc -l < '${invocationMarker}' 2>/dev/null || echo 0)\necho x >> '${invocationMarker}'\nif [ "$count" -eq 0 ]; then\n  exit 1\nfi\necho '${pid} Sat Jul 25 13:39:12 2026'\n`
+    );
+    fs.chmodSync(psPath, 0o755);
+
+    let result: Awaited<ReturnType<typeof readPidStartTimesBatchPosix>>;
+    try {
+      process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+      result = await readPidStartTimesBatchPosix([pid], undefined, fastForwardRetryClock());
+    } finally {
+      process.env.PATH = realPath;
+    }
+
+    const invocationCount = fs
+      .readFileSync(invocationMarker, "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0).length;
+
+    assert.equal(result.status, "ok", "a transient miss must never settle as observer-failure");
+    if (result.status === "ok") {
+      assert.equal(result.rows.length, 1, "the retry must recover the requested pid's row");
+      assert.equal(result.rows[0]!.pid, pid);
+    }
+    assert.ok(
+      invocationCount >= 2,
+      `expected at least 2 real ps invocations (the initial not-found plus the retry that found it), saw ${invocationCount}`
+    );
+
+    process.kill(-pid, "SIGKILL");
+  }
+);
+
+test("readPidStartTimesBatchPosix: the not-found retry is capped by the caller's OWN aggregate timeoutMs+grace when that is smaller than the shared retry-scheduling bound", async () => {
+  const realPath = process.env.PATH;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-batch-aggregate-cap-ps-"));
+  const invocationMarker = path.join(dir, "invocations.txt");
+  const psPath = path.join(dir, "ps");
+  // Never finds anything - the point is to prove the loop stops on the
+  // AGGREGATE cap alone, before the much larger shared not-found
+  // retry-scheduling bound (1000ms) would ever end it.
+  fs.writeFileSync(psPath, `#!/bin/sh\necho x >> '${invocationMarker}'\nexit 1\n`);
+  fs.chmodSync(psPath, 0o755);
+
+  // timeoutMs is the LARGEST value that still keeps the aggregate
+  // deadline (timeoutMs + grace) strictly below the shared
+  // BIRTH_IDENTITY_NOT_FOUND_RETRY_BOUND_MS (1000ms) - the exact
+  // "smaller than the shared retry-scheduling bound" case this test's
+  // own title claims - while leaving headroom for the one real `ps`
+  // spawn this test performs, since a freshly-written script pays real
+  // one-time exec overhead on its first invocation. The injected clock
+  // steps through fixed values on each sleep() call rather than
+  // advancing in real time, so the aggregate boundary itself is landed
+  // on deterministically.
+  const timeoutMs = 749;
+  const aggregateMs = timeoutMs + ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS; // 999ms
+  // aggregateMs - 49 trips the aggregate deadline (its own 250ms
+  // settlement grace makes 749ms the threshold) while sitting below the
+  // shared 1000ms retry-scheduling bound - the one clock value where the
+  // two guards can disagree, which is what makes this test discriminate
+  // between them rather than merely landing after both have expired.
+  const clockValues = [0, aggregateMs - 49, aggregateMs];
+  let callCount = 0;
+  const steppedClock = {
+    now: () => clockValues[Math.min(callCount, clockValues.length - 1)]!,
+    sleep: async (ms: number) => {
+      callCount++;
+      await new Promise((resolve) => setTimeout(resolve, Math.min(ms, 5)));
+    },
+  };
+
+  let result: Awaited<ReturnType<typeof readPidStartTimesBatchPosix>>;
+  try {
+    process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
+    result = await readPidStartTimesBatchPosix([99_999_991], timeoutMs, steppedClock);
+  } finally {
+    process.env.PATH = realPath;
+  }
+
+  assert.deepEqual(
+    result,
+    { status: "ok", rows: [] },
+    "a persistently-missing pid still settles ok with empty rows, exactly as before this fix - the aggregate cap only bounds HOW LONG retrying continues, never the final answer's shape"
+  );
+
+  const invocationCount = fs
+    .readFileSync(invocationMarker, "utf8")
+    .split("\n")
+    .filter((line) => line.trim().length > 0).length;
+  // Exactly ONE real `ps` invocation: the first attempt's not-found
+  // result starts the retry window (deadline at 1000ms), the injected
+  // clock then steps to 950ms - past the 999ms aggregate deadline's own
+  // 749ms threshold, but still short of that 1000ms retry-scheduling
+  // deadline - and the SECOND iteration's own aggregate check ends the
+  // loop before a second real `ps` call is ever attempted. Because the
+  // retry-scheduling bound has NOT yet been reached at that same clock
+  // value, only the aggregate guard can be responsible for stopping
+  // this: without it, the second iteration would fall through to
+  // computing its own effective per-call timeout from a negative
+  // remaining-aggregate budget, which throws rather than settling `ok`.
+  assert.equal(
+    invocationCount,
+    1,
+    `expected exactly ONE real ps invocation - the 999ms aggregate deadline (749ms timeoutMs + 250ms grace, below the shared 1000ms not-found bound) must end retrying before a second real call, saw ${invocationCount}`
+  );
+});
 
 // --- captureEscalationIdentitySnapshot: the pre-SIGTERM membership snapshot ---
 
@@ -4932,295 +5156,314 @@ function runJobIdOf(result: ReturnType<typeof runTool.handler>): string {
   return jobId as string;
 }
 
-// REGRESSION for the fail-open GHANTIKA_CWD_ROOTS bug: a non-empty raw
-// value that splits and filters down to zero effective roots (a lone
-// `path.delimiter`, on its own) must NOT be read as "unrestricted" - it
-// must deny every cwd. Exercised through the REAL run() production path
-// (not resolveCwd directly), because the real defect was reachable there:
-// a job with this env var set could spawn and exit 0 in an arbitrary
-// directory outside every intended root.
-test("REGRESSION: run() rejects every cwd, never spawning, when GHANTIKA_CWD_ROOTS is set to a non-empty value that filters to zero effective roots", () => {
-  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-run-delimonly-"));
-  const original = process.env[CWD_ROOTS_ENV_VAR_NAME];
-  try {
-    process.env[CWD_ROOTS_ENV_VAR_NAME] = path.delimiter;
-    const result = runTool.handler({ command: ["true"], cwd: outside });
-    const jobId = runJobIdOf(result);
-    const record = jobStore.get(jobId)!;
-    // createFailedJob settles the job synchronously and immediately - no
-    // real child was ever spawned, so no wait-for-terminal is needed.
-    assert.equal(record.state, "failed");
-    assert.equal(record.diagnostic?.reason, "spawn-error");
-    assert.match(record.diagnostic!.message, /outside the configured allowed roots/);
-  } finally {
-    if (original === undefined) delete process.env[CWD_ROOTS_ENV_VAR_NAME];
-    else process.env[CWD_ROOTS_ENV_VAR_NAME] = original;
-  }
-});
-
-test(
-  "run(): omitting deadline_ms leaves a job's own natural lifecycle completely untouched, even across a huge mocked time jump - no deadline was ever scheduled to expire",
-  { skip: POSIX_PROCESS_GROUP_SKIP },
-  async (t) => {
-    t.mock.timers.enable({ apis: ["setTimeout"] });
-    const result = runTool.handler({ command: ["sleep", "60"] }); // deadline_ms omitted entirely
-    const jobId = runJobIdOf(result);
-    const handle = jobStore.getChildHandle(jobId)!;
-
-    // A jump far larger than any deadline this file sets anywhere else -
-    // if this feature's mere existence affected an un-timed job at all,
-    // this is where it would show up.
-    t.mock.timers.tick(10 * 60 * 1000);
-    t.mock.timers.reset();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-
+// This suite's spawning children need requireSpawnPolicy; its pre-policy
+// validation children do not: each of the four tests below returns
+// before src/tools/run.ts ever reaches
+// decideRunPolicy/decideShellPolicy - the cwd-roots regression settles via
+// createFailedJob from resolveCwd, and the three deadline_ms rejections
+// settle via validateRunInput - so none of them needs, or is affected by,
+// GHANTIKA_POLICY_FILE being set. Guarding this describe would fail these
+// four under an unset policy for no reason connected to what they assert.
+describe("Optional per-job execution deadline (real run() tool) - pre-policy validation", () => {
+  // REGRESSION for the fail-open GHANTIKA_CWD_ROOTS bug: a non-empty raw
+  // value that splits and filters down to zero effective roots (a lone
+  // `path.delimiter`, on its own) must NOT be read as "unrestricted" - it
+  // must deny every cwd. Exercised through the REAL run() production path
+  // (not resolveCwd directly), because the real defect was reachable there:
+  // a job with this env var set could spawn and exit 0 in an arbitrary
+  // directory outside every intended root.
+  test("REGRESSION: run() rejects every cwd, never spawning, when GHANTIKA_CWD_ROOTS is set to a non-empty value that filters to zero effective roots", () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-cwdroots-run-delimonly-"));
+    const original = process.env[CWD_ROOTS_ENV_VAR_NAME];
     try {
-      assert.equal(
-        jobStore.get(jobId)!.state,
-        "running",
-        "an un-timed job must still be running after a huge mocked time jump - nothing was ever scheduled to end it early"
-      );
-      assert.equal(
-        isProcessGroupAlive(handle.pid),
-        true,
-        "a real, external liveness check must confirm the process is still genuinely alive, not merely trust the job record's own state"
-      );
+      process.env[CWD_ROOTS_ENV_VAR_NAME] = path.delimiter;
+      const result = runTool.handler({ command: ["true"], cwd: outside });
+      const jobId = runJobIdOf(result);
+      const record = jobStore.get(jobId)!;
+      // createFailedJob settles the job synchronously and immediately - no
+      // real child was ever spawned, so no wait-for-terminal is needed.
+      assert.equal(record.state, "failed");
+      assert.equal(record.diagnostic?.reason, "spawn-error");
+      assert.match(record.diagnostic!.message, /outside the configured allowed roots/);
     } finally {
-      process.kill(-handle.pid, "SIGKILL");
+      if (original === undefined) delete process.env[CWD_ROOTS_ENV_VAR_NAME];
+      else process.env[CWD_ROOTS_ENV_VAR_NAME] = original;
     }
-  }
-);
+  });
 
-test(
-  "run(): a still-running job whose deadline_ms elapses is terminated through the real process-group kill machinery, recorded as failed with its record still present - driven entirely by a deterministic mocked clock, never a real sleep for the deadline itself",
-  { skip: POSIX_PROCESS_GROUP_SKIP },
-  async (t) => {
-    const deadlineMs = 200_000; // reachable only by advancing the mocked clock - a real wait this long would make this test itself the thing it is meant to prove unnecessary
-    t.mock.timers.enable({ apis: ["setTimeout"] });
-    const result = runTool.handler({ command: ["sleep", "600"], deadline_ms: deadlineMs });
-    const jobId = runJobIdOf(result);
-    const handle = jobStore.getChildHandle(jobId)!;
-    const pid = handle.pid;
+  test("run(): deadline_ms rejects a non-positive or non-finite value rather than silently accepting it", () => {
+    for (const badValue of [
+      0,
+      -1,
+      -1000,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+    ]) {
+      const result = runTool.handler({ command: ["true"], deadline_ms: badValue });
+      assert.equal(result.isError, true, `expected deadline_ms: ${badValue} to be rejected`);
+    }
+  });
 
-    assert.notEqual(
-      jobStore.get(jobId)!.state,
-      "failed",
-      "the job must not already be failed before its deadline has elapsed at all"
+  test("run(): deadline_ms rejects a non-number value", () => {
+    for (const badValue of ["1000", true, [], {}, null]) {
+      const result = runTool.handler({
+        command: ["true"],
+        deadline_ms: badValue as unknown as number,
+      });
+      assert.equal(
+        result.isError,
+        true,
+        `expected deadline_ms: ${JSON.stringify(badValue)} to be rejected`
+      );
+    }
+  });
+
+  test("run(): deadline_ms rejects the first value above Node's own timer maximum, before ever spawning - Node itself would otherwise silently clamp this to a near-immediate deadline rather than honoring the requested one", () => {
+    const result = runTool.handler({ command: ["sleep", "60"], deadline_ms: 2_147_483_648 });
+    assert.equal(result.isError, true, "the first overflowing value must be rejected outright");
+    assert.match(
+      (result.content[0] as { text: string }).text,
+      /2147483647/,
+      "the rejection message must name Node's own maximum, not just say the value is invalid"
     );
-
-    // Advance the mocked clock past the deadline - the entire "wait" this
-    // test ever performs for the deadline itself - then hand real timers
-    // back so the real kill mechanics this fires off (the identity gate,
-    // the real SIGTERM, the grace-period wait, the external confirmation)
-    // run and complete against the real spawned process on real time,
-    // exactly as this file's own existing kill tests already do elsewhere.
-    t.mock.timers.tick(deadlineMs);
-    t.mock.timers.reset();
-
-    await waitFor(() => jobStore.get(jobId)?.state === "failed", 5000);
-    // A real, external, no-zombie-survivors liveness check - polled rather
-    // than sampled once, so a process still mid-death from the SIGTERM this
-    // codebase just sent cannot read as a flaky failure.
-    await waitFor(() => !isProcessGroupAlive(pid), 5000);
-
-    const record = jobStore.get(jobId)!;
-    assert.equal(record.state, "failed");
-    assert.ok(
-      KNOWN_JOB_STATES.includes(record.state),
-      `expected one of this codebase's five pre-existing job states, got "${record.state}"`
-    );
-    assert.notEqual(record.state, "expired", "a deadline must never introduce a new job status");
-    assert.equal(
-      record.diagnostic?.reason,
-      "watcher/runtime-error",
-      "a deadline-exceeded job must reuse the same closed diagnostic-reason enum every other failed job already uses, never a bespoke one"
-    );
-    assert.match(record.diagnostic!.message, /deadline/i);
-    assert.equal(
-      isProcessGroupAlive(pid),
-      false,
-      "the real process group must be genuinely dead - an external liveness observation, not merely a claimed state"
-    );
-
-    // A deadline is a job-layer concern only - it must never surface as
-    // anything other than an ordinary failed job's own real output counts.
-    assert.equal(jobStore.getOutputCounts(jobId).stdout_lines, 0);
-
-    // The deadline transition itself does not remove the job's record -
-    // it is present immediately after the deadline failure. This does not
-    // claim the record is retained forever: see the combined test below
-    // for what happens once TASK_TTL_MS has also elapsed and a Tasks read
-    // triggers the purge.
-    assert.equal(
-      jobStore.has(jobId),
-      true,
-      "a deadline-expired job's record must be present immediately after the deadline fires"
-    );
-    assert.notEqual(jobStore.get(jobId), undefined);
-  }
-);
-
-test(
-  "run(): a deadline-expired job's record, present right after the deadline fires, is later purged by the ordinary Tasks-extension TTL read once TASK_TTL_MS has also elapsed - the two mechanisms compose, proving the distinctness claim above rather than merely asserting it",
-  { skip: POSIX_PROCESS_GROUP_SKIP },
-  async (t) => {
-    const deadlineMs = 200_000;
-    t.mock.timers.enable({ apis: ["setTimeout"] });
-    const result = runTool.handler({ command: ["sleep", "600"], deadline_ms: deadlineMs });
-    const jobId = runJobIdOf(result);
-    const handle = jobStore.getChildHandle(jobId)!;
-    const pid = handle.pid;
-
-    t.mock.timers.tick(deadlineMs);
-    t.mock.timers.reset();
-
-    await waitFor(() => jobStore.get(jobId)?.state === "failed", 5000);
-    await waitFor(() => !isProcessGroupAlive(pid), 5000);
-
-    // Immediately after the deadline fires: failed, record present -
-    // the same claim the test above already covers, re-asserted here as
-    // the starting point this test's own TTL half builds on.
-    assert.equal(jobStore.get(jobId)!.state, "failed");
-    assert.equal(jobStore.has(jobId), true);
-
-    // getTask takes an explicit `now`, so the TTL half needs no timer
-    // mock at all - just a computed instant past TASK_TTL_MS from this
-    // job's real end time.
-    const endedAtMs = jobStore.get(jobId)!.ended_at
-      ? new Date(jobStore.get(jobId)!.ended_at!).getTime()
-      : Date.now();
-    const notYetPastTtl = getTask(jobId, endedAtMs + TASK_TTL_MS - 1000);
-    assert.equal(
-      notYetPastTtl.status,
-      "failed",
-      "just under TASK_TTL_MS since the deadline-driven end, the record must still read normally"
-    );
-    assert.equal(jobStore.has(jobId), true, "not yet purged - still under TASK_TTL_MS");
-
-    // getTask THROWS (task_not_found, -32602) rather than returning a
-    // tagged success value on the released contract - see
-    // src/tasksAdapter.ts's own taskNotFoundError docs.
-    assert.throws(
-      () => getTask(jobId, endedAtMs + TASK_TTL_MS + 1000),
-      (error: unknown) => {
-        const message = String((error as { message?: unknown })?.message ?? error);
-        return /-32602|not found|task_not_found/i.test(message);
-      },
-      "expected the deadline-failed record to be purged past TASK_TTL_MS by the ordinary TTL read, throwing task_not_found"
-    );
-    assert.equal(
-      jobStore.has(jobId),
-      false,
-      "the TTL read must have actually removed the record from jobStore, not merely reported it as gone"
-    );
-  }
-);
-
-test(
-  "run(): a job that finishes naturally well before its own deadline keeps its natural outcome - the deadline timer never fires and never overrides a real result",
-  { skip: POSIX_PROCESS_GROUP_SKIP },
-  async () => {
-    const result = runTool.handler({
-      command: ["sh", "-c", "exit 7"],
-      deadline_ms: 3000, // a real deadline the job's own near-instant exit will always beat
-    });
-    const jobId = runJobIdOf(result);
-
-    await waitFor(() => jobStore.get(jobId)?.state === "exited", 5000);
-
-    const record = jobStore.get(jobId)!;
-    assert.equal(record.state, "exited");
-    assert.equal(record.exit_code, 7);
-    assert.equal(
-      record.diagnostic,
-      undefined,
-      "a job that finished on its own must never carry a deadline-exceeded diagnostic"
-    );
-  }
-);
-
-test("run(): deadline_ms rejects a non-positive or non-finite value rather than silently accepting it", () => {
-  for (const badValue of [
-    0,
-    -1,
-    -1000,
-    Number.NaN,
-    Number.POSITIVE_INFINITY,
-    Number.NEGATIVE_INFINITY,
-  ]) {
-    const result = runTool.handler({ command: ["true"], deadline_ms: badValue });
-    assert.equal(result.isError, true, `expected deadline_ms: ${badValue} to be rejected`);
-  }
+    // validateRunInput (see validateDeadlineMs) fails and this handler
+    // returns via toolError() BEFORE ever reaching the block that resolves
+    // cwd/executable, calls spawnManaged, or generates a job id - reading
+    // that control flow directly shows no path from a rejected deadline_ms
+    // to a real spawn. So the isError assertion above already establishes
+    // "no job started" by construction; there is no observable job id or
+    // process to additionally check, the same way the sibling rejection
+    // tests below (non-positive/non-finite, non-number) don't either.
+  });
 });
 
-test("run(): deadline_ms rejects a non-number value", () => {
-  for (const badValue of ["1000", true, [], {}, null]) {
-    const result = runTool.handler({
-      command: ["true"],
-      deadline_ms: badValue as unknown as number,
-    });
-    assert.equal(
-      result.isError,
-      true,
-      `expected deadline_ms: ${JSON.stringify(badValue)} to be rejected`
-    );
+// Every test below is POSIX_PROCESS_GROUP_SKIP on win32, so the
+// registration is conditioned on the same predicate - otherwise the hook
+// would throw on unset policy on win32 with nothing left to guard.
+describe("Optional per-job execution deadline (real run() tool)", () => {
+  if (process.platform !== "win32") {
+    before(requireSpawnPolicy);
   }
-});
 
-test("run(): deadline_ms rejects the first value above Node's own timer maximum, before ever spawning - Node itself would otherwise silently clamp this to a near-immediate deadline rather than honoring the requested one", () => {
-  const result = runTool.handler({ command: ["sleep", "60"], deadline_ms: 2_147_483_648 });
-  assert.equal(result.isError, true, "the first overflowing value must be rejected outright");
-  assert.match(
-    (result.content[0] as { text: string }).text,
-    /2147483647/,
-    "the rejection message must name Node's own maximum, not just say the value is invalid"
+  test(
+    "run(): omitting deadline_ms leaves a job's own natural lifecycle completely untouched, even across a huge mocked time jump - no deadline was ever scheduled to expire",
+    { skip: POSIX_PROCESS_GROUP_SKIP },
+    async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const result = runTool.handler({ command: ["sleep", "60"] }); // deadline_ms omitted entirely
+      const jobId = runJobIdOf(result);
+      const handle = jobStore.getChildHandle(jobId)!;
+
+      // A jump far larger than any deadline this file sets anywhere else -
+      // if this feature's mere existence affected an un-timed job at all,
+      // this is where it would show up.
+      t.mock.timers.tick(10 * 60 * 1000);
+      t.mock.timers.reset();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      try {
+        assert.equal(
+          jobStore.get(jobId)!.state,
+          "running",
+          "an un-timed job must still be running after a huge mocked time jump - nothing was ever scheduled to end it early"
+        );
+        assert.equal(
+          isProcessGroupAlive(handle.pid),
+          true,
+          "a real, external liveness check must confirm the process is still genuinely alive, not merely trust the job record's own state"
+        );
+      } finally {
+        process.kill(-handle.pid, "SIGKILL");
+      }
+    }
   );
-  // validateRunInput (see validateDeadlineMs) fails and this handler
-  // returns via toolError() BEFORE ever reaching the block that resolves
-  // cwd/executable, calls spawnManaged, or generates a job id - reading
-  // that control flow directly shows no path from a rejected deadline_ms
-  // to a real spawn. So the isError assertion above already establishes
-  // "no job started" by construction; there is no observable job id or
-  // process to additionally check, the same way the sibling rejection
-  // tests above (non-positive/non-finite, non-number) don't either.
-});
 
-test(
-  "run(): deadline_ms accepts Node's own exact timer maximum (2147483647) - the supported boundary is not accidentally excluded by the overflow rejection above",
-  { skip: POSIX_PROCESS_GROUP_SKIP },
-  async (t) => {
-    t.mock.timers.enable({ apis: ["setTimeout"] });
-    const result = runTool.handler({
-      command: ["sleep", "600"],
-      deadline_ms: 2_147_483_647,
-    });
-    assert.equal(result.isError, undefined, "the exact supported maximum must be accepted");
-    const jobId = runJobIdOf(result);
-    assert.notEqual(
-      jobStore.get(jobId)!.state,
-      "failed",
-      "the job must be running normally immediately after accepting the boundary deadline"
-    );
+  test(
+    "run(): a still-running job whose deadline_ms elapses is terminated through the real process-group kill machinery, recorded as failed with its record still present - driven entirely by a deterministic mocked clock, never a real sleep for the deadline itself",
+    { skip: POSIX_PROCESS_GROUP_SKIP },
+    async (t) => {
+      const deadlineMs = 200_000; // reachable only by advancing the mocked clock - a real wait this long would make this test itself the thing it is meant to prove unnecessary
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const result = runTool.handler({ command: ["sleep", "600"], deadline_ms: deadlineMs });
+      const jobId = runJobIdOf(result);
+      const handle = jobStore.getChildHandle(jobId)!;
+      const pid = handle.pid;
 
-    // Prove the timer was genuinely scheduled at this exact value, not
-    // silently rounded or dropped - tick the mocked clock to one
-    // millisecond short of it first (must NOT fire), then to the exact
-    // value (must fire), reusing this file's own real-kill-verification
-    // pattern rather than a bare timer-scheduled assertion.
-    t.mock.timers.tick(2_147_483_646);
-    assert.notEqual(
-      jobStore.get(jobId)!.state,
-      "failed",
-      "the deadline must not fire one millisecond early"
-    );
-    t.mock.timers.tick(1);
-    t.mock.timers.reset();
+      assert.notEqual(
+        jobStore.get(jobId)!.state,
+        "failed",
+        "the job must not already be failed before its deadline has elapsed at all"
+      );
 
-    await waitFor(() => jobStore.get(jobId)?.state === "failed", 5000);
-    const handle = jobStore.getChildHandle(jobId);
-    if (handle !== undefined) {
-      await waitFor(() => !isProcessGroupAlive(handle.pid), 5000);
+      // Advance the mocked clock past the deadline - the entire "wait" this
+      // test ever performs for the deadline itself - then hand real timers
+      // back so the real kill mechanics this fires off (the identity gate,
+      // the real SIGTERM, the grace-period wait, the external confirmation)
+      // run and complete against the real spawned process on real time,
+      // exactly as this file's own existing kill tests already do elsewhere.
+      t.mock.timers.tick(deadlineMs);
+      t.mock.timers.reset();
+
+      await waitFor(() => jobStore.get(jobId)?.state === "failed", 5000);
+      // A real, external, no-zombie-survivors liveness check - polled rather
+      // than sampled once, so a process still mid-death from the SIGTERM this
+      // codebase just sent cannot read as a flaky failure.
+      await waitFor(() => !isProcessGroupAlive(pid), 5000);
+
+      const record = jobStore.get(jobId)!;
+      assert.equal(record.state, "failed");
+      assert.ok(
+        KNOWN_JOB_STATES.includes(record.state),
+        `expected one of this codebase's five pre-existing job states, got "${record.state}"`
+      );
+      assert.notEqual(record.state, "expired", "a deadline must never introduce a new job status");
+      assert.equal(
+        record.diagnostic?.reason,
+        "watcher/runtime-error",
+        "a deadline-exceeded job must reuse the same closed diagnostic-reason enum every other failed job already uses, never a bespoke one"
+      );
+      assert.match(record.diagnostic!.message, /deadline/i);
+      assert.equal(
+        isProcessGroupAlive(pid),
+        false,
+        "the real process group must be genuinely dead - an external liveness observation, not merely a claimed state"
+      );
+
+      // A deadline is a job-layer concern only - it must never surface as
+      // anything other than an ordinary failed job's own real output counts.
+      assert.equal(jobStore.getOutputCounts(jobId).stdout_lines, 0);
+
+      // The deadline transition itself does not remove the job's record -
+      // it is present immediately after the deadline failure. This does not
+      // claim the record is retained forever: see the combined test below
+      // for what happens once TASK_TTL_MS has also elapsed and a Tasks read
+      // triggers the purge.
+      assert.equal(
+        jobStore.has(jobId),
+        true,
+        "a deadline-expired job's record must be present immediately after the deadline fires"
+      );
+      assert.notEqual(jobStore.get(jobId), undefined);
     }
-    assert.equal(jobStore.get(jobId)!.diagnostic?.reason, "watcher/runtime-error");
-  }
-);
+  );
+
+  test(
+    "run(): a deadline-expired job's record, present right after the deadline fires, is later purged by the ordinary Tasks-extension TTL read once TASK_TTL_MS has also elapsed - the two mechanisms compose, proving the distinctness claim above rather than merely asserting it",
+    { skip: POSIX_PROCESS_GROUP_SKIP },
+    async (t) => {
+      const deadlineMs = 200_000;
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const result = runTool.handler({ command: ["sleep", "600"], deadline_ms: deadlineMs });
+      const jobId = runJobIdOf(result);
+      const handle = jobStore.getChildHandle(jobId)!;
+      const pid = handle.pid;
+
+      t.mock.timers.tick(deadlineMs);
+      t.mock.timers.reset();
+
+      await waitFor(() => jobStore.get(jobId)?.state === "failed", 5000);
+      await waitFor(() => !isProcessGroupAlive(pid), 5000);
+
+      // Immediately after the deadline fires: failed, record present -
+      // the same claim the test above already covers, re-asserted here as
+      // the starting point this test's own TTL half builds on.
+      assert.equal(jobStore.get(jobId)!.state, "failed");
+      assert.equal(jobStore.has(jobId), true);
+
+      // getTask takes an explicit `now`, so the TTL half needs no timer
+      // mock at all - just a computed instant past TASK_TTL_MS from this
+      // job's real end time.
+      const endedAtMs = jobStore.get(jobId)!.ended_at
+        ? new Date(jobStore.get(jobId)!.ended_at!).getTime()
+        : Date.now();
+      const notYetPastTtl = getTask(jobId, endedAtMs + TASK_TTL_MS - 1000);
+      assert.equal(
+        notYetPastTtl.status,
+        "failed",
+        "just under TASK_TTL_MS since the deadline-driven end, the record must still read normally"
+      );
+      assert.equal(jobStore.has(jobId), true, "not yet purged - still under TASK_TTL_MS");
+
+      // getTask THROWS (task_not_found, -32602) rather than returning a
+      // tagged success value on the released contract - see
+      // src/tasksAdapter.ts's own taskNotFoundError docs.
+      assert.throws(
+        () => getTask(jobId, endedAtMs + TASK_TTL_MS + 1000),
+        (error: unknown) => {
+          const message = String((error as { message?: unknown })?.message ?? error);
+          return /-32602|not found|task_not_found/i.test(message);
+        },
+        "expected the deadline-failed record to be purged past TASK_TTL_MS by the ordinary TTL read, throwing task_not_found"
+      );
+      assert.equal(
+        jobStore.has(jobId),
+        false,
+        "the TTL read must have actually removed the record from jobStore, not merely reported it as gone"
+      );
+    }
+  );
+
+  test(
+    "run(): a job that finishes naturally well before its own deadline keeps its natural outcome - the deadline timer never fires and never overrides a real result",
+    { skip: POSIX_PROCESS_GROUP_SKIP },
+    async () => {
+      const result = runTool.handler({
+        command: ["sh", "-c", "exit 7"],
+        deadline_ms: 3000, // a real deadline the job's own near-instant exit will always beat
+      });
+      const jobId = runJobIdOf(result);
+
+      await waitFor(() => jobStore.get(jobId)?.state === "exited", 5000);
+
+      const record = jobStore.get(jobId)!;
+      assert.equal(record.state, "exited");
+      assert.equal(record.exit_code, 7);
+      assert.equal(
+        record.diagnostic,
+        undefined,
+        "a job that finished on its own must never carry a deadline-exceeded diagnostic"
+      );
+    }
+  );
+
+  test(
+    "run(): deadline_ms accepts Node's own exact timer maximum (2147483647) - the supported boundary is not accidentally excluded by the overflow rejection above",
+    { skip: POSIX_PROCESS_GROUP_SKIP },
+    async (t) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const result = runTool.handler({
+        command: ["sleep", "600"],
+        deadline_ms: 2_147_483_647,
+      });
+      assert.equal(result.isError, undefined, "the exact supported maximum must be accepted");
+      const jobId = runJobIdOf(result);
+      assert.notEqual(
+        jobStore.get(jobId)!.state,
+        "failed",
+        "the job must be running normally immediately after accepting the boundary deadline"
+      );
+
+      // Prove the timer was genuinely scheduled at this exact value, not
+      // silently rounded or dropped - tick the mocked clock to one
+      // millisecond short of it first (must NOT fire), then to the exact
+      // value (must fire), reusing this file's own real-kill-verification
+      // pattern rather than a bare timer-scheduled assertion.
+      t.mock.timers.tick(2_147_483_646);
+      assert.notEqual(
+        jobStore.get(jobId)!.state,
+        "failed",
+        "the deadline must not fire one millisecond early"
+      );
+      t.mock.timers.tick(1);
+      t.mock.timers.reset();
+
+      await waitFor(() => jobStore.get(jobId)?.state === "failed", 5000);
+      const handle = jobStore.getChildHandle(jobId);
+      if (handle !== undefined) {
+        await waitFor(() => !isProcessGroupAlive(handle.pid), 5000);
+      }
+      assert.equal(jobStore.get(jobId)!.diagnostic?.reason, "watcher/runtime-error");
+    }
+  );
+});
