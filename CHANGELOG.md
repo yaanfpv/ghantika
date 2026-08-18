@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 - Corrected a comment in the CI configuration that understated which checks branch protection actually requires.
+- Local test runs can now opt into bounded file concurrency instead of running one file at a time, cutting a direct suite run's wall-clock time by roughly two-thirds on this host with no change in coverage. CI stays serial; this is a local-only, opt-in speedup for the plain suite run, not the coverage-bound gate.
 - Fixed the batched process-identity read treating a single transient not-found observation as a final, confident result instead of retrying, closing an asymmetry with the single-pid read, which already retried.
 
 ### Added

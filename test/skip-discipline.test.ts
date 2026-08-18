@@ -22,6 +22,7 @@ import {
   isTodoValue,
   loadCriticalTests,
   loadSkipBaseline,
+  parseArgs,
 } from "../scripts/run-tests.mjs";
 import { pgrepGroupMembers } from "./harness.ts";
 
@@ -1551,5 +1552,173 @@ test("scripts/run-tests.mjs itself contains no reference to any of the four hist
       !sourceText.includes(name),
       `scripts/run-tests.mjs must not reference ${name} anywhere in its own source`
     );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// File-level concurrency. --test-timeout on `node --test`'s own
+// CLI is a DIFFERENT knob from the `concurrency` option this repo's own
+// run({ files, ... }) call reads (see run-tests.mjs's own doc comment on
+// this option, including the measured sweep behind its recommended
+// value) - a CLI flag that merely gets parsed but never reaches the real
+// run() call would pass a bare parseArgs() unit check while doing
+// nothing. The tests below prove concurrency behavior reaches the real
+// run() call by observing genuine wall-clock overlap (or its absence)
+// between two real spawned test-file processes, never by parsing alone -
+// covering both the unset default (must stay strictly serial) and the
+// explicit --test-concurrency=N opt-in.
+// ---------------------------------------------------------------------------
+
+test("parseArgs maps --test-concurrency to options.concurrency, and the unset default is undefined - no concurrency key reaches run() unless a caller opts in", () => {
+  assert.equal(parseArgs([]).concurrency, undefined);
+  assert.equal(parseArgs(["--test-concurrency=4"]).concurrency, 4);
+  assert.equal(parseArgs(["--test-concurrency=6"]).concurrency, 6);
+});
+
+/**
+ * Two fixture test files, each writing its own start timestamp to a
+ * private marker file before sleeping `sleepMs` - long enough that a
+ * genuine overlap gap (tens to low hundreds of ms, even under real host
+ * contention) and a genuine serial gap (at least `sleepMs` plus spawn
+ * overhead) never land in the same range, so one fixture serves both the
+ * overlap proof and its serial control below.
+ */
+function buildConcurrencyProbeFiles(dir: string, sleepMs: number) {
+  const markerA = path.join(dir, "start-a.json");
+  const markerB = path.join(dir, "start-b.json");
+  const probe = (markerPath: string) =>
+    [
+      'import { test } from "node:test";',
+      'import { writeFileSync } from "node:fs";',
+      'test("concurrency probe", async () => {',
+      `  writeFileSync(${JSON.stringify(markerPath)}, JSON.stringify({ start: Date.now() }));`,
+      `  await new Promise((resolve) => setTimeout(resolve, ${sleepMs}));`,
+      "});",
+      "",
+    ].join("\n");
+  return {
+    files: { "a.test.mjs": probe(markerA), "b.test.mjs": probe(markerB) },
+    markerA,
+    markerB,
+  };
+}
+
+function readStartGapMs(markerA: string, markerB: string): number {
+  const a = JSON.parse(readFileSync(markerA, "utf8")) as { start: number };
+  const b = JSON.parse(readFileSync(markerB, "utf8")) as { start: number };
+  return Math.abs(a.start - b.start);
+}
+
+test("omitting --test-concurrency entirely still runs discovered test files strictly serially - the default this option must not silently change", () => {
+  const SLEEP_MS = 1200;
+  const dir = realpathSync(mkdtempSync(path.join(tmpdir(), "ghantika-concurrency-unset-")));
+  try {
+    const { files, markerA, markerB } = buildConcurrencyProbeFiles(dir, SLEEP_MS);
+    for (const [relPath, content] of Object.entries(files)) {
+      writeFileSync(path.join(dir, relPath), content);
+    }
+    const baselinePath = path.join(dir, "skip-baseline.json");
+    const criticalPath = path.join(dir, "critical-tests.json");
+    writeFileSync(baselinePath, "{}");
+    writeFileSync(criticalPath, "[]");
+
+    const env = { ...process.env };
+    delete env.GHANTIKA_JUNIT;
+    delete env.NODE_TEST_CONTEXT;
+
+    // No --test-concurrency flag anywhere in argv - this is the exact
+    // shape CI and the local gate's `coverage` job both invoke this
+    // harness with, and the shape any local `node scripts/run-tests.mjs`
+    // invocation gets unless the caller opts in explicitly.
+    const result = collectChildResult(HARNESS_PATH, [dir, baselinePath, criticalPath], env);
+    assert.equal(
+      result.status,
+      0,
+      `expected exit 0, got ${result.status}. stderr: ${result.stderr}`
+    );
+
+    const gapMs = readStartGapMs(markerA, markerB);
+    assert.ok(
+      gapMs >= 1000,
+      `expected the second file to start at least ~${SLEEP_MS}ms after the first with no --test-concurrency flag (strictly serial default), got only a ${gapMs}ms gap`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("--test-concurrency=2 makes two real discovered test-file processes genuinely overlap in wall-clock time", () => {
+  const SLEEP_MS = 1200;
+  const dir = realpathSync(mkdtempSync(path.join(tmpdir(), "ghantika-concurrency-overlap-")));
+  try {
+    const { files, markerA, markerB } = buildConcurrencyProbeFiles(dir, SLEEP_MS);
+    for (const [relPath, content] of Object.entries(files)) {
+      writeFileSync(path.join(dir, relPath), content);
+    }
+    const baselinePath = path.join(dir, "skip-baseline.json");
+    const criticalPath = path.join(dir, "critical-tests.json");
+    writeFileSync(baselinePath, "{}");
+    writeFileSync(criticalPath, "[]");
+
+    const env = { ...process.env };
+    delete env.GHANTIKA_JUNIT;
+    delete env.NODE_TEST_CONTEXT;
+
+    const result = collectChildResult(
+      HARNESS_PATH,
+      [dir, baselinePath, criticalPath, "--test-concurrency=2"],
+      env
+    );
+    assert.equal(
+      result.status,
+      0,
+      `expected exit 0, got ${result.status}. stderr: ${result.stderr}`
+    );
+
+    const gapMs = readStartGapMs(markerA, markerB);
+    assert.ok(
+      gapMs < 500,
+      `expected both files to start within 500ms of each other at concurrency=2 (genuine overlap), got a ${gapMs}ms gap`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("explicitly opting into --test-concurrency=1 still runs discovered test files strictly serially, matching the unset default", () => {
+  const SLEEP_MS = 1200;
+  const dir = realpathSync(mkdtempSync(path.join(tmpdir(), "ghantika-concurrency-serial-")));
+  try {
+    const { files, markerA, markerB } = buildConcurrencyProbeFiles(dir, SLEEP_MS);
+    for (const [relPath, content] of Object.entries(files)) {
+      writeFileSync(path.join(dir, relPath), content);
+    }
+    const baselinePath = path.join(dir, "skip-baseline.json");
+    const criticalPath = path.join(dir, "critical-tests.json");
+    writeFileSync(baselinePath, "{}");
+    writeFileSync(criticalPath, "[]");
+
+    const env = { ...process.env };
+    delete env.GHANTIKA_JUNIT;
+    delete env.NODE_TEST_CONTEXT;
+
+    const result = collectChildResult(
+      HARNESS_PATH,
+      [dir, baselinePath, criticalPath, "--test-concurrency=1"],
+      env
+    );
+    assert.equal(
+      result.status,
+      0,
+      `expected exit 0, got ${result.status}. stderr: ${result.stderr}`
+    );
+
+    const gapMs = readStartGapMs(markerA, markerB);
+    assert.ok(
+      gapMs >= 1000,
+      `expected the second file to start at least ~${SLEEP_MS}ms after the first at concurrency=1 (strictly serial), got only a ${gapMs}ms gap`
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
