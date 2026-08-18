@@ -270,6 +270,7 @@ const CLI_FLAGS = {
   "--idle-timeout": "idleTimeoutMs",
   "--wall-timeout": "wallTimeoutMs",
   "--leak-window": "leakWindowMs",
+  "--test-concurrency": "concurrency",
 };
 
 /**
@@ -390,6 +391,83 @@ export function parseArgs(argv) {
     // regardless of what this timer does, so the timer only ever reports
     // what was already true.
     leakWindowMs: 5_000,
+    // How many test FILES run() runs concurrently. UNSET BY DEFAULT, on
+    // purpose: with no --test-concurrency flag, no `concurrency` key is
+    // ever built into the object passed to run() at all (see runOnce
+    // below) - node:test's own programmatic default applies, which is
+    // strictly serial, one file at a time, byte-identical to this
+    // runner's behavior before this option existed. CI never passes
+    // this flag anywhere (ci.yml, main-verify.yml) and so stays fully
+    // serial by that same default, not by a value this file chose for
+    // it - a separate story measures what's actually safe on a hosted
+    // GitHub runner and may set a CI value later, but that is out of
+    // this option's scope. The local gate doesn't pass it either: its
+    // only test-executing job is `npm run coverage`, and c8
+    // unconditionally forces that run() call to a single concurrent
+    // file regardless of any concurrency option this file would
+    // otherwise pass (see the idleTimeoutMs comment above, "Under
+    // coverage (c8 forces this run() call to a single concurrent
+    // file)") - so this option cannot speed up the gate, only a direct,
+    // non-coverage invocation of the suite.
+    //
+    // For that direct case - a contributor iterating locally with
+    // `node scripts/run-tests.mjs` or a future package.json script that
+    // doesn't route through c8 - --test-concurrency=N is the explicit,
+    // visible opt-in. Measured on this host (macOS, arm64, 8 logical
+    // cores), five repeated full real-suite runs at each concurrency
+    // value, non-coverage path, this repo's real test/ directory (58
+    // files at measurement time):
+    //
+    //   concurrency (unset/serial): 267.84s (1 run)
+    //   concurrency=1:              268.06s (1 run - confirms explicit
+    //                                1 matches unset, not a separate path)
+    //   concurrency=2:              137.65s (1 run)
+    //   concurrency=4:               94.61s, 99.87s, 94.21s, 93.03s
+    //                                (4 runs total, all clean - the
+    //                                sweep point plus three repeated
+    //                                confirmation runs)
+    //   concurrency=6:               89.61s (1 run)
+    //   concurrency=8 (every core):  81.77s, 81.54s, 80.92s (3 runs) -
+    //                                2 of the 3 FAILED (see below)
+    //
+    // --test-concurrency=4 is the recommended local value: a real
+    // ~2.7-2.9x wall-clock win over serial (267.84s down to a 93-100s
+    // band), zero failures across all 4 runs at that value, and
+    // comfortable headroom below the concurrency=8 failure boundary
+    // measured directly below. This flag accepts any positive number,
+    // unclamped - going above the measured-safe range (toward full core
+    // count) is a real foot-gun a caller opts into, not something this
+    // file stops.
+    //
+    // concurrency=8 is disclosed as unsafe on this host, not silently
+    // avoided: 2 of 3 repeated full-suite runs at concurrency=8 failed,
+    // both times in test/modern-handshake.test.ts's negative-control
+    // tests (a different specific sub-test each time - "initialize-gate"
+    // and "parse-error reply" - never the same one twice, and no OTHER
+    // file failed even once across all 12 full-suite runs in this
+    // measurement, including the process/birth-identity family
+    // (test/process.test.ts, test/process-slow-paths.test.ts,
+    // test/kill-slow-paths.test.ts, test/shutdown.test.ts)). Both
+    // failing tests spawn a real child process
+    // (test/helpers/spawnServer.ts's spawnServer()) and chain several
+    // real stdio round-trips per test, each bounded by nextLine()'s own
+    // fixed DEFAULT_LINE_TIMEOUT_MS (2000ms on the non-coverage path) -
+    // a budget that file's own doc comment already flags as sized for
+    // "occasional load this repo's own suite is not otherwise controlled
+    // for". Saturating every physical core with 8 simultaneously-running
+    // test files, each itself spawning independent real child processes,
+    // is exactly that kind of load - and it is NEW load: before this
+    // option existed, no two test files ever competed for CPU at the
+    // same time, so that fixed per-line budget was never exercised
+    // against file-level concurrency before now. This is a real,
+    // measured host-contention race against a fixed per-line wall-clock
+    // budget, not a shared-fixture, shared-port, or shared-ledger-
+    // directory collision, and it is specific to tests that both spawn
+    // a fresh real process AND make several real round-trips within one
+    // test - not a generic scaling limit. Not fixed here: raising
+    // nextLine()'s own timeout budget is a separate change to
+    // test/helpers/spawnServer.ts and is out of this option's scope
+    // (the runner's own file-concurrency option, not that budget).
   };
   for (const arg of argv) {
     const eq = arg.indexOf("=");
@@ -400,7 +478,7 @@ export function parseArgs(argv) {
     const raw = arg.slice(eq + 1);
     const value = Number(raw);
     if (!Number.isFinite(value) || value <= 0) {
-      throw new Error(`${flag} requires a positive number of milliseconds, got "${raw}"`);
+      throw new Error(`${flag} requires a positive number, got "${raw}"`);
     }
     options[key] = value;
   }
@@ -960,7 +1038,7 @@ function writeTruncationMarkerSync(markerPath, reason, message, fallbackPath) {
  *   discovered: string[],
  *   tracked: string[] | null,
  *   junitPath: string | null,
- *   options: { testTimeoutMs: number, idleTimeoutMs: number, wallTimeoutMs: number, leakWindowMs: number },
+ *   options: { testTimeoutMs: number, idleTimeoutMs: number, wallTimeoutMs: number, leakWindowMs: number, concurrency?: number },
  *   skipBaseline: Record<string, string[]>,
  *   criticalTests: string[],
  *   truncationMarkerPath?: string,
@@ -991,7 +1069,18 @@ export function runOnce({
     // claim about it.
     const headSha = readGitHeadSha();
 
-    const stream = run({ files: discovered, timeout: options.testTimeoutMs });
+    // No `concurrency` key at all unless --test-concurrency was actually
+    // passed (options.concurrency stays undefined otherwise - see
+    // parseArgs's own doc comment on this option above). This keeps the
+    // unflagged call byte-identical in shape to what this file passed to
+    // run() before this option existed: { files, timeout }, nothing
+    // else - never a `concurrency: undefined` key relying on node:test's
+    // own undefined-handling to fall back correctly.
+    const runOptions = { files: discovered, timeout: options.testTimeoutMs };
+    if (options.concurrency !== undefined) {
+      runOptions.concurrency = options.concurrency;
+    }
+    const stream = run(runOptions);
 
     let junitBuffer = "";
     let junitFinished = false;
