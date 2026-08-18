@@ -18,23 +18,30 @@
  * actual external client sends `threadId` that way is outside what
  * either file establishes.
  *
- * The two real transport classes making up `DEFAULT_TRANSPORTS` are
+ * The three real transport classes making up `DEFAULT_TRANSPORTS` are
  * neither frozen nor injected via any seam in `tasksAdapter.ts` - it calls
  * `selectAndWake(DEFAULT_TRANSPORTS, ...)` directly, no DI point - so this
- * file spies on the real, singleton `DEFAULT_TRANSPORTS[0]`/`[1]` instances'
- * own `probe()`/`wake()` methods via `t.mock.method`. Importing
+ * file spies on the real, singleton `DEFAULT_TRANSPORTS[0]`/`[1]`/`[2]`
+ * instances' own `probe()`/`wake()` methods via `t.mock.method`. Importing
  * `DEFAULT_TRANSPORTS` from `../dist/wake/selectTransport.js` here is the
  * same module-cache singleton `../dist/tasksAdapter.js` itself imports and
  * calls `selectAndWake(DEFAULT_TRANSPORTS, ...)` against - Node's own ESM
  * module cache is what makes mutating a method on these instances here
  * visible to the adapter's own internal call.
  *
+ * `DEFAULT_TRANSPORTS[0]` is `ClaudeMessagingWakeTransport`, added by
+ * story-0264 - every test below neutralizes it first via
+ * `neutralizeClaudeMessagingTransport` (see that function's own doc
+ * comment for why this is required, not optional, in THIS process). The
+ * app-server and desktop-IPC transports this file actually exercises sit
+ * at indices 1 and 2.
+ *
  * Jobs are created and driven terminal directly via `jobStore.createJob`/
  * `markExited`/`markKilled` - never a real spawned process, never
  * `requestSlot()` (this file never exercises admission control).
  */
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 
 import type { CallToolResult } from "@modelcontextprotocol/server";
 
@@ -143,6 +150,36 @@ function rejectsAsync(message: string): () => Promise<WakeResult> {
   return () => Promise.reject(new Error(message));
 }
 
+/**
+ * Neutralizes the real `ClaudeMessagingWakeTransport` singleton at
+ * `DEFAULT_TRANSPORTS[0]` for the duration of one test, mocking its
+ * `probe()` to report unavailable - REQUIRED at the top of every test
+ * below, not a convenience. This test process is itself a Claude Code
+ * Bash-tool subprocess and genuinely inherits `CLAUDE_CODE_MESSAGING_SOCKET`/
+ * `CLAUDE_CODE_MESSAGING_TOKEN` (Claude Code sets both for every stdio MCP
+ * server subprocess AND every Bash/PowerShell tool subprocess it spawns,
+ * mirroring `CLAUDECODE` itself - see `test/wake-select-transport.test.ts`'s
+ * own `withClaudeCodeEnv` doc comment for that same fact about
+ * `CLAUDECODE`, and this file's own header for why mutating a method on
+ * these singletons here is visible to `tasksAdapter.ts`'s real call).
+ * Left unmocked, the real transport's `probe()` would genuinely connect to
+ * that real socket and report `available: true` - and because
+ * `selectAndWake` tries transports strictly in array order, it would then
+ * be the one every "delivered" assertion below actually exercises, ahead
+ * of the app-server/desktop-IPC mocks this file exists to test, sending a
+ * live NDJSON payload into whichever real session owns that socket. This
+ * function exists specifically to make that impossible.
+ */
+function neutralizeClaudeMessagingTransport(t: TestContext): void {
+  t.mock.method(
+    DEFAULT_TRANSPORTS[0]!,
+    "probe",
+    unavailable(
+      "neutralized for this test - see neutralizeClaudeMessagingTransport's own doc comment"
+    )
+  );
+}
+
 // =============================================================================
 // "absent" AND "malformed" never call selectAndWake - asserted against
 // real spies, never reasoned about.
@@ -150,10 +187,11 @@ function rejectsAsync(message: string): () => Promise<WakeResult> {
 
 test("with the gate ON, resolution 'absent' never calls selectAndWake - the real transports' probe()/wake() are never invoked", async (t) => {
   await withWakeTransportEnabled("1", async () => {
-    const probeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", unreachableProbe);
-    const wakeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", unreachableWake);
-    const probeB = t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unreachableProbe);
-    const wakeB = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", unreachableWake);
+    neutralizeClaudeMessagingTransport(t);
+    const probeA = t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unreachableProbe);
+    const wakeA = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", unreachableWake);
+    const probeB = t.mock.method(DEFAULT_TRANSPORTS[2]!, "probe", unreachableProbe);
+    const wakeB = t.mock.method(DEFAULT_TRANSPORTS[2]!, "wake", unreachableWake);
 
     const job = createNonTerminalJob("resolution-absent");
     const resolution: WakeTargetResolution = { state: "absent" };
@@ -187,10 +225,11 @@ test("with the gate ON, resolution 'absent' never calls selectAndWake - the real
 
 test("with the gate ON, resolution 'malformed' never calls selectAndWake either - logged via console.error, but still zero transport calls", async (t) => {
   await withWakeTransportEnabled("1", async () => {
-    const probeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", unreachableProbe);
-    const wakeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", unreachableWake);
-    const probeB = t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unreachableProbe);
-    const wakeB = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", unreachableWake);
+    neutralizeClaudeMessagingTransport(t);
+    const probeA = t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unreachableProbe);
+    const wakeA = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", unreachableWake);
+    const probeB = t.mock.method(DEFAULT_TRANSPORTS[2]!, "probe", unreachableProbe);
+    const wakeB = t.mock.method(DEFAULT_TRANSPORTS[2]!, "wake", unreachableWake);
     const errorSpy = t.mock.method(console, "error");
 
     const job = createNonTerminalJob("resolution-malformed");
@@ -229,10 +268,11 @@ test("with the gate ON, resolution 'malformed' never calls selectAndWake either 
 
 test("gate OFF (default, no env var set): a 'resolved' target still never calls selectAndWake - proves the default-off behavior directly", async (t) => {
   await withWakeTransportEnabled(undefined, async () => {
-    const probeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", unreachableProbe);
-    const wakeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", unreachableWake);
-    const probeB = t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unreachableProbe);
-    const wakeB = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", unreachableWake);
+    neutralizeClaudeMessagingTransport(t);
+    const probeA = t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unreachableProbe);
+    const wakeA = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", unreachableWake);
+    const probeB = t.mock.method(DEFAULT_TRANSPORTS[2]!, "probe", unreachableProbe);
+    const wakeB = t.mock.method(DEFAULT_TRANSPORTS[2]!, "wake", unreachableWake);
 
     const job = createNonTerminalJob("gate-off-resolved");
     const resolution: WakeTargetResolution = { state: "resolved", target: "thread-gate-off" };
@@ -253,10 +293,11 @@ test("gate OFF (default, no env var set): a 'resolved' target still never calls 
 });
 
 test('the gate is an EXACT match on "1" - "true"/"0"/"yes"/empty-string all read as OFF, never a truthy/falsy env-var check', async (t) => {
-  const probeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", unreachableProbe);
-  const wakeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", unreachableWake);
-  const probeB = t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unreachableProbe);
-  const wakeB = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", unreachableWake);
+  neutralizeClaudeMessagingTransport(t);
+  const probeA = t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unreachableProbe);
+  const wakeA = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", unreachableWake);
+  const probeB = t.mock.method(DEFAULT_TRANSPORTS[2]!, "probe", unreachableProbe);
+  const wakeB = t.mock.method(DEFAULT_TRANSPORTS[2]!, "wake", unreachableWake);
 
   for (const value of ["true", "0", "yes", ""]) {
     await withWakeTransportEnabled(value, async () => {
@@ -285,16 +326,17 @@ test('the gate is an EXACT match on "1" - "true"/"0"/"yes"/empty-string all read
 
 test("gate ON + resolution 'resolved': the first real transport's wake() is called with the exact resolved target and a non-empty, factual payload naming the task", async (t) => {
   await withWakeTransportEnabled("1", async () => {
-    t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", available);
-    const wakeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", delivers("codex-app-server-goal"));
+    neutralizeClaudeMessagingTransport(t);
+    t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", available);
+    const wakeA = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", delivers("codex-app-server-goal"));
     // The second transport must never even be probed once the first
     // delivers - selectAndWake's own already-proven short-circuit (see
     // test/wake-select-transport.test.ts's "first transport probes
     // available and delivers ... second transport's probe/wake are never
     // called" test); re-asserted here against the REAL DEFAULT_TRANSPORTS
     // array this adapter actually calls through.
-    const probeB = t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unreachableProbe);
-    const wakeB = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", unreachableWake);
+    const probeB = t.mock.method(DEFAULT_TRANSPORTS[2]!, "probe", unreachableProbe);
+    const wakeB = t.mock.method(DEFAULT_TRANSPORTS[2]!, "wake", unreachableWake);
 
     const job = createNonTerminalJob("gate-on-resolved");
     const target: WakeTarget = "thread-resolved-target";
@@ -340,9 +382,10 @@ test("gate ON + resolution 'resolved': the first real transport's wake() is call
 
 test("a 'refused' selectAndWake outcome never propagates into the already-minted CallToolResult - the poll floor stays authoritative", async (t) => {
   await withWakeTransportEnabled("1", async () => {
-    t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", available);
-    t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", refuses("codex-app-server-goal"));
-    t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unavailable("skip for this scenario"));
+    neutralizeClaudeMessagingTransport(t);
+    t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", available);
+    t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", refuses("codex-app-server-goal"));
+    t.mock.method(DEFAULT_TRANSPORTS[2]!, "probe", unavailable("skip for this scenario"));
     const errorSpy = t.mock.method(console, "error");
 
     const job = createNonTerminalJob("outcome-refused");
@@ -368,9 +411,10 @@ test("a 'refused' selectAndWake outcome never propagates into the already-minted
 
 test("an 'unavailable' selectAndWake outcome never propagates into the already-minted CallToolResult", async (t) => {
   await withWakeTransportEnabled("1", async () => {
-    t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", available);
-    t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", reportsUnavailable("codex-app-server-goal"));
-    t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unavailable("skip for this scenario"));
+    neutralizeClaudeMessagingTransport(t);
+    t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", available);
+    t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", reportsUnavailable("codex-app-server-goal"));
+    t.mock.method(DEFAULT_TRANSPORTS[2]!, "probe", unavailable("skip for this scenario"));
     const errorSpy = t.mock.method(console, "error");
 
     const job = createNonTerminalJob("outcome-unavailable");
@@ -396,10 +440,11 @@ test("an 'unavailable' selectAndWake outcome never propagates into the already-m
 
 test("selectAndWake itself rejecting (a transport throwing/rejecting all the way out) never propagates into the already-minted CallToolResult, and never crashes the process - caught by this adapter's own .catch", async (t) => {
   await withWakeTransportEnabled("1", async () => {
-    t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", available);
-    t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", rejectsAsync("connection reset"));
+    neutralizeClaudeMessagingTransport(t);
     t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", available);
-    t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", rejectsAsync("no owning client"));
+    t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", rejectsAsync("connection reset"));
+    t.mock.method(DEFAULT_TRANSPORTS[2]!, "probe", available);
+    t.mock.method(DEFAULT_TRANSPORTS[2]!, "wake", rejectsAsync("no owning client"));
     const errorSpy = t.mock.method(console, "error");
 
     const job = createNonTerminalJob("outcome-rejects");
@@ -439,9 +484,10 @@ test("selectAndWake itself rejecting (a transport throwing/rejecting all the way
 
 test("the transport-wake subscriber fires AT MOST ONCE per task - a duplicate markExited/markKilled on an already-terminal job is jobStore's own no-op, so selectAndWake is never called twice", async (t) => {
   await withWakeTransportEnabled("1", async () => {
-    t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", available);
-    const wakeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", delivers("codex-app-server-goal"));
-    t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unreachableProbe);
+    neutralizeClaudeMessagingTransport(t);
+    t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", available);
+    const wakeA = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", delivers("codex-app-server-goal"));
+    t.mock.method(DEFAULT_TRANSPORTS[2]!, "probe", unreachableProbe);
 
     const job = createNonTerminalJob("fires-once");
     const resolution: WakeTargetResolution = { state: "resolved", target: "thread-fires-once" };
@@ -502,8 +548,9 @@ test("the transport-wake subscriber fires AT MOST ONCE per task - a duplicate ma
 
 test("gate ON + resolution 'resolved' + isCapableConnection FALSE - wake() fires, since startTransportWakeOnTerminal does not read isCapableConnection at all", async (t) => {
   await withWakeTransportEnabled("1", async () => {
-    t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", available);
-    const wakeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", delivers("codex-app-server-goal"));
+    neutralizeClaudeMessagingTransport(t);
+    t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", available);
+    const wakeA = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", delivers("codex-app-server-goal"));
 
     const job = createNonTerminalJob("non-capable-gate-on-resolved");
     const target: WakeTarget = "thread-non-capable-target";
@@ -537,10 +584,11 @@ test("gate ON + resolution 'resolved' + isCapableConnection FALSE - wake() fires
 });
 
 test('gate OFF (the default code path) + resolution "resolved" + isCapableConnection FALSE - the subscription now reaches this codepath but STILL makes zero transport calls, proving no observable behavior changes on the default code path', async (t) => {
-  const probeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", unreachableProbe);
-  const wakeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", unreachableWake);
-  const probeB = t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unreachableProbe);
-  const wakeB = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", unreachableWake);
+  neutralizeClaudeMessagingTransport(t);
+  const probeA = t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", unreachableProbe);
+  const wakeA = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", unreachableWake);
+  const probeB = t.mock.method(DEFAULT_TRANSPORTS[2]!, "probe", unreachableProbe);
+  const wakeB = t.mock.method(DEFAULT_TRANSPORTS[2]!, "wake", unreachableWake);
 
   const job = createNonTerminalJob("non-capable-gate-off-resolved");
   const target: WakeTarget = "thread-non-capable-gate-off-target";
@@ -581,10 +629,11 @@ test('gate OFF (the default code path) + resolution "resolved" + isCapableConnec
 
 test("gate ON + resolution 'resolved' + isCapableConnection FALSE + wake() rejects - the listener still unsubscribes, proving the cleanup is unconditional on the async outcome", async (t) => {
   await withWakeTransportEnabled("1", async () => {
-    t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", available);
-    t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", rejectsAsync("connection reset"));
+    neutralizeClaudeMessagingTransport(t);
     t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", available);
-    t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", rejectsAsync("no owning client"));
+    t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", rejectsAsync("connection reset"));
+    t.mock.method(DEFAULT_TRANSPORTS[2]!, "probe", available);
+    t.mock.method(DEFAULT_TRANSPORTS[2]!, "wake", rejectsAsync("no owning client"));
     const errorSpy = t.mock.method(console, "error");
 
     const job = createNonTerminalJob("non-capable-gate-on-rejects");
@@ -625,8 +674,9 @@ test("gate ON + resolution 'resolved' + isCapableConnection FALSE + wake() rejec
 
 test("regression guard: isCapableConnection FALSE never starts startTaskWatch/startTaskStatusNotifier - notifier is never invoked, even with a resolved transport target and the gate on", async (t) => {
   await withWakeTransportEnabled("1", async () => {
-    t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", available);
-    t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", delivers("codex-app-server-goal"));
+    neutralizeClaudeMessagingTransport(t);
+    t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", available);
+    t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", delivers("codex-app-server-goal"));
 
     const job = createNonTerminalJob("non-capable-notifier-guard");
     const resolution: WakeTargetResolution = {
@@ -652,8 +702,9 @@ test("regression guard: isCapableConnection FALSE never starts startTaskWatch/st
 
 test("regression guard: the capable path is byte-for-byte unchanged - isCapableConnection TRUE still starts all three mechanisms and still returns the minted CreateTaskResult shape, never the raw passthrough result", async (t) => {
   await withWakeTransportEnabled("1", async () => {
-    t.mock.method(DEFAULT_TRANSPORTS[0]!, "probe", available);
-    const wakeA = t.mock.method(DEFAULT_TRANSPORTS[0]!, "wake", delivers("codex-app-server-goal"));
+    neutralizeClaudeMessagingTransport(t);
+    t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", available);
+    const wakeA = t.mock.method(DEFAULT_TRANSPORTS[1]!, "wake", delivers("codex-app-server-goal"));
 
     const job = createNonTerminalJob("capable-unchanged");
     const resolution: WakeTargetResolution = {
