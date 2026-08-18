@@ -4,6 +4,7 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+- Added a temporary workflow that sweeps file concurrency on ubuntu-latest and macos-latest to measure a safe value for each, ahead of a later change that puts the measured value to use. It runs on push to its own branch, reports which concurrency values stay clean, and is removed once that follow-up change lands.
 - Corrected a comment in the CI configuration that understated which checks branch protection actually requires.
 - Fixed the batched process-identity read treating a single transient not-found observation as a final, confident result instead of retrying, closing an asymmetry with the single-pid read, which already retried.
 
