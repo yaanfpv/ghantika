@@ -38,6 +38,30 @@ export const SERVER_ENTRY = path.join(REPO_ROOT, "dist", "index.js");
 const CONTAIN_TEST_SERVER_IN_OWN_PROCESS_GROUP = process.platform !== "win32";
 
 /**
+ * `spawn()` with no `env` option inherits this test-runner process's own
+ * `process.env` in full - and when this test runner is itself a Claude
+ * Code Bash-tool subprocess, that includes a genuinely live
+ * `CLAUDE_CODE_MESSAGING_SOCKET`/`CLAUDE_CODE_MESSAGING_TOKEN` pair
+ * (`src/wake/claudeMessagingTransport.ts`'s own inherited-connection
+ * contract). Any spawned-server suite that also flips
+ * `GHANTIKA_WAKE_TRANSPORT_ENABLED` on - `test/modern-handshake.test.ts`
+ * today, and any future suite using this same helper - would otherwise
+ * hand the server-under-test a real, live channel into whatever session
+ * actually owns that socket, letting a test attempt a genuine wake
+ * delivery into a real Claude Code session as a side effect. The
+ * server-under-test is a sandboxed test subject, not a caller with any
+ * legitimate reason to reach a real session, so both variables are
+ * stripped unconditionally here - for every spawned test server, not
+ * just the one test file that happens to exercise the wake gate today.
+ */
+function envWithoutInheritedMessagingChannel(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env.CLAUDE_CODE_MESSAGING_SOCKET;
+  delete env.CLAUDE_CODE_MESSAGING_TOKEN;
+  return env;
+}
+
+/**
  * The per-line wait `nextLine` defaults to, as a pure function of the
  * environment it's given - not read from `process.env` at module load -
  * so a test can assert on both branches directly (see
@@ -107,6 +131,7 @@ export function spawnServer(entry: readonly string[] = [SERVER_ENTRY]): SpawnedS
     stdio: ["pipe", "pipe", "pipe"],
     detached: CONTAIN_TEST_SERVER_IN_OWN_PROCESS_GROUP,
     windowsHide: true,
+    env: envWithoutInheritedMessagingChannel(),
   });
 
   // `allLines` is the full historical log (what `allLines()` returns).

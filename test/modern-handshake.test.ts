@@ -1725,7 +1725,7 @@ async function pollStderrFor(server: SpawnedServer, substring: string): Promise<
 describe('wake-target hand-off tests (spawn a real job through the real "run" tool)', () => {
   before(requireSpawnPolicy);
 
-  test("wake-target hand-off, malformed: a real modern tools/call whose own request _meta carries threadId:'' alongside the required envelope keys logs the malformed-target skip diagnostic once the job reaches terminal", async (t) => {
+  test("wake-target hand-off, malformed: a real modern tools/call whose own request _meta carries threadId:'' alongside the required envelope keys logs the malformed-target diagnostic once the job reaches terminal", async (t) => {
     const originalGate = process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED;
     process.env.GHANTIKA_WAKE_TRANSPORT_ENABLED = "1";
     const server = tracked();
@@ -1764,7 +1764,7 @@ describe('wake-target hand-off tests (spawn a real job through the real "run" to
 
     const found = await pollStderrFor(
       server,
-      `transport wake skipped for task ${jobId as string}: wake target threadId present but is an empty string, expected non-empty string`
+      `transport wake target malformed for task ${jobId as string}: wake target threadId present but is an empty string, expected non-empty string`
     );
     assert.ok(
       found,

@@ -261,6 +261,16 @@ This wake's reach into a subagent or delegated context is untested rather than e
 
 None of this is required for ghantika to work: `status`, `output`, and `tail` remain the retrieval floor for any job id, retrievable by polling on every client with no configuration needed. `follow` stays available as a client-independent bounded wait on that same floor - the very tool this document tells you to reach for instead of polling - and needs neither variable set to work. `run`, `kill`, and `list` are ordinary request-response operations, never polling endpoints in the first place. This wake is strictly an upgrade on top of that floor, never a replacement for it.
 
+### The inherited-messaging wake (Claude Code)
+
+There's a third Claude Code path, separate from both of the above and needing nothing set in your launch environment. When Claude Code launches ghantika as an MCP server subprocess, it already exports a private messaging socket path and matching credential into that subprocess's environment - the same channel the client itself uses to inject a message into one of its own sessions. Ghantika reads that inherited socket and credential and nothing else: never a path it constructs from a process id, never a directory it scans, never a credential belonging to a different session. That means this route reaches exactly the session that launched ghantika, by construction, and nothing else - not another session on the same machine, not a session ghantika was never handed a credential for.
+
+The wake only ever fires in response to a job this same session started and that later reached a terminal state - never unconditionally, never on a timer, never for a job it did not start.
+
+This is on by default; there's nothing to set. If you don't want ghantika writing to this channel, set `GHANTIKA_DISABLE_CLAUDE_MESSAGING_WAKE=1` in ghantika's own environment.
+
+**Status: `not-tested`, for the delivery itself.** The route is implemented, its authentication is enforced and passes with the real inherited credential, and it sits off the critical path of everything else this project does - job completion is still confirmed by an ordinary poll regardless of whether this wake ever fires, and it falls through cleanly when the channel it depends on is unavailable. What has not yet been observed is whether a message written over this channel actually resumes a genuinely idle session. See `docs/wake-support-matrix.md` for the full record.
+
 ### The app-server wake (Codex)
 
 Independent of both the Tasks-extension notification described in the "Early days" note above and the Claude Code mechanism above, ghantika also carries its own code that pushes a message directly into a Codex thread once a job it started finishes - not a client-side mechanism, and not gated on any capability negotiation.

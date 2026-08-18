@@ -1059,6 +1059,28 @@ export function runOnce({
   completionMarkerPath = COMPLETION_MARKER_PATH,
   runToken,
 }) {
+  // This process's own env is what every per-file child node:test's
+  // isolation:'process' spawns inherits by default (run() below passes no
+  // env override), and it is also the base every further spawn from
+  // WITHIN a test file inherits, whether or not that spawn goes through
+  // test/helpers/spawnServer.ts's own stripping. When this process is
+  // itself a child of a real Claude Code session (a developer running
+  // `npm test` locally, or this repo's own local-gate), it carries a
+  // genuinely live CLAUDE_CODE_MESSAGING_SOCKET/TOKEN pair - and
+  // ClaudeMessagingWakeTransport is first in DEFAULT_TRANSPORTS and
+  // enabled by default, so ANY test that runs a job to completion
+  // in-process (never spawning a child server at all - most of the
+  // registry/jobStore/tasksAdapter suite does exactly this) sees that
+  // live pair via a bare `process.env` read and can deliver a real wake
+  // into the session that happened to run the suite. Stripping both vars
+  // here, once, before the first test file's process ever starts, closes
+  // this for every test file and every spawn depth structurally - no
+  // individual test or helper has to remember to do it. Confirmed live
+  // 2026-08-18: a gate run of a branch carrying this transport delivered
+  // six real, unheld wakes into the reviewer's own session this way.
+  delete process.env.CLAUDE_CODE_MESSAGING_SOCKET;
+  delete process.env.CLAUDE_CODE_MESSAGING_TOKEN;
+
   return new Promise((resolve) => {
     // Computed ONCE per invocation of this function - never per-test-file,
     // never per-event - and read live via git, the exact pattern

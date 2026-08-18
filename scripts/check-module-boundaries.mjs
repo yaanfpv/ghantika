@@ -183,6 +183,7 @@ export const FROZEN_MODULES = [
   "tools/status.ts",
   "tools/tail.ts",
   "wake/appServerTransport.ts",
+  "wake/claudeMessagingTransport.ts",
   "wake/desktopIpcTransport.ts",
   "wake/resolveWakeTarget.ts",
   "wake/selectTransport.ts",
