@@ -1051,6 +1051,35 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+/**
+ * Polls the real on-disk lock file (via the same `readLockFile` the
+ * assertions below already read from) until `predicate` is true against
+ * its current parsed content, rather than guessing a fixed delay for the
+ * handful of in-process microtask/promise hops `acquireAsFloorJob`'s own
+ * async `captureChildIdentity` step takes before its next synchronous
+ * `writeFn` call actually lands on disk. `writeIdentityAtomic` (this
+ * module's own `writeFn`) writes to a temp file and renames into place, so
+ * every read this observes is a complete, non-partial write - never a
+ * torn/half-written record.
+ */
+async function waitForLockFileField(
+  lockPath: string,
+  predicate: (record: Record<string, unknown> | null) => boolean,
+  timeoutMs = 3000
+): Promise<Record<string, unknown>> {
+  const start = Date.now();
+  for (;;) {
+    const record = readLockFile(lockPath) as Record<string, unknown> | null;
+    if (predicate(record)) return record as Record<string, unknown>;
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(
+        `waitForLockFileField: timed out after ${timeoutMs}ms waiting for lock file at ${lockPath} to satisfy the predicate, last read: ${JSON.stringify(record)}`
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 test("stale-write regression [buggy]: composeIdentityWrite spreading from a stale object REGRESSES write A's own fields at write B", async () => {
   await withScratchDir("ghantika-cfl-stale-buggy-", async (dir) => {
     const lockPath = path.join(dir, "lock.json");
@@ -1090,10 +1119,14 @@ test("stale-write regression [buggy]: composeIdentityWrite spreading from a stal
 
     // THE EXACT INTERLEAVING WINDOW: write A has landed, write B (via the
     // buggy compose) has landed, and the flow is now blocked awaiting
-    // `spawned.done` - read the on-disk state right here, before write 4
-    // or release ever run.
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const afterWriteB = readLockFile(lockPath) as Record<string, unknown>;
+    // `spawned.done` - poll for write B's own real, on-disk signal
+    // (floorJobBirthIdentity landing) rather than guessing a fixed delay,
+    // then read the on-disk state right here, before write 4 or release
+    // ever run.
+    const afterWriteB = await waitForLockFileField(
+      lockPath,
+      (record) => record !== null && "floorJobBirthIdentity" in record
+    );
 
     assert.equal(
       afterWriteB.phase,
@@ -1155,8 +1188,13 @@ test("stale-write regression [fixed]: the real, default composeIdentityWrite doe
       // production default.
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const afterWriteB = readLockFile(lockPath) as Record<string, unknown>;
+    // Poll for write B's own real, on-disk signal (floorJobBirthIdentity
+    // landing) rather than guessing a fixed delay for the same handful of
+    // async hops the [buggy] control above waits out.
+    const afterWriteB = await waitForLockFileField(
+      lockPath,
+      (record) => record !== null && "floorJobBirthIdentity" in record
+    );
 
     assert.equal(
       afterWriteB.phase,
@@ -1313,11 +1351,16 @@ test("STALE-IDENTITY FIX: reclaiming a 'done'-phase record carrying a real, prio
 
     // THE EXACT INTERLEAVING WINDOW: write A has landed, write B never ran
     // (identity capture above resolves undefined), and the flow is now
-    // blocked awaiting spawned.done - read the on-disk state right here,
-    // before write 4 or release ever run. Same technique the stale-write
-    // regression control above uses to isolate its own write-A/write-B window.
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const afterWriteA = readLockFile(lockPath) as Record<string, unknown>;
+    // blocked awaiting spawned.done - poll for write A's own real, on-disk
+    // signal (the NEW attempt's floorJobPid landing) rather than guessing a
+    // fixed delay, then read the on-disk state right here, before write 4
+    // or release ever run. Same technique the stale-write regression
+    // control above uses to isolate its own write-A/write-B window.
+    const afterWriteA = await waitForLockFileField(
+      lockPath,
+      (record) =>
+        record !== null && record.floorJobPid === 333333 && record.phase === "floor-running"
+    );
 
     assert.equal(
       afterWriteA.phase,

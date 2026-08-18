@@ -65,6 +65,31 @@ import { armKillConfirmedWatchdog } from "./helpers/killConfirmedPollWatchdog.ts
 // lives further down in this same file).
 // ---------------------------------------------------------------------------
 
+/**
+ * Polls `jobStore` for `jobId` to actually reach `state`, rather than
+ * guessing a fixed delay for the real async `onSpawn` callback (which
+ * drives `markRunning`, see src/jobStore.ts) to have landed - the same
+ * real-predicate-poll shape as test/process.test.ts's own local `waitFor`,
+ * scoped here to a job's real recorded state.
+ */
+function waitForJobState(jobId: string, state: string, timeoutMs = 3000): Promise<void> {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      if (jobStore.get(jobId)?.state === state) return resolve();
+      if (Date.now() - start > timeoutMs) {
+        return reject(
+          new Error(
+            `waitForJobState: timed out after ${timeoutMs}ms waiting for job ${jobId} to reach state "${state}" (currently "${jobStore.get(jobId)?.state}")`
+          )
+        );
+      }
+      setTimeout(tick, 10);
+    };
+    tick();
+  });
+}
+
 function assertToolError(result: CallToolResult, expectedSubstring: string): void {
   assert.equal(
     result.isError,
@@ -154,7 +179,7 @@ describe("kill: unit-level tests against a real spawned job", () => {
       }
     );
     jobStore.attachChild(record.job_id, child!);
-    await new Promise((resolve) => setTimeout(resolve, 50)); // let the spawn event actually land
+    await waitForJobState(record.job_id, "running"); // let the spawn event actually land
 
     // No `signal` argument at all - the true default path.
     const result = await killTool.handler({ job_id: record.job_id });
@@ -198,7 +223,7 @@ describe("kill: unit-level tests against a real spawned job", () => {
       }
     );
     jobStore.attachChild(record.job_id, child!);
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await waitForJobState(record.job_id, "running");
     const pid = child!.pid!;
 
     const realKill = process.kill.bind(process);
@@ -403,7 +428,7 @@ describe("kill: unit-level tests against a real spawned job", () => {
       }
     );
     jobStore.attachChild(record.job_id, child!);
-    await new Promise((resolve) => setTimeout(resolve, 50)); // let the spawn event actually land
+    await waitForJobState(record.job_id, "running"); // let the spawn event actually land
 
     // The explicit "SIGTERM" form of the SAME default path.
     const result = await killTool.handler({ job_id: record.job_id, signal: "SIGTERM" });
@@ -455,7 +480,7 @@ describe("kill: unit-level tests against a real spawned job", () => {
       }
     );
     jobStore.attachChild(record.job_id, child!);
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await waitForJobState(record.job_id, "running");
 
     const start = Date.now();
     const result = await killTool.handler({ job_id: record.job_id, signal: "SIGKILL" });

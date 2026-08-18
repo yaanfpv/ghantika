@@ -719,6 +719,40 @@ function waitFor(check: () => boolean, timeoutMs = 3000): Promise<void> {
   });
 }
 
+/**
+ * Polls a real `pgrep -g <pgid>` count until the process GROUP has at
+ * least `minMembers` live members, rather than guessing a fixed delay for
+ * real forked descendants to actually land - the same real external
+ * process-table observation test/harness.ts's own
+ * pgrepGroupMembers/waitForPgrepGroupMembers pair uses (this file drives
+ * src/process.ts's primitives directly rather than over the wire, so it
+ * does not already import that harness).
+ */
+async function waitForGroupMemberCount(
+  pgid: number,
+  minMembers: number,
+  timeoutMs = 3000
+): Promise<number> {
+  const start = Date.now();
+  for (;;) {
+    let count = 0;
+    try {
+      const output = execFileSync("pgrep", ["-g", String(pgid)], { encoding: "utf8" });
+      count = output.split("\n").filter((line) => line.trim().length > 0).length;
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException & { status?: number };
+      if (err.status !== 1) throw error; // pgrep's own "nothing matched" exit code - a real, expected zero-members result
+    }
+    if (count >= minMembers) return count;
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(
+        `waitForGroupMemberCount: timed out after ${timeoutMs}ms waiting for pgid ${pgid} to reach >= ${minMembers} members, last saw ${count}`
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 test("spawnManaged runs a real command and reports spawn -> stdout -> exit(0) in order, returning a real ChildProcess", async () => {
   const rec = recorder();
   const env = buildChildEnv("merge", {});
@@ -4437,7 +4471,7 @@ test(
     await waitFor(() => rec.spawned > 0);
     const leaderPid = child!.pid!;
     // Let the two descendants actually fork before snapshotting.
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await waitForGroupMemberCount(leaderPid, 3);
     const snapshot = await captureEscalationIdentitySnapshot(leaderPid);
     assert.equal(snapshot.degraded, false);
     assert.ok(
@@ -4685,7 +4719,7 @@ test(
     const leaderPid = child!.pid!;
     // Let the two descendants actually fork before snapshotting, exactly
     // as the real-group-with-descendants test above does.
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await waitForGroupMemberCount(leaderPid, 3);
 
     // Same injected-clock technique as the enumeration-budget test above,
     // one step later: the first THREE `now()` reads (entry, the leader
@@ -4729,7 +4763,7 @@ test(
     );
     await waitFor(() => rec.spawned > 0);
     const leaderPid = child!.pid!;
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await waitForGroupMemberCount(leaderPid, 3);
 
     // A `ps` wrapper that is a real, correct observer for the single-pid
     // leader call (delegates straight to the real system `ps`, inheriting
@@ -5077,7 +5111,7 @@ test(
     );
     await waitFor(() => rec.spawned > 0);
     const leaderPid = child!.pid!;
-    await new Promise((resolve) => setTimeout(resolve, 200)); // let descendants fork
+    await waitForGroupMemberCount(leaderPid, 4); // let descendants fork
 
     const realKill = process.kill.bind(process);
     const observedTargets: number[] = [];

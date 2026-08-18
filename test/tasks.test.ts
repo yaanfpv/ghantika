@@ -292,6 +292,33 @@ async function mintJob(
   return result as unknown as Record<string, unknown>;
 }
 
+/**
+ * Polls `jobStore` for `taskId` (== `job_id`, see tasksAdapter.ts's own
+ * "taskId == job_id, one handle namespace" docs) to actually reach
+ * `state`, rather than guessing a fixed delay for the real async
+ * `onSpawn` callback (which drives `markRunning`, see src/jobStore.ts) to
+ * have landed - the same real-predicate-poll shape as
+ * test/process.test.ts's own local `waitFor`, scoped here to a job's real
+ * recorded state.
+ */
+function waitForJobState(taskId: string, state: string, timeoutMs = 3000): Promise<void> {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      if (jobStore.get(taskId)?.state === state) return resolve();
+      if (Date.now() - start > timeoutMs) {
+        return reject(
+          new Error(
+            `waitForJobState: timed out after ${timeoutMs}ms waiting for job ${taskId} to reach state "${state}" (currently "${jobStore.get(taskId)?.state}")`
+          )
+        );
+      }
+      setTimeout(tick, 10);
+    };
+    tick();
+  });
+}
+
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 /** A real `Date#toISOString()` shape - shared by every check below that validates a genuinely nondeterministic (real wall-clock) timestamp field's FORMAT rather than skipping it outright. */
@@ -1799,7 +1826,7 @@ describe("spawning tests: task lifecycle - kill-to-cancelled mapping needs a rea
       const taskId = minted.taskId as string;
 
       // Give the process a moment to actually spawn before killing it.
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await waitForJobState(taskId, "running");
       await pair.client.callTool({ name: "kill", arguments: { job_id: taskId } });
       await pollUntilTerminal(pair.client, taskId);
 
@@ -2004,7 +2031,7 @@ describe("spawning tests: task lifecycle - ack idempotency needs a genuinely liv
         label: "live-interim-contract",
       });
       const taskId = minted.taskId as string;
-      await new Promise((resolve) => setTimeout(resolve, 30)); // let it actually start running
+      await waitForJobState(taskId, "running"); // let it actually start running
 
       const before = await tasksRequest(pair.client, "tasks/get", taskId);
       await assertTaskStatus(
@@ -2386,7 +2413,7 @@ describe("spawning tests: seven-tool mint rule (run mints, every other tool stay
         label: "seven-tool-mint-rule-kill-target",
       });
       const secondTaskId = second.taskId as string;
-      await new Promise((resolve) => setTimeout(resolve, 50)); // let it actually start running
+      await waitForJobState(secondTaskId, "running"); // let it actually start running
       const killResult = runResultStructured(
         await pair.client.callTool({ name: "kill", arguments: { job_id: secondTaskId } })
       );
