@@ -13,6 +13,7 @@ All notable changes to this project are documented in this file.
 - Corrected a comment in the CI configuration that understated which checks branch protection actually requires.
 - Local test runs can now opt into bounded file concurrency instead of running one file at a time, cutting a direct suite run's wall-clock time by roughly two-thirds on this host with no change in coverage. CI stays serial; this is a local-only, opt-in speedup for the plain suite run, not the coverage-bound gate.
 - Fixed the batched process-identity read treating a single transient not-found observation as a final, confident result instead of retrying, closing an asymmetry with the single-pid read, which already retried.
+- Added a new wake route for Claude Code that needs no environment variable set: ghantika reads the private messaging socket and credential the client already exports into its own subprocess's environment, and writes to it directly once a job that same session started reaches a terminal state. It reaches exactly the session that spawned ghantika, by construction, never anywhere else; it sits off the critical path of every other tool this server offers, and falls through cleanly wherever it is unavailable. `GHANTIKA_DISABLE_CLAUDE_MESSAGING_WAKE=1` opts out. End-to-end delivery through this route has not yet been observed; see `docs/wake-support-matrix.md`.
 
 ### Added
 

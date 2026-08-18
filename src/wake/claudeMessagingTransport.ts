@@ -81,7 +81,7 @@
  * ack, and named explicitly in every "delivered" `WakeResult.detail` this
  * transport returns.
  *
- * ## AC4 - the child path structurally, but NOT YET PROVEN not-held
+ * ## AC4 - the child path structurally, but end-to-end delivery is unproven
  *
  * The binary's own logic distinguishes a `childToken` (this transport's
  * whole path - the credential this session's own parent already handed it)
@@ -93,21 +93,15 @@
  * which is the child token by construction of how that token reached this
  * process in the first place.
  *
- * THAT IS THE STRUCTURAL ARGUMENT ALONE, and AC4 explicitly forbids
- * shipping on it: "do not ship on 'the gate reads origin.kind === peer so
- * we should be fine.'" A structural argument for why the hold SHOULD not
- * apply is not a demonstration that a real `wake()` call is NOT held. That
- * demonstration requires a real delivered `wake()` against a real socket -
- * which, unlike `probe()`'s auth-only line, DOES write the user-message
- * line and therefore DOES inject a real turn into whatever session owns
- * the socket. The two prior live proofs in this exact investigation
- * (story-0263's AC2 cross-session wake, and this file's own AC3 `probe()`
- * evidence above) were both run only with explicit Soham-level
- * authorization for exactly that reason - an action with a real,
- * observable side effect on a live session is not something this
- * transport's own build work self-authorizes. AC4 (and AC7's "prove the
- * wake end to end... on an idle session") therefore stay OPEN pending that
- * same authorization, disclosed here rather than closed by inference.
+ * THAT IS THE STRUCTURAL ARGUMENT ALONE, and it does not by itself establish
+ * that a real `wake()` call is undelivered-or-held. That requires a real
+ * delivered `wake()` against a real socket - which, unlike `probe()`'s
+ * auth-only line, DOES write the user-message line and therefore DOES
+ * inject a real turn into whatever session owns the socket. No such
+ * end-to-end delivery has yet been observed. What this section establishes
+ * is the shape of the boundary (child versus peer); whether a real `wake()`
+ * call actually lands, undelivered, is not yet demonstrated either way, and
+ * is disclosed here as open rather than closed by inference.
  */
 import net from "node:net";
 
