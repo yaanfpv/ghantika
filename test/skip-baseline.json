@@ -109,6 +109,7 @@
     "test/process.test.ts::killProcessGroupPosix: the SIGTERM-site already-gone race is treated as success end to end, via a mocked process.kill (EPERM) on a fake pid, WITHOUT ever claiming a delivery that never happened",
     "test/process.test.ts::readPidStartTimesBatchPosix: a mix of one alive and one already-gone pid returns ONLY the alive one's row, ok - never an error for the merely-absent one",
     "test/process.test.ts::readPidStartTimesBatchPosix: a mix of one well-formed row and one malformed row keeps the well-formed one - a malformed row is discarded, never poisoning the others",
+    "test/process.test.ts::readPidStartTimesBatchPosix: a transient not-found observation for the whole batch retries and recovers once ps starts answering",
     "test/process.test.ts::readPidStartTimesBatchPosix: reads MULTIPLE real pids in ONE batched call (a fake ps counts its own invocations to prove this), returning every one's own correct row",
     "test/process.test.ts::readPidStartTimesBatchPosix: reads a real, single, freshly-spawned process's own pid+lstart correctly",
     "test/process.test.ts::resolveCwd's root check validates the REAL, symlink-resolved target - a symlink whose own path sits inside an allowed root but that POINTS OUTSIDE every root is rejected",

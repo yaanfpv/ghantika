@@ -1,7 +1,7 @@
 {
   "name": "ghantika",
   "version": "0.1.0",
-  "description": "A background command-runner MCP server: start a command without blocking the calling agent, then poll it for status and output (a direct wake on completion is planned, not wired yet).",
+  "description": "A background command-runner MCP server: start a command without blocking the calling agent, then poll it for status and output, with a push notification on a client and configuration that support it.",
   "type": "module",
   "license": "MIT",
   "author": "Soham Patankar",

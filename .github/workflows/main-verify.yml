@@ -22,8 +22,9 @@ name: Main Verify
 # literally require success from, EVERY job in that file - so a job that
 # only ever runs on push would show up "skipped" on every PR run and make
 # `gate` red on every PR, not just on main. Keeping this in its own file
-# means it never enters that computation at all, and it is never added to
-# any required check - branch protection points only at `gate`.
+# means it never enters that computation at all, and none of this file's
+# own jobs is ever added to a required check - branch protection's
+# required contexts (`gate`, `lint`) both come from ci.yml alone.
 #
 # LOCKSTEP WARNING: the `test` job below is a DELIBERATE, DISCLOSED
 # duplicate of ci.yml's own `test` job (same reasoning ci.yml's
