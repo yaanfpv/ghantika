@@ -744,7 +744,7 @@ test("acquireAsFloorJob: a corrupted primary lock file refuses with a clear diag
 });
 
 // ===========================================================================
-// REQUIRED CONTROL 1: the deadlock-fix, RED then GREEN.
+// The release-on-failure guard: RED then GREEN.
 //
 // A write inside the worker's own sequence is forced to throw AFTER a
 // real, long-running child has already been spawned. `releaseFn` is the
@@ -782,7 +782,7 @@ async function confirmPidGone(pid: number | undefined): Promise<void> {
   assert.fail(`pid ${pid} was still alive ${2000}ms after the deadlock-fix's own kill attempt`);
 }
 
-test("REQUIRED CONTROL 1 [RED]: with releaseFn disabled, a write failure still kills the spawned child, but a second invocation deadlocks against the live-but-non-releasing owner", async () => {
+test("release-on-failure guard [RED]: with releaseFn disabled, a write failure still kills the spawned child, but a second invocation deadlocks against the live-but-non-releasing owner", async () => {
   await withScratchDir("ghantika-cfl-deadlock-red-", async (dir) => {
     const lockPath = path.join(dir, "lock.json");
     const headSha = "deadbeef";
@@ -825,7 +825,7 @@ test("REQUIRED CONTROL 1 [RED]: with releaseFn disabled, a write failure still k
   });
 });
 
-test("REQUIRED CONTROL 1 [GREEN]: with the real releaseFn, the same write failure kills the spawned child AND leaves the lock genuinely reclaimable by a subsequent invocation", async () => {
+test("release-on-failure guard [GREEN]: with the real releaseFn, the same write failure kills the spawned child AND leaves the lock genuinely reclaimable by a subsequent invocation", async () => {
   await withScratchDir("ghantika-cfl-deadlock-green-", async (dir) => {
     const lockPath = path.join(dir, "lock.json");
     const headSha = "deadbeef";
@@ -869,7 +869,7 @@ test("REQUIRED CONTROL 1 [GREEN]: with the real releaseFn, the same write failur
   });
 });
 
-test("REQUIRED CONTROL 1, floor-side variant [GREEN]: the same release-on-failure guarantee holds for acquireAsFloorJob's own write-A/write-4 failures", async () => {
+test("release-on-failure guard, floor-side variant [GREEN]: the same release-on-failure guarantee holds for acquireAsFloorJob's own write-A/write-4 failures", async () => {
   await withScratchDir("ghantika-cfl-deadlock-floor-", async (dir) => {
     const lockPath = path.join(dir, "lock.json");
     const headSha = "deadbeef";
@@ -902,13 +902,13 @@ test("REQUIRED CONTROL 1, floor-side variant [GREEN]: the same release-on-failur
   });
 });
 
-test("REQUIRED CONTROL 1, floor-side variant [RED]: with releaseFn disabled, acquireAsFloorJob's own write-A failure still kills the spawned child, but a subsequent acquireAsWorker deadlocks against the live-but-non-releasing owner", async () => {
+test("release-on-failure guard, floor-side variant [RED]: with releaseFn disabled, acquireAsFloorJob's own write-A failure still kills the spawned child, but a subsequent acquireAsWorker deadlocks against the live-but-non-releasing owner", async () => {
   await withScratchDir("ghantika-cfl-deadlock-floor-red-", async (dir) => {
     const lockPath = path.join(dir, "lock.json");
     const headSha = "deadbeef";
     // Write 1 of this earlier, real acquireAsWorker call records ownerPid
     // as THIS TEST PROCESS itself - genuinely alive for the whole test,
-    // exactly mirroring REQUIRED CONTROL 1 [RED]'s own approach above.
+    // exactly mirroring the release-on-failure guard [RED]'s own approach above.
     // ownerPid is the identity that matters for THIS scenario: unlike
     // floorJobPid (the failing floor job's own spawned child, killed
     // unconditionally below, independent of releaseFn), ownerPid is
@@ -933,7 +933,7 @@ test("REQUIRED CONTROL 1, floor-side variant [RED]: with releaseFn disabled, acq
       writeFn: writeThatFailsOnCall(1), // fails write A itself, after spawn
       releaseFn: () => {
         // Simulates the pre-fix design: cleanup never actually vacates the
-        // lock - the same no-op REQUIRED CONTROL 1 [RED] injects above.
+        // lock - the same no-op the release-on-failure guard [RED] injects above.
       },
     });
     assert.equal(failingResult.exitCode, 1);
@@ -1015,7 +1015,7 @@ test("abandonOnFailure guard: acquireAsFloorJob never throws even when BOTH a wr
 });
 
 // ===========================================================================
-// REQUIRED CONTROL 2: the same-process-writer / stale-snapshot bug.
+// Same-process stale-write regression: the same-process-writer / stale-snapshot bug.
 //
 // Constructs the exact interleaving window between write A and write B of
 // acquireAsFloorJob's own floor-running transition, by holding
@@ -1036,7 +1036,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-test("REQUIRED CONTROL 2 [buggy]: composeIdentityWrite spreading from a stale object REGRESSES write A's own fields at write B", async () => {
+test("stale-write regression [buggy]: composeIdentityWrite spreading from a stale object REGRESSES write A's own fields at write B", async () => {
   await withScratchDir("ghantika-cfl-stale-buggy-", async (dir) => {
     const lockPath = path.join(dir, "lock.json");
     const headSha = "deadbeef";
@@ -1101,7 +1101,7 @@ test("REQUIRED CONTROL 2 [buggy]: composeIdentityWrite spreading from a stale ob
   });
 });
 
-test("REQUIRED CONTROL 2 [fixed]: the real, default composeIdentityWrite does NOT regress write A's own fields, and correctly gains floorJobBirthIdentity", async () => {
+test("stale-write regression [fixed]: the real, default composeIdentityWrite does NOT regress write A's own fields, and correctly gains floorJobBirthIdentity", async () => {
   await withScratchDir("ghantika-cfl-stale-fixed-", async (dir) => {
     const lockPath = path.join(dir, "lock.json");
     const headSha = "deadbeef";
@@ -1196,7 +1196,7 @@ test("REQUIRED CONTROL 2 [fixed]: the real, default composeIdentityWrite does NO
   });
 });
 
-test("REQUIRED CONTROL 2, negative control: a write-B failure never blocks write 4 / release, and never triggers the deadlock-fix abandon path", async () => {
+test("negative control: a write-B failure never blocks write 4 / release, and never triggers the deadlock-fix abandon path", async () => {
   await withScratchDir("ghantika-cfl-stale-writeb-fails-", async (dir) => {
     const lockPath = path.join(dir, "lock.json");
     const headSha = "deadbeef";
@@ -1299,8 +1299,8 @@ test("STALE-IDENTITY FIX: reclaiming a 'done'-phase record carrying a real, prio
     // THE EXACT INTERLEAVING WINDOW: write A has landed, write B never ran
     // (identity capture above resolves undefined), and the flow is now
     // blocked awaiting spawned.done - read the on-disk state right here,
-    // before write 4 or release ever run. Same technique REQUIRED CONTROL 2
-    // above uses to isolate its own write-A/write-B window.
+    // before write 4 or release ever run. Same technique the stale-write
+    // regression control above uses to isolate its own write-A/write-B window.
     await new Promise((resolve) => setTimeout(resolve, 50));
     const afterWriteA = readLockFile(lockPath) as Record<string, unknown>;
 
@@ -1330,7 +1330,7 @@ test("STALE-IDENTITY FIX: reclaiming a 'done'-phase record carrying a real, prio
 });
 
 // ===========================================================================
-// REQUIRED CONTROL 3: exhaustiveness - none of the three new source files
+// Exhaustiveness check: none of the three new source files
 // registers a periodic write mechanism or a SIGTERM/SIGINT handler. This
 // design's whole crash-safety guarantee rests on checking real OS process
 // identity on demand, never on a background timer refreshing/faking
@@ -1360,7 +1360,7 @@ function extractBalancedArgs(sourceText: string, openParenIndex: number): string
   throw new Error("extractBalancedArgs: unbalanced parentheses");
 }
 
-test("REQUIRED CONTROL 3: none of coverage-floor-lock.mjs / the two wrapper scripts registers setInterval, a SIGTERM/SIGINT handler, or a self-rescheduling setTimeout", () => {
+test("exhaustiveness check: none of coverage-floor-lock.mjs / the two wrapper scripts registers setInterval, a SIGTERM/SIGINT handler, or a self-rescheduling setTimeout", () => {
   for (const filePath of [LOCK_LIB_PATH, WORKER_WRAPPER_PATH, FLOOR_WRAPPER_PATH]) {
     const source = readFileSync(filePath, "utf8");
     const label = path.relative(REPO_ROOT, filePath);

@@ -141,12 +141,12 @@ test("coverage-lock-floor-wrapper: refuses with a clear message and exit 1 when 
 });
 
 // ===========================================================================
-// REQUIRED CONTROL 4: the end-to-end handoff, across two real, separate
+// End-to-end handoff: across two real, separate
 // child processes, pointed at the same lock path and the same real head
 // SHA - exactly mirroring the CI shape.
 // ===========================================================================
 
-test("REQUIRED CONTROL 4: worker wrapper (real child) -> floor wrapper (real, SEPARATE child) - the full handoff, ending done + released", () => {
+test("end-to-end handoff: worker wrapper (real child) -> floor wrapper (real, SEPARATE child) - the full handoff, ending done + released", () => {
   withScratchDir("ghantika-clw-e2e-", (dir) => {
     const lockPath = path.join(dir, "lock.json");
     const realHeadSha = readGitHeadSha();
@@ -172,7 +172,7 @@ test("REQUIRED CONTROL 4: worker wrapper (real child) -> floor wrapper (real, SE
   });
 });
 
-test("REQUIRED CONTROL 4: the floor-check command's own real exit code is faithfully propagated by the real floor wrapper process", () => {
+test("end-to-end handoff: the floor-check command's own real exit code is faithfully propagated by the real floor wrapper process", () => {
   withScratchDir("ghantika-clw-e2e-exitcode-", (dir) => {
     const lockPath = path.join(dir, "lock.json");
     const workerRun = runWrapper(WORKER_WRAPPER_PATH, successFixture(), { lockPath });
@@ -189,7 +189,7 @@ test("REQUIRED CONTROL 4: the floor-check command's own real exit code is faithf
   });
 });
 
-test("REQUIRED CONTROL 4 [REFUSE]: a headSha mismatch refuses with a non-zero exit and never runs the wrapped floor-check command at all", () => {
+test("end-to-end handoff [REFUSE]: a headSha mismatch refuses with a non-zero exit and never runs the wrapped floor-check command at all", () => {
   withScratchDir("ghantika-clw-e2e-shamismatch-", (dir) => {
     const lockPath = path.join(dir, "lock.json");
     const sentinelPath = path.join(dir, "ran.sentinel");
@@ -214,7 +214,7 @@ test("REQUIRED CONTROL 4 [REFUSE]: a headSha mismatch refuses with a non-zero ex
   });
 });
 
-test('REQUIRED CONTROL 4 [REFUSE]: phase "working" (the worker step never finished) refuses with a non-zero exit and never runs the wrapped floor-check command', () => {
+test('end-to-end handoff [REFUSE]: phase "working" (the worker step never finished) refuses with a non-zero exit and never runs the wrapped floor-check command', () => {
   withScratchDir("ghantika-clw-e2e-neverfinished-", (dir) => {
     const lockPath = path.join(dir, "lock.json");
     const sentinelPath = path.join(dir, "ran.sentinel");
@@ -244,7 +244,7 @@ test('REQUIRED CONTROL 4 [REFUSE]: phase "working" (the worker step never finish
   });
 });
 
-test("REQUIRED CONTROL 4 [REFUSE]: no lock file at all refuses with a non-zero exit and never runs the wrapped floor-check command", () => {
+test("end-to-end handoff [REFUSE]: no lock file at all refuses with a non-zero exit and never runs the wrapped floor-check command", () => {
   withScratchDir("ghantika-clw-e2e-nolock-", (dir) => {
     const lockPath = path.join(dir, "lock.json");
     const sentinelPath = path.join(dir, "ran.sentinel");
