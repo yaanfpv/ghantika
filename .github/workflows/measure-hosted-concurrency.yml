@@ -1,0 +1,129 @@
+name: Measure hosted concurrency
+
+# MEASUREMENT SCAFFOLDING, not part of the shipped gate. This workflow
+# exists to answer one question with real data - not inferred from any
+# local machine or guest VM, and not copied from one hosted runner to the
+# other: what node:test file-concurrency value can ubuntu-latest and
+# macos-latest each sustain, on their own hardware, before this repo's
+# process-spawning tests (test/e2e-server.test.ts and friends, via
+# test/helpers/spawnServer.ts's wall-clock-bounded nextLine()) start
+# losing the race. scripts/measure-hosted-concurrency.mjs does the actual
+# work; see that file's header for the full rationale, including exactly
+# which of ci.yml's two test-running jobs this reproduces (the
+# non-coverage `test` matrix job - never the c8-wrapped `coverage` job,
+# which forces a single concurrent file and would report a flat,
+# meaningless result regardless of any value passed here).
+#
+# NOT wired into ci.yml's own `gate` aggregate, and deliberately a
+# separate file rather than a job appended to ci.yml - the same reasoning
+# main-verify.yml's own header already gives for staying separate:
+# scripts/verify-workflow-topology.mjs and scripts/lint-workflow-jobs.mjs
+# are both hardcoded to `.github/workflows/ci.yml` alone (confirmed by
+# reading WORKFLOW_PATH in both files directly), so a job living in this
+# file never enters either check's computation, and branch protection's
+# required contexts (`gate`, `lint`) both come from ci.yml alone - a red
+# run here can never block a PR.
+#
+# LIFECYCLE: this file, and scripts/measure-hosted-concurrency.mjs, are
+# temporary. They are removed in the follow-up PR that lands the measured
+# value into ci.yml and scripts/run-tests.mjs, once a separate change
+# already in flight against those same two files has merged (landing both
+# together would collide on the same files), unless that follow-up PR's
+# author finds a concrete reason periodic re-measurement is worth keeping
+# this as a tracked artifact, in which case that PR states the reason
+# explicitly rather than carrying this forward by default.
+#
+# TRIGGER, and why it is not workflow_dispatch alone: GitHub's own docs
+# state plainly that "this event will only trigger a workflow run if the
+# workflow file exists on the default branch" - so a workflow_dispatch-only
+# version of this file would be undispatchable from this feature branch
+# until AFTER it merges to main, which defeats measuring anything before
+# landing. `push` to this exact branch, scoped by path so it does not fire
+# on unrelated commits, is what actually runs on push right now.
+# workflow_dispatch stays as a second trigger for free - harmless today,
+# and it becomes the normal way to re-run this once/if the file is ever
+# on main.
+on:
+  push:
+    branches:
+      - feat/hosted-ci-concurrency-measurement
+    paths:
+      - ".github/workflows/measure-hosted-concurrency.yml"
+      - "scripts/measure-hosted-concurrency.mjs"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: measure-hosted-concurrency-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Two runners, swept and reported SEPARATELY - a value measured on one
+  # is never carried over to the other. Candidate concurrency values are
+  # scaled to each runner's own vCPU count (ubuntu-latest = 4, macos-latest
+  # = 3 vCPU M1, per GitHub's own hosted-runner spec for a public repo),
+  # spanning roughly 0.25x through 2x cores so the range brackets the
+  # ratio the local 8-core measurement found unsafe (concurrency 8 on 8
+  # cores = 1.0x, one file per core, at full occupancy) as well as the
+  # ratio it found clean (concurrency 4 on 8 cores = 0.5x).
+  sweep:
+    name: sweep (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Up to 6 candidate values x 3 repeats x one full-suite run each,
+    # sequentially in one job. The real `test` job's own single-run
+    # timeout is 15 minutes; this budgets generously above 18x that many
+    # runs rather than trying to predict how contention at a high
+    # candidate value affects wall time.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            concurrency_values: "1,2,3,4,6,8"
+          - os: macos-latest
+            concurrency_values: "1,2,3,4,6"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history, matching the real `test` job's own checkout
+          # exactly (see ci.yml's own comment on why: a commit-range test
+          # needs origin/main resolvable). A shallow checkout leaves
+          # origin/main unresolvable, which is not a concurrency effect at
+          # all but a fixed per-run skip that reads as an unrelated
+          # failure at every candidate value alike - found live on this
+          # workflow's own first run, which is why this comment exists.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # Fixed at one node version, not swept - this workflow measures
+          # the CPU/hardware axis only. ci.yml's own `test` job matrix
+          # already covers node 22 and 24 separately; concurrency safety
+          # is a wall-clock/scheduling question, not a language-runtime
+          # one, so sweeping node version here would multiply the job
+          # count without adding a distinct axis of evidence.
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      # Same --test-timeout the real `test` job passes
+      # (node scripts/run-tests.mjs --test-timeout=120000) - read directly
+      # from ci.yml rather than assumed, so this sweep's per-test budget
+      # matches production exactly. Matrix values are read through env,
+      # not interpolated directly into the shell command, matching this
+      # repo's own convention elsewhere in ci.yml (matrix.* is never
+      # spliced straight into a `run:` string there either) even though
+      # these particular values are static strings this file's own
+      # `strategy.matrix.include` defines, never attacker-influenced.
+      - run: >
+          node scripts/measure-hosted-concurrency.mjs
+          --concurrency-values="$CONCURRENCY_VALUES"
+          --repeats=3
+          --test-timeout=120000
+          --label="$RUNNER_LABEL"
+        env:
+          CONCURRENCY_VALUES: ${{ matrix.concurrency_values }}
+          RUNNER_LABEL: ${{ matrix.os }}
