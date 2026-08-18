@@ -219,10 +219,14 @@ export function spawnPoller({
   nodePath = process.execPath,
   scriptPath = fileURLToPath(import.meta.url),
 }) {
-  return spawn(nodePath, [scriptPath, "--poll-loop", JSON.stringify(checkCommand), String(pollIntervalMs)], {
-    detached: true,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  return spawn(
+    nodePath,
+    [scriptPath, "--poll-loop", JSON.stringify(checkCommand), String(pollIntervalMs)],
+    {
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    }
+  );
 }
 
 /**
@@ -442,7 +446,9 @@ export function startExternalWakeDetector({
     resolveOutcome = resolve;
   });
 
-  const rl = readline.createInterface({ input: /** @type {NodeJS.ReadableStream} */ (child.stdout) });
+  const rl = readline.createInterface({
+    input: /** @type {NodeJS.ReadableStream} */ (child.stdout),
+  });
   /** @type {Buffer[]} */
   const stderrChunks = [];
   if (child.stderr) {
@@ -517,7 +523,10 @@ export function startExternalWakeDetector({
 
     if (line.startsWith(POLL_LOOP_DETECTION_FAILED_PREFIX)) {
       outcomeDeciding = true;
-      finish({ type: "detectionFailed", reason: line.slice(POLL_LOOP_DETECTION_FAILED_PREFIX.length) });
+      finish({
+        type: "detectionFailed",
+        reason: line.slice(POLL_LOOP_DETECTION_FAILED_PREFIX.length),
+      });
     }
   });
 

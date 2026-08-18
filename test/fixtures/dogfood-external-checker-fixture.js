@@ -54,7 +54,9 @@ if (step === "terminal") {
   process.exit(0);
 }
 if (step === "error") {
-  process.stderr.write(`dogfood-external-checker-fixture: simulated detection failure at invocation ${index}\n`);
+  process.stderr.write(
+    `dogfood-external-checker-fixture: simulated detection failure at invocation ${index}\n`
+  );
   process.exit(3);
 }
 process.stdout.write("EXTERNAL_STATE_PENDING\n");

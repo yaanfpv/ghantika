@@ -53,10 +53,7 @@ import { fileURLToPath } from "node:url";
 // scripts/*.mjs is plain, uncompiled ESM - imported directly, never
 // through dist/, the same way test/doorbell-cutover.test.ts already
 // imports scripts/lib/doorbell-cutover.mjs's own siblings.
-import {
-  runCheckerOnce,
-  startExternalWakeDetector,
-} from "../scripts/dogfood-external-wake.mjs";
+import { runCheckerOnce, startExternalWakeDetector } from "../scripts/dogfood-external-wake.mjs";
 // The real, compiled wake-transport door - the same ../dist/<module>.js
 // convention every other test in this repo already uses to reach real
 // ghantika code (see test/registry.test.ts's own import comment).
@@ -120,7 +117,9 @@ async function waitForNoPidReferencing(marker: string, timeoutMs = 5000): Promis
     const pids = pgrepPids(pattern);
     if (pids.length === 0) return;
     if (Date.now() >= deadline) {
-      throw new Error(`process(es) still referencing ${marker} ${timeoutMs}ms after reap: ${JSON.stringify(pids)}`);
+      throw new Error(
+        `process(es) still referencing ${marker} ${timeoutMs}ms after reap: ${JSON.stringify(pids)}`
+      );
     }
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
@@ -139,7 +138,10 @@ function freshScratchDir(): string {
   return fs.mkdtempSync(path.join(SCRATCH_ROOT, `${randomUUID()}-`));
 }
 
-function writePlan(dir: string, steps: readonly string[]): { planPath: string; counterPath: string } {
+function writePlan(
+  dir: string,
+  steps: readonly string[]
+): { planPath: string; counterPath: string } {
   const planPath = path.join(dir, "plan.json");
   const counterPath = path.join(dir, "counter");
   fs.writeFileSync(planPath, JSON.stringify({ steps }), "utf8");
@@ -226,7 +228,10 @@ test("a2: no existing tracked source in this repo already signals a GitHub Actio
   // This story's own new files are the FIRST and ONLY producers of this
   // signal - excluded here so their own presence can never trivially fail
   // the absence this test exists to establish.
-  const NEW_FILES = new Set(["scripts/dogfood-external-wake.mjs", "scripts/dogfood-gh-run-checker.mjs"]);
+  const NEW_FILES = new Set([
+    "scripts/dogfood-external-wake.mjs",
+    "scripts/dogfood-gh-run-checker.mjs",
+  ]);
 
   // Narrowly scoped to ACTUAL signaling machinery - a cross-workflow
   // trigger key, a webhook event name, or a real check/watch invocation -
@@ -287,19 +292,34 @@ test("runCheckerOnce classifies terminal, pending, and error checker output exac
   const terminalDir = freshScratchDir();
   scratchDirs.push(terminalDir);
   const terminalPlan = writePlan(terminalDir, ["terminal"]);
-  const terminalResult = runCheckerOnce(["node", FIXTURE_CHECKER, terminalPlan.planPath, terminalPlan.counterPath]);
+  const terminalResult = runCheckerOnce([
+    "node",
+    FIXTURE_CHECKER,
+    terminalPlan.planPath,
+    terminalPlan.counterPath,
+  ]);
   assert.equal(terminalResult.kind, "terminal");
 
   const pendingDir = freshScratchDir();
   scratchDirs.push(pendingDir);
   const pendingPlan = writePlan(pendingDir, ["pending"]);
-  const pendingResult = runCheckerOnce(["node", FIXTURE_CHECKER, pendingPlan.planPath, pendingPlan.counterPath]);
+  const pendingResult = runCheckerOnce([
+    "node",
+    FIXTURE_CHECKER,
+    pendingPlan.planPath,
+    pendingPlan.counterPath,
+  ]);
   assert.equal(pendingResult.kind, "pending");
 
   const errorDir = freshScratchDir();
   scratchDirs.push(errorDir);
   const errorPlan = writePlan(errorDir, ["error"]);
-  const errorResult = runCheckerOnce(["node", FIXTURE_CHECKER, errorPlan.planPath, errorPlan.counterPath]);
+  const errorResult = runCheckerOnce([
+    "node",
+    FIXTURE_CHECKER,
+    errorPlan.planPath,
+    errorPlan.counterPath,
+  ]);
   assert.equal(errorResult.kind, "error");
   if (errorResult.kind === "error") {
     assert.match(errorResult.reason, /simulated detection failure/);
@@ -357,7 +377,10 @@ test(
     assert.match(outcome.detail, /"fixtureInvocation":2/);
 
     // --- this mechanism never touches .trigger, anywhere it could have reached ---
-    assert.deepEqual(fs.readdirSync(dir).filter((entry) => entry === ".trigger"), []);
+    assert.deepEqual(
+      fs.readdirSync(dir).filter((entry) => entry === ".trigger"),
+      []
+    );
 
     // --- reap proof: a real, EXTERNAL pgrep confirms the whole process group is gone ---
     await waitForNoPidReferencing(planPath);
@@ -446,7 +469,11 @@ test(
       handle.outcome.then(() => "settled" as const),
       new Promise((resolve) => setTimeout(() => resolve("still-pending" as const), 40)),
     ]);
-    assert.equal(stillPending, "still-pending", "outcome must not settle while the detector is merely pending");
+    assert.equal(
+      stillPending,
+      "still-pending",
+      "outcome must not settle while the detector is merely pending"
+    );
 
     const outcome = await handle.outcome;
     assert.equal(outcome.type, "detectionFailed");

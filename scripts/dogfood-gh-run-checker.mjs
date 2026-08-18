@@ -49,7 +49,9 @@ let parsed;
 try {
   parsed = JSON.parse(raw);
 } catch (error) {
-  console.error(`gh run view produced unparseable JSON: ${error instanceof Error ? error.message : String(error)}`);
+  console.error(
+    `gh run view produced unparseable JSON: ${error instanceof Error ? error.message : String(error)}`
+  );
   process.exit(1);
 }
 
