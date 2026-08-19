@@ -1428,6 +1428,92 @@ function buildTransportWakePayload(taskId: string, record: JobRecord): string {
   return `ghantika job ${taskId} reached ${record.state} - use status/output/tail to read the result`;
 }
 
+// ---------------------------------------------------------------------------
+// Wake-latency instrumentation. Correlates three of the four
+// timestamps a wake's actual latency is made of, for `startTransportWakeOnTerminal`
+// below to capture and emit alongside every wake attempt it makes.
+//
+// The fourth - the woken thread's own transcript actually showing the
+// resumed turn - is deliberately NOT captured here and never will be by
+// this file: it happens inside a session this server has no visibility
+// into (a Codex thread, a Claude Code turn), on a machine this process
+// does not control the clock or the observation surface for. An external
+// harness that DOES watch that transcript correlates its own observed
+// instant against `WakeLatencySample.taskId`, and computes that third gap
+// itself - this module only ever reports the two gaps it CAN measure from
+// inside this process, and reports them SEPARATELY, never collapsed into
+// one summary duration: a single "wake latency: Ns" figure conflates
+// three owners with three different remedies (ghantika's own dispatch
+// code, the transport call, and the receiving app's own scheduling) into
+// one number nobody can act on.
+//
+// NEVER writes to stdout - this file reserves stdout for the MCP protocol
+// stream (see src/server.ts's own docs on stdio purity), so this emits
+// through `console.error` exactly like every other diagnostic in this
+// file (the malformed-target and wake-outcome lines just above). This
+// changes nothing about `buildTransportWakePayload`'s own output - see
+// test/wake-latency-diagnostics.test.ts's own byte-comparison proof.
+// ---------------------------------------------------------------------------
+
+/** The three timestamps this file can itself observe for one wake attempt, plus its outcome and which transport produced it - everything `buildWakeLatencyRecord` needs to compute the two gaps this section's own header explains are reported separately, never collapsed. */
+export interface WakeLatencySample {
+  readonly taskId: string;
+  readonly tTerminalMs: number;
+  readonly tSelectAndWakeEnterMs: number;
+  readonly tTransportCompleteMs: number;
+  /**
+   * The wake's own outcome - `"delivered"` / `"refused"` / `"unavailable"`
+   * from a real `WakeResult`, or the literal string `"threw"` when
+   * `selectAndWake`'s own promise rejected rather than resolving (kept as
+   * a plain string here, not `WakeOutcome`, so this record carries no
+   * runtime dependency on `wakeTransport.ts`'s types beyond what it
+   * already imports for other reasons).
+   */
+  readonly outcome: string;
+  /** Which transport produced `outcome` - `SELECTOR_TRANSPORT_NAME` for a full-exhaustion result, a real transport's own `name` for anything else, or `"n/a"` for the `"threw"` case (no transport result exists to name one). */
+  readonly transportName: string;
+}
+
+/** The tag every wake-latency diagnostic line starts with - stable and greppable, matching this file's own `"[ghantika] ..."` prefix convention. Exported so a test can assert against the exact string rather than a substring guess. */
+export const WAKE_LATENCY_LOG_TAG = "[ghantika] wake-latency";
+
+/**
+ * The full, correlated record for one wake attempt - three raw instants,
+ * the wake's own outcome, and the two DERIVED, NAMED gaps this section's
+ * own header explains are reported separately rather than collapsed:
+ * `dispatchSeamMs` (ghantika's own terminal-to-selectAndWake seam) and
+ * `transportCallMs` (the transport call itself, start to settle). Pure -
+ * no I/O, no clock read; every timestamp is `sample`'s own. Exported
+ * separately from `emitWakeLatency` so a test can assert on the computed
+ * gaps directly, without parsing a `console.error` call's stringified
+ * argument.
+ */
+export function buildWakeLatencyRecord(sample: WakeLatencySample): Record<string, unknown> {
+  return {
+    taskId: sample.taskId,
+    outcome: sample.outcome,
+    transportName: sample.transportName,
+    tTerminalMs: sample.tTerminalMs,
+    tSelectAndWakeEnterMs: sample.tSelectAndWakeEnterMs,
+    tTransportCompleteMs: sample.tTransportCompleteMs,
+    dispatchSeamMs: sample.tSelectAndWakeEnterMs - sample.tTerminalMs,
+    transportCallMs: sample.tTransportCompleteMs - sample.tSelectAndWakeEnterMs,
+  };
+}
+
+/**
+ * Emits one `console.error` line for `sample` - `WAKE_LATENCY_LOG_TAG`
+ * followed by `buildWakeLatencyRecord(sample)` as a single JSON string, so
+ * the whole record is one greppable, machine-parseable line rather than
+ * this file's own multi-argument `console.error` spacing used elsewhere
+ * (fine for a human reading a log by eye, but exactly the shape an
+ * external harness correlating by `taskId` across many lines would
+ * rather not re-parse).
+ */
+export function emitWakeLatency(sample: WakeLatencySample): void {
+  console.error(WAKE_LATENCY_LOG_TAG, JSON.stringify(buildWakeLatencyRecord(sample)));
+}
+
 /**
  * Starts the transport-layer wake for a still-live job - called only from
  * `maybeAugmentRunResult`, alongside (never instead of)
@@ -1495,6 +1581,13 @@ function buildTransportWakePayload(taskId: string, record: JobRecord): string {
  */
 function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetResolution): void {
   const unsubscribeTerminal = jobStore.onJobTerminal(taskId, () => {
+    // t_terminal: the first statement in this callback, which
+    // itself runs synchronously as part of the same fireJobTerminal
+    // dispatch that just wrote the terminal state (see this function's own
+    // doc comment on that ordering) - as close to the real terminal
+    // transition as this process can observe it.
+    const tTerminalMs = Date.now();
+
     // Called first, unconditionally, before any of this callback's own
     // early returns - `onJobTerminal` fires this at most once per task,
     // but `fireJobTerminal` never removes a fired listener from its own
@@ -1532,8 +1625,26 @@ function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetReso
 
     const target = resolution.state === "resolved" ? resolution.target : taskId;
 
+    // t_selectAndWake_enter: captured immediately before the
+    // call, so `dispatchSeamMs` (see this file's own wake-latency section
+    // above) measures exactly the code between the terminal transition and
+    // this dispatch - nothing inside selectAndWake's own async work.
+    const tSelectAndWakeEnterMs = Date.now();
+
     selectAndWake(transports, target, buildTransportWakePayload(taskId, record))
       .then((wakeResult) => {
+        // t_transport_complete for the "completion" half of
+        // AC1's own wording - captured at the top of this handler, before
+        // anything else runs in it, so `transportCallMs` measures the
+        // transport call itself and nothing this handler does afterward.
+        emitWakeLatency({
+          taskId,
+          tTerminalMs,
+          tSelectAndWakeEnterMs,
+          tTransportCompleteMs: Date.now(),
+          outcome: wakeResult.outcome,
+          transportName: wakeResult.transportName,
+        });
         if (wakeResult.outcome !== "delivered") {
           console.error(
             // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- wakeResult.outcome is this codebase's own WakeResult union ("refused" | "unavailable"), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
@@ -1545,6 +1656,20 @@ function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetReso
         }
       })
       .catch((error: unknown) => {
+        // t_transport_complete for the "failure" half of AC1's
+        // own wording - selectAndWake's own promise rejected rather than
+        // resolving (a real contract violation by a transport, or a bug in
+        // the selector itself - see selectAndWake's own doc comment on why
+        // this should not normally happen), so there is no real WakeResult
+        // to name a transport from; "threw"/"n/a" record exactly that.
+        emitWakeLatency({
+          taskId,
+          tTerminalMs,
+          tSelectAndWakeEnterMs,
+          tTransportCompleteMs: Date.now(),
+          outcome: "threw",
+          transportName: "n/a",
+        });
         console.error("[ghantika] transport wake threw for task", taskId, error);
       });
   });
