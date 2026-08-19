@@ -109,17 +109,35 @@ jobs:
       # and scripts/lib/coverage-floor-lock.mjs), so nothing extra is needed
       # to make it reach the same place a plain `npm test` invocation would.
       #
-      # --test-concurrency=4 runs every test file EXCEPT
-      # test/loader-escape-matrix.test.ts concurrently (see that file's own
-      # exclusion in scripts/run-tests.mjs's SERIAL_ONLY_TEST_FILES) -
-      # measured on this exact job's own hardware (ubuntu-latest, x86_64,
-      # under coverage, three repeated runs at this value): with the
-      # exclusion in place, the concurrent batch and the excluded file's own
-      # isolated batch both complete cleanly every time. Before the
-      # exclusion, this same concurrency value failed the one excluded file
-      # in 1 of 3 hosted repeats - a contention-sensitive nested spawn
-      # inside that file losing a race against three other files running
-      # at once; see the file's own doc comment for the full mechanism.
+      # --test-concurrency=4 is wired below but IS NOT VALIDATED SAFE. A
+      # sweep of 2/3/4 against this exact command - the coverage-floor
+      # lock, c8, run-tests.mjs, with test/loader-escape-matrix.test.ts's
+      # own exclusion (SERIAL_ONLY_TEST_FILES) already in place - run on
+      # this job's own hardware (ubuntu-latest, x86_64, under coverage),
+      # three repeats per value, found no value clean across all three:
+      #
+      #   concurrency=2: 1 of 3 repeats failed
+      #   concurrency=3: 1 of 3 repeats failed
+      #   concurrency=4: 2 of 3 repeats failed
+      #
+      # and the failures are not confined to one file. They land on
+      # test/modern-handshake.test.ts:1414 (a negative-control test
+      # already documented as contention-sensitive at concurrency=8,
+      # locally, non-coverage, on an 8-core Mac - a result that plainly
+      # does not transfer to this job's own conditions) and on
+      # test/doorbell-cutover.test.ts:770 (a synthetic-cycle test whose
+      # own import chain never spawns a process at all - a different
+      # contention mechanism, CPU scheduling pressure on its own timers
+      # rather than a spawn racing a fixed timeout). Together with
+      # test/loader-escape-matrix.test.ts, that is at least three files
+      # sharing one shape - a real spawn or async cycle racing a fixed
+      # assertion under load - surfaced across two independent sweeps, not
+      # a single instance. Two sweeps finding three is not evidence the set
+      # is closed. test/loader-escape-matrix.test.ts's own exclusion below
+      # stays regardless of what this value ends up being: its own margin
+      # justifies it on its own, separate from the concurrency question.
+      # What this job actually runs at is not yet settled; this comment
+      # states the measured result rather than a resolved one.
       - run: npm run coverage -- --test-concurrency=4
         env:
           GHANTIKA_JUNIT: test-results.xml
