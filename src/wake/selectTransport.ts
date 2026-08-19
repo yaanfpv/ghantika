@@ -22,6 +22,7 @@
  * protect.
  */
 import { AppServerGoalWakeTransport } from "./appServerTransport.js";
+import { ClaudeMessagingWakeTransport } from "./claudeMessagingTransport.js";
 import { DesktopIpcWakeTransport } from "./desktopIpcTransport.js";
 import type {
   Capability,
@@ -42,34 +43,70 @@ export const SELECTOR_TRANSPORT_NAME = "wake-transport-selector";
 
 /**
  * The default, real-world attempt order a real caller passes to
- * `selectAndWake`: the app-server transport first, then the desktop-IPC
- * transport.
+ * `selectAndWake`: the Claude Code messaging transport first, then the
+ * app-server transport, then the desktop-IPC transport.
  *
- * Ordering rationale (a real decision, not arbitrary): `appServerTransport`
- * talks to the documented, versioned `codex app-server` subcommand and has
- * exactly one well-defined reason to report itself unavailable - the
- * running app-server not reporting its `"goals"` experimental feature
- * enabled (see that file's own `probe()`). `desktopIpcTransport` instead
- * depends on a live GUI window with the exact target conversation
- * currently open in it, and reaches into the ChatGPT desktop app's
- * undocumented internals over a socket path that has already relocated
- * once inside a single app update (see that file's own header for the
- * measured history). Trying the better-documented, more narrowly-scoped
- * mechanism first means a caller only ever falls through to the riskier,
- * GUI-dependent one once the safer one has already ruled itself out for
- * this specific target - never the other way around.
+ * Ordering rationale (a real decision, not arbitrary): `claudeMessagingTransport`
+ * probes by reading two environment variables and, at most, opening a local
+ * socket connection - no subprocess spawn, no GUI dependency - so trying it
+ * first costs nothing when it does not apply (a caller not running as a
+ * Claude Code subprocess simply has neither env var set, and `probe()`
+ * returns `unavailable` near-instantly) and is the harness's own genuine
+ * push-wake mechanism when it does. `appServerTransport` talks to the
+ * documented, versioned `codex app-server` subcommand and has exactly one
+ * well-defined reason to report itself unavailable - the running
+ * app-server not reporting its `"goals"` experimental feature enabled (see
+ * that file's own `probe()`). `desktopIpcTransport` instead depends on a
+ * live GUI window with the exact target conversation currently open in it,
+ * and reaches into the ChatGPT desktop app's undocumented internals over a
+ * socket path that has already relocated once inside a single app update
+ * (see that file's own header for the measured history). Trying the
+ * better-documented, more narrowly-scoped mechanisms first means a caller
+ * only ever falls through to the riskier, GUI-dependent one once the safer
+ * ones have already ruled themselves out for this specific target - never
+ * the other way around.
+ *
+ * In practice these three transports are mutually exclusive by harness (a
+ * Claude Code subprocess has the messaging env vars set and neither `codex`
+ * nor the desktop app's socket meaningfully reachable in a useful way; a
+ * Codex thread has neither messaging env var set), so this ordering rarely
+ * matters for which one actually delivers - it matters for which one is
+ * asked first when more than one might, in principle, answer.
  *
  * Built once, at module load, with each transport's own defaults - cheap
- * and side-effect-free, since neither constructor does anything beyond
- * assigning its own option fields (see each class's own constructor). A
- * caller that needs different transport options (a different socket path,
- * a different token budget) builds its own array instead of using this
- * one - `selectAndWake` takes the transport list as a plain parameter
- * specifically so this default is a convenience, never the only path.
+ * and side-effect-free, since none of these constructors does anything
+ * beyond assigning its own option fields (see each class's own
+ * constructor). A caller that needs different transport options (a
+ * different socket path, a different token budget) builds its own array
+ * instead of using this one - `selectAndWake` takes the transport list as a
+ * plain parameter specifically so this default is a convenience, never the
+ * only path.
  */
-export const DEFAULT_TRANSPORTS: readonly WakeTransport[] = [
+/**
+ * The one transport whose reach `GHANTIKA_WAKE_TRANSPORT_ENABLED` does NOT
+ * govern - see `tasksAdapter.ts`'s own header comment on that gate for why:
+ * this transport's destination is fixed by AC2's env-only chokepoint, not a
+ * runtime address the gate exists to guard. Exported as its own singleton,
+ * never folded into `CODEX_GATED_TRANSPORTS` below, so the two populations
+ * stay structurally distinct - a future change to what the gate means has
+ * no way to reach this one by accident.
+ */
+export const CLAUDE_MESSAGING_WAKE_TRANSPORT: WakeTransport = new ClaudeMessagingWakeTransport();
+
+/**
+ * The transports `GHANTIKA_WAKE_TRANSPORT_ENABLED` governs - both address a
+ * runtime-resolved Codex thread id over a channel whose reach is genuinely
+ * uncertain (a shared app-server, an IPC bus with ambiguous session
+ * ownership), which is exactly the case that gate exists for.
+ */
+export const CODEX_GATED_TRANSPORTS: readonly WakeTransport[] = [
   new AppServerGoalWakeTransport(),
   new DesktopIpcWakeTransport(),
+];
+
+export const DEFAULT_TRANSPORTS: readonly WakeTransport[] = [
+  CLAUDE_MESSAGING_WAKE_TRANSPORT,
+  ...CODEX_GATED_TRANSPORTS,
 ];
 
 /** Turns a caught value of unknown shape (per `catch`'s own typing under `strict`) into a readable message - for a transport that violates its own contract by throwing or rejecting instead of resolving a `WakeResult`. */
@@ -95,59 +132,20 @@ interface Attempt {
 }
 
 /**
- * True only when THIS process is itself running as a stdio MCP server
- * subprocess Claude Code spawned - the one signal Claude Code documents as
- * set for that case (confirmed by fetching
- * https://code.claude.com/docs/en/env-vars.md: "Set to 1 in subprocesses
- * Claude Code spawns (Bash and PowerShell tools, tmux sessions, hook
- * commands, status line commands, stdio MCP server subprocesses)").
- * ghantika itself runs exactly that way when Claude Code is the caller, so
- * this env var is a real, first-party fact about this process's own
- * parentage - never a platform or harness guess. Read on demand rather
- * than cached at module load: nothing in this module needs the answer
- * before the exhaustion path below actually runs, and a fresh read costs
- * nothing measurable.
- *
- * Deliberately the ONLY signal this function checks. A second heuristic
- * stacked on top (a parent-process name sniff, another env var) would only
- * widen the surface for a false read without adding real confidence - this
- * one is already a documented, first-party fact rather than an inference.
- *
- * Used for exactly one thing: composing the exhaustion `detail` string
- * below. See `selectAndWake`'s own doc comment for the hard boundary this
- * respects - it never changes which transports are tried, in what order,
- * or what `outcome` this function returns.
- */
-function isRunningUnderClaudeCode(): boolean {
-  return process.env.CLAUDECODE === "1";
-}
-
-/**
  * Composes the aggregate `detail` string for `selectAndWake`'s exhaustion
- * path - called only after the loop above has confirmed nothing delivered,
- * with `outcome` already decided by the caller and passed in read-only.
- * This function never influences that decision, only how it reads.
+ * path - called only after the loop above has confirmed nothing delivered.
  *
- * On `"unavailable"` specifically - never `"refused"`, since a refusal
- * means some live transport actually answered, and that answer belongs in
- * the log verbatim and unqualified, never reframed - this leads with a
- * plain-language summary when `isRunningUnderClaudeCode()` is true: none
- * of today's `DEFAULT_TRANSPORTS` serve that harness at all (both are
- * Codex-specific), so "tried 2, here's why each individually fell short"
- * reads as two unrelated near-misses when the honest fact is one absent
- * capability - this client has no configured push-wake mechanism at all,
- * and the caller's real working path is the poll floor
- * (`status`/`output`/`tail`). The full per-transport log still follows,
- * unchanged, for a reader who wants the mechanical detail underneath -
- * this PREPENDS the clearer summary rather than replacing the log, so
- * nothing already true about this run is lost.
- *
- * Every other case (a non-empty attempt list on any other outcome, or an
- * empty one) returns exactly the wording this produced before this
- * function existed - see `test/wake-select-transport.test.ts` for the
- * exact strings this is pinned against.
+ * A bare per-transport enumeration, always - no harness-specific
+ * special-casing. `DEFAULT_TRANSPORTS` now includes
+ * `ClaudeMessagingWakeTransport`, so there is no longer a harness with
+ * zero configured transports serving it; the per-transport log already
+ * says, per transport, exactly what happened (skipped as unavailable,
+ * attempted and refused, or attempted and unavailable), which is the
+ * accurate report whether or not the caller happens to be running under
+ * Claude Code. See `test/wake-select-transport.test.ts` for the exact
+ * strings this is pinned against.
  */
-function buildExhaustionDetail(attempts: readonly Attempt[], outcome: WakeOutcome): string {
+function buildExhaustionDetail(attempts: readonly Attempt[]): string {
   if (attempts.length === 0) {
     return "no transports were configured to try";
   }
@@ -155,14 +153,6 @@ function buildExhaustionDetail(attempts: readonly Attempt[], outcome: WakeOutcom
   const perTransportLog = `tried ${attempts.length} in order - ${attempts
     .map((attempt) => attempt.summary)
     .join("; ")}`;
-
-  if (outcome === "unavailable" && isRunningUnderClaudeCode()) {
-    return (
-      `no transport delivered; this process is running under Claude Code, and none of the ` +
-      `${attempts.length} configured transport(s) serve that client - there is no push-wake ` +
-      `mechanism available here, poll status/output/tail instead. ${perTransportLog}`
-    );
-  }
 
   return `no transport delivered; ${perTransportLog}`;
 }
@@ -221,15 +211,10 @@ function buildExhaustionDetail(attempts: readonly Attempt[], outcome: WakeOutcom
  * loop below simply never runs, so this needs no special-cased branch.
  *
  * The exhaustion `detail` string itself is built by `buildExhaustionDetail`
- * below, which on the `"unavailable"` outcome may lead with a plain-
- * language summary when the CURRENT PROCESS is running under Claude Code
- * (see `isRunningUnderClaudeCode`'s own doc comment) - today's
- * `DEFAULT_TRANSPORTS` are both Codex-specific, so on that harness a bare
- * per-transport enumeration reads as "two things broke" rather than "this
- * client has no push-wake mechanism at all." This affects MESSAGE TEXT
- * ONLY: it changes no branch above, decides no `outcome`, and requires no
- * caller of this function to know or pass in which harness it runs on -
- * this function's own signature is unchanged.
+ * below - a plain per-transport enumeration, the same on every harness. See
+ * that function's own doc comment for why no harness-specific wording is
+ * needed once every configured harness has a transport of its own in
+ * `DEFAULT_TRANSPORTS`.
  */
 export async function selectAndWake(
   transports: readonly WakeTransport[],
@@ -291,7 +276,7 @@ export async function selectAndWake(
 
   return {
     outcome,
-    detail: buildExhaustionDetail(attempts, outcome),
+    detail: buildExhaustionDetail(attempts),
     transportName: SELECTOR_TRANSPORT_NAME,
   };
 }

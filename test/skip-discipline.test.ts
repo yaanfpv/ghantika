@@ -833,6 +833,7 @@ function runSupervisorAgainstFixture({
   buildBaseline,
   buildCriticalTests,
   extraArgs = [],
+  extraEnv = {},
 }: {
   testFiles?: Record<string, string>;
   buildTestFiles?: (dir: string) => Record<string, string>;
@@ -840,6 +841,8 @@ function runSupervisorAgainstFixture({
   buildCriticalTests: (dir: string) => string[];
   /** Timing-flag overrides (e.g. `--test-timeout=500`) appended after the harness's three positional arguments - see run-tests-fixture-harness.mjs's own usage comment. */
   extraArgs?: string[];
+  /** Env vars merged on top of the inherited-and-cleaned base below - e.g. a caller simulating a real inherited CLAUDE_CODE_MESSAGING_SOCKET, which this test file's own real env normally does not carry. */
+  extraEnv?: Record<string, string>;
 }): FixtureResult {
   // Realpath'd for the same reason scripts/lib/is-main.mjs realpaths
   // process.argv[1]: on macOS, /tmp and /var are themselves symlinks
@@ -882,6 +885,7 @@ function runSupervisorAgainstFixture({
     // runOnce() invokes node:test's run() exactly like production does,
     // so this deletion is exactly as necessary here as it always was.
     delete env.NODE_TEST_CONTEXT;
+    Object.assign(env, extraEnv);
 
     return collectChildResult(HARNESS_PATH, [dir, baselinePath, criticalPath, ...extraArgs], env);
   } finally {
@@ -948,6 +952,57 @@ test("the real supervisor exits zero when only legitimate per-platform skips are
   });
 
   assert.equal(result.status, 0, `expected exit 0, got ${result.status}. stderr: ${result.stderr}`);
+});
+
+// ---------------------------------------------------------------------------
+// The suite is structurally incapable of inheriting a live messaging
+// channel into a test's own process - runOnce()'s own env strip, proven
+// end to end through the exact isolation:'process' chain production uses
+// (this harness's own runOnce() call, spawning this fixture file as a real
+// per-file child), not just as a unit test of a helper function.
+// ---------------------------------------------------------------------------
+
+test("runOnce() strips a real inherited CLAUDE_CODE_MESSAGING_SOCKET/TOKEN pair before any test file's own process can see it", () => {
+  const FAKE_SOCKET = "/tmp/ghantika-fixture-fake-messaging-socket-should-never-be-seen";
+  const FAKE_TOKEN = "fixture-fake-messaging-token-should-never-be-seen";
+
+  const result = runSupervisorAgainstFixture({
+    testFiles: {
+      "sees-no-inherited-messaging-env.test.mjs": [
+        'import { test } from "node:test";',
+        'import assert from "node:assert/strict";',
+        "test(\"this fixture test's own process must never see the parent's messaging env\", () => {",
+        "  assert.equal(",
+        "    process.env.CLAUDE_CODE_MESSAGING_SOCKET,",
+        "    undefined,",
+        "    \"CLAUDE_CODE_MESSAGING_SOCKET leaked into this test file's own process - runOnce()'s env strip did not run, or ran too late\"",
+        "  );",
+        "  assert.equal(",
+        "    process.env.CLAUDE_CODE_MESSAGING_TOKEN,",
+        "    undefined,",
+        "    \"CLAUDE_CODE_MESSAGING_TOKEN leaked into this test file's own process - runOnce()'s env strip did not run, or ran too late\"",
+        "  );",
+        "});",
+        "",
+      ].join("\n"),
+    },
+    buildBaseline: () => ({}),
+    buildCriticalTests: () => [],
+    // Simulates exactly the live incident: the process running the suite
+    // (here, the fixture harness this test spawns) carries a real,
+    // live-looking inherited messaging pair, the same way a developer's
+    // own Claude Code session would hand it to a locally-run `npm test`.
+    extraEnv: {
+      CLAUDE_CODE_MESSAGING_SOCKET: FAKE_SOCKET,
+      CLAUDE_CODE_MESSAGING_TOKEN: FAKE_TOKEN,
+    },
+  });
+
+  assert.equal(
+    result.status,
+    0,
+    `expected the fixture test to pass (the strip should hide both vars before its own process starts), got exit ${result.status}. stderr: ${result.stderr}`
+  );
 });
 
 // ---------------------------------------------------------------------------
