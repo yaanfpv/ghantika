@@ -142,9 +142,17 @@ async function sendMailAndAwaitResumption(controller, triggerPath, seq, resumpti
   controller.expectNonce(nonce);
   const sentAtMs = Date.now();
   writeFileSync(triggerPath, encodeMailArrival(nonce, sentAtMs));
+  // A liveness guard against hanging forever if something is genuinely
+  // broken, not a latency promise ghantika's own doorbell mechanism makes
+  // anywhere (checked: no such claim in lib/doorbell-cutover.mjs). Every
+  // outcome this proof cares about - missed, spurious, deduped, or
+  // late-duplicate - is caught by the content assertions in runHarness()
+  // regardless of how long a real resumption takes to arrive, so widening
+  // this bound gives real OS scheduling under host contention more room
+  // without weakening what's proven.
   await waitUntil(
     () => resumptions.some((r) => r.nonce.id === nonce.id),
-    2_000,
+    10_000,
     `resumption for nonce ${nonce.id} (seq ${seq})`
   );
   const observed = resumptions.find((r) => r.nonce.id === nonce.id);

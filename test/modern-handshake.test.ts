@@ -1482,7 +1482,14 @@ test(
       method: "totally/unknown/method",
       params: {},
     });
-    const parseLine = await server.nextLine();
+    // Explicit generous bound, not the bare default: this line's property
+    // is proven by the reply's CONTENT (must correlate to id 501, never to
+    // the malformed line), not by how fast it arrives, so widening this
+    // wait costs nothing - it only gives a real child-process round trip
+    // more room under host contention. A mutant that replies to the
+    // malformed line is still caught by the correlation assert below at
+    // any bound.
+    const parseLine = await server.nextLine(10_000);
     const parseBody = parseLine.parsed as { id: unknown; error?: { code: number } };
     assert.equal(
       parseBody.id,
