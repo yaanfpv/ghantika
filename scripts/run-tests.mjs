@@ -246,6 +246,34 @@ export const RUN_TOKEN_PATH = path.join(REPO_ROOT, ".run-token.json");
 // are helpers the real suites import, not suites themselves.
 const TEST_FILE_PATTERN = /\.test\.(ts|js|mjs|cjs|mts|cts)$/;
 
+// Test files excluded from run()'s file-level concurrent pool, run in
+// their own serial batch instead - see runOnce's own doc comment for how
+// the split is executed. Repo-relative paths, matched against rel(f).
+//
+// test/loader-escape-matrix.test.ts is here because its own timing margin
+// does not survive sharing the host with other files. Its first test
+// blocks on a nested `node --test` supervisor (runPermanentGuardSuite,
+// spawnSync with timeout: 45_000) running three other permanent-guard
+// files; measured directly (file-based instrumentation, three repeated
+// runs under coverage on a real hosted ubuntu-latest x86_64 runner at
+// --test-concurrency=4), that nested run completes in 32-43s with no
+// other file contending for the host, and brushes or exceeds its own 45s
+// bound under contention from three concurrently-running sibling files
+// (two consecutive ~45s timeouts observed in the one failing repeat of
+// three). The file's own baseline-caching (`ensureBaseline()`) does not
+// memoize a FAILED attempt, so a single marginal timeout leaves the next
+// test that needs the baseline retrying the identical expensive spawn
+// from scratch - two such retries already spend ~90s of the wrapper's own
+// 120s per-file budget, and a third attempt gets torn down externally
+// before it can even report its own failure, which is why a hang here
+// shows zero internal test-start events for the whole file. Running it
+// alone, with no sibling file contending for the host, sidesteps the
+// mechanism rather than raising its own already-generous 45s bound
+// further - a higher bound narrows the failure window without removing
+// it, since the underlying race is against whatever else happens to be
+// running at that moment, not against a fixed cost this file controls.
+const SERIAL_ONLY_TEST_FILES = new Set(["test/loader-escape-matrix.test.ts"]);
+
 // Every event name the test runner emits that can carry a `.file`
 // property, used both to reset the idle watchdog on ANY sign of life and
 // to record which files have been heard from at all. See node:test's
@@ -333,11 +361,10 @@ export function parseArgs(argv) {
     // sees, because test:start for that same test does not arrive until
     // the callback (block included) has already settled. Under coverage,
     // no OTHER file is running at the same time to paper over the
-    // silence either - not because c8 forces anything (it doesn't; see
-    // the --test-concurrency comment below for the actual mechanism),
-    // but because the coverage script itself never passes
-    // --test-concurrency, so this call falls to node:test's own
-    // serial-by-default.
+    // silence either - this file is a member of SERIAL_ONLY_TEST_FILES
+    // (see that constant's own doc comment), so runOnce runs it alone in
+    // its own batch regardless of what --test-concurrency the coverage
+    // script passes for every other file.
     //
     // Measured directly, not assumed: instrumenting this file's own
     // noteEvent() to log the gap before every liveness event and running
@@ -395,43 +422,37 @@ export function parseArgs(argv) {
     // regardless of what this timer does, so the timer only ever reports
     // what was already true.
     leakWindowMs: 5_000,
-    // How many test FILES run() runs concurrently. UNSET BY DEFAULT, on
-    // purpose: with no --test-concurrency flag, no `concurrency` key is
-    // ever built into the object passed to run() at all (see runOnce
-    // below) - node:test's own programmatic default applies, which is
-    // strictly serial, one file at a time, byte-identical to this
-    // runner's behavior before this option existed. CI never passes
-    // this flag anywhere (ci.yml, main-verify.yml) and so stays fully
-    // serial by that same default, not by a value this file chose for
-    // it - a separate story measures what's actually safe on a hosted
-    // GitHub runner and may set a CI value later, but that is out of
-    // this option's scope. The local gate doesn't pass it either: its
-    // only test-executing job is `npm run coverage`, and that script
-    // never passes --test-concurrency, so this call falls to the exact
-    // same node:test default described three sentences up - not
-    // something c8 imposes. c8 has no mechanism that could impose it:
-    // its entire implementation (confirmed by reading bcoe/c8's
-    // bin/c8.js) is setting NODE_V8_COVERAGE and spawning the wrapped
-    // command as one foreground child process; it never inspects or
-    // throttles what that command does internally, and V8's own
-    // per-process coverage output (one file per process, keyed by
-    // pid/timestamp/threadId) has no collision hazard that would make
-    // concurrent files under coverage unsafe by construction. If
-    // --test-concurrency WERE passed to `npm run coverage` too, nothing
-    // here or in c8 would strip it - this file's own runOptions.concurrency
-    // assignment above is unconditional on whether coverage is active.
-    // That is UNMEASURED, not unsafe: no run in this repo's history has
-    // exercised it, so this option in practice cannot speed up the gate
-    // today, only a direct, non-coverage invocation of the suite -
-    // simply because nobody has wired the flag into that script.
+    // How many test FILES run() runs concurrently, for every file OUTSIDE
+    // SERIAL_ONLY_TEST_FILES (that set always runs alone, regardless of
+    // this value - see its own doc comment and runOnce's batch split).
+    // UNSET BY DEFAULT for a bare invocation: with no --test-concurrency
+    // flag, no `concurrency` key is ever built into the object passed to
+    // run() at all (see runOnce below) - node:test's own programmatic
+    // default applies, which is strictly serial, one file at a time,
+    // byte-identical to this runner's behavior before this option
+    // existed. `npm run coverage` (ci.yml's `coverage` job) DOES now pass
+    // --test-concurrency=4 - see ci.yml's own comment on that step for
+    // the hosted x86_64-under-coverage measurement that value rests on.
+    // The `test` job's direct `node scripts/run-tests.mjs` invocation
+    // still passes no such flag and stays serial by the same default;
+    // widening that is a separate, unmeasured-under-that-path change and
+    // out of this option's scope. c8 itself has no mechanism that could
+    // impose or block concurrency either way: its entire implementation
+    // (confirmed by reading bcoe/c8's bin/c8.js) is setting
+    // NODE_V8_COVERAGE and spawning the wrapped command as one foreground
+    // child process; it never inspects or throttles what that command
+    // does internally, and V8's own per-process coverage output (one
+    // file per process, keyed by pid/timestamp/threadId) has no
+    // collision hazard that would make concurrent files under coverage
+    // unsafe by construction - confirmed empirically too, by the hosted
+    // measurement ci.yml's own comment cites.
     //
-    // For that direct case - a contributor iterating locally with
-    // `node scripts/run-tests.mjs` or a future package.json script that
-    // doesn't route through c8 - --test-concurrency=N is the explicit,
-    // visible opt-in. Measured on this host (macOS, arm64, 8 logical
-    // cores), five repeated full real-suite runs at each concurrency
-    // value, non-coverage path, this repo's real test/ directory (58
-    // files at measurement time):
+    // For a contributor iterating locally with `node scripts/run-tests.mjs`
+    // directly, or the `test` job's own path - --test-concurrency=N is
+    // the explicit, visible opt-in. Measured on this host (macOS, arm64, 8
+    // logical cores), five repeated full real-suite runs at each
+    // concurrency value, non-coverage path, this repo's real test/
+    // directory (58 files at measurement time):
     //
     //   concurrency (unset/serial): 267.84s (1 run)
     //   concurrency=1:              268.06s (1 run - confirms explicit
@@ -935,6 +956,33 @@ function flushJunitSync(junitPath, buffer) {
   }
 }
 
+// Derives one batch's own junit output path from the caller's single
+// GHANTIKA_JUNIT value. Each of runOnce's batches is its OWN node:test
+// run() call, and node:test's junit reporter emits one complete,
+// independently-valid <testsuites>...</testsuites> XML document per
+// run() - concatenating two such documents into one file is not valid
+// XML (two root elements), so each batch gets its own file rather than
+// sharing runOnce's single junitBuffer the way a single-batch invocation
+// always has. ci.yml's own report_paths is a glob (mikepenz/action-junit-
+// report groups every file it matches), which is what recombines them for
+// the annotate step - no merge logic needed on this side.
+//
+// `suffix === ""` returns basePath UNCHANGED, so the batch that keeps
+// this call's default suffix produces the exact same filename a
+// single-batch invocation always has (`test-results.xml`, not
+// `test-results.xml` with an empty suffix inserted) - existing consumers
+// that assume that exact name keep working. A falsy basePath (no
+// GHANTIKA_JUNIT set at all) returns null for every batch regardless of
+// suffix, matching flushJunitSync's own no-op-on-falsy-path behavior.
+function batchJunitPath(basePath, suffix) {
+  if (!basePath) return null;
+  if (!suffix) return basePath;
+  const dir = path.dirname(basePath);
+  const ext = path.extname(basePath);
+  const base = path.basename(basePath, ext);
+  return path.join(dir, `${base}${suffix}${ext}`);
+}
+
 /**
  * Records that this run terminated via one of the two hang-recovery paths
  * that write a marker at all (idle-watchdog, wall-cap - never
@@ -1106,20 +1154,63 @@ export function runOnce({
     // claim about it.
     const headSha = readGitHeadSha();
 
-    // No `concurrency` key at all unless --test-concurrency was actually
-    // passed (options.concurrency stays undefined otherwise - see
-    // parseArgs's own doc comment on this option above). This keeps the
-    // unflagged call byte-identical in shape to what this file passed to
-    // run() before this option existed: { files, timeout }, nothing
-    // else - never a `concurrency: undefined` key relying on node:test's
-    // own undefined-handling to fall back correctly.
-    const runOptions = { files: discovered, timeout: options.testTimeoutMs };
-    if (options.concurrency !== undefined) {
-      runOptions.concurrency = options.concurrency;
+    // Two batches at most, run SEQUENTIALLY rather than as one run() call:
+    // SERIAL_ONLY_TEST_FILES members alone first (no `concurrency` key at
+    // all - node:test's own strictly-serial default, so a member of that
+    // set never shares the host with any other file regardless of what
+    // --test-concurrency the caller passed), then everything else under
+    // the caller's requested concurrency exactly as a single-batch call
+    // would have used it. A file list with nothing in the serial set
+    // produces one batch, byte-identical in shape to what this file
+    // passed to run() before batching existed: { files, timeout }, plus
+    // `concurrency` only when --test-concurrency was actually passed -
+    // never a `concurrency: undefined` key relying on node:test's own
+    // undefined-handling to fall back correctly.
+    const serialBatchFiles = discovered.filter((f) => SERIAL_ONLY_TEST_FILES.has(rel(f)));
+    const concurrentBatchFiles = discovered.filter((f) => !SERIAL_ONLY_TEST_FILES.has(rel(f)));
+    const batchDefs = [];
+    if (serialBatchFiles.length > 0) {
+      batchDefs.push({
+        files: serialBatchFiles,
+        concurrency: undefined,
+        junitPath: batchJunitPath(junitPath, "-serial-only"),
+      });
     }
-    const stream = run(runOptions);
+    if (concurrentBatchFiles.length > 0) {
+      batchDefs.push({
+        files: concurrentBatchFiles,
+        concurrency: options.concurrency,
+        junitPath: batchJunitPath(junitPath, ""),
+      });
+    }
+    // main() already refuses a zero-file `discovered` before runOnce is
+    // ever called (see its own "discovered zero test files" check), so
+    // batchDefs is never empty here - the filter above only redistributes
+    // files between the two groups, never drops any.
 
-    let junitBuffer = "";
+    // One buffer PER BATCH, each flushed to its own file (see
+    // batchJunitPath's own doc comment for why: two `run()` calls each
+    // produce their own complete, independently-valid JUnit XML document,
+    // and concatenating two such documents into one file is not valid
+    // XML - ci.yml's own report_paths glob is what recombines them for
+    // the annotate step instead). Indexed by batch, pre-allocated for
+    // every batch up front so onIdleTimeout/onWallTimeout/onPostCompletionLeak
+    // below can flush whatever any STARTED batch has accumulated so far
+    // without caring which batch was active when they fired.
+    const junitBuffers = batchDefs.map((def) => ({ path: def.junitPath, buffer: "" }));
+    let currentBatchIndex = 0;
+    function flushAllJunits() {
+      // Only batches that have actually STARTED (index <= current): an
+      // unstarted future batch has produced no data at all, and writing
+      // an empty file for it would be a false, misleadingly-precise
+      // artifact rather than an honest absence - the exact distinction
+      // TRUNCATION_MARKER_PATH's own doc comment draws for the run as a
+      // whole, applied here per file.
+      for (let i = 0; i <= currentBatchIndex; i++) {
+        flushJunitSync(junitBuffers[i].path, junitBuffers[i].buffer);
+      }
+    }
+
     let junitFinished = false;
     let streamEnded = false;
     let terminationFired = false;
@@ -1151,12 +1242,10 @@ export function runOnce({
     // once per real test regardless of pass, fail, or skip outcome,
     // carrying the same `skip`/`todo` fields either way (confirmed
     // empirically: a skipped test always reports via "test:pass", never
-    // "test:fail").
+    // "test:fail"). Declared here, shared across every batch; the actual
+    // "test:complete" listener is wired per batch inside runBatch below,
+    // against that batch's own stream.
     const skipResults = [];
-    stream.on("test:complete", (data) => {
-      const classified = classifyTestCompletionForSkipDiscipline(data);
-      if (classified) skipResults.push(classified);
-    });
 
     function noteEvent(name, data) {
       lastEvent = { name, file: data?.file, name_: data?.name };
@@ -1178,43 +1267,93 @@ export function runOnce({
 
     const wallTimer = setTimeout(onWallTimeout, options.wallTimeoutMs);
 
-    for (const name of LIVENESS_EVENT_NAMES) {
-      stream.on(name, (data) => {
-        noteEvent(name, data);
-        if (name === "test:fail") didFail = true;
-        if (name === "test:start" && data?.file) {
-          // "stderr always carries the name of the last test started" -
-          // written before the test runs, per the design this
-          // implements. This is a claim about stderr alone: stdout (the
-          // spec reporter, piped separately below) and stderr are
-          // different pipes with no interleaving guarantee, so the
-          // combined log is not claimed to end with this line, only
-          // stderr on its own.
-          process.stderr.write(`start: ${rel(data.file)} :: ${data.name}\n`);
+    // Runs batchDefs[currentBatchIndex], then either advances to the next
+    // batch or - on the LAST batch - sets the same streamEnded/junitFinished
+    // flags a single-batch call always set, so tryFinalizeNormal below
+    // never has to know batching exists. Every per-event tracker
+    // (noteEvent, didFail, skipResults, the idle timer) is the OUTER,
+    // batch-spanning one declared above; only the raw node:test stream and
+    // this batch's own junit sink are local to one runBatch() call. The
+    // wall timer is likewise NOT reset here - it bounds the whole
+    // runOnce() invocation, all batches together, exactly as it did
+    // before batching existed.
+    function runBatch() {
+      const def = batchDefs[currentBatchIndex];
+      const entry = junitBuffers[currentBatchIndex];
+      const isLastBatch = currentBatchIndex === batchDefs.length - 1;
+
+      const runOptions = { files: def.files, timeout: options.testTimeoutMs };
+      if (def.concurrency !== undefined) {
+        runOptions.concurrency = def.concurrency;
+      }
+      const stream = run(runOptions);
+
+      stream.on("test:complete", (data) => {
+        const classified = classifyTestCompletionForSkipDiscipline(data);
+        if (classified) skipResults.push(classified);
+      });
+
+      for (const name of LIVENESS_EVENT_NAMES) {
+        stream.on(name, (data) => {
+          noteEvent(name, data);
+          if (name === "test:fail") didFail = true;
+          if (name === "test:start" && data?.file) {
+            // "stderr always carries the name of the last test started" -
+            // written before the test runs, per the design this
+            // implements. This is a claim about stderr alone: stdout (the
+            // spec reporter, piped separately below) and stderr are
+            // different pipes with no interleaving guarantee, so the
+            // combined log is not claimed to end with this line, only
+            // stderr on its own.
+            process.stderr.write(`start: ${rel(data.file)} :: ${data.name}\n`);
+          }
+        });
+      }
+
+      // { end: false } on every batch's pipe into process.stdout: this
+      // destination is reused across batches (there is only ever one real
+      // stdout), so no single batch's own stream ending may close it out
+      // from under a later batch still to run.
+      stream.compose(spec).pipe(process.stdout, { end: false });
+
+      const junitSink = new Writable({
+        write(chunk, _enc, cb) {
+          entry.buffer += chunk;
+          cb();
+        },
+      });
+      stream.compose(junit).pipe(junitSink);
+
+      let batchStreamEnded = false;
+      let batchJunitFinished = false;
+      function tryAdvanceOrFinishBatch() {
+        if (terminationFired) return;
+        if (!batchStreamEnded || !batchJunitFinished) return;
+        if (isLastBatch) {
+          streamEnded = true;
+          junitFinished = true;
+          tryFinalizeNormal();
+        } else {
+          currentBatchIndex += 1;
+          runBatch();
         }
+      }
+
+      junitSink.on("finish", () => {
+        batchJunitFinished = true;
+        tryAdvanceOrFinishBatch();
+      });
+
+      stream.on("end", () => {
+        batchStreamEnded = true;
+        if (isLastBatch) {
+          clearTimeout(idleTimer);
+          clearTimeout(wallTimer);
+        }
+        tryAdvanceOrFinishBatch();
       });
     }
-
-    stream.compose(spec).pipe(process.stdout);
-
-    const junitSink = new Writable({
-      write(chunk, _enc, cb) {
-        junitBuffer += chunk;
-        cb();
-      },
-    });
-    stream.compose(junit).pipe(junitSink);
-    junitSink.on("finish", () => {
-      junitFinished = true;
-      tryFinalizeNormal();
-    });
-
-    stream.on("end", () => {
-      streamEnded = true;
-      clearTimeout(idleTimer);
-      clearTimeout(wallTimer);
-      tryFinalizeNormal();
-    });
+    runBatch();
 
     function tryFinalizeNormal() {
       if (terminationFired || !streamEnded || !junitFinished) return;
@@ -1239,7 +1378,7 @@ export function runOnce({
         for (const error of skipErrors) console.error(`  - ${error}`);
       }
 
-      flushJunitSync(junitPath, junitBuffer);
+      flushAllJunits();
       const ok = !didFail && missingFloor.length === 0 && skipErrors.length === 0;
 
       // Proof this run reached ITS OWN completion point, bound to the exact
@@ -1324,7 +1463,7 @@ export function runOnce({
         idleMessage,
         truncationMarkerFallbackPath
       );
-      flushJunitSync(junitPath, junitBuffer);
+      flushAllJunits();
       process.exit(1);
     }
 
@@ -1342,7 +1481,7 @@ export function runOnce({
         wallMessage,
         truncationMarkerFallbackPath
       );
-      flushJunitSync(junitPath, junitBuffer);
+      flushAllJunits();
       process.exit(1);
     }
 
@@ -1364,7 +1503,7 @@ export function runOnce({
       // unfinished test file - c8's own numbers here are not the same kind
       // of untrustworthy the idle/wall paths produce, so this path
       // deliberately does NOT write the truncation marker.
-      flushJunitSync(junitPath, junitBuffer);
+      flushAllJunits();
       process.exit(1);
     }
   });

@@ -108,7 +108,19 @@ jobs:
       # spawns with `env: process.env` (see coverage-lock-worker-wrapper.mjs
       # and scripts/lib/coverage-floor-lock.mjs), so nothing extra is needed
       # to make it reach the same place a plain `npm test` invocation would.
-      - run: npm run coverage
+      #
+      # --test-concurrency=4 runs every test file EXCEPT
+      # test/loader-escape-matrix.test.ts concurrently (see that file's own
+      # exclusion in scripts/run-tests.mjs's SERIAL_ONLY_TEST_FILES) -
+      # measured on this exact job's own hardware (ubuntu-latest, x86_64,
+      # under coverage, three repeated runs at this value): with the
+      # exclusion in place, the concurrent batch and the excluded file's own
+      # isolated batch both complete cleanly every time. Before the
+      # exclusion, this same concurrency value failed the one excluded file
+      # in 1 of 3 hosted repeats - a contention-sensitive nested spawn
+      # inside that file losing a race against three other files running
+      # at once; see the file's own doc comment for the full mechanism.
+      - run: npm run coverage -- --test-concurrency=4
         env:
           GHANTIKA_JUNIT: test-results.xml
       - name: enforce the absolute coverage floor (blocking)
@@ -119,11 +131,18 @@ jobs:
       # Same reporter, same reasoning as the test job's own step above: this
       # is the run this leg actually reports on rather than a second one,
       # and a truncated/empty report must fail rather than silently pass.
+      # report_paths is a glob (mikepenz/action-junit-report groups every
+      # file it matches) rather than the single test-results.xml name it
+      # used to be: run-tests.mjs's own batching now produces a SECOND file,
+      # test-results-serial-only.xml, for the one file excluded from the
+      # concurrent pool - each batch is its own complete, independently-
+      # valid JUnit document, and this glob is what recombines them for
+      # this one annotate pass rather than either file being read alone.
       - name: annotate any failing tests from this leg on the PR
         if: ${{ !cancelled() }}
         uses: mikepenz/action-junit-report@d9f48fc87bc235f7e214acf696ca5abc0a986f16 # v6.4.2
         with:
-          report_paths: test-results.xml
+          report_paths: test-results*.xml
           annotate_only: true
           fail_on_parse_error: true
           require_tests: true
@@ -203,11 +222,18 @@ jobs:
       # moment the job actually needs it, and the default would let that
       # disappear silently. This step must fail, not annotate nothing,
       # when the report it's given cannot be trusted.
+      #
+      # report_paths is a glob for the same reason the coverage job's own
+      # step is: run-tests.mjs always runs
+      # test/loader-escape-matrix.test.ts in its own batch (see
+      # SERIAL_ONLY_TEST_FILES), regardless of whether --test-concurrency
+      # is passed to this invocation at all, so this job also always
+      # produces test-results-serial-only.xml alongside test-results.xml.
       - name: annotate any failing tests from this leg on the PR
         if: ${{ !cancelled() }}
         uses: mikepenz/action-junit-report@d9f48fc87bc235f7e214acf696ca5abc0a986f16 # v6.4.2
         with:
-          report_paths: test-results.xml
+          report_paths: test-results*.xml
           annotate_only: true
           fail_on_parse_error: true
           require_tests: true
