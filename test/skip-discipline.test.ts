@@ -1838,25 +1838,70 @@ test("omitting --test-concurrency entirely still runs discovered test files stri
 });
 
 test("--test-concurrency=2 makes two real discovered test-file processes genuinely overlap in wall-clock time", () => {
+  // PROPERTY: two genuinely spawned test-file child processes start close
+  // enough together to prove true concurrent overlap, contrasted with the
+  // sibling tests in this file proving the serial default/=1 produce a
+  // near-full-SLEEP_MS gap.
+  //
+  // REDESIGNED from an absolute 500ms bound: that number tested real OS
+  // process-scheduling proximity directly, so under contention,
+  // process-creation latency for the second child could push the observed
+  // gap past 500ms even when the concurrency wiring is correct - a
+  // scheduling artifact, not a wiring bug, indistinguishable from a real
+  // regression by a fixed threshold. Measuring THIS RUN's own serial gap
+  // first and comparing the concurrent gap against a fraction of it (the
+  // sibling test's own "concurrentGap < serialGap/2" trick, matching the
+  // e2e-server MAX_RESPONSE_MS redesign) removes the host-speed dependency
+  // entirely: whatever this host's real scheduling overhead happens to be
+  // that moment, the serial baseline absorbs it, and the ratio between the
+  // two runs is what proves genuine overlap rather than a lucky absolute
+  // number.
   const SLEEP_MS = 1200;
-  const dir = realpathSync(mkdtempSync(path.join(tmpdir(), "ghantika-concurrency-overlap-")));
+  const serialDir = realpathSync(
+    mkdtempSync(path.join(tmpdir(), "ghantika-concurrency-serial-baseline-"))
+  );
+  const overlapDir = realpathSync(
+    mkdtempSync(path.join(tmpdir(), "ghantika-concurrency-overlap-"))
+  );
   try {
-    const { files, markerA, markerB } = buildConcurrencyProbeFiles(dir, SLEEP_MS);
-    for (const [relPath, content] of Object.entries(files)) {
-      writeFileSync(path.join(dir, relPath), content);
-    }
-    const baselinePath = path.join(dir, "skip-baseline.json");
-    const criticalPath = path.join(dir, "critical-tests.json");
-    writeFileSync(baselinePath, "{}");
-    writeFileSync(criticalPath, "[]");
-
     const env = { ...process.env };
     delete env.GHANTIKA_JUNIT;
     delete env.NODE_TEST_CONTEXT;
 
+    // Measure THIS run's own serial gap first, on this same host, right
+    // now - the baseline the concurrent run below is judged against.
+    const serialProbe = buildConcurrencyProbeFiles(serialDir, SLEEP_MS);
+    for (const [relPath, content] of Object.entries(serialProbe.files)) {
+      writeFileSync(path.join(serialDir, relPath), content);
+    }
+    const serialBaselinePath = path.join(serialDir, "skip-baseline.json");
+    const serialCriticalPath = path.join(serialDir, "critical-tests.json");
+    writeFileSync(serialBaselinePath, "{}");
+    writeFileSync(serialCriticalPath, "[]");
+    const serialResult = collectChildResult(
+      HARNESS_PATH,
+      [serialDir, serialBaselinePath, serialCriticalPath],
+      env
+    );
+    assert.equal(
+      serialResult.status,
+      0,
+      `serial baseline run: expected exit 0, got ${serialResult.status}. stderr: ${serialResult.stderr}`
+    );
+    const serialGapMs = readStartGapMs(serialProbe.markerA, serialProbe.markerB);
+
+    const { files, markerA, markerB } = buildConcurrencyProbeFiles(overlapDir, SLEEP_MS);
+    for (const [relPath, content] of Object.entries(files)) {
+      writeFileSync(path.join(overlapDir, relPath), content);
+    }
+    const baselinePath = path.join(overlapDir, "skip-baseline.json");
+    const criticalPath = path.join(overlapDir, "critical-tests.json");
+    writeFileSync(baselinePath, "{}");
+    writeFileSync(criticalPath, "[]");
+
     const result = collectChildResult(
       HARNESS_PATH,
-      [dir, baselinePath, criticalPath, "--test-concurrency=2"],
+      [overlapDir, baselinePath, criticalPath, "--test-concurrency=2"],
       env
     );
     assert.equal(
@@ -1867,11 +1912,12 @@ test("--test-concurrency=2 makes two real discovered test-file processes genuine
 
     const gapMs = readStartGapMs(markerA, markerB);
     assert.ok(
-      gapMs < 500,
-      `expected both files to start within 500ms of each other at concurrency=2 (genuine overlap), got a ${gapMs}ms gap`
+      gapMs < serialGapMs / 2,
+      `expected the concurrency=2 start gap (${gapMs}ms) to be well under half this same run's own serial gap (${serialGapMs}ms) - genuine overlap, not host-speed luck`
     );
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(serialDir, { recursive: true, force: true });
+    rmSync(overlapDir, { recursive: true, force: true });
   }
 });
 

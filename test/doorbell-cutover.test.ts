@@ -450,6 +450,11 @@ test("nonce ordering, dedupe window, and rollback order: dedupe window boundary 
 });
 
 test("nonce ordering, dedupe window, and rollback order: in-flight nonce order is preserved through a live cutover - resumptions are never reordered relative to send order", async () => {
+  // PROPERTY: sending N real nonces through a live cutover, resumption
+  // order exactly matches send order - the controller never reorders
+  // relative to what a real filesystem's own delivery gives it (not a
+  // claim about correcting OS-level reordering; see this file's own scope
+  // note below).
   const dir = mkdtempSync(path.join(tmpdir(), "ghantika-doorbell-order-"));
   const triggerPath = path.join(dir, "scratch.trigger");
   writeFileSync(triggerPath, "");
@@ -462,19 +467,36 @@ test("nonce ordering, dedupe window, and rollback order: in-flight nonce order i
     onResumption: (e) => resumptionSeqs.push((e as { nonce: { seq: number } }).nonce.seq),
   });
 
+  // Waits for `onResumption` to have actually fired for nonce `seq` -
+  // a REAL synchronization point on this test's own oracle, replacing a
+  // fixed inter-write sleep that was only ever a timing GUESS. The
+  // poller's cadence (15ms) can race a fixed write-spacing sleep under
+  // host contention (a delayed poll tick could coalesce two writes into
+  // one observed content read, silently dropping a sequence number
+  // rather than reordering it - the same assert.deepEqual would still
+  // catch it, but only after the fact); waiting on the actual processed
+  // count instead means the harness never writes nonce N+1 until N is
+  // confirmed observed, so there is nothing left to race.
+  const waitForResumption = async (seq: number, timeoutMs: number): Promise<void> => {
+    const deadline = Date.now() + timeoutMs;
+    while (!resumptionSeqs.includes(seq) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
+
   try {
     await monitor.arm();
-    // Send several nonces in send-order, spaced enough for this real
-    // filesystem's own event delivery to keep up (see this file's own
-    // scope note: this proves the CONTROLLER never reorders what it is
-    // given, on a real filesystem's own real ordering - not that this
-    // mechanism corrects an OS-level reordering, which is a different,
-    // unclaimed property).
+    // Send several nonces in send-order. Each write is followed by a
+    // real wait on that nonce's own resumption having been observed -
+    // never a guessed sleep - so this proves the CONTROLLER never
+    // reorders what it is given, on a real filesystem's own real
+    // ordering - not that this mechanism corrects an OS-level
+    // reordering, which is a different, unclaimed property.
     for (let seq = 1; seq <= 5; seq++) {
       const nonce = generateNonce(seq);
       controller.expectNonce(nonce);
       writeFileSync(triggerPath, encodeMailArrival(nonce, Date.now()));
-      await new Promise((resolve) => setTimeout(resolve, 40));
+      await waitForResumption(seq, 3_000);
     }
     // A cutover happens WHILE more nonces are already in flight in the
     // sense that they were registered ahead of time - exercised here by
@@ -485,13 +507,9 @@ test("nonce ordering, dedupe window, and rollback order: in-flight nonce order i
       const nonce = generateNonce(seq);
       controller.expectNonce(nonce);
       writeFileSync(triggerPath, encodeMailArrival(nonce, Date.now()));
-      await new Promise((resolve) => setTimeout(resolve, 40));
+      await waitForResumption(seq, 3_000);
     }
 
-    const deadline = Date.now() + 3_000;
-    while (resumptionSeqs.length < 7 && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
     assert.deepEqual(
       resumptionSeqs,
       [1, 2, 3, 4, 5, 6, 7],

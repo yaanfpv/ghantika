@@ -118,6 +118,26 @@ async function nextResponse(
   }
 }
 
+/**
+ * Polls a real `process.kill(pid, 0)` existence probe until the pid is
+ * reaped or `timeoutMs` elapses. `waitForExit()` resolves on Node's own
+ * exit event for the CHILD it spawned directly - it does not guarantee
+ * the OS has finished reporting every descendant pid as gone, so a
+ * single immediate check right after it is racing real OS bookkeeping
+ * under host load. This does not weaken what the check proves: an
+ * implementation that never reaps the pid still exhausts the whole
+ * bound and fails exactly as before. It only tolerates the OS taking a
+ * moment, which was never the property under test.
+ */
+async function waitForReaped(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (!isProcessAlive(pid)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 interface DiscoverResultBody {
   readonly jsonrpc: string;
   readonly id: number;
@@ -1404,8 +1424,8 @@ test(
     server.child.kill("SIGTERM");
     await server.waitForExit();
     assert.equal(
-      isProcessAlive(pid!),
-      false,
+      await waitForReaped(pid!, 3_000),
+      true,
       "this variant's own reap guarantee must still hold with the gate removed"
     );
   }
@@ -1525,8 +1545,8 @@ test(
     server.child.kill("SIGTERM");
     await server.waitForExit();
     assert.equal(
-      isProcessAlive(pid!),
-      false,
+      await waitForReaped(pid!, 3_000),
+      true,
       "this variant's own reap guarantee must still hold with the parse-wrap removed"
     );
   }

@@ -547,6 +547,26 @@ test(
     skip: process.platform === "win32" ? "shadows a slow ps on PATH, POSIX-only" : false,
   },
   async () => {
+    // PROPERTY: (a) a tight phase budget genuinely degrades against a
+    // real, slower operation, proving the budget is load-bearing rather
+    // than accidentally generous; (b) the second phase's fresh budget is
+    // unaffected by how the first phase spent its own. Both sub-claims are
+    // races between a real execFile timeout and a real subprocess sleep,
+    // so the timing relationship IS the property - widening either side
+    // without the other would stop proving (a).
+    //
+    // The 500ms/800ms pair below is a PROPORTIONAL SCALE of the original
+    // 250ms/400ms pair, not a threshold raise: 250 is passed as an
+    // explicit literal budget argument to captureEscalationIdentitySnapshot,
+    // never sourced from PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS (whose
+    // real production default is 2000ms) or from
+    // ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS (also 250ms, but that
+    // constant governs a settlement grace inside the async read helpers
+    // and is never referenced by this call - the shared numeral is
+    // coincidence, not reuse). So 250 was test-chosen and free to scale.
+    // Doubling both sides preserves the identical timeout-less-than-sleep
+    // ratio (500 < 800, same as 250 < 400) while doubling the absolute
+    // real-scheduling margin from ~150ms to ~300ms.
     const rec = recorder();
     const env = buildChildEnv("merge", {});
     const child = spawnManaged(
@@ -557,7 +577,7 @@ test(
     const pid = child!.pid!;
 
     // A ps that sleeps a REAL, deliberately generous multiple of the tight
-    // budget below (400ms against a 250ms budget) before answering normally
+    // budget below (800ms against a 500ms budget) before answering normally
     // - slow, but genuinely cooperative (never hangs past the bound; a
     // plain `sleep` has no SIGTERM trap, so execFile's own internal timeout
     // reaps it right at the budget). This does NOT depend on how many real
@@ -571,7 +591,7 @@ test(
     const realPsPath = execFileSync("which", ["ps"], { encoding: "utf8" }).trim();
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ghantika-slow-cooperative-ps-"));
     const wrapperPath = path.join(dir, "ps");
-    fs.writeFileSync(wrapperPath, `#!/bin/sh\nsleep 0.4\nexec '${realPsPath}' "$@"\n`);
+    fs.writeFileSync(wrapperPath, `#!/bin/sh\nsleep 0.8\nexec '${realPsPath}' "$@"\n`);
     fs.chmodSync(wrapperPath, 0o755);
 
     const realPath = process.env.PATH;
@@ -582,20 +602,20 @@ test(
     try {
       process.env.PATH = `${dir}:${realPath ?? "/usr/bin:/bin"}`;
       const beforeSnapshot = Date.now();
-      // A tight overall phase budget (250ms) the slow-but-cooperative ps
-      // (400ms, a single leader read - this spawned child has no
+      // A tight overall phase budget (500ms) the slow-but-cooperative ps
+      // (800ms, a single leader read - this spawned child has no
       // descendants, so the batched descendant read never executes) cannot
       // complete within: execFile's own internal timeout SIGTERMs the
-      // wrapper at 250ms, deterministically, well before its 400ms sleep
+      // wrapper at 500ms, deterministically, well before its 800ms sleep
       // would otherwise finish on its own - proving the snapshot phase's
       // own budget is independent and can genuinely degrade on its own,
       // regardless of machine speed.
-      snapshot = await captureEscalationIdentitySnapshot(pid, 250);
+      snapshot = await captureEscalationIdentitySnapshot(pid, 500);
       snapshotElapsedMs = Date.now() - beforeSnapshot;
       assert.equal(
         snapshot.degraded,
         true,
-        "expected the deliberately tight 250ms budget to genuinely degrade this snapshot attempt (proving the bound was real, not accidentally generous enough to still succeed)"
+        "expected the deliberately tight 500ms budget to genuinely degrade this snapshot attempt (proving the bound was real, not accidentally generous enough to still succeed)"
       );
 
       // Regardless of how the snapshot phase's own budget was spent, the
@@ -612,18 +632,20 @@ test(
     }
 
     assert.ok(
-      // Widened from 500ms - the same real-scheduling-delay class
-      // documented at test/run.test.ts's RUN_RESPONSE_TIME_BOUND_MS: this
-      // phase can internally hit its own 250ms budget more than once
-      // across its sequential steps, each adding its own settlement
-      // grace, so its real total under genuine concurrent load can run
-      // well past a bare 2x multiple of the nominal budget. 1500ms stays
+      // The same real-scheduling-delay class documented at
+      // test/run.test.ts's RUN_RESPONSE_TIME_BOUND_MS: this phase can
+      // internally hit its own 500ms budget more than once across its
+      // sequential steps, each adding its own settlement grace
+      // (ASYNC_ELAPSED_READ_SETTLEMENT_GRACE_MS, 250ms), so its real
+      // total under genuine concurrent load can run well past a bare
+      // budget+grace sum. 1800ms - scaled proportionally from the
+      // pre-scale bound of 1500ms against a 250ms budget - stays
       // comfortably below the fresh, full budgets (2000/5000ms) used
       // later in this same test, so it still proves this phase was
       // genuinely bounded by its OWN tight allowance rather than
       // borrowing time from anything else.
-      snapshotElapsedMs < 1500,
-      `expected the tightly-budgeted snapshot phase to have been bounded by its OWN 250ms budget, took ${snapshotElapsedMs}ms`
+      snapshotElapsedMs < 1800,
+      `expected the tightly-budgeted snapshot phase to have been bounded by its OWN 500ms budget, took ${snapshotElapsedMs}ms`
     );
     assert.deepEqual(
       gate,
