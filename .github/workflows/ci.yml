@@ -309,6 +309,7 @@ jobs:
       - run: npm run guard:wake-transport-boundaries
       - run: npm run guard:no-bounded-kill-confirmed-wait
       - run: npm run guard:polling-claim
+      - run: npm run guard:wake-claim
 
   # Confirms the checked-out commit really is the pull request's head rather
   # than the synthetic merge commit a pull_request event checks out by
