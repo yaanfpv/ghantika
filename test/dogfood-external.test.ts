@@ -461,10 +461,19 @@ test(
       ],
     });
 
-    // While the first "pending" step is still outstanding, outcome must
-    // NOT have settled - "no event yet" is represented only by the
-    // promise remaining unresolved, never by a value. Race it against a
-    // short timer to observe that, without waiting for the real failure.
+    // PROPERTY: while the external wake detector's poll loop has not yet
+    // produced a real result, handle.outcome stays unresolved rather than
+    // settling to a placeholder - proven by racing it against a 40ms
+    // timer. "No event yet" is represented only by the promise remaining
+    // unresolved, never by a value, so this races the outcome against a
+    // short timer to observe that without waiting for the real failure.
+    //
+    // DISCLOSED MARGIN: pollIntervalMs is 150 with two "pending" steps
+    // before the real one, so the earliest possible real result is
+    // ~150ms+ out; the 40ms probe has ~110ms of real margin against that.
+    // That ratio (150 vs 40) is controlled by this test's own fixture
+    // plan, not by host speed, so it does not shrink under concurrent
+    // load the way a fixed-vs-host-scheduling race would.
     const stillPending = await Promise.race([
       handle.outcome.then(() => "settled" as const),
       new Promise((resolve) => setTimeout(() => resolve("still-pending" as const), 40)),
