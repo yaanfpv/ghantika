@@ -1857,8 +1857,12 @@ test("--test-concurrency=2 makes two real discovered test-file processes genuine
   // two runs is what proves genuine overlap rather than a lucky absolute
   // number.
   const SLEEP_MS = 1200;
-  const serialDir = realpathSync(mkdtempSync(path.join(tmpdir(), "ghantika-concurrency-serial-baseline-")));
-  const overlapDir = realpathSync(mkdtempSync(path.join(tmpdir(), "ghantika-concurrency-overlap-")));
+  const serialDir = realpathSync(
+    mkdtempSync(path.join(tmpdir(), "ghantika-concurrency-serial-baseline-"))
+  );
+  const overlapDir = realpathSync(
+    mkdtempSync(path.join(tmpdir(), "ghantika-concurrency-overlap-"))
+  );
   try {
     const env = { ...process.env };
     delete env.GHANTIKA_JUNIT;
