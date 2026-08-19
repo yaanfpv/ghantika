@@ -10,9 +10,12 @@ name: Measure hosted concurrency
 # losing the race. scripts/measure-hosted-concurrency.mjs does the actual
 # work; see that file's header for the full rationale, including exactly
 # which of ci.yml's two test-running jobs this reproduces (the
-# non-coverage `test` matrix job - never the c8-wrapped `coverage` job,
-# which forces a single concurrent file and would report a flat,
-# meaningless result regardless of any value passed here).
+# non-coverage `test` matrix job, not the c8-wrapped `coverage` job - not
+# because c8 forces anything about file concurrency, which it doesn't,
+# but because measuring through the coverage job would confound file
+# concurrency with coverage instrumentation's own per-module cost, and
+# passing --test-concurrency to `npm run coverage` is itself unmeasured
+# for safety today).
 #
 # NOT wired into ci.yml's own `gate` aggregate, and deliberately a
 # separate file rather than a job appended to ci.yml - the same reasoning
