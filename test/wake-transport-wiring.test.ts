@@ -267,15 +267,17 @@ test("with the gate ON, resolution 'malformed' still never calls CODEX_GATED_TRA
       "CLAUDE_MESSAGING_WAKE_TRANSPORT.probe() must still be attempted for a malformed Codex target - it needs no target at all"
     );
 
-    // Two console.error calls: the malformed-target diagnostic (logged
-    // unconditionally before the transport list is even built), then the
-    // non-"delivered" outcome diagnostic from selectAndWake's own
-    // exhausted-attempts result (unreachableProbe reports unavailable, so
-    // selectAndWake never reaches wake() and resolves "unavailable").
+    // Three console.error calls: the malformed-target diagnostic (logged
+    // unconditionally before the transport list is even built), the
+    // wake-latency instrumentation line (emitted unconditionally at the top
+    // of the .then handler, regardless of outcome), then the non-"delivered"
+    // outcome diagnostic from selectAndWake's own exhausted-attempts result
+    // (unreachableProbe reports unavailable, so selectAndWake never reaches
+    // wake() and resolves "unavailable").
     assert.equal(
       errorSpy.mock.callCount(),
-      2,
-      `expected exactly two console.error calls (malformed-target diagnostic + exhaustion diagnostic), got ${errorSpy.mock.callCount()}`
+      3,
+      `expected exactly three console.error calls (malformed-target diagnostic + wake-latency diagnostic + exhaustion diagnostic), got ${errorSpy.mock.callCount()}`
     );
 
     const malformedArgs = errorSpy.mock.calls[0]!.arguments;
@@ -285,7 +287,10 @@ test("with the gate ON, resolution 'malformed' still never calls CODEX_GATED_TRA
       `[ghantika] transport wake target malformed for task ${job.job_id}: wake target ${resolution.reason}`
     );
 
-    const exhaustionArgs = errorSpy.mock.calls[1]!.arguments;
+    const wakeLatencyArgs = errorSpy.mock.calls[1]!.arguments;
+    assert.equal(wakeLatencyArgs[0], "[ghantika] wake-latency");
+
+    const exhaustionArgs = errorSpy.mock.calls[2]!.arguments;
     assert.equal(exhaustionArgs[0], "[ghantika] transport wake unavailable for task");
     assert.equal(exhaustionArgs[1], job.job_id);
     assert.equal(exhaustionArgs[2], "-");
