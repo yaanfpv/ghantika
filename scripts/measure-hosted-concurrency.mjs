@@ -10,13 +10,24 @@
  *
  * WHICH JOB THIS MIRRORS, AND WHY IT MATTERS: this repo's CI runs the test
  * suite through two structurally different paths. The `coverage` job
- * wraps scripts/run-tests.mjs in c8, which - per that file's own header
- * comment - forces a single concurrent file regardless of any concurrency
- * value passed to node:test's run(); measuring concurrency through that
- * path always reports a flat, meaningless result. The `test` job (the
- * os x node matrix in ci.yml) runs `node scripts/run-tests.mjs
- * --test-timeout=120000` directly, with no c8 wrapper at all - that is the
- * only path where file concurrency changes anything, and it is the path
+ * wraps scripts/run-tests.mjs in c8; that file's own npm script never
+ * passes --test-concurrency to it, so node:test's run() falls to its own
+ * programmatic default (serial) there - the SAME reason any invocation
+ * without that flag is serial, coverage or not. c8 itself has no
+ * mechanism that could force or limit run()'s internal file concurrency:
+ * its whole implementation is setting NODE_V8_COVERAGE and spawning the
+ * wrapped command as one child process (confirmed by reading bcoe/c8's
+ * bin/c8.js directly), with no inspection of what that command does
+ * internally. This script still reproduces the `test` job rather than
+ * the `coverage` job, but for a narrower, still-real reason: measuring
+ * concurrency through the coverage job would confound two variables at
+ * once (coverage instrumentation's own per-module cost, separate from
+ * file concurrency), and the `coverage` job's own local-gate leg is
+ * unmeasured for concurrent-file safety today (nothing has exercised
+ * passing --test-concurrency to `npm run coverage`) - not because c8
+ * forbids it. The `test` job (the os x node matrix in ci.yml) runs `node
+ * scripts/run-tests.mjs --test-timeout=120000` directly, with no c8
+ * wrapper and no coverage-instrumentation confound - that is the path
  * this script reproduces: same discovery, same skip-baseline and
  * critical-test machinery, same GHANTIKA_POLICY_FILE setup, same
  * --test-timeout default, no coverage instrumentation anywhere in this

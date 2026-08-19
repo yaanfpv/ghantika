@@ -331,9 +331,13 @@ export function parseArgs(argv) {
     // test:dequeue reach the parent first. While the blocking call is in
     // flight, this file still emits nothing this wrapper's stream ever
     // sees, because test:start for that same test does not arrive until
-    // the callback (block included) has already settled. Under coverage
-    // (c8 forces this run() call to a single concurrent file), no OTHER
-    // file is running at the same time to paper over the silence either.
+    // the callback (block included) has already settled. Under coverage,
+    // no OTHER file is running at the same time to paper over the
+    // silence either - not because c8 forces anything (it doesn't; see
+    // the --test-concurrency comment below for the actual mechanism),
+    // but because the coverage script itself never passes
+    // --test-concurrency, so this call falls to node:test's own
+    // serial-by-default.
     //
     // Measured directly, not assumed: instrumenting this file's own
     // noteEvent() to log the gap before every liveness event and running
@@ -402,13 +406,24 @@ export function parseArgs(argv) {
     // it - a separate story measures what's actually safe on a hosted
     // GitHub runner and may set a CI value later, but that is out of
     // this option's scope. The local gate doesn't pass it either: its
-    // only test-executing job is `npm run coverage`, and c8
-    // unconditionally forces that run() call to a single concurrent
-    // file regardless of any concurrency option this file would
-    // otherwise pass (see the idleTimeoutMs comment above, "Under
-    // coverage (c8 forces this run() call to a single concurrent
-    // file)") - so this option cannot speed up the gate, only a direct,
-    // non-coverage invocation of the suite.
+    // only test-executing job is `npm run coverage`, and that script
+    // never passes --test-concurrency, so this call falls to the exact
+    // same node:test default described three sentences up - not
+    // something c8 imposes. c8 has no mechanism that could impose it:
+    // its entire implementation (confirmed by reading bcoe/c8's
+    // bin/c8.js) is setting NODE_V8_COVERAGE and spawning the wrapped
+    // command as one foreground child process; it never inspects or
+    // throttles what that command does internally, and V8's own
+    // per-process coverage output (one file per process, keyed by
+    // pid/timestamp/threadId) has no collision hazard that would make
+    // concurrent files under coverage unsafe by construction. If
+    // --test-concurrency WERE passed to `npm run coverage` too, nothing
+    // here or in c8 would strip it - this file's own runOptions.concurrency
+    // assignment above is unconditional on whether coverage is active.
+    // That is UNMEASURED, not unsafe: no run in this repo's history has
+    // exercised it, so this option in practice cannot speed up the gate
+    // today, only a direct, non-coverage invocation of the suite -
+    // simply because nobody has wired the flag into that script.
     //
     // For that direct case - a contributor iterating locally with
     // `node scripts/run-tests.mjs` or a future package.json script that
