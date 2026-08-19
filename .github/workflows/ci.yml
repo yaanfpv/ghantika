@@ -109,36 +109,60 @@ jobs:
       # and scripts/lib/coverage-floor-lock.mjs), so nothing extra is needed
       # to make it reach the same place a plain `npm test` invocation would.
       #
-      # --test-concurrency=4 is wired below but IS NOT VALIDATED SAFE. A
-      # sweep of 2/3/4 against this exact command - the coverage-floor
-      # lock, c8, run-tests.mjs, with test/loader-escape-matrix.test.ts's
-      # own exclusion (SERIAL_ONLY_TEST_FILES) already in place - run on
-      # this job's own hardware (ubuntu-latest, x86_64, under coverage),
-      # three repeats per value, found no value clean across all three:
+      # --test-concurrency=3, chosen from two independent sweeps against
+      # this exact command - the coverage-floor lock, c8, run-tests.mjs,
+      # with test/loader-escape-matrix.test.ts's own exclusion
+      # (SERIAL_ONLY_TEST_FILES) already in place - both run on this job's
+      # own hardware (ubuntu-latest, x86_64, under coverage), three repeats
+      # per value.
+      #
+      # First sweep (before the widenings below): no value clean across
+      # all three repeats.
       #
       #   concurrency=2: 1 of 3 repeats failed
       #   concurrency=3: 1 of 3 repeats failed
       #   concurrency=4: 2 of 3 repeats failed
       #
-      # and the failures are not confined to one file. They land on
-      # test/modern-handshake.test.ts:1414 (a negative-control test
-      # already documented as contention-sensitive at concurrency=8,
-      # locally, non-coverage, on an 8-core Mac - a result that plainly
-      # does not transfer to this job's own conditions) and on
-      # test/doorbell-cutover.test.ts:770 (a synthetic-cycle test whose
-      # own import chain never spawns a process at all - a different
-      # contention mechanism, CPU scheduling pressure on its own timers
-      # rather than a spawn racing a fixed timeout). Together with
-      # test/loader-escape-matrix.test.ts, that is at least three files
-      # sharing one shape - a real spawn or async cycle racing a fixed
-      # assertion under load - surfaced across two independent sweeps, not
-      # a single instance. Two sweeps finding three is not evidence the set
-      # is closed. test/loader-escape-matrix.test.ts's own exclusion below
-      # stays regardless of what this value ends up being: its own margin
-      # justifies it on its own, separate from the concurrency question.
-      # What this job actually runs at is not yet settled; this comment
-      # states the measured result rather than a resolved one.
-      - run: npm run coverage -- --test-concurrency=4
+      # The failures landed on test/modern-handshake.test.ts:1414 (a
+      # negative-control test already documented as contention-sensitive
+      # at concurrency=8, locally, non-coverage, on an 8-core Mac - a
+      # result that plainly did not transfer to this job's own conditions)
+      # and on test/doorbell-cutover.test.ts:770 (a synthetic-cycle test
+      # whose own import chain never spawns a process at all - a
+      # different contention mechanism, CPU scheduling pressure on its
+      # own timers rather than a spawn racing a fixed timeout). Both were
+      # bare timing bounds racing real load rather than proving a timing
+      # property, so both were widened (see that commit for the
+      # per-site reasoning on why widening costs only headroom there,
+      # never proof).
+      #
+      # Confirming re-sweep on the widened candidate: same instrument,
+      # same repeat count, before/after on the same three values.
+      #
+      #   concurrency=2: 1 of 3 -> 0 of 3 failed, CLEAN
+      #   concurrency=3: 1 of 3 -> 0 of 3 failed, CLEAN
+      #   concurrency=4: 2 of 3 -> 1 of 3 failed, still not clean
+      #
+      # Both originally-fixed sites are confirmed absent across all 9
+      # repeats of the re-sweep, including the one that failed. 4 was
+      # tested and rejected: ~136s against 3's ~148s is roughly 8% for a
+      # value that still fails one run in three, and a gate that reds
+      # 1-in-3 unrelated to the change under review destroys the signal -
+      # the same reasoning that rejected every value the first time. 3 is
+      # the value actually run here.
+      #
+      # The concurrency=4/repeat-1 failure that remains is a genuine new
+      # finding, not touched by the widenings above: two different tests
+      # (test/coverage-floor-lock.test.ts:649 and a second,
+      # previously-untouched test in test/modern-handshake.test.ts:1311)
+      # failed under that load, both the same shape - a spawn or
+      # identity-capture racing a fixed assertion. Neither was widened;
+      # concurrency=4 is simply not run.
+      #
+      # test/loader-escape-matrix.test.ts's own exclusion below stays
+      # regardless of what this value is: its own margin justifies it on
+      # its own, separate from the concurrency question.
+      - run: npm run coverage -- --test-concurrency=3
         env:
           GHANTIKA_JUNIT: test-results.xml
       - name: enforce the absolute coverage floor (blocking)

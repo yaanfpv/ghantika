@@ -431,8 +431,9 @@ export function parseArgs(argv) {
     // default applies, which is strictly serial, one file at a time,
     // byte-identical to this runner's behavior before this option
     // existed. `npm run coverage` (ci.yml's `coverage` job) DOES now pass
-    // --test-concurrency=4 - see ci.yml's own comment on that step for
-    // the hosted x86_64-under-coverage measurement that value rests on.
+    // --test-concurrency=3 - see ci.yml's own comment on that step for
+    // the hosted x86_64-under-coverage measurement that value rests on
+    // (4 was measured and rejected there: still 1-in-3 failing).
     // The `test` job's direct `node scripts/run-tests.mjs` invocation
     // still passes no such flag and stays serial by the same default;
     // widening that is a separate, unmeasured-under-that-path change and
