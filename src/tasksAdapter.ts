@@ -1332,7 +1332,17 @@ function startTaskWatch(taskId: string, notifier: TaskWakeNotifier): void {
  * notifications.
  */
 function startTaskStatusNotifier(taskId: string, notifier: TaskWakeNotifier): void {
-  jobStore.onJobTerminal(taskId, () => {
+  const unsubscribeTerminal = jobStore.onJobTerminal(taskId, () => {
+    // Called first, unconditionally, before any of this callback's own
+    // early returns - `onJobTerminal` fires this at most once per task,
+    // but `fireJobTerminal` never removes a fired listener from its own
+    // Set on its own (see that method's own docs), so this closure must
+    // unsubscribe itself to avoid staying registered for the job's whole
+    // remaining life. Matches `startTransportWakeOnTerminal`'s own
+    // identical `unsubscribeTerminal()` call, which does the same for its
+    // sibling subscription.
+    unsubscribeTerminal();
+
     const record = jobStore.get(taskId);
     // Defensive only - the record that just transitioned into a terminal
     // state must still exist at this exact synchronous instant (this

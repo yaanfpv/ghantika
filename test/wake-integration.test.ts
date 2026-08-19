@@ -894,6 +894,51 @@ test("the released spec's own `notifications/tasks` status notification fires ex
   }
 });
 
+test("startTaskStatusNotifier releases its own onJobTerminal subscription on the terminal transition - the count-based real oracle, asserted AFTER terminalization (never before, which is precisely how the sibling leak this guards against survived its own prior test coverage)", async () => {
+  const pair = await startPair(true);
+  let jobId: string | undefined;
+  try {
+    const minted = await mintJob(pair.client, {
+      command: [process.execPath, "-e", "process.stdout.write('listener-leak-line\\n');"],
+      label: "status-notifier-listener-leak",
+    });
+    jobId = minted.taskId as string;
+
+    // All three onJobTerminal subscribers this connection's capability
+    // and this job's non-terminal mint-time state together wire -
+    // startTaskWatch, startTaskStatusNotifier, and startTransportWakeOnTerminal
+    // (registered unconditionally, regardless of isCapableConnection or the
+    // wake-transport gate - see maybeAugmentRunResult's own doc comment) -
+    // are all live before the job's real terminal transition. The same
+    // real oracle test/wake-transport-wiring.test.ts's own "fires AT MOST
+    // ONCE" test already asserts this exact count before terminalization.
+    assert.equal(
+      jobStore.getJobTerminalListenerCount(jobId),
+      3,
+      "expected all three onJobTerminal subscribers registered before the terminal transition"
+    );
+
+    await pollTaskUntilTerminal(pair.client, jobId);
+
+    // The real regression this test exists for: startTaskWatch's own
+    // stopWatch() and startTransportWakeOnTerminal's own unsubscribeTerminal()
+    // both already unsubscribe themselves correctly - checking only that
+    // the count DROPPED would pass even with startTaskStatusNotifier's own
+    // subscription leaked forever (count 3 -> 1, still a drop). The
+    // assertion is exact-zero, which only holds once every one of the
+    // three has released its own listener - the leaked shape would read 1
+    // here, never 0.
+    assert.equal(
+      jobStore.getJobTerminalListenerCount(jobId),
+      0,
+      "expected ZERO onJobTerminal listeners remaining after the terminal transition - a nonzero count means at least one subscriber (most likely startTaskStatusNotifier, whose own onJobTerminal call this test guards) is still registered and will never be released for this job's whole remaining life"
+    );
+  } finally {
+    if (jobId !== undefined) await killAndReapRealChild(jobId);
+    await pair.close();
+  }
+});
+
 test("notifications/tasks still fires on the real terminal transition even after a firehose has already auto-stopped GHANTIKA_OUTPUT_WAKE_METHOD's own watch for the SAME job - proving the two notifications are independent subscriptions, never torn down together, since the firehose guard governs the output-delta wake only and this notification fires at most once regardless of output volume", async () => {
   const pair = await startPair(true);
   let jobId: string | undefined;
