@@ -201,6 +201,7 @@ import {
   CLIENT_CAPABILITIES_META_KEY,
   ProtocolError,
   ProtocolErrorCode,
+  SERVER_INFO_META_KEY,
   Server,
   deserializeMessage,
 } from "@modelcontextprotocol/server";
@@ -674,14 +675,14 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
   //
   // A REAL, MEASURED WIRE FACT about the installed SDK, disclosed here
   // rather than left to surprise a future reader: on the 2026-07-28 era
-  // specifically, `tasks/get` and `tasks/cancel` are UNROUTABLE regardless
-  // of what this file registers. Confirmed by reading the installed
-  // `@modelcontextprotocol/server` package's own dispatch source directly,
-  // then reproduced end to end against the real built server: `tasks/get`
-  // and `tasks/cancel` (but not `tasks/update`, which the legacy vocabulary
-  // never defined) are members of the SDK's own 2025-11-25-era
-  // `requestMethodKeys` registry - the deprecated get/result/list/cancel
-  // vocabulary this codebase's own adapter deliberately never imports (see
+  // specifically, `tasks/get` and `tasks/cancel` are UNROUTABLE through
+  // this registration alone, regardless of what this file registers.
+  // Confirmed by reading the installed `@modelcontextprotocol/server`
+  // package's own dispatch source directly: `tasks/get` and `tasks/cancel`
+  // (but not `tasks/update`, which the legacy vocabulary never defined)
+  // are members of the SDK's own 2025-11-25-era `requestMethodKeys`
+  // registry - the deprecated get/result/list/cancel vocabulary this
+  // codebase's own adapter deliberately never imports (see
   // tasksAdapter.ts's own header) - but ABSENT from the 2026-07-28 era's
   // own registry, which lists only core methods
   // (`tools/*`/`prompts/*`/`resources/*`/`completion/complete`/
@@ -689,23 +690,26 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
   // own request dispatch checks `isSpecRequestMethod(method) &&
   // !codec.hasRequestMethod(method)` BEFORE ever consulting this file's own
   // `_requestHandlers` map, and replies -32601 "Method not found" the
-  // instant that holds - so a modern-era `tasks/get`/`tasks/cancel` request
-  // never reaches `tasksAdapter.getTask`/`cancelTask` at all, with or
-  // without Tasks capability declared (the block fires on the METHOD NAME
-  // alone, before any capability is even read). `tasks/update` has no
-  // legacy-era precedent at all, so it is recognized as a spec method by
-  // NEITHER codec, falls through that guard entirely, and reaches this
-  // file's own handler normally on both eras - reproduced directly: a real
-  // modern-wire `tasks/update` call against a real minted task returns the
-  // genuine `{resultType: "complete"}` ack, while `tasks/get`/`tasks/cancel`
-  // against that SAME task on that SAME connection both return -32601. See
-  // `test/modern-handshake.test.ts`'s own task-method tests for the
-  // reproduction. This is an installed-SDK routing fact about the era, not
-  // a defect in this file's own registration or a capability gate this
-  // codebase applies - a legacy-era connection, or any in-process
-  // `InMemoryTransport` test, reaches all three normally, and that is
-  // where `tasks/get`/`tasks/cancel` are actually exercised end to end
-  // today.
+  // instant that holds - so a modern-era `tasks/get`/`tasks/cancel`
+  // REQUEST reaching that dispatch never gets to `_requestHandlers` at
+  // all, with or without Tasks capability declared (the block fires on the
+  // METHOD NAME alone, before any capability is even read). `tasks/update`
+  // has no legacy-era precedent at all, so it is recognized as a spec
+  // method by NEITHER codec, falls through that guard entirely, and
+  // reaches this file's own handler normally on both eras.
+  //
+  // `attachExtensionTaskMethodInterceptor` (below, wired from `.connect`)
+  // is what makes `tasks/get`/`tasks/cancel` dispatch anyway on the modern
+  // era: it answers a genuine modern-era request for either method BEFORE
+  // it ever reaches the SDK's own dispatch, by calling straight into
+  // `tasksAdapter.getTask`/`cancelTask` and sending the response itself -
+  // see that function's own doc comment for the interception mechanism and
+  // why it is safe. Every other message, on either era, still reaches
+  // `_requestHandlers` exactly as before - including `tasks/get`/
+  // `tasks/cancel` on a LEGACY connection, where the guard above never
+  // fires in the first place and this file's own registration already
+  // dispatches them normally. See `test/modern-handshake.test.ts`'s own
+  // task-method tests for the real-wire proof, on both eras.
   server.setRequestHandler(
     "tasks/get",
     { params: tasksAdapter.taskIdParamsSchema() },
@@ -742,19 +746,33 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
     // this one ran first. `requestCancellationControllers`'s own doc
     // comment above explains why this exists at all (the installed SDK's
     // own cancellation dispatch drops a legal request id of `0`).
+    //
+    // `attachExtensionTaskMethodInterceptor` is wired the OPPOSITE way from
+    // every observer above: AFTER `realConnect(transport)` resolves, on
+    // BOTH branches, rather than before. Every observer above attaches
+    // before `realConnect` runs, so the SDK's own dispatch becomes the new
+    // OUTER wrapper once `realConnect` installs it - correct for a passive
+    // second look that runs the SDK's handling first and adds its own on
+    // top, and the wrong shape for this interceptor, which needs to run
+    // FIRST and choose whether the SDK's own dispatch ever sees a given
+    // message at all (see that function's own doc comment for why this
+    // ordering is what makes that possible, and for the exact scope of
+    // what it intercepts).
     if (server.getNegotiatedProtocolVersion() !== undefined) {
       // A pre-negotiated MODERN connection - see this file's header doc
       // ("Modern era's own trust anchor") for why `serveStdio` setting
       // this BEFORE calling `.connect()` is itself the proof a legacy
       // connection has no equivalent for and does not need one. Nothing
-      // else claims `transport.onmessage` on this branch, so this is a
-      // plain (first) assignment, not actually a chain - see this
-      // function's own doc comment.
+      // else claims `transport.onmessage` on this branch before
+      // `realConnect` runs, so the SDK's own assignment inside it is a
+      // plain (first) assignment, not actually a chain.
       servedModernEra = true;
       initializeNegotiationSucceeded = true;
       receivedInitializedNotification = true;
       attachCancelledNotificationObserver(transport, applyCancellation);
-      return realConnect(transport);
+      await realConnect(transport);
+      attachExtensionTaskMethodInterceptor(transport, () => servedModernEra);
+      return;
     }
     attachInitializeRequestObserver(transport, (id) => {
       pendingInitializeRequestId = id;
@@ -778,7 +796,22 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
     // that observer's own `transport.onmessage` assignment rather than
     // silently discarding it - see this function's own doc comment.
     attachCancelledNotificationObserver(transport, applyCancellation);
-    return realConnect(transport);
+    await realConnect(transport);
+    // `servedModernEra` stays `false` for the rest of this connection's
+    // life on this branch: it is set true ONLY on the pre-negotiated
+    // branch above, and this branch's own `initialize` negotiation never
+    // sets it, on success or failure - the two eras are entered through
+    // genuinely disjoint paths, not through one negotiation with two
+    // outcomes. So `attachExtensionTaskMethodInterceptor`'s own per-message
+    // read of it always sees `false` here, and its `tasks/get`/
+    // `tasks/cancel` branch never fires on a connection that negotiated
+    // this way - correctly: those two methods already dispatch normally
+    // through `_requestHandlers` on the legacy era (see this function's
+    // own header doc above), so there is nothing for the interceptor to
+    // do. Wired uniformly on both branches anyway, rather than only on the
+    // pre-negotiated one, so there is one interceptor implementation whose
+    // correctness does not depend on which branch happened to run it.
+    attachExtensionTaskMethodInterceptor(transport, () => servedModernEra);
   };
 
   return { server, isInitialized: isInitializedForToolCalls };
@@ -1273,6 +1306,237 @@ function cancelledNotificationInfo(
     requestId: params.requestId,
     reason: typeof params.reason === "string" ? params.reason : undefined,
   };
+}
+
+/**
+ * The methods `attachExtensionTaskMethodInterceptor` self-handles - see
+ * that function's own doc comment for why. Kept as its own named union
+ * rather than inlined so `interceptableTaskMethodRequest`'s own membership
+ * check and every switch on the result stay exhaustive against ONE
+ * definition.
+ */
+type InterceptableTaskMethod = "tasks/get" | "tasks/cancel";
+
+/**
+ * Wires `attachExtensionTaskMethodInterceptor`'s own outermost handler onto
+ * `transport.onmessage`, capturing whatever handler is ALREADY installed
+ * (the SDK's own dispatch, once `realConnect` has run) as `previousOnMessage`
+ * - the opposite chaining direction from every observer above, and
+ * deliberately so.
+ *
+ * WHY this has to run first, not alongside: the base `Protocol` class's own
+ * dispatch replies -32601 for `tasks/get`/`tasks/cancel` on the modern era
+ * BEFORE it ever looks at this file's own `_requestHandlers` map (see this
+ * function's own call site in `.connect`, and the header doc above
+ * `buildGhantikaServerCore`'s task-method registration, for the exact
+ * mechanism and where it was independently re-verified against the
+ * installed SDK's raw dispatch rather than trusted from a comment). A
+ * SECOND look at the same traffic - the shape every other observer in this
+ * file uses - cannot change a decision the SDK's dispatch already made and
+ * already replied to. Getting in front of that decision is the only way to
+ * change the outcome, which is why this attaches AFTER `realConnect`
+ * (capturing the SDK's now-installed dispatch as `previousOnMessage`)
+ * rather than before it (which would make this file's own handler the
+ * INNER one, called only after the SDK's dispatch already ran and already
+ * decided).
+ *
+ * SCOPE, deliberately narrow: only a genuine `tasks/get`/`tasks/cancel`
+ * REQUEST (a real `id`, never a notification) on a connection where
+ * `isServedModernEra()` reads `true` AT THE MOMENT the message arrives is
+ * self-handled - `previousOnMessage` is never called for that one message,
+ * and this codebase answers it directly via `tasksAdapter.getTask`/
+ * `cancelTask`. Every other message - every other method, both these
+ * methods on a legacy connection, any notification - is passed through to
+ * `previousOnMessage` completely unchanged, so the SDK's own dispatch still
+ * sees and handles it exactly as it always did.
+ *
+ * `isServedModernEra` is a callback rather than a captured boolean,
+ * matching `attachInitializeResponseObserver`'s own `isPendingId` pattern
+ * above and for the same reason: the era is not yet settled at the moment
+ * this attaches on the legacy-negotiation branch of `.connect`, so a value
+ * captured once at wiring time could read stale. In practice
+ * `servedModernEra` is set (or not) entirely BEFORE `realConnect` returns
+ * on every path this file has - see `.connect`'s own doc comment for why
+ * there is no window where a request can arrive before the era is decided
+ * - but reading it fresh per message costs nothing and removes the need to
+ * reason about that timing at every future change to `.connect`.
+ */
+function attachExtensionTaskMethodInterceptor(
+  transport: Transport,
+  isServedModernEra: () => boolean
+): void {
+  const previousOnMessage = transport.onmessage;
+  transport.onmessage = (message) => {
+    const request = interceptableTaskMethodRequest(message);
+    if (request === undefined || !isServedModernEra()) {
+      previousOnMessage?.(message);
+      return;
+    }
+    void handleInterceptedTaskMethodRequest(transport, request);
+  };
+}
+
+/**
+ * Returns `{ method, id, rawParams }` when `message` is a genuine
+ * `tasks/get` or `tasks/cancel` REQUEST (a real, present `id` - never a
+ * notification, which has none), `undefined` otherwise. A pure syntactic
+ * classifier, the same shape as `initializeRequestId`/
+ * `cancelledNotificationInfo` above - deliberately never reads era here,
+ * since that is `attachExtensionTaskMethodInterceptor`'s own job via
+ * `isServedModernEra`, keeping this function a stable, unconditional fact
+ * about the message alone.
+ */
+function interceptableTaskMethodRequest(
+  message: JSONRPCMessage
+): { method: InterceptableTaskMethod; id: string | number; rawParams: unknown } | undefined {
+  if (typeof message !== "object" || message === null) return undefined;
+  const candidate = message as { method?: unknown; id?: unknown; params?: unknown };
+  if (candidate.method !== "tasks/get" && candidate.method !== "tasks/cancel") return undefined;
+  if (typeof candidate.id !== "string" && typeof candidate.id !== "number") return undefined;
+  return { method: candidate.method, id: candidate.id, rawParams: candidate.params };
+}
+
+/**
+ * Self-handles one intercepted `tasks/get`/`tasks/cancel` request: validates
+ * `rawParams` through the SAME `tasksAdapter.taskIdParamsSchema()` this
+ * file's own (legacy-era-reached) registration for these two methods
+ * already uses, calls straight into `tasksAdapter.getTask`/`cancelTask`,
+ * and sends the response itself via `transport.send` - there is no
+ * `_requestHandlers` entry involved on this path at all, so nothing here
+ * reuses `server.setRequestHandler`'s own machinery.
+ *
+ * The RESULT shape sent on success matches the real modern-era wire
+ * response BYTE FOR BYTE, not merely approximately - see
+ * `applyModernEraResultMetaStamp`'s own doc comment for how that was
+ * established (measured against `test/modern-handshake.test.ts`'s own
+ * `tasks/update` assertion, the one task method that already reaches the
+ * SDK's real 2026-07-28 encode pipeline today, rather than derived by
+ * reading that pipeline's private internals alone).
+ *
+ * The ERROR shape on a thrown `ProtocolError` (an unknown or expired
+ * `taskId`, or a schema-invalid `taskId`) mirrors exactly what the SDK's
+ * own dispatch does for a handler that throws one - confirmed by reading
+ * that dispatch's own catch clause directly: `{jsonrpc: "2.0", id,
+ * error: {code: error.code, message: error.message, ...(error.data !==
+ * undefined && {data: error.data})}}`. Any OTHER thrown value (never
+ * expected from `getTask`/`cancelTask`, which only ever throw
+ * `ProtocolError` - see tasksAdapter.ts's own docs) is reported as
+ * `ProtocolErrorCode.InternalError` rather than left unhandled, so a
+ * connection can never hang on this path.
+ */
+async function handleInterceptedTaskMethodRequest(
+  transport: Transport,
+  request: { method: InterceptableTaskMethod; id: string | number; rawParams: unknown }
+): Promise<void> {
+  const outcome = await tasksAdapter.taskIdParamsSchema()["~standard"].validate(request.rawParams);
+  if ("issues" in outcome) {
+    await sendInterceptedTaskMethodError(
+      transport,
+      request.id,
+      ProtocolErrorCode.InvalidParams,
+      outcome.issues?.[0]?.message ?? "Invalid params"
+    );
+    return;
+  }
+  try {
+    const result =
+      request.method === "tasks/get"
+        ? tasksAdapter.getTask(outcome.value.taskId)
+        : await tasksAdapter.cancelTask(outcome.value.taskId);
+    const response = {
+      jsonrpc: "2.0" as const,
+      id: request.id,
+      result: applyModernEraResultMetaStamp(result),
+    } as unknown as JSONRPCMessage;
+    await transport.send(response);
+  } catch (error) {
+    if (error instanceof ProtocolError) {
+      await sendInterceptedTaskMethodError(
+        transport,
+        request.id,
+        error.code,
+        error.message,
+        error.data
+      );
+      return;
+    }
+    await sendInterceptedTaskMethodError(
+      transport,
+      request.id,
+      ProtocolErrorCode.InternalError,
+      error instanceof Error ? error.message : "Internal error"
+    );
+  }
+}
+
+/**
+ * Reproduces the ONE real transform the installed SDK's own 2026-07-28
+ * `encodeResult` pipeline performs on a `tasks/get`/`tasks/cancel` result -
+ * stamping `_meta["io.modelcontextprotocol/serverInfo"]` with this server's
+ * own `{name, version}` - confirmed by reading that pipeline's own four
+ * steps directly (`stampResultType`, `fillCacheFields`,
+ * `enforceDeletedFields`, `stampServerInfoMeta`, chained in that order) AND
+ * cross-checked against `test/modern-handshake.test.ts`'s own real-wire
+ * `tasks/update` assertion, which already exercises this SAME pipeline for
+ * the one task method the SDK's dispatch already reaches on this era:
+ *
+ * - `stampResultType`: a no-op here - `GetTaskResult` and `AckResult` both
+ *   already carry `resultType: "complete"` on every variant (see
+ *   tasksAdapter.ts's own `buildDetailedTaskResult`/`ACK_RESULT`), and the
+ *   stamp only ever ADDS the field when absent or passes an already-
+ *   `"complete"` value through unchanged.
+ * - `fillCacheFields`: a no-op - `tasks/get`/`tasks/cancel` are not in the
+ *   installed SDK's own closed `CACHEABLE_RESULT_METHODS` list, so this
+ *   step never fires for either method regardless of the result shape.
+ * - `enforceDeletedFields`: a no-op - it only ever touches a `tools/list`
+ *   result's own `execution` field or a `capabilities.tasks` sub-object,
+ *   and neither a task snapshot nor an ack carries either.
+ * - `stampServerInfoMeta`: the one real transform, reproduced below
+ *   directly rather than called (the installed package never exports the
+ *   private pipeline itself) - adds the key when `_meta` is absent or
+ *   present without it, exactly matching the real pipeline's own
+ *   most-specific-author-wins behavior. Neither `getTask` nor `cancelTask`
+ *   ever populates `_meta` themselves, so the unconditional-add branch is
+ *   the only one this file's own results ever reach in practice; the
+ *   already-populated branch is kept anyway so this stays correct if that
+ *   ever changes.
+ */
+function applyModernEraResultMetaStamp(result: Record<string, unknown>): Record<string, unknown> {
+  const serverInfo = { name: SERVER_NAME, version: SERVER_VERSION };
+  const meta = result["_meta"];
+  if (meta === undefined) {
+    return { ...result, _meta: { [SERVER_INFO_META_KEY]: serverInfo } };
+  }
+  if (typeof meta !== "object" || meta === null || Array.isArray(meta)) return result;
+  const existing = meta as Record<string, unknown>;
+  if (existing[SERVER_INFO_META_KEY] !== undefined) return result;
+  return { ...result, _meta: { ...existing, [SERVER_INFO_META_KEY]: serverInfo } };
+}
+
+/**
+ * Sends one JSON-RPC error response for an intercepted `tasks/get`/
+ * `tasks/cancel` request, echoing the REAL request `id` - unlike
+ * `sendProtocolErrorResponse` above, which always sends `id: null` because
+ * every one of its own call sites fires before a request `id` can even be
+ * determined (a parse failure, a malformed envelope). This path always has
+ * a real request `id` in hand (`interceptableTaskMethodRequest` never
+ * returns one otherwise), so echoing it back is both correct per JSON-RPC
+ * 2.0 and required for the caller to correlate the error to its own
+ * request.
+ */
+async function sendInterceptedTaskMethodError(
+  transport: Transport,
+  id: string | number,
+  code: ProtocolErrorCode,
+  message: string,
+  data?: unknown
+): Promise<void> {
+  const response = {
+    jsonrpc: "2.0" as const,
+    id,
+    error: { code, message, ...(data !== undefined && { data }) },
+  } as unknown as JSONRPCMessage;
+  await transport.send(response);
 }
 
 /**
