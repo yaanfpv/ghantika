@@ -33,6 +33,16 @@ Some real time later, a notification carrying the job's terminal state (exit cod
 
 **Open question, disclosed rather than explained away.** The very first `follow` call past the threshold in a fresh session did not background - it returned inline after holding the call open for the full duration, as if no threshold were configured. A same-parameter replication on a session that was no longer making its first call did background correctly. The one difference identified is "first call of the session," which is a real candidate but not confirmed as the cause; nothing here should be read as explaining it. If it turns out to be real, the practical consequence is that the very first long call an agent makes in a session may not get the accelerator even with everything configured correctly - worth knowing since it would be the least visible time to lose it, but the poll floor covers it exactly as it covers everything else.
 
+### The Tasks-extension notification
+
+**Status: `did-not-work`.** This is the one route in this document backed by an actual negative result rather than an untested gap. A client that declares the reserved `io.modelcontextprotocol/tasks` extension key gets pushed a notification directly as a job's output arrives, on top of the existing poll floor - that emission is real and unconditional. Whether the notification resumes an idle agent loop is a separate question, and it is the one this row answers.
+
+**What was driven.** README.md's own "Early days" note records the measurement directly: against Claude Code, twice, the result was a clean negative - no autonomous wake, and the host's own reply on being asked directly confirmed the notification was never surfaced to it at all. Neither run advertised the extension at handshake in the first place, so both describe a host that was never capability-negotiated for this in the way the extension expects.
+
+**Why this belongs here and not only in the README.** This document's stated purpose is recording which mechanisms have been observed waking a client, with a vocabulary of `worked`/`did-not-work`/`not-tested`. The Tasks-extension notification is the mechanism the README leans on most heavily, and it had no row here at all - a reader consulting this matrix to check the README's own central claim would find nothing.
+
+**Against Codex CLI:** not tested. Codex CLI's single-shot execution model has no persistent idle window for this to be observed against.
+
 ### Ghantika's own wake, over the client's own inherited messaging channel
 
 **Status: `not-tested`**, for the wake delivery itself. What follows is what has actually been established and what has not, kept deliberately separate rather than rounded up to a single verdict.
