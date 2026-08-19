@@ -61,8 +61,10 @@
  * `client.callTool()`) with no bound of its own. It is deliberately NOT
  * wired into `test/kill.test.ts`'s four inline loops: their one awaited
  * call, `server.nextLine()` (`test/helpers/spawnServer.ts`), already
- * rejects on its own `DEFAULT_LINE_TIMEOUT_MS` (2000ms, 6000ms under
- * coverage instrumentation) - always far under this watchdog's own bound -
+ * rejects on its own `DEFAULT_LINE_TIMEOUT_MS` (6000ms, both with and
+ * without coverage instrumentation - see `spawnServer.ts`'s own comment
+ * for why the two paths are unified) - always far under this watchdog's
+ * own bound -
  * so those loops already avoid an indefinite await and fire well before
  * node:test's own per-test ceiling without `race()`'s help. That is not an
  * absolute guarantee that `nextLine()`'s own timeout never surfaces

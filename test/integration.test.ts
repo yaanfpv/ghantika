@@ -19,6 +19,7 @@ import {
   JOBS,
   NOISE_BYTES,
   type SpawnedServer,
+  barrier,
   buildNoisyLiveJobShellCommand,
   callTool,
   callToolsConcurrently,
@@ -330,8 +331,17 @@ describe('run-dispatching tests (spawn a real job through the real "run" tool)',
     const jobId = requireStructuredContent(runBody, "run()").job_id as string;
 
     // A real moment for the spawn event to actually land before we kill it -
-    // matching test/kill.test.ts's own established pattern.
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    // matching test/kill.test.ts's own established pattern, but over the
+    // real wire: poll status() for the job's real recorded state rather
+    // than guessing a fixed delay for the spawn event to have landed.
+    await barrier("spawn event landed before kill", async () => {
+      const statusBody = await callTool(server, nextId(), "status", { job_id: jobId });
+      const statusStructured = requireStructuredContent(
+        statusBody,
+        "status() while waiting for the spawn event to land"
+      );
+      return statusStructured.state === "running";
+    });
 
     const killBody = await callTool(server, nextId(), "kill", { job_id: jobId }, 8000);
     const killStructured = requireStructuredContent(killBody, "kill()");

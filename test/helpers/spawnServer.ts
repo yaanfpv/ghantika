@@ -64,33 +64,52 @@ function envWithoutInheritedMessagingChannel(): NodeJS.ProcessEnv {
 /**
  * The per-line wait `nextLine` defaults to, as a pure function of the
  * environment it's given - not read from `process.env` at module load -
- * so a test can assert on both branches directly (see
- * `test/spawnServer.test.ts`) without mutating real process state, and so
- * a future inversion of the two branches reds mechanically instead of
- * surviving as contradictory prose.
+ * so a test can assert on it directly (see `test/spawnServer.test.ts`)
+ * without mutating real process state. The env parameter is kept even
+ * though the current value is coverage-independent: it is the seam a
+ * future re-split would use if the two paths ever again need different
+ * numbers, and `test/spawnServer.test.ts`'s own mutation control still
+ * asserts that a coverage-instrumented run is never given LESS time
+ * than an uninstrumented one, which now holds by equality rather than
+ * by a strict inequality.
  *
- * The measurements this budget rests on: a real coverage run was once
- * observed to time out waiting on a stdout line at the previous flat
- * 2000ms budget. Two direct measurements under coverage instrumentation
- * did not reproduce a wait anywhere near that: an isolated burst of
- * concurrent instrumented spawns, timing only the very first stdout
- * line, found a worst case of 705ms; a full real `npm run coverage` run,
- * instrumented to record every single `nextLine` wait in the entire
- * suite, found a worst case of 503ms and zero waits anywhere near
- * 2000ms.
+ * Both paths return 6000ms. They were not always equal: the coverage
+ * path carried a measured 6000ms while the non-coverage branch stayed at
+ * an unmeasured flat 2000ms - an asymmetry that assumed file-level
+ * concurrency was a coverage-only concern. It stopped being one once
+ * `npm test` gained an opt-in concurrent-file mode (that contention now
+ * lands on exactly the branch with no measurement behind it, never the
+ * one with 12x headroom). Raised to match the coverage branch instead of
+ * inventing a second, differently-justified number.
  *
- * This budget is set well above both measured worst cases rather than
- * tied to either one directly, so it also covers occasional load this
- * repo's own suite is not otherwise controlled for: 6000ms is roughly
- * 12x the full-suite measured worst case (503ms) and comfortably exceeds
- * the uninstrumented 2000ms, satisfying the one hard requirement here
- * (the instrumented budget must never be tighter than the uninstrumented
- * one). A server that never emits a line still rejects, on either budget
- * - this only changes how long a genuine failure takes to report under
- * coverage.
+ * The measurement behind the raise: `npm run coverage -- --test-concurrency=4`,
+ * 14 full-suite runs on a genuinely loaded shared host (load 4-9
+ * throughout, via `single-run.sh`), instrumented to record every bare
+ * `nextLine()` wait in the entire suite. Zero timeouts across all 14;
+ * worst observed wait 653ms, and - worth stating plainly because it
+ * inverts the intuition this story started from - the worst case landed
+ * at concurrency=4, not the also-tested concurrency=8, so ambient host
+ * load mattered more than the concurrency setting itself on this run.
+ * 6000ms is ~9.2x that measured worst case.
+ *
+ * 653ms is a measured FLOOR on the worst case, not a proven ceiling: the
+ * documented failure mode this story investigates (this file's
+ * `nextLine()` wait itself was once observed to time out at the previous
+ * 2000ms budget under real contention) did not reproduce in any of the
+ * 14 runs. That non-reproduction is disclosed here rather than treated
+ * as confirmation the failure mode is gone - it may be rare, or it may
+ * be sensitive to conditions this particular run of 14 did not hit. The
+ * margin is deliberately wide because of that, not despite it; do not
+ * read "measured max 653ms" as license to tighten this toward 653ms
+ * without a fresh measurement of your own.
+ *
+ * A server that never emits a line still rejects, on this budget as on
+ * the old one - this only changes how long a genuine failure takes to
+ * report.
  */
-export function lineTimeoutFor(env: Pick<NodeJS.ProcessEnv, "NODE_V8_COVERAGE">): number {
-  return env.NODE_V8_COVERAGE ? 6000 : 2000;
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- documented seam, see the doc comment above
+export function lineTimeoutFor(_env: Pick<NodeJS.ProcessEnv, "NODE_V8_COVERAGE">): number {
+  return 6000;
 }
 
 const DEFAULT_LINE_TIMEOUT_MS = lineTimeoutFor(process.env);

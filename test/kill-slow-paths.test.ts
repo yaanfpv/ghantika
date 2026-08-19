@@ -108,6 +108,54 @@ function assertFieldsAbsent(
   }
 }
 
+/**
+ * Polls `jobStore` for `jobId` to actually reach `state`, rather than
+ * guessing a fixed delay for the real async `onSpawn` callback (which
+ * drives `markRunning`, see src/jobStore.ts) to have landed - the same
+ * real-predicate-poll shape as test/process.test.ts's own local `waitFor`,
+ * scoped here to a job's real recorded state.
+ */
+function waitForJobState(jobId: string, state: string, timeoutMs = 3000): Promise<void> {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      if (jobStore.get(jobId)?.state === state) return resolve();
+      if (Date.now() - start > timeoutMs) {
+        return reject(
+          new Error(
+            `waitForJobState: timed out after ${timeoutMs}ms waiting for job ${jobId} to reach state "${state}" (currently "${jobStore.get(jobId)?.state}")`
+          )
+        );
+      }
+      setTimeout(tick, 10);
+    };
+    tick();
+  });
+}
+
+/**
+ * Polls the real process table (`isProcessAlive`, a real `kill(pid, 0)`
+ * existence check) until `pid` is genuinely gone, rather than guessing a
+ * fixed delay for a signal already sent to have actually reaped it.
+ */
+function waitForProcessDead(pid: number, timeoutMs = 3000): Promise<void> {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      if (!isProcessAlive(pid)) return resolve();
+      if (Date.now() - start > timeoutMs) {
+        return reject(
+          new Error(
+            `waitForProcessDead: timed out after ${timeoutMs}ms waiting for pid ${pid} to die`
+          )
+        );
+      }
+      setTimeout(tick, 10);
+    };
+    tick();
+  });
+}
+
 // ORDERING REGRESSION: a group that exits naturally in the narrow window
 // between killProcessGroupPosix's own existence precheck and the actual
 // signal syscall must end up recorded as
@@ -149,7 +197,7 @@ test("kill: ORDERING REGRESSION - a group that exits naturally between the prech
     }
   );
   jobStore.attachChild(record.job_id, child!);
-  await new Promise((resolve) => setTimeout(resolve, 50)); // let the spawn event actually land
+  await waitForJobState(record.job_id, "running"); // let the spawn event actually land
   const pid = child!.pid!;
 
   const realKill = process.kill.bind(process);
@@ -258,7 +306,7 @@ test(
       }
     );
     jobStore.attachChild(record.job_id, child!);
-    await new Promise((resolve) => setTimeout(resolve, 50)); // let the spawn event actually land
+    await waitForJobState(record.job_id, "running"); // let the spawn event actually land
 
     const result = await killTool.handler({ job_id: record.job_id, signal: "SIGSTOP" });
     assert.notEqual(
@@ -343,7 +391,7 @@ test(
     );
     const followUpStructured = followUp.structuredContent as Record<string, unknown>;
     assert.equal(followUpStructured.state, "killed");
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await waitForProcessDead(child!.pid!);
     assert.equal(
       isProcessAlive(child!.pid!),
       false,
@@ -390,7 +438,7 @@ test(
     );
     assert.notEqual(birthIdentity, undefined, "expected a real, successful spawn-time capture");
     jobStore.attachChild(record.job_id, child!, birthIdentity);
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await waitForJobState(record.job_id, "running");
 
     assert.equal(
       isProcessAlive(child!.pid!),
@@ -438,7 +486,7 @@ test(
       "identity could not be verified (the observer itself failed) - must be honestly disclosed as unconfirmed, never silently confirmed"
     );
 
-    await new Promise((resolve) => setTimeout(resolve, 300));
+    await waitForProcessDead(child!.pid!);
     assert.equal(
       isProcessAlive(child!.pid!),
       false,
@@ -491,7 +539,7 @@ test(
     );
     assert.notEqual(birthIdentity, undefined);
     jobStore.attachChild(record.job_id, child!, birthIdentity);
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await waitForJobState(record.job_id, "running");
 
     process.env.PATH = dir;
     let result: Awaited<ReturnType<typeof killTool.handler>> | undefined;
@@ -525,7 +573,7 @@ test(
       "pgrep was unavailable for the process-group confirmation - must be honestly reported as unconfirmed, never silently upgraded to true"
     );
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await waitForProcessDead(child!.pid!);
     assert.equal(
       isProcessAlive(child!.pid!),
       false,
