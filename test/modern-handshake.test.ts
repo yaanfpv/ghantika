@@ -12,15 +12,18 @@
  * opening exchange itself (`server/discover` succeeding, the
  * probe-then-fallback per-instance-state proof), and the three registered
  * task methods (`tasks/get`/`tasks/update`/`tasks/cancel`) exercised over
- * real JSON-RPC on both eras rather than only ever minting a handle.
- * `tasks/get` and `tasks/cancel` are UNROUTABLE on the 2026-07-28 era,
- * full stop, because the installed SDK's own base dispatch recognizes
- * both as belonging to the deprecated 2025-11-25 vocabulary and refuses
- * them before this codebase's own handler is ever reached; `tasks/update`,
- * which that vocabulary never defined, is unaffected and reaches this
- * codebase's own handler normally on both eras. See the task-method tests
- * below, and `src/server.ts`'s own doc comment at its three `tasks/*`
- * registrations, for the full grounding.
+ * real JSON-RPC on both eras rather than only ever minting a handle. The
+ * installed SDK's own base dispatch recognizes `tasks/get` and
+ * `tasks/cancel` as belonging to the deprecated 2025-11-25 vocabulary and
+ * refuses both with `-32601` BEFORE this codebase's own handler is ever
+ * reached, on its own - `tasks/update`, which that vocabulary never
+ * defined, is unaffected by that guard either way. All three dispatch on
+ * both eras today because `src/server.ts`'s own
+ * `attachExtensionTaskMethodInterceptor` answers `tasks/get` and
+ * `tasks/cancel` itself on the modern era, before the SDK's dispatch ever
+ * makes that refusal. See the task-method tests below, and
+ * `src/server.ts`'s own doc comment at its three `tasks/*` registrations
+ * and at `attachExtensionTaskMethodInterceptor`, for the full grounding.
  * Also three negative controls - a comparison server
  * (`test/fixtures/negative-control-server.ts`) built in three variants,
  * each of which removes exactly one of the three guarantees `src/server.ts`
@@ -830,26 +833,25 @@ test("modern handshake: seven-tool mint rule on the real wire - run() mints whil
 // proof); src/server.ts registers tasks/get, tasks/update, and
 // tasks/cancel with NO such check at all (confirmed directly by reading
 // server.ts's own `server.setRequestHandler` calls for the three, which
-// take only a params schema, never a capability read). `tasks/get` and
-// `tasks/cancel` are UNROUTABLE on the 2026-07-28 era through this
-// connection's own request dispatch, regardless of capability, because
-// the installed SDK's own base `Protocol` class recognizes both as
-// belonging to the deprecated 2025-11-25 vocabulary and refuses them with
-// -32601 "Method not found" BEFORE this codebase's own registered handler
-// is ever consulted (see server.ts's own doc comment at its three
-// `tasks/*` registrations for the full grounding, including the exact
-// installed-SDK mechanism). `tasks/update` has no legacy-era precedent at
-// all, so it is recognized as a spec method by NEITHER era's codec, is
-// never caught by that guard, and reaches this codebase's own handler
-// normally on both eras - the one method whose capability-independence
-// this file can demonstrate on the real modern wire, since the wire
-// itself does not block it. `tasks/get`'s and `tasks/cancel`'s own
-// capability-independence is demonstrated on the legacy era instead
-// (below), and by the in-process suites (test/tasks.test.ts,
-// test/tasks-lifecycle.test.ts), which exercise both fully.
+// take only a params schema, never a capability read).
+//
+// `tasks/get` and `tasks/cancel` reach `_requestHandlers` on the modern
+// era ONLY because `attachExtensionTaskMethodInterceptor` (server.ts)
+// answers a genuine request for either method itself, BEFORE the
+// installed SDK's own base `Protocol` class ever makes its own -32601
+// "Method not found" decision - that decision is real and unavoidable
+// through `_requestHandlers` alone (the SDK recognizes both as belonging
+// to the deprecated 2025-11-25 vocabulary, absent from the 2026-07-28
+// codec's own registry - see server.ts's own doc comment at its three
+// `tasks/*` registrations for the full grounding), which is exactly why
+// this codebase answers them itself rather than through that path.
+// `tasks/update` has no legacy-era precedent at all, so it is recognized
+// as a spec method by NEITHER era's codec, is never caught by that guard,
+// and reaches this codebase's own handler normally through
+// `_requestHandlers` on both eras without any interception needed.
 // ---------------------------------------------------------------------------
 
-test("modern wire: tasks/get and tasks/cancel are UNROUTABLE on the 2026-07-28 era - the installed SDK's own base Protocol class refuses both before this codebase's handler runs, regardless of Tasks-capability, with the SAME outcome declared or not", async (t) => {
+test("modern wire: tasks/get and tasks/cancel actually dispatch on the 2026-07-28 era - attachExtensionTaskMethodInterceptor answers both itself, capability-independent, matching tasks/update's own capability-independence above", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
   // explicit server.child.kill() below - a thrown assertion, in
@@ -865,70 +867,166 @@ test("modern wire: tasks/get and tasks/cancel are UNROUTABLE on the 2026-07-28 e
   const discoverLine = await server.nextLine();
   assert.ok((discoverLine.parsed as DiscoverResultBody).result, "discover must succeed first");
 
-  // Mint a real task first - WITH capability declared, since minting
-  // itself IS gated (see the run-only-mint-rule test above). A real taskId
-  // must exist for the calls below to target, even though - as this test
-  // itself proves - that target is never reached for two of the three
-  // methods on this era.
-  server.send({
-    jsonrpc: "2.0",
-    id: 2,
-    method: "tools/call",
-    params: withModernEnvelope(
-      { name: "run", arguments: { command: ["true"], label: "modernwire-unroutable-methods" } },
-      { extensions: { [TASKS_EXTENSION_URI]: {} } }
-    ),
-  });
-  // A bare nextLine() is safe here - the mint's OWN immediate response,
-  // the first tools/call on this connection; the loop below reads through
-  // nextResponse() precisely because it is exposed and this read is not.
-  const runLine = await server.nextLine();
-  const runBody = runLine.parsed as { result?: { taskId?: unknown; resultType?: unknown } };
-  assert.equal(
-    runBody.result?.resultType,
-    "task",
-    `setup: run() must genuinely mint on this connection, or this test proves nothing - got: ${JSON.stringify(runBody.result)}`
-  );
-  const taskId = runBody.result?.taskId;
-  assert.equal(typeof taskId, "string", "setup: run() must return a real taskId to target below");
-
   // Both WITH and WITHOUT Tasks capability declared on the request itself -
-  // the identical -32601 outcome either way is exactly what proves this is
-  // a method-routing fact of the installed SDK's own dispatch, never a
-  // capability gate this codebase applies.
+  // the identical dispatch either way is exactly what proves this is a
+  // capability-independent path, matching tasks/update's own proof above
+  // and the doc comment at server.ts's own task-method registrations
+  // ("the meaningful boundary is does this taskId resolve to something
+  // real, not did this connection declare the extension").
   const capabilityVariants: ReadonlyArray<Record<string, unknown>> = [
     { extensions: { [TASKS_EXTENSION_URI]: {} } },
     {},
   ];
-  let nextId = 3;
-  for (const method of ["tasks/get", "tasks/cancel"]) {
-    for (const clientCapabilities of capabilityVariants) {
-      const id = nextId;
-      nextId += 1;
-      server.send({
-        jsonrpc: "2.0",
-        id,
-        method,
-        params: withModernEnvelope({ taskId }, clientCapabilities),
-      });
-      // nextResponse, not server.nextLine() directly - see that helper's
-      // own docs: the mint above (`command: ["true"]`) exits almost
-      // immediately, so its own notifications/tasks terminal notification
-      // can land on this wire at any point from here on.
-      const body = (await nextResponse(server)) as {
-        id: number;
-        error?: { code?: number; message?: string };
-        result?: unknown;
-      };
-      assert.equal(body.id, id);
-      assert.equal(
-        body.error?.code,
-        -32601,
-        `expected "${method}" on the modern era to fail with -32601 Method Not Found (capability=${JSON.stringify(clientCapabilities)}), got: ${JSON.stringify(body)}`
-      );
-      assert.equal(body.error?.message, "Method not found");
-      assert.equal(body.result, undefined);
-    }
+
+  let nextId = 2;
+  const mintTask = async (label: string): Promise<string> => {
+    const id = nextId;
+    nextId += 1;
+    server.send({
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: withModernEnvelope(
+        { name: "run", arguments: { command: ["true"], label } },
+        { extensions: { [TASKS_EXTENSION_URI]: {} } }
+      ),
+    });
+    const body = (await nextResponse(server)) as {
+      result?: { taskId?: unknown; resultType?: unknown };
+    };
+    assert.equal(
+      body.result?.resultType,
+      "task",
+      `setup: run() must genuinely mint on this connection, or this test proves nothing - got: ${JSON.stringify(body.result)}`
+    );
+    const taskId = body.result?.taskId;
+    assert.equal(typeof taskId, "string", "setup: run() must return a real taskId to target below");
+    return taskId as string;
+  };
+
+  // The task-methods test below is what pins the expected _meta SHAPE
+  // (byte for byte, against the real wire) - this test's own job is only
+  // to establish the ground truth THIS run's server actually produces
+  // through the real SDK encode pipeline, on THIS connection, right now.
+  // Comparing against that captured value - rather than a hardcoded
+  // literal repeated in this test - is deliberate: tasks/update reaches
+  // `_requestHandlers` normally and so traverses the SDK's own
+  // `encodeResult` pipeline unmodified, while tasks/get and tasks/cancel
+  // are self-handled by `attachExtensionTaskMethodInterceptor`, which
+  // reproduces that pipeline's one real effect on this era
+  // (`applyModernEraResultMetaStamp`, server.ts) rather than calling it -
+  // the same "keyed to bundle internals with no compile-time signal"
+  // concern that ruled out patching `requestMethodKeys` directly (see
+  // server.ts's own doc comment at its `.connect` override) applies here
+  // too. A hardcoded literal would stay green through a future SDK bump
+  // that changes what that pipeline actually stamps; comparing against
+  // tasks/update's own live result on the SAME run reds the moment the
+  // two diverge, because only ONE of them is reproduced rather than real.
+  const updateTaskId = await mintTask("modernwire-tasks-meta-ground-truth");
+  const updateId = nextId;
+  nextId += 1;
+  server.send({
+    jsonrpc: "2.0",
+    id: updateId,
+    method: "tasks/update",
+    params: withModernEnvelope({ taskId: updateTaskId }),
+  });
+  const updateBody = (await nextResponse(server)) as {
+    id: number;
+    error?: unknown;
+    result?: Record<string, unknown>;
+  };
+  assert.equal(updateBody.id, updateId);
+  assert.equal(
+    updateBody.error,
+    undefined,
+    `setup: tasks/update must succeed to establish the _meta ground truth, got: ${JSON.stringify(updateBody)}`
+  );
+  const expectedMeta = updateBody.result?._meta;
+  assert.ok(
+    expectedMeta !== undefined,
+    `setup: tasks/update's real modern-era result must carry the SDK's own injected _meta, or this test has no ground truth to compare against - got: ${JSON.stringify(updateBody.result)}`
+  );
+
+  // tasks/get is a pure read (tasksAdapter.ts's own docs) - the SAME
+  // minted task is targeted by both capability variants below.
+  const getTaskId = await mintTask("modernwire-tasks-get");
+  for (const clientCapabilities of capabilityVariants) {
+    const id = nextId;
+    nextId += 1;
+    server.send({
+      jsonrpc: "2.0",
+      id,
+      method: "tasks/get",
+      params: withModernEnvelope({ taskId: getTaskId }, clientCapabilities),
+    });
+    const body = (await nextResponse(server)) as {
+      id: number;
+      error?: unknown;
+      result?: Record<string, unknown>;
+    };
+    assert.equal(body.id, id);
+    assert.equal(
+      body.error,
+      undefined,
+      `tasks/get must succeed on the modern era regardless of capability=${JSON.stringify(clientCapabilities)}, got: ${JSON.stringify(body)}`
+    );
+    assert.equal(
+      body.result?.taskId,
+      getTaskId,
+      "tasks/get must resolve the SAME task it was asked for"
+    );
+    assert.equal(body.result?.resultType, "complete");
+    // EQUALS tasks/update's own live _meta from this same run, not a
+    // hardcoded shape - see the ground-truth capture above for why.
+    assert.deepEqual(
+      body.result?._meta,
+      expectedMeta,
+      `expected tasks/get's real modern-era _meta to equal tasks/update's own, got: ${JSON.stringify(body.result?._meta)} vs ${JSON.stringify(expectedMeta)}`
+    );
+  }
+
+  // tasks/cancel has a REAL side effect (a real process-group kill via
+  // tools/kill.ts - tasksAdapter.ts's own docs), so - unlike tasks/get
+  // above - each capability variant targets its OWN freshly minted task
+  // rather than reusing one already terminated by the first call.
+  for (const clientCapabilities of capabilityVariants) {
+    const cancelTaskId = await mintTask(`modernwire-tasks-cancel-${nextId}`);
+    const id = nextId;
+    nextId += 1;
+    server.send({
+      jsonrpc: "2.0",
+      id,
+      method: "tasks/cancel",
+      params: withModernEnvelope({ taskId: cancelTaskId }, clientCapabilities),
+    });
+    const body = (await nextResponse(server)) as {
+      id: number;
+      error?: unknown;
+      result?: Record<string, unknown>;
+    };
+    assert.equal(body.id, id);
+    assert.equal(
+      body.error,
+      undefined,
+      `tasks/cancel must succeed on the modern era regardless of capability=${JSON.stringify(clientCapabilities)}, got: ${JSON.stringify(body)}`
+    );
+    // tasks/cancel returns the SAME fixed ack tasks/update's own test
+    // above asserts (tasksAdapter.ts's own ACK_RESULT).
+    assert.equal(body.result?.resultType, "complete");
+    assert.deepEqual(
+      Object.keys(body.result ?? {}).sort(),
+      ["_meta", "resultType"],
+      `expected tasks/cancel's real modern-era wire result to carry only resultType plus the SDK's own injected _meta, got: ${JSON.stringify(body.result)}`
+    );
+    // EQUALS tasks/update's own live _meta from this same run - see the
+    // ground-truth capture above for why this is a comparison, not a
+    // hardcoded literal.
+    assert.deepEqual(
+      body.result?._meta,
+      expectedMeta,
+      `expected tasks/cancel's real modern-era _meta to equal tasks/update's own, got: ${JSON.stringify(body.result?._meta)} vs ${JSON.stringify(expectedMeta)}`
+    );
   }
 
   server.child.kill("SIGKILL");
@@ -1130,7 +1228,7 @@ describe('run-dispatching tests: legacy task-method proof needs a real still-run
   });
 });
 
-test("an unknown taskId on tasks/get, tasks/update, and tasks/cancel each fail closed with -32602 on the legacy era, matching the released spec's shared error code for both an unknown and an expired-and-purged id (the modern era cannot exercise tasks/get/tasks/cancel at all - see the unroutable-methods test above - so this is legacy-only, deliberately, rather than parameterized across both eras)", async (t) => {
+test("an unknown taskId on tasks/get, tasks/update, and tasks/cancel each fail closed with -32602 on the legacy era, matching the released spec's shared error code for both an unknown and an expired-and-purged id (legacy-only, deliberately, rather than parameterized across both eras - the modern era's own version of this proof is the test immediately below, exercising attachExtensionTaskMethodInterceptor's error path specifically)", async (t) => {
   const server = tracked();
   // Guaranteed cleanup for every path that never reaches this test's own
   // explicit server.child.kill() below - a thrown assertion, in
@@ -1159,6 +1257,50 @@ test("an unknown taskId on tasks/get, tasks/update, and tasks/cancel each fail c
       body.error?.code,
       -32602,
       `expected ${method} on an unknown taskId to fail with -32602, got: ${JSON.stringify(body)}`
+    );
+    assert.equal(body.result, undefined);
+  }
+  server.child.kill("SIGKILL");
+});
+
+test("an unknown taskId on tasks/get and tasks/cancel fails closed with -32602 on the modern era too - the same error code as the legacy era above, proving attachExtensionTaskMethodInterceptor's error path (not just its success path, already covered by the actually-dispatch test above) matches the SDK's own real dispatch behavior for a handler that throws a ProtocolError", async (t) => {
+  const server = tracked();
+  // Guaranteed cleanup for every path that never reaches this test's own
+  // explicit server.child.kill() below - a thrown assertion, in
+  // particular, must never leave a spawned server process alive for a
+  // later test to trip over. A backstop only: server.child.killed is
+  // already true by the time this runs on every normal green pass, since
+  // the explicit kill below fires first in the test's own synchronous
+  // flow.
+  t.after(() => {
+    if (!server.child.killed) server.child.kill("SIGKILL");
+  });
+  server.send(discoverRequest(1));
+  const discoverLine = await server.nextLine();
+  assert.ok((discoverLine.parsed as DiscoverResultBody).result, "discover must succeed first");
+
+  const bogusTaskId = "00000000-0000-0000-0000-000000000000";
+  const cases: ReadonlyArray<{ method: string; id: number }> = [
+    { method: "tasks/get", id: 2 },
+    { method: "tasks/cancel", id: 3 },
+  ];
+  for (const { method, id } of cases) {
+    server.send({
+      jsonrpc: "2.0",
+      id,
+      method,
+      params: withModernEnvelope({ taskId: bogusTaskId }),
+    });
+    const body = (await nextResponse(server)) as {
+      id: number;
+      error?: { code?: number };
+      result?: unknown;
+    };
+    assert.equal(body.id, id);
+    assert.equal(
+      body.error?.code,
+      -32602,
+      `expected ${method} on an unknown taskId to fail with -32602 on the modern era too, got: ${JSON.stringify(body)}`
     );
     assert.equal(body.result, undefined);
   }

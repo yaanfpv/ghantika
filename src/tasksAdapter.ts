@@ -1403,16 +1403,16 @@ function isClaudeMessagingWakeDisabled(): boolean {
  * poll floor), nothing about what happens next beyond what is literally
  * true.
  *
- * Names only `status`/`output`/`tail`, deliberately never `tasks/get` - this
- * payload has no way to know which protocol era the RECIPIENT session is
- * actually running (it travels out-of-band through a real transport, not
- * back down the connection this job's own request arrived on), and
- * `tasks/get` is unroutable on the modern 2026-07-28 era regardless of any
- * capability this codebase controls. `status`/`output`/`tail` are the
- * plain poll floor and work unconditionally on every era this codebase
- * serves, so they are the only instruction this payload can make without
- * risking sending a real recipient into a method their own connection may
- * not even be able to route.
+ * Names only `status`/`output`/`tail`, deliberately never `tasks/get` -
+ * those three are the ordinary `tools/call` surface every MCP client
+ * already knows how to invoke, while `tasks/get` is a raw Tasks-extension
+ * wire method a recipient's own client has to understand on its own terms
+ * to call at all. `tasks/get` now dispatches on both protocol eras (see
+ * server.ts's own `attachExtensionTaskMethodInterceptor`), so era-routing
+ * is no longer a reason to exclude it here - but this payload still has no
+ * way to know whether the RECIPIENT session's client software is
+ * Tasks-extension-aware in the first place, and `status`/`output`/`tail`
+ * are the one instruction this payload can make without depending on that.
  */
 function buildTransportWakePayload(taskId: string, record: JobRecord): string {
   return `ghantika job ${taskId} reached ${record.state} - use status/output/tail to read the result`;
