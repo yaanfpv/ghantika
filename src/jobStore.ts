@@ -55,6 +55,12 @@ import {
   normalizeConcurrencyConfig,
   normalizeRetentionConfig,
 } from "./scheduler.js";
+// A type-only import - this file never imports any transport-specific
+// symbol, and wakeTransport.ts is itself a deliberately zero-runtime,
+// type-only module, so this adds no real coupling: JobWakeAttemptOutcome
+// below is a plain compile-time widening of WakeOutcome, never a value
+// this file constructs or branches on.
+import type { WakeOutcome } from "./wake/wakeTransport.js";
 
 // ---------------------------------------------------------------------------
 // Frozen shapes
@@ -133,6 +139,66 @@ export function isJobDiagnosticReason(value: unknown): value is JobDiagnosticRea
 export interface JobDiagnostic {
   readonly reason: JobDiagnosticReason;
   readonly message: string;
+}
+
+/**
+ * The outcome recorded for a job's most recent transport-layer wake
+ * attempt - `WakeOutcome`'s own three values (`"delivered"` / `"refused"`
+ * / `"unavailable"` - see `wake/wakeTransport.ts`'s own docs) plus
+ * `"threw"`, this store's own extension for the one outcome `WakeOutcome`
+ * itself cannot represent: `src/tasksAdapter.ts`'s own
+ * `startTransportWakeOnTerminal` calls `selectAndWake`, and that call's
+ * returned promise can REJECT rather than resolve (a real contract
+ * violation by a transport, or a bug in the selector itself - see that
+ * function's own doc comment on why this should not normally happen).
+ * `"threw"` records exactly that case, matching the same literal string
+ * `emitWakeLatency`'s own diagnostic already uses for it.
+ */
+export type JobWakeAttemptOutcome = WakeOutcome | "threw";
+
+/**
+ * The most recent transport-layer wake attempt this store knows about for
+ * a job whose terminal transition triggered one - see
+ * `tasksAdapter.ts`'s own `startTransportWakeOnTerminal` for when that
+ * happens (only for a job that was not already terminal at mint time, and
+ * only when at least one transport was eligible to try - most jobs finish
+ * while the operator watching them is still there, so the overwhelming
+ * majority of jobs never have this written at all; see
+ * `JobRecord.last_wake_attempt`'s own docs for what an absent value here
+ * means versus a present one). Written once, from that same function's
+ * `.then()`/`.catch()` handler, the instant `selectAndWake`'s own promise
+ * settles or rejects - see `JobStore.setLastWakeAttempt` below.
+ */
+export interface JobWakeAttempt {
+  readonly outcome: JobWakeAttemptOutcome;
+  /** `SELECTOR_TRANSPORT_NAME` for a full-exhaustion result, a real transport's own `name` for a single-transport `"delivered"` result, or `"n/a"` for a `"threw"` outcome (no real `WakeResult` exists to name a transport from) - the same three shapes `WakeLatencySample.transportName` already carries, read straight through. */
+  readonly transportName: string;
+  /** The real transport's (or the aggregate selector's) own `detail` string, verbatim - never re-worded or summarized here. */
+  readonly detail: string;
+  /**
+   * Present only when `outcome` is neither `"delivered"` nor `"threw"` -
+   * `WakeResult.permanent` read straight through from the settled result
+   * (see that field's own docs in `wake/wakeTransport.ts` for exactly
+   * what `true` versus `false` claims, and `wake/selectTransport.ts`'s
+   * own `computeAggregatePermanence` for how the aggregate exhaustion
+   * case computes it). `true` means every transport this attempt reached
+   * reported the decline as permanent for this process's remaining
+   * life - a caller can stop expecting a later attempt on this SAME
+   * server process to behave differently; `false` means at least one
+   * might still resolve differently later. Absent for `"delivered"`
+   * (permanence is not a meaningful claim about a wake that succeeded)
+   * and for `"threw"` (a rejected `selectAndWake` call carries no
+   * transport's own permanence claim to report at all).
+   */
+  readonly permanent?: boolean;
+  /**
+   * ISO-8601 instant this attempt's own outcome settled - the same
+   * instant `emitWakeLatency`'s own record already captures as
+   * `tTransportCompleteMs`, converted to an ISO string here rather than
+   * carried as a bare epoch number, matching every other timestamp this
+   * store already exposes (`started_at`, `last_updated_at`, `ended_at`).
+   */
+  readonly attemptedAt: string;
 }
 
 /**
@@ -322,6 +388,24 @@ export interface JobRecord {
    * died within grace, or was already gone) or when escalation proceeded.
    */
   escalation_refused_reason?: string;
+  /**
+   * The most recent transport-layer wake attempt this store knows about
+   * for this job - see `JobWakeAttempt`'s own docs for the full shape, and
+   * `JobStore.setLastWakeAttempt` for when this is written. `undefined`
+   * for the overwhelming majority of jobs: `startTransportWakeOnTerminal`
+   * (`src/tasksAdapter.ts`) subscribes only on a job's terminal
+   * transition, and even then only ever ATTEMPTS a wake when at least one
+   * transport is eligible (see that function's own two-gate docs) - a job
+   * whose operator was still watching when it finished, or one that ran
+   * with every wake transport opted out, simply never has this written at
+   * all, and this field stays absent rather than a placeholder "no
+   * attempt" record that would read as a problem where there is none.
+   * Present once a real wake attempt has actually settled (or thrown) for
+   * this job - written exactly once, since `onJobTerminal` fires this
+   * subscription's callback at most once per job (see that method's own
+   * single-fire guarantee).
+   */
+  last_wake_attempt?: JobWakeAttempt;
 }
 
 /**
@@ -388,6 +472,8 @@ export interface PublicJobProjection {
   readonly identity_capture?: "pending" | "captured" | "unavailable";
   /** See `JobRecord.escalation_refused_reason`'s own docs - the same value, passed through verbatim. */
   readonly escalation_refused_reason?: string;
+  /** See `JobRecord.last_wake_attempt`'s own docs - the same value, passed through verbatim. */
+  readonly last_wake_attempt?: JobWakeAttempt;
 }
 
 /**
@@ -428,6 +514,7 @@ export function toPublicProjection(
     identity_confirmed: record.identity_confirmed,
     identity_capture: record.identity_capture,
     escalation_refused_reason: record.escalation_refused_reason,
+    last_wake_attempt: record.last_wake_attempt,
   };
 }
 
@@ -3105,6 +3192,29 @@ export class JobStore {
     const record = this.jobs.get(jobId);
     if (!record || !isTerminalJobState(record.state)) return;
     record.escalation_refused_reason = reason;
+  }
+
+  /**
+   * Records the most recent transport-layer wake attempt for this job -
+   * see `JobRecord.last_wake_attempt`/`JobWakeAttempt`'s own docs for the
+   * full shape. Called exactly once, from `tasksAdapter.ts`'s own
+   * `startTransportWakeOnTerminal`, the instant `selectAndWake`'s own
+   * promise settles or rejects. No terminal-state guard, matching
+   * `setKillConfirmation`/`setIdentityConfirmation` above rather than
+   * `setEscalationRefusedReason`: the job is ALREADY terminal by
+   * construction here (this only ever fires from an `onJobTerminal`
+   * subscription, which only fires on a real terminal transition), so
+   * there is no terminal-state race for a guard to protect against - the
+   * only real race is the record having been evicted entirely by the time
+   * this async attempt settles (retention TTL/cap can purge a terminal
+   * record while `selectAndWake`'s own work is still in flight), which
+   * this handles the same way `setKillConfirmation` handles its own
+   * identical "record no longer exists" case: a silent no-op.
+   */
+  setLastWakeAttempt(jobId: string, attempt: JobWakeAttempt): void {
+    const record = this.jobs.get(jobId);
+    if (!record) return;
+    record.last_wake_attempt = attempt;
   }
 
   /**

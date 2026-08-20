@@ -350,7 +350,14 @@ export class ClaudeMessagingWakeTransport implements WakeTransport {
     const probedAt = new Date().toISOString();
     const inherited = readInheritedConnectionInfo(this.env);
     if (!inherited.ok) {
-      return { available: false, reason: inherited.reason, probedAt };
+      // permanent: true - readInheritedConnectionInfo's only failure
+      // mode is one of the two inherited env vars being absent or
+      // empty, and an environment variable is fixed at this process's
+      // spawn time: it cannot appear, disappear, or change value later
+      // in this same process's life. Genuinely known here, never
+      // guessed - see Capability.permanent's own docs for the bar this
+      // has to clear.
+      return { available: false, reason: inherited.reason, probedAt, permanent: true };
     }
 
     const outcome = await sendOverSocket(
@@ -396,7 +403,20 @@ export class ClaudeMessagingWakeTransport implements WakeTransport {
   async wake(target: WakeTarget, payload: string): Promise<WakeResult> {
     const inherited = readInheritedConnectionInfo(this.env);
     if (!inherited.ok) {
-      return { outcome: "unavailable", detail: inherited.reason, transportName: this.name };
+      // Defensive only - the WakeTransport contract requires probe() to
+      // have already reported available: true before wake() is ever
+      // called, and readInheritedConnectionInfo reads the exact same
+      // fixed-at-spawn env vars probe() already checked moments earlier
+      // in the same process, so this branch should not be reachable in
+      // practice. If it ever is, the reason is the identical structural
+      // one probe() would have reported - see this method's own
+      // permanent:true comment above.
+      return {
+        outcome: "unavailable",
+        detail: inherited.reason,
+        transportName: this.name,
+        permanent: true,
+      };
     }
 
     const outcome = await sendOverSocket(

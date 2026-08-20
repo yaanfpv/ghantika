@@ -76,9 +76,14 @@ import {
   WAKE_COALESCE_WINDOW_MS,
   WATCH_STOP_REASON_FIREHOSE,
 } from "../dist/tasksAdapter.js";
+// A public export from src/wake/selectTransport.ts (see its own header) -
+// the declined-wake-visibility test below asserts against it directly, the
+// same way test/wake-select-transport.test.ts already does.
+import { SELECTOR_TRANSPORT_NAME } from "../dist/wake/selectTransport.js";
 
 import {
   type SpawnedServer,
+  completeHandshake,
   parsesAsPgid,
   pgrepGroupMembers,
   spawnServer,
@@ -2077,3 +2082,149 @@ test(
     }
   }
 );
+
+// =============================================================================
+// A declined transport-layer wake becomes visible through the ordinary tool
+// surface (status/output/tail), not only in server stderr - see
+// src/jobStore.ts's own JobRecord.last_wake_attempt docs and
+// src/tasksAdapter.ts's own startTransportWakeOnTerminal for the mechanism.
+//
+// Exercises a real ghantika server process, spawned exactly the way an app
+// (Claude Desktop, the ChatGPT desktop app) spawns one - with no Claude
+// Code session ancestry at all. spawnServer() (test/helpers/spawnServer.ts)
+// strips CLAUDE_CODE_MESSAGING_SOCKET/CLAUDE_CODE_MESSAGING_TOKEN
+// unconditionally from every spawned server's own environment, so the
+// inherited-messaging transport (src/wake/claudeMessagingTransport.ts) has
+// nothing to inherit. Neither of the two Codex-reaching transports engages
+// either: GHANTIKA_WAKE_TRANSPORT_ENABLED defaults OFF, and this test's own
+// `run` request carries no `_meta.threadId`, so resolveWakeTarget.ts
+// resolves "absent" - leaving the inherited-messaging transport as the
+// only one ever configured to try.
+// =============================================================================
+
+/** Every plain (non-Tasks-capable) `tools/call` response this section reads. Mirrors RunResponseBody/TasksGetResponseBody above, but for the ORDINARY (non-minted) toPublicProjection shape a plain connection's `run`/`status` calls actually return - job_id, not taskId. */
+interface PlainToolResponseBody {
+  readonly error?: unknown;
+  readonly result?: {
+    isError?: boolean;
+    structuredContent?: Record<string, unknown>;
+  };
+}
+
+/**
+ * Saves, deletes, runs `fn`, then restores the two wake-transport env
+ * vars, matching the save/mutate/restore-in-finally shape
+ * test/wake-select-transport.test.ts's own withClaudeCodeEnv already
+ * establishes for CLAUDECODE - so the outcome cannot depend on whatever
+ * this repo's own test-runner process happens to have set ambiently.
+ * Deleting rather than forcing a specific value: both vars default to
+ * unset/OFF, which is the real, documented default behavior this test
+ * needs to prove against.
+ */
+async function withoutWakeGateEnvVars(fn: () => Promise<void>): Promise<void> {
+  const ENABLED_VAR = "GHANTIKA_WAKE_TRANSPORT_ENABLED";
+  const DISABLE_CLAUDE_VAR = "GHANTIKA_DISABLE_CLAUDE_MESSAGING_WAKE";
+  const savedEnabled = process.env[ENABLED_VAR];
+  const savedDisableClaude = process.env[DISABLE_CLAUDE_VAR];
+  try {
+    delete process.env[ENABLED_VAR];
+    delete process.env[DISABLE_CLAUDE_VAR];
+    await fn();
+  } finally {
+    if (savedEnabled === undefined) delete process.env[ENABLED_VAR];
+    else process.env[ENABLED_VAR] = savedEnabled;
+    if (savedDisableClaude === undefined) delete process.env[DISABLE_CLAUDE_VAR];
+    else process.env[DISABLE_CLAUDE_VAR] = savedDisableClaude;
+  }
+}
+
+test("a declined wake on a real, app-spawned server (no Claude Code session ancestry, no resolvable Codex thread id) is visible through a subsequent status() call - unavailable, permanent:true, naming the inherited-messaging transport by name", async () => {
+  await withoutWakeGateEnvVars(async () => {
+    const server = spawnServer();
+    // No node:test `t` fixture in scope here (this test takes no
+    // parameter) - cleanup is a plain try/finally instead of `t.after`,
+    // guaranteed even if an assertion below throws.
+    try {
+      await completeHandshake(server); // plain (non-Tasks-capable) - the topology under test has nothing to do with Tasks capability at all (startTransportWakeOnTerminal never reads it)
+
+      // ids start at 100 - well clear of completeHandshake's own id:1
+      // initialize exchange (already fully consumed by the time it
+      // returns above), so there is no ambiguity about which response
+      // answers which request.
+      server.send({
+        jsonrpc: "2.0",
+        id: 100,
+        method: "tools/call",
+        params: {
+          name: "run",
+          // A real, near-instantly-terminal command with no _meta at all -
+          // no _meta.threadId means resolveWakeTarget.ts resolves
+          // "absent", which is what keeps CODEX_GATED_TRANSPORTS excluded
+          // regardless of GHANTIKA_WAKE_TRANSPORT_ENABLED's own value.
+          arguments: { command: ["true"], label: "ac4-declined-wake-visibility" },
+        },
+      });
+      const runBody = (await server.nextLine()).parsed as PlainToolResponseBody;
+      assert.notEqual(
+        runBody.result?.isError,
+        true,
+        `run() must succeed: ${JSON.stringify(runBody)}`
+      );
+      const jobId = runBody.result?.structuredContent?.job_id as string;
+      assert.equal(typeof jobId, "string");
+
+      // Poll status() until last_wake_attempt actually settles - the
+      // wake attempt is fire-and-forget async (startTransportWakeOnTerminal's
+      // own .then()/.catch() handler in src/tasksAdapter.ts), so it can
+      // genuinely still be in flight for a beat or two after the job
+      // itself has already reached its own terminal state.
+      let lastWakeAttempt: Record<string, unknown> | undefined;
+      let lastStatusBody: PlainToolResponseBody | undefined;
+      for (let attempt = 0; attempt < 200 && lastWakeAttempt === undefined; attempt += 1) {
+        server.send({
+          jsonrpc: "2.0",
+          id: 101 + attempt,
+          method: "tools/call",
+          params: { name: "status", arguments: { job_id: jobId } },
+        });
+        lastStatusBody = (await server.nextLine()).parsed as PlainToolResponseBody;
+        lastWakeAttempt = lastStatusBody.result?.structuredContent?.last_wake_attempt as
+          Record<string, unknown> | undefined;
+        if (lastWakeAttempt === undefined) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+      }
+      assert.ok(
+        lastWakeAttempt !== undefined,
+        `expected status() to eventually show a last_wake_attempt for this job (a wake was genuinely eligible: no Claude Code env, no Codex thread id, so only the inherited-messaging transport was ever configured to try), got: ${JSON.stringify(lastStatusBody)}`
+      );
+
+      // A DECLINED wake is visible, and correctly classified as
+      // PERMANENT for this process - the only configured
+      // transport's own reason (its two inherited env vars are both
+      // fixed at this process's spawn time and neither was ever set)
+      // cannot resolve differently on a later attempt against this SAME
+      // server process.
+      assert.notEqual(lastWakeAttempt.outcome, "delivered");
+      assert.equal(lastWakeAttempt.outcome, "unavailable");
+      assert.equal(lastWakeAttempt.transportName, SELECTOR_TRANSPORT_NAME);
+      assert.equal(lastWakeAttempt.permanent, true);
+      assert.equal(typeof lastWakeAttempt.detail, "string");
+      assert.ok(
+        (lastWakeAttempt.detail as string).includes("claude-code-uds-messaging"),
+        `expected the detail to name the one configured transport by its own name, got: ${lastWakeAttempt.detail}`
+      );
+      assert.ok(
+        (lastWakeAttempt.detail as string).includes("CLAUDE_CODE_MESSAGING_SOCKET is not set"),
+        `expected the detail to name the real, structural reason, got: ${lastWakeAttempt.detail}`
+      );
+      assert.equal(typeof lastWakeAttempt.attemptedAt, "string");
+      assert.ok(
+        !Number.isNaN(Date.parse(lastWakeAttempt.attemptedAt as string)),
+        `expected attemptedAt to be a real parseable ISO timestamp, got: ${lastWakeAttempt.attemptedAt}`
+      );
+    } finally {
+      if (!server.child.killed) server.child.kill("SIGKILL");
+    }
+  });
+});

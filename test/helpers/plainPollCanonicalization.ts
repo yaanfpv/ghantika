@@ -26,7 +26,7 @@ import assert from "node:assert/strict";
 // RACY_IN_PRESENCE_CONFIRMATION_FIELDS / canonicalizePlainPollResponse
 // -----------------------------------------------------------------------
 
-// These four fields are real, pre-existing (unchanged by the wake-layer
+// These five fields are real, pre-existing (unchanged by the wake-layer
 // story) process-GROUP confirmation fields whose PRESENCE, not just value,
 // is a genuine timing race independent of the wake layer entirely -
 // kill_confirmed/identity_confirmed depend on whether an async pgrep-based
@@ -34,29 +34,47 @@ import assert from "node:assert/strict";
 // whether the async ps-based birth-identity capture has settled, and
 // escalation_refused_reason only ever appears on a SIGKILL-escalation
 // identity mismatch. Confirmed directly against src/jobStore.ts's own
-// `PublicJobProjection`/`toPublicProjection`: all four are declared OPTIONAL
+// `PublicJobProjection`/`toPublicProjection`: all five are declared OPTIONAL
 // and are passed through verbatim from a `JobRecord` field that is itself
 // only ever written once its own async, fire-and-forget confirmation
 // settles - and JSON serialization drops an unset optional field entirely
 // rather than carrying it as `null`. So a real, honest capture can
-// legitimately have any of these four present or fully absent depending on
-// nothing but timing, independent of any real bug. That is why these four
+// legitimately have any of these five present or fully absent depending on
+// nothing but timing, independent of any real bug. That is why these five
 // are EXCLUDED from the comparison below rather than masked to a stable
 // token the way job_id/started_at/ended_at/label are: masking replaces the
-// VALUE of a field that is always PRESENT, but forcing one of these four to
+// VALUE of a field that is always PRESENT, but forcing one of these five to
 // always compare as present (or always absent) would fabricate a
 // determinism the real wire protocol does not have - which would silently
 // paper over a genuine regression in their presence rather than prove
-// anything about it. None of the four is something the wake layer (or
+// anything about it. None of the five is something the wake layer (or
 // anything else this canonicalization protects) could plausibly regress
 // (already governed by test/kill.test.ts and friends) - excluding them
 // keeps the comparison this feeds scoped to the additivity property it
 // exists to prove.
+//
+// `last_wake_attempt` (see src/jobStore.ts's own `JobRecord.
+// last_wake_attempt` docs) is the FIFTH, and its race is even wider than
+// its four siblings': it depends not only
+// on whether `tasksAdapter.ts`'s own `startTransportWakeOnTerminal` fire-
+// and-forget `selectAndWake().then()/.catch()` handler has settled by the
+// moment a response is read (the same async-settle race the other four
+// already have), but ALSO on whether a wake was ever ATTEMPTED at all for
+// this specific job - which itself depends on which wake transports are
+// eligible in the ambient process environment this test suite happens to
+// run under (e.g. whether CLAUDE_CODE_MESSAGING_SOCKET/
+// CLAUDE_CODE_MESSAGING_TOKEN are genuinely set on the host, since these
+// InMemoryTransport-based scenarios run in-process rather than through
+// spawnServer()'s own env-stripping - see test/helpers/spawnServer.ts's own
+// header). None of that is a fact about the projection shape this file's
+// golden proves additive; it is a fact about this specific host's own
+// ambient environment at test-run time.
 export const RACY_IN_PRESENCE_CONFIRMATION_FIELDS = new Set([
   "kill_confirmed",
   "identity_confirmed",
   "identity_capture",
   "escalation_refused_reason",
+  "last_wake_attempt",
 ]);
 
 /**

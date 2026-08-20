@@ -1637,14 +1637,45 @@ function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetReso
         // AC1's own wording - captured at the top of this handler, before
         // anything else runs in it, so `transportCallMs` measures the
         // transport call itself and nothing this handler does afterward.
+        // Captured ONCE into a local rather than a second bare Date.now()
+        // call: this same instant is also what setLastWakeAttempt's own
+        // `attemptedAt` below records, and the two must never be allowed to
+        // drift apart by whatever this handler does in between.
+        const tTransportCompleteMs = Date.now();
         emitWakeLatency({
           taskId,
           tTerminalMs,
           tSelectAndWakeEnterMs,
-          tTransportCompleteMs: Date.now(),
+          tTransportCompleteMs,
           outcome: wakeResult.outcome,
           transportName: wakeResult.transportName,
         });
+        // Persisted regardless of outcome - a caller polling status/output/
+        // tail for this job (see JobRecord.last_wake_attempt's own docs on
+        // why this is worth surfacing at all) is told what happened even
+        // when the wake delivered cleanly, never only when it declined.
+        // `permanent` is meaningful only for a non-delivered outcome - see
+        // JobWakeAttempt.permanent's own docs - so the key itself is left
+        // OFF the object for a delivered result (built via two distinct
+        // object literals below, never a `permanent: undefined` on a
+        // single shared one), matching src/tools/status.ts's own
+        // documented reasoning for pid/birth_identity: an object literal
+        // always creates a key it assigns, even when the assigned value is
+        // `undefined`, so this keeps the in-process shape and the
+        // JSON.stringify'd wire shape identical rather than relying on the
+        // wire serialization alone to hide the difference.
+        const baseWakeAttempt = {
+          outcome: wakeResult.outcome,
+          transportName: wakeResult.transportName,
+          detail: wakeResult.detail ?? "no detail given",
+          attemptedAt: new Date(tTransportCompleteMs).toISOString(),
+        };
+        jobStore.setLastWakeAttempt(
+          taskId,
+          wakeResult.outcome === "delivered"
+            ? baseWakeAttempt
+            : { ...baseWakeAttempt, permanent: wakeResult.permanent === true }
+        );
         if (wakeResult.outcome !== "delivered") {
           console.error(
             // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- wakeResult.outcome is this codebase's own WakeResult union ("refused" | "unavailable"), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
@@ -1662,13 +1693,23 @@ function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetReso
         // the selector itself - see selectAndWake's own doc comment on why
         // this should not normally happen), so there is no real WakeResult
         // to name a transport from; "threw"/"n/a" record exactly that.
+        // Captured once, same reasoning as the .then() branch above.
+        const tTransportCompleteMs = Date.now();
         emitWakeLatency({
           taskId,
           tTerminalMs,
           tSelectAndWakeEnterMs,
-          tTransportCompleteMs: Date.now(),
+          tTransportCompleteMs,
           outcome: "threw",
           transportName: "n/a",
+        });
+        // "threw" carries no transport's own permanence claim at all (see
+        // JobWakeAttempt.permanent's own docs) - permanent stays absent.
+        jobStore.setLastWakeAttempt(taskId, {
+          outcome: "threw",
+          transportName: "n/a",
+          detail: error instanceof Error ? error.message : String(error),
+          attemptedAt: new Date(tTransportCompleteMs).toISOString(),
         });
         console.error("[ghantika] transport wake threw for task", taskId, error);
       });
