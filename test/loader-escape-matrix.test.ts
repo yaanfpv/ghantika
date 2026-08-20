@@ -322,6 +322,24 @@ function reapSupervisorProcessGroup(supervisorPid: number | undefined): void {
  * open is POSIX-only reach (win32 has no process-group signalling) and
  * the PGID-reuse race reapSupervisorProcessGroup's own comment discloses.
  */
+/**
+ * Builds the environment `runPermanentGuardSuite()`'s nested `spawnSync`
+ * passes to the supervisor, extracted as its own function so a test can
+ * exercise the REAL code path rather than a re-implementation of it - see
+ * "buildNestedGuardChildEnv strips the coverage variable a real child
+ * process actually receives" below, which spawns a real child under this
+ * exact function's output and reads back what that child actually saw,
+ * rather than inspecting the returned object (which is the wrong place to
+ * look - see this function's own inline comment on NODE_V8_COVERAGE).
+ */
+function buildNestedGuardChildEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const childEnv = { ...baseEnv };
+  delete childEnv.NODE_TEST_CONTEXT;
+  delete childEnv.NODE_TEST_WORKER_ID;
+  childEnv.NODE_V8_COVERAGE = "";
+  return childEnv;
+}
+
 function runPermanentGuardSuite(): { tests: number; pass: number; fail: number; raw: string } {
   // NODE_TEST_CONTEXT / NODE_TEST_WORKER_ID are set by the OUTER `node
   // --test` process running THIS file and, being ordinary environment
@@ -345,14 +363,25 @@ function runPermanentGuardSuite(): { tests: number; pass: number; fail: number; 
   // TOP LEVEL of this repo's own coverage suite - 31, 100, and 135 tests
   // respectively, confirmed directly from a real coverage run's own output,
   // not assumed - so their production code is already fully exercised and
-  // measured there. Stripping NODE_V8_COVERAGE here removes only the
-  // redundant, unmeasured-benefit instrumentation cost of running them a
-  // SECOND time inside this nested supervisor; it does not remove coverage
-  // of anything, since nothing here is the only place that measures it.
-  const childEnv = { ...process.env };
-  delete childEnv.NODE_TEST_CONTEXT;
-  delete childEnv.NODE_TEST_WORKER_ID;
-  delete childEnv.NODE_V8_COVERAGE;
+  // measured there. Removing this here removes only the redundant,
+  // unmeasured-benefit instrumentation cost of running them a SECOND time
+  // inside this nested supervisor; it does not remove coverage of anything,
+  // since nothing here is the only place that measures it.
+  //
+  // SET TO AN EMPTY STRING, NEVER DELETED - deletion looks correct and is
+  // not: Node deliberately propagates a nonempty NODE_V8_COVERAGE to
+  // subprocesses even when the explicit spawn environment omits the key
+  // entirely, so a deleted key here still leaves this supervisor and every
+  // one of its 3 children instrumented. Confirmed directly, not assumed:
+  // observed via each child's own received environment (never this
+  // object, which is the wrong place to look - see
+  // "buildNestedGuardChildEnv strips the coverage variable a real child
+  // process actually receives" below, which asserts on a real child's own
+  // env rather than on this object), the deleted key left all 4 processes
+  // instrumented and only childEnv.NODE_V8_COVERAGE = "" changed what they
+  // actually received. The documented opt-out is an empty value, not
+  // omission: https://nodejs.org/api/cli.html#node_v8_coveragedir
+  const childEnv = buildNestedGuardChildEnv(process.env);
   const result = spawnSync(
     process.execPath,
     [
@@ -408,6 +437,60 @@ function runPermanentGuardSuite(): { tests: number; pass: number; fail: number; 
     raw,
   };
 }
+
+test("buildNestedGuardChildEnv strips the coverage variable a real child process actually receives", () => {
+  // Asserts on what a REAL child process reports about its OWN
+  // process.env, never on the returned childEnv object - inspecting the
+  // object is exactly the check that missed the original defect, because
+  // Node re-propagates a nonempty NODE_V8_COVERAGE to a spawned child even
+  // when the explicit spawn environment object omits the key entirely.
+  // Setting a real, deterministic nonempty value on THIS process, rather
+  // than relying on whatever npm run coverage happens to set (or not set,
+  // under a plain npm test run), so this test is meaningful either way.
+  const priorCoverage = process.env.NODE_V8_COVERAGE;
+  const scratchCoverageDir = mkdtempSync(path.join(tmpdir(), "ghantika-coverage-propagation-"));
+  try {
+    process.env.NODE_V8_COVERAGE = scratchCoverageDir;
+    const childEnv = buildNestedGuardChildEnv(process.env);
+    const result = spawnSync(
+      process.execPath,
+      ["-e", "process.stdout.write(JSON.stringify({ v8Coverage: process.env.NODE_V8_COVERAGE }));"],
+      { env: childEnv, encoding: "utf8", timeout: 10_000 }
+    );
+    assert.equal(result.status, 0, `probe child exited nonzero: ${result.stderr}`);
+    const observed = JSON.parse(result.stdout);
+    assert.equal(
+      observed.v8Coverage,
+      "",
+      "a real child process must receive the empty-string opt-out, not the outer nonempty " +
+        "coverage directory Node would otherwise re-propagate regardless of childEnv's own contents"
+    );
+  } finally {
+    if (priorCoverage === undefined) delete process.env.NODE_V8_COVERAGE;
+    else process.env.NODE_V8_COVERAGE = priorCoverage;
+    rmSync(scratchCoverageDir, { recursive: true, force: true });
+  }
+});
+
+test("buildNestedGuardChildEnv's own returned object is NOT sufficient evidence on its own (documents the exact miss)", () => {
+  // Mutation-style negative control: proves the class of check that missed
+  // the original defect - inspecting childEnv rather than a real child's
+  // env - genuinely cannot distinguish the broken `delete` behavior from
+  // the working `= ""` behavior, because a deleted key and an empty-string
+  // key BOTH read as "no truthy NODE_V8_COVERAGE" from the object alone.
+  // This is why the test above spawns a real process instead.
+  const withDelete = { ...process.env };
+  delete withDelete.NODE_V8_COVERAGE;
+  const withEmpty = buildNestedGuardChildEnv(process.env);
+  assert.equal(Object.prototype.hasOwnProperty.call(withDelete, "NODE_V8_COVERAGE"), false);
+  assert.equal(withEmpty.NODE_V8_COVERAGE, "");
+  // Both objects are "falsy" on this key by the ONLY test that looked at
+  // the object directly before this story - a check that only inspects
+  // childEnv cannot tell these two real, behaviorally-different objects
+  // apart, which is the exact miss this file's own history records.
+  assert.equal(!withDelete.NODE_V8_COVERAGE, true);
+  assert.equal(!withEmpty.NODE_V8_COVERAGE, true);
+});
 
 /**
  * Captured once, on FIRST ACCESS rather than in a `before()` hook - the
