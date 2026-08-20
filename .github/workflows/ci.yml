@@ -128,11 +128,20 @@ jobs:
       # else's clean PR again. Serial is the value with a real green
       # history behind it.
       #
-      # A fifteen-run local campaign at the reverted concurrent value
-      # included one contention failure - a real improvement on the three
-      # repeats above, but still not enough runs to rule out a comparably
-      # rare site it did not happen to hit. Serial stays until the
-      # remaining contention is resolved.
+      # A fifteen-run local campaign at the reverted concurrent value, a
+      # real denominator against the three repeats above, included one
+      # contention failure - a similar rate to the two production
+      # failures that motivated the revert. Fifteen runs is not enough to
+      # rule out a comparably rare failure it did not happen to hit, but
+      # it is enough to confirm the gate reds on load unrelated to the
+      # change under review at this value, which is the actual
+      # requirement here.
+      #
+      # The races were investigated - static tracing of the affected
+      # mechanism plus the campaign above - without isolating a fix.
+      # Since no concurrent value clears that requirement, serial is not
+      # a fallback measurement; it is the complete answer this
+      # investigation supports.
       #
       # test/loader-escape-matrix.test.ts's own exclusion below is
       # unrelated to this and stays regardless: its own margin justifies
