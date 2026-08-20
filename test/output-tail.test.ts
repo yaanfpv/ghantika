@@ -700,7 +700,11 @@ test("output/tail on an unknown job_id is a typed not-found error, never a fabri
     const result = mod.handler({ job_id: "definitely-not-a-real-job-id" });
     assert.equal(result.isError, true);
     const text = result.content[0]!.type === "text" ? result.content[0]!.text : "";
-    assert.ok(text.includes("unknown job_id"));
+    assert.ok(text.includes('no job with job_id "definitely-not-a-real-job-id"'));
+    assert.ok(
+      text.includes("scoped to the server process"),
+      `${mod.name} not-found error must disclose per-server-process job scoping`
+    );
     assert.equal(
       result.structuredContent,
       undefined,
@@ -1698,6 +1702,11 @@ test("e2e: output/tail over the wire on an unknown job_id is a typed not-found t
     );
     assert.equal(body.result?.isError, true);
     assert.equal(body.result?.structuredContent, undefined);
+    const wireText = body.result?.content[0]?.text ?? "";
+    assert.ok(
+      wireText.includes("scoped to the server process"),
+      `${toolName} wire-level not-found error must disclose per-server-process job scoping`
+    );
   }
   server.child.kill("SIGKILL");
 });

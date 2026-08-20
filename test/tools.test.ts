@@ -623,8 +623,17 @@ test("(green control) status on an unknown job_id is a typed not-found isError r
   assert.doesNotThrow(() => statusTool.handler({ job_id: "no-such-job-ghantika-status-test" }));
   assertToolError(
     statusTool.handler({ job_id: "no-such-job-ghantika-status-test" }),
-    "no job found"
+    'no job with job_id "no-such-job-ghantika-status-test"'
   );
+});
+
+// The message must disclose that job ids are scoped to the server process
+// that started them - never a bare "not found" that reads as proof the id
+// was invalid, when it may simply be live in a different ghantika instance.
+test("status on an unknown job_id discloses per-server-process job scoping, not a bare not-found", () => {
+  const result = statusTool.handler({ job_id: "no-such-job-ghantika-status-test" });
+  assertToolError(result, "scoped to the server process");
+  assertToolError(result, "different one");
 });
 
 describe("status: dispatches through the real run tool's policy gate (via a real run() call)", () => {
@@ -721,7 +730,8 @@ describe("status: dispatches through the real run tool's policy gate (live-trans
 test("output/tail: a syntactically-valid but unknown job_id is a typed not-found error, never the old stub message", () => {
   for (const mod of [outputTool, tailTool]) {
     const result = mod.handler({ job_id: "some-job-id-that-does-not-exist" });
-    assertToolError(result, "unknown job_id");
+    assertToolError(result, 'no job with job_id "some-job-id-that-does-not-exist"');
+    assertToolError(result, "scoped to the server process");
     assert.ok(
       !(
         result.content[0]!.type === "text" &&

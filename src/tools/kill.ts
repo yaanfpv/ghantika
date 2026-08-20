@@ -283,6 +283,7 @@
 import type { CallToolResult, Tool } from "@modelcontextprotocol/server";
 
 import {
+  describeUnknownJobId,
   isTerminalJobState,
   jobStore,
   reapOutcomeToReleaseDecision,
@@ -360,7 +361,7 @@ export async function handler(args: Record<string, unknown> | undefined): Promis
   if (!jobStore.has(jobId)) {
     // Typed, distinctly-worded not-found - never confused
     // with a validation error or a generic internal exception.
-    return toolError(`kill: no such job_id "${jobId}"`);
+    return toolError(describeUnknownJobId("kill", jobId));
   }
 
   const record = jobStore.get(jobId)!;

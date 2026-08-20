@@ -1182,7 +1182,12 @@ describe("status()/list() against real spawned jobs (needs a real spawn policy)"
       "an unknown job_id must never be a JSON-RPC protocol error"
     );
     assert.equal(notFoundBody.result?.isError, true);
-    assert.ok((notFoundBody.result?.content[0]?.text ?? "").includes("no job found"));
+    const notFoundText = notFoundBody.result?.content[0]?.text ?? "";
+    assert.ok(notFoundText.includes('no job with job_id "no-such-job-e2e-ghantika"'));
+    assert.ok(
+      notFoundText.includes("scoped to the server process"),
+      "the wire-level not-found message must disclose per-server-process job scoping"
+    );
 
     server.child.kill("SIGKILL");
   });

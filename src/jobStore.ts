@@ -431,6 +431,33 @@ export function toPublicProjection(
   };
 }
 
+/**
+ * The ONE error message every job-id-keyed tool (`status`/`output`/`tail`/
+ * `kill`/`follow`) returns for a `job_id` its own `JobStore` has never seen.
+ * Callers on a system running more than one `ghantika` process at once (for
+ * instance Claude Desktop and Claude Code side by side, each launching its
+ * own server) will otherwise read a bare "not found" as proof the id was
+ * invalid, when it may simply be live in the OTHER process - this server has
+ * no way to tell those two cases apart, by the singleton design documented
+ * at the top of this file, so it does not pretend to; it names the real
+ * scoping instead.
+ *
+ * Deliberately ONE message rather than two: there is no code path that
+ * distinguishes "this id was never created anywhere" from "this id is live
+ * in a different server process" - both look identical to a `Map` lookup
+ * that returns nothing - so a message implying that distinction exists
+ * would itself be dishonest.
+ */
+export function describeUnknownJobId(tool: string, jobId: string): string {
+  return (
+    `${tool}: no job with job_id "${jobId}" on this server process. ` +
+    "Job ids are scoped to the server process that started them - if you " +
+    "are running more than one ghantika instance (for example Claude " +
+    "Desktop and Claude Code at once), the same job_id may be live in a " +
+    "different one."
+  );
+}
+
 /** A leading `NAME=value` shell-assignment token (POSIX allows zero or more of these before the real command word - e.g. `A=1 B=2 /bin/echo hi` still just runs `/bin/echo`). */
 const SHELL_ASSIGNMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=/;
 /** A token wrapped in one matching pair of single or double quotes, captured without the quotes. */
