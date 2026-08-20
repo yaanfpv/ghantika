@@ -430,12 +430,11 @@ export function parseArgs(argv) {
     // run() at all (see runOnce below) - node:test's own programmatic
     // default applies, which is strictly serial, one file at a time,
     // byte-identical to this runner's behavior before this option
-    // existed. `npm run coverage` (ci.yml's `coverage` job) DOES now pass
-    // --test-concurrency=3 - see ci.yml's own comment on that step for
-    // the hosted x86_64-under-coverage measurement that value rests on
-    // (4 was measured and rejected there: still 1-in-3 failing).
+    // existed. `npm run coverage` (ci.yml's `coverage` job) runs serially
+    // too, with no --test-concurrency flag - see ci.yml's own comment on
+    // that step for why a concurrent value tried there was reverted.
     // The `test` job's direct `node scripts/run-tests.mjs` invocation
-    // still passes no such flag and stays serial by the same default;
+    // also passes no such flag and stays serial by the same default;
     // widening that is a separate, unmeasured-under-that-path change and
     // out of this option's scope. c8 itself has no mechanism that could
     // impose or block concurrency either way: its entire implementation
@@ -445,8 +444,7 @@ export function parseArgs(argv) {
     // does internally, and V8's own per-process coverage output (one
     // file per process, keyed by pid/timestamp/threadId) has no
     // collision hazard that would make concurrent files under coverage
-    // unsafe by construction - confirmed empirically too, by the hosted
-    // measurement ci.yml's own comment cites.
+    // unsafe by construction.
     //
     // For a contributor iterating locally with `node scripts/run-tests.mjs`
     // directly, or the `test` job's own path - --test-concurrency=N is
