@@ -126,11 +126,13 @@ jobs:
       # makes a contention failure rarer without removing the
       # contention, so the same false red eventually lands on someone
       # else's clean PR again. Serial is the value with a real green
-      # history behind it. The speedup is still worth pursuing, but
-      # needs a sweep with a denominator that can actually distinguish
-      # "fixed" from "less frequent," and the two named sites need
-      # treating as real contention bugs before any concurrent value is
-      # reintroduced here.
+      # history behind it.
+      #
+      # A fifteen-run local campaign at the reverted concurrent value
+      # included one contention failure - a real improvement on the three
+      # repeats above, but still not enough runs to rule out a comparably
+      # rare site it did not happen to hit. Serial stays until the
+      # remaining contention is resolved.
       #
       # test/loader-escape-matrix.test.ts's own exclusion below is
       # unrelated to this and stays regardless: its own margin justifies
