@@ -111,13 +111,17 @@
  * tool result - never a thrown error, never a JSON-RPC protocol error -
  * consistent with `run.ts`'s own `toolError` path for schema-invalid
  * input (the same failure CLASS, a normal successful RPC whose result
- * says "this didn't work", just for a different reason).
+ * says "this didn't work", just for a different reason). The message
+ * itself is `jobStore.ts`'s shared `describeUnknownJobId` - see that
+ * function's own docs for why it discloses per-process job scoping
+ * rather than a bare "not found".
  */
 import type { CallToolResult, Tool } from "@modelcontextprotocol/server";
 
 import {
   type JobRecord,
   type PublicJobProjection,
+  describeUnknownJobId,
   jobStore,
   toPublicProjection,
 } from "../jobStore.js";
@@ -205,7 +209,7 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
   // a mutation control in test/tools.test.ts).
   const record = jobStore.get(args.job_id);
   if (!record) {
-    return toolError(`status: no job found with job_id "${args.job_id}"`);
+    return toolError(describeUnknownJobId("status", args.job_id));
   }
   return toolSuccess(buildStatusProjection(record));
 }

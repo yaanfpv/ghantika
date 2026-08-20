@@ -125,7 +125,8 @@ test("kill: unknown job_id is a distinct, typed not-found error - never confused
   const result = await killTool.handler({
     job_id: "this-job-id-does-not-exist-ghantika-kill-test",
   });
-  assertToolError(result, "no such job_id");
+  assertToolError(result, 'no job with job_id "this-job-id-does-not-exist-ghantika-kill-test"');
+  assertToolError(result, "scoped to the server process");
 });
 
 test("kill on an already-terminal job is an idempotent no-op, never an error", async () => {

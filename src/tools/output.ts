@@ -67,6 +67,7 @@ import {
   type ManagedStream,
   type StreamBufferSnapshot,
   type StreamLineTerminator,
+  describeUnknownJobId,
   jobStore,
 } from "../jobStore.js";
 
@@ -145,7 +146,7 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
   const limit = limitResult.value;
 
   if (!jobStore.has(jobId)) {
-    return toolError(`output: unknown job_id "${jobId}"`);
+    return toolError(describeUnknownJobId("output", jobId));
   }
 
   const view = readStreamView(jobId, stream, afterCursor);

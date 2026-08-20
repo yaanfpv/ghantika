@@ -149,6 +149,7 @@ import {
   type PublicJobProjection,
   type StreamBufferSnapshot,
   type StreamLineTerminator,
+  describeUnknownJobId,
   isTerminalJobState,
   jobStore,
   MAX_OUTSTANDING_FOLLOWS,
@@ -247,7 +248,7 @@ export async function handler(
   const timeoutMs = timeoutResult.value;
 
   if (!jobStore.has(jobId)) {
-    return toolError(`follow: unknown job_id "${jobId}"`);
+    return toolError(describeUnknownJobId("follow", jobId));
   }
 
   // If the calling MCP request was already cancelled before this handler

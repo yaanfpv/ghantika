@@ -92,7 +92,8 @@ test("follow: unknown job_id is a distinct, typed not-found error - never confus
   const result = await followTool.handler({
     job_id: "definitely-not-a-real-job-id-ghantika-follow-test",
   });
-  assertToolError(result, "unknown job_id");
+  assertToolError(result, 'no job with job_id "definitely-not-a-real-job-id-ghantika-follow-test"');
+  assertToolError(result, "scoped to the server process");
 });
 
 // ---------------------------------------------------------------------------
