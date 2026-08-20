@@ -129,6 +129,18 @@ interface Attempt {
    * `"refused"` outcome.
    */
   readonly wasRefused: boolean;
+  /**
+   * Whether THIS transport's own contribution to this attempt is known to
+   * be PERMANENT for this process's remaining lifetime - `Capability.
+   * permanent`/`WakeResult.permanent` (see `wakeTransport.ts`'s own docs
+   * on the bar those clear), read straight through, `undefined` treated
+   * as `false`. `false` (never `true`) for a probe() throw or a wake()
+   * throw/rejection: an exception is a transport violating its own
+   * contract, not a permanence claim it made about anything, so it can
+   * never be read as one. This is the per-transport signal
+   * `computeAggregatePermanence` below reduces over.
+   */
+  readonly permanent: boolean;
 }
 
 /**
@@ -231,6 +243,7 @@ export async function selectAndWake(
       attempts.push({
         summary: `${transport.name}: probe() threw before reporting availability - ${describeThrown(error)}`,
         wasRefused: false,
+        permanent: false,
       });
       continue;
     }
@@ -240,6 +253,7 @@ export async function selectAndWake(
       attempts.push({
         summary: `${transport.name}: skipped, probe reported unavailable - ${reason}`,
         wasRefused: false,
+        permanent: capability.permanent === true,
       });
       continue;
     }
@@ -251,6 +265,7 @@ export async function selectAndWake(
       attempts.push({
         summary: `${transport.name}: probed available, but wake() threw rather than resolving - ${describeThrown(error)}`,
         wasRefused: false,
+        permanent: false,
       });
       continue;
     }
@@ -268,6 +283,7 @@ export async function selectAndWake(
     attempts.push({
       summary: `${transport.name}: attempted, ${result.outcome} - ${detail}`,
       wasRefused: result.outcome === "refused",
+      permanent: result.permanent === true,
     });
   }
 
@@ -278,5 +294,35 @@ export async function selectAndWake(
     outcome,
     detail: buildExhaustionDetail(attempts),
     transportName: SELECTOR_TRANSPORT_NAME,
+    permanent: computeAggregatePermanence(attempts),
   };
+}
+
+/**
+ * Whether EVERY transport this attempt actually reached reported its own
+ * unavailability as PERMANENT for this process's remaining lifetime - see
+ * `Capability.permanent`/`WakeResult.permanent`'s own docs in
+ * `wakeTransport.ts` for the bar a single transport has to clear before
+ * `Attempt.permanent` is ever `true` for it. "Every attempted transport
+ * says this can never work here" is a meaningfully stronger, more
+ * actionable claim than "nothing here could be reached this time" - the
+ * same asymmetry `selectAndWake`'s own aggregate-outcome rule already
+ * applies to `"refused"` versus `"unavailable"`, one level down: a caller
+ * reading `permanent: true` back can reasonably stop retrying this
+ * server process's wake path entirely, where `permanent: false` (or
+ * unset on a `"delivered"` result, where the question does not arise at
+ * all) leaves room for a later attempt to succeed once conditions change.
+ *
+ * `false` whenever `attempts` is empty (an empty `transports` array, or -
+ * in this codebase's real caller - a configuration where every transport
+ * opted itself out before this function ever ran): the absence of any
+ * attempt is a fact about what was CONFIGURED to try, never a permanence
+ * claim any transport itself made by actually being probed. Called only
+ * from the exhaustion path, after the loop above has confirmed nothing
+ * delivered - see `buildExhaustionDetail`'s own sibling doc comment for
+ * why both functions read the same `attempts` array built by that same
+ * loop.
+ */
+function computeAggregatePermanence(attempts: readonly Attempt[]): boolean {
+  return attempts.length > 0 && attempts.every((attempt) => attempt.permanent);
 }

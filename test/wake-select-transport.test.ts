@@ -84,20 +84,28 @@ function available(): Promise<Capability> {
   return Promise.resolve({ available: true, probedAt: nowIso() });
 }
 
-function unavailableCapability(reason: string): () => Promise<Capability> {
-  return () => Promise.resolve({ available: false, reason, probedAt: nowIso() });
+function unavailableCapability(reason: string, permanent?: boolean): () => Promise<Capability> {
+  return () => Promise.resolve({ available: false, reason, probedAt: nowIso(), permanent });
 }
 
 function delivers(transportName: string, detail = "delivered"): () => Promise<WakeResult> {
   return () => Promise.resolve({ outcome: "delivered", detail, transportName });
 }
 
-function refuses(transportName: string, detail = "declined"): () => Promise<WakeResult> {
-  return () => Promise.resolve({ outcome: "refused", detail, transportName });
+function refuses(
+  transportName: string,
+  detail = "declined",
+  permanent?: boolean
+): () => Promise<WakeResult> {
+  return () => Promise.resolve({ outcome: "refused", detail, transportName, permanent });
 }
 
-function reportsUnavailable(transportName: string, detail = "raced"): () => Promise<WakeResult> {
-  return () => Promise.resolve({ outcome: "unavailable", detail, transportName });
+function reportsUnavailable(
+  transportName: string,
+  detail = "raced",
+  permanent?: boolean
+): () => Promise<WakeResult> {
+  return () => Promise.resolve({ outcome: "unavailable", detail, transportName, permanent });
 }
 
 /** A wake() that never resolves cleanly - used for both the throw case and the promise-rejection case. */
@@ -262,6 +270,142 @@ test("all transports attempted and refused - selector returns non-delivered aggr
   assert.ok(result.detail?.includes("owner gate closed"));
   assert.ok(result.detail?.includes("second"));
   assert.ok(result.detail?.includes("no owning client"));
+});
+
+// --- 6b. aggregate `permanent` - see selectTransport.ts's own
+// computeAggregatePermanence doc comment for the rule this section proves:
+// TRUE only when every attempted transport's own contribution reported
+// itself permanent; false the moment even one did not, or made no
+// permanence claim at all (probe()/wake() throwing, or a transport simply
+// leaving Capability.permanent/WakeResult.permanent unset). ---
+
+test("every transport probes permanently unavailable - the aggregate result reports permanent:true", async () => {
+  const first = new FakeTransport(
+    "first",
+    unavailableCapability("no socket env var", true),
+    unreachableWake
+  );
+  const second = new FakeTransport(
+    "second",
+    unavailableCapability("no token env var", true),
+    unreachableWake
+  );
+
+  const result = await selectAndWake([first, second], "thread-1", "resume");
+
+  assert.equal(result.outcome, "unavailable");
+  assert.equal(result.permanent, true);
+});
+
+test("every transport probes unavailable but NOT permanently - the aggregate result is NOT permanent (a later attempt might still work)", async () => {
+  const first = new FakeTransport(
+    "first",
+    unavailableCapability("no app-server running"),
+    unreachableWake
+  );
+  const second = new FakeTransport(
+    "second",
+    unavailableCapability("no socket present"),
+    unreachableWake
+  );
+
+  const result = await selectAndWake([first, second], "thread-1", "resume");
+
+  assert.equal(result.outcome, "unavailable");
+  assert.notEqual(result.permanent, true);
+});
+
+test("a mix of one permanently-unavailable transport and one merely situationally-unavailable transport - the aggregate is NOT permanent, since at least one might still resolve later", async () => {
+  const first = new FakeTransport(
+    "first",
+    unavailableCapability("no env var - fixed for this process", true),
+    unreachableWake
+  );
+  const second = new FakeTransport(
+    "second",
+    unavailableCapability("no app-server running right now"),
+    unreachableWake
+  );
+
+  const result = await selectAndWake([first, second], "thread-1", "resume");
+
+  assert.equal(result.outcome, "unavailable");
+  assert.notEqual(
+    result.permanent,
+    true,
+    "one non-permanent transport is enough to make the WHOLE aggregate non-permanent"
+  );
+});
+
+test("every transport's wake() attempt refuses permanently - the aggregate refused result reports permanent:true too, not just the unavailable case", async () => {
+  const first = new FakeTransport("first", available, refuses("first", "owner gate closed", true));
+  const second = new FakeTransport(
+    "second",
+    available,
+    refuses("second", "no owning client", true)
+  );
+
+  const result = await selectAndWake([first, second], "thread-1", "resume");
+
+  assert.equal(result.outcome, "refused");
+  assert.equal(result.permanent, true);
+});
+
+test("a transport whose probe() throws is never counted as permanent, even when every OTHER transport genuinely is - an exception is not a permanence claim", async () => {
+  const brokenProbe = new FakeTransport(
+    "brokenProbe",
+    () => {
+      throw new Error("probe blew up");
+    },
+    unreachableWake
+  );
+  const permanentlyGone = new FakeTransport(
+    "permanentlyGone",
+    unavailableCapability("no env var - fixed for this process", true),
+    unreachableWake
+  );
+
+  const result = await selectAndWake([brokenProbe, permanentlyGone], "thread-1", "resume");
+
+  assert.equal(result.outcome, "unavailable");
+  assert.notEqual(
+    result.permanent,
+    true,
+    "a thrown probe() makes no claim about permanence at all, so it must never be treated as one"
+  );
+});
+
+test("a transport whose wake() throws is never counted as permanent, even when it probed as permanently unavailable would have been reported by a sibling", async () => {
+  const throwsOnWake = new FakeTransport(
+    "throwsOnWake",
+    available,
+    throwsSynchronously("wake blew up")
+  );
+
+  const result = await selectAndWake([throwsOnWake], "thread-1", "resume");
+
+  assert.equal(result.outcome, "unavailable");
+  assert.notEqual(result.permanent, true);
+});
+
+test("an empty transports array reports permanent:false - the absence of any attempt is a configuration fact, never a permanence claim any transport made", async () => {
+  const result = await selectAndWake([], "thread-1", "resume");
+  assert.notEqual(result.outcome, "delivered");
+  assert.equal(result.permanent, false);
+});
+
+test("a delivered result never carries an aggregate permanent claim - permanence is meaningless once a wake actually succeeded", async () => {
+  const permanentlyGone = new FakeTransport(
+    "permanentlyGone",
+    unavailableCapability("no env var - fixed for this process", true),
+    unreachableWake
+  );
+  const healthy = new FakeTransport("healthy", available, delivers("healthy"));
+
+  const result = await selectAndWake([permanentlyGone, healthy], "thread-1", "resume");
+
+  assert.equal(result.outcome, "delivered");
+  assert.equal(result.permanent, undefined);
 });
 
 // --- 7. deterministic order across 3+ transports, proven via a call-order spy ---

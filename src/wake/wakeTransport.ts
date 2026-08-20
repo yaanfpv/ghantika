@@ -33,6 +33,23 @@ export interface Capability {
   readonly available: boolean;
   /** Required when `available` is `false`. Human-readable, names what was checked and what it found. */
   readonly reason?: string;
+  /**
+   * Present only when `available` is `false`. `true` only when this
+   * transport KNOWS `reason` can never resolve for this process's
+   * remaining lifetime - a fact genuinely fixed at process-spawn time
+   * (an environment variable this session's own parent either did or did
+   * not export, say), never a guess and never inferred from platform or
+   * harness identity: the same "never claim more than was actually
+   * observed" discipline this interface's own header already requires
+   * for `available: true` applies here too. `undefined`/`false` for
+   * anything SITUATIONAL - a live connection attempt that failed, a
+   * feature flag that could flip on a later restart of the thing being
+   * probed, a socket that does not exist yet but might once some other
+   * process starts - where a caller retrying later could plausibly get a
+   * different answer. A transport that cannot tell the two apart leaves
+   * this unset rather than guessing either way.
+   */
+  readonly permanent?: boolean;
   /** ISO-8601 instant this probe actually ran. Callers use this to judge staleness themselves - see the caching note below. */
   readonly probedAt: string;
 }
@@ -51,6 +68,17 @@ export interface WakeResult {
   readonly detail?: string;
   /** Which transport produced this result - a future selection layer wires this into a retrievable record; this module only carries the field so a transport can report it. */
   readonly transportName: string;
+  /**
+   * The `wake()`-time twin of `Capability.permanent` - see that field's
+   * own docs for the exact bar. Meaningful only for a non-`"delivered"`
+   * outcome; a transport never sets this for `"delivered"` (permanence
+   * is not a claim about a wake that succeeded). Most transports never
+   * have anything genuinely permanent to report AT `wake()` time - a
+   * live connection/RPC attempt failing is definitionally situational -
+   * so this stays unset far more often than `Capability.permanent` does;
+   * see each transport's own docs for whether it ever sets this at all.
+   */
+  readonly permanent?: boolean;
 }
 
 /**

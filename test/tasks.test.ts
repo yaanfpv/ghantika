@@ -353,6 +353,71 @@ function withTimestampFieldsChecked(
   return rest;
 }
 
+/**
+ * Validates `record.last_wake_attempt`'s SHAPE when it is present, and does
+ * nothing when it is not - matching every OTHER call site's own reasoning
+ * for `identity_capture`/`pid`/`birth_identity`: whether
+ * `startTransportWakeOnTerminal`'s fire-and-forget async handler
+ * (`src/tasksAdapter.ts`) has settled by the moment a caller reads a
+ * job's projection is a genuine timing race no plain (non-explicitly-
+ * polling) call site in this file gates on, and its settled VALUE (which
+ * transport, what detail string, whether the decline is permanent) depends
+ * on the ambient environment this suite happens to run under - neither is
+ * something a call site can pin to a literal. Never asserts PRESENCE;
+ * only ever asserts that a PRESENT value is internally well-formed.
+ */
+function assertLastWakeAttemptStructurallyValidIfPresent(record: Record<string, unknown>): void {
+  const wakeAttempt = record.last_wake_attempt as
+    | {
+        outcome?: unknown;
+        transportName?: unknown;
+        detail?: unknown;
+        permanent?: unknown;
+        attemptedAt?: unknown;
+      }
+    | undefined;
+  if (wakeAttempt === undefined) return;
+
+  assert.ok(
+    ["delivered", "refused", "unavailable", "threw"].includes(wakeAttempt.outcome as string),
+    `expected last_wake_attempt.outcome to be one of delivered/refused/unavailable/threw, got: ${JSON.stringify(wakeAttempt.outcome)}`
+  );
+  assert.equal(
+    typeof wakeAttempt.transportName,
+    "string",
+    `expected last_wake_attempt.transportName to be a string, got: ${JSON.stringify(wakeAttempt.transportName)}`
+  );
+  assert.equal(
+    typeof wakeAttempt.detail,
+    "string",
+    `expected last_wake_attempt.detail to be a string, got: ${JSON.stringify(wakeAttempt.detail)}`
+  );
+  assert.equal(
+    typeof wakeAttempt.attemptedAt,
+    "string",
+    `expected last_wake_attempt.attemptedAt to be a string, got: ${JSON.stringify(wakeAttempt.attemptedAt)}`
+  );
+  assert.ok(
+    !Number.isNaN(Date.parse(wakeAttempt.attemptedAt as string)),
+    `expected last_wake_attempt.attemptedAt to be a real parseable timestamp, got: ${JSON.stringify(wakeAttempt.attemptedAt)}`
+  );
+  // permanent is meaningful only for a non-"delivered" outcome (see
+  // JobWakeAttempt.permanent's own docs) - absent for "delivered", a real
+  // boolean for everything else.
+  if (wakeAttempt.outcome === "delivered") {
+    assert.ok(
+      !("permanent" in wakeAttempt),
+      `expected last_wake_attempt.permanent to be absent for a "delivered" outcome, got: ${JSON.stringify(wakeAttempt)}`
+    );
+  } else {
+    assert.equal(
+      typeof wakeAttempt.permanent,
+      "boolean",
+      `expected last_wake_attempt.permanent to be a boolean for a non-delivered outcome, got: ${JSON.stringify(wakeAttempt.permanent)}`
+    );
+  }
+}
+
 async function pollUntilTerminal(
   client: Client,
   jobId: string,
@@ -1277,7 +1342,7 @@ describe("spawning tests: connection capability and mint mechanics - plain proje
 
       // The COMPLETE key set the real PublicJobProjection shape carries -
       // see src/jobStore.ts's own toPublicProjection, which always writes
-      // all twelve fields (the six optional ones included, EXPLICITLY as
+      // all thirteen fields (the seven optional ones included, EXPLICITLY as
       // `undefined` when a job hasn't reached that point yet - verified
       // empirically here rather than assumed: InMemoryTransport passes the
       // structured content through without an actual JSON.stringify pass,
@@ -1297,6 +1362,7 @@ describe("spawning tests: connection capability and mint mechanics - plain proje
           "job_id",
           "kill_confirmed",
           "label",
+          "last_wake_attempt",
           "queue_position",
           "signal",
           "started_at",
@@ -1318,6 +1384,12 @@ describe("spawning tests: connection capability and mint mechanics - plain proje
         "kill_confirmed",
         "identity_confirmed",
         "escalation_refused_reason",
+        // last_wake_attempt: only ever written once a real wake ATTEMPT has
+        // settled (see JobRecord.last_wake_attempt's own docs) - this job
+        // is still synchronously "starting" (asserted just above), so
+        // startTransportWakeOnTerminal has not even subscribed on its
+        // terminal transition yet, let alone attempted anything.
+        "last_wake_attempt",
       ]) {
         assert.equal(
           structured[key],
@@ -2173,6 +2245,7 @@ describe("spawning tests: seven-tool mint rule (run mints, every other tool stay
         "job_id",
         "kill_confirmed",
         "label",
+        "last_wake_attempt",
         "queue_position",
         "signal",
         "started_at",
@@ -2298,10 +2371,17 @@ describe("spawning tests: seven-tool mint rule (run mints, every other tool stay
         );
       }
 
+      // last_wake_attempt is excluded from the exact-value comparison below
+      // for the SAME reason identity_capture/pid/birth_identity are - see
+      // assertLastWakeAttemptStructurallyValidIfPresent's own doc comment
+      // for the full reasoning. Structural validity is checked instead.
+      assertLastWakeAttemptStructurallyValidIfPresent(statusResult);
+
       const statusWithoutIdentityCapture = { ...statusResult };
       delete statusWithoutIdentityCapture.identity_capture;
       delete statusWithoutIdentityCapture.pid;
       delete statusWithoutIdentityCapture.birth_identity;
+      delete statusWithoutIdentityCapture.last_wake_attempt;
       assert.deepEqual(
         withTimestampFieldsChecked(statusWithoutIdentityCapture, ["started_at", "ended_at"]),
         {
@@ -2480,9 +2560,15 @@ describe("spawning tests: seven-tool mint rule (run mints, every other tool stay
       // is the one assertion that actually depends on kill_confirmed's real
       // value.
       const confirmedKillResult = await pollUntilKillConfirmed(pair.client, secondTaskId);
+      // See assertLastWakeAttemptStructurallyValidIfPresent's own doc
+      // comment (called on the first job's statusResult above) for why
+      // last_wake_attempt is excluded from the exact-value comparison below
+      // rather than asserted either present or absent.
+      assertLastWakeAttemptStructurallyValidIfPresent(confirmedKillResult);
       const killResultWithoutIdentityFields = { ...confirmedKillResult };
       delete killResultWithoutIdentityFields.identity_confirmed;
       delete killResultWithoutIdentityFields.identity_capture;
+      delete killResultWithoutIdentityFields.last_wake_attempt;
       // `counts` below needs no `pollUntilCountsSettled`-style wait, unlike
       // the first job above: this job's own command
       // (`setTimeout(() => {}, 60000)`) never writes a single byte to either

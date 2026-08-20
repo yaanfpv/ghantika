@@ -373,6 +373,73 @@ test("setKillConfirmation records true/false regardless of the job's own state, 
   );
 });
 
+// ---------------------------------------------------------------------------
+// last_wake_attempt / setLastWakeAttempt / JobWakeAttempt passthrough
+// ---------------------------------------------------------------------------
+
+test("a fresh job's last_wake_attempt is undefined - a job never had a wake attempted for it unless setLastWakeAttempt is actually called", () => {
+  const store = new JobStore();
+  const record = store.createJob({ argv: ["echo"], cwd: "/tmp", env: {}, isShell: false });
+  assert.equal(store.get(record.job_id)!.last_wake_attempt, undefined);
+  const projection = toPublicProjection(record, store.getOutputCounts(record.job_id));
+  assert.equal(
+    projection.last_wake_attempt,
+    undefined,
+    "the public projection must not fabricate an attempt record for a job that never had one"
+  );
+});
+
+test("setLastWakeAttempt records the full attempt shape on any job that exists, regardless of state, and is overwritable - toPublicProjection passes it through verbatim", () => {
+  const store = new JobStore();
+  const record = store.createJob({ argv: ["echo"], cwd: "/tmp", env: {}, isShell: false });
+
+  const declined = {
+    outcome: "unavailable" as const,
+    transportName: "wake-transport-selector",
+    detail: "no transport delivered; tried 1 in order - x: skipped, probe reported unavailable - y",
+    permanent: true,
+    attemptedAt: "2026-01-01T00:00:00.000Z",
+  };
+  store.setLastWakeAttempt(record.job_id, declined);
+  assert.deepEqual(store.get(record.job_id)!.last_wake_attempt, declined);
+
+  const projection = toPublicProjection(record, store.getOutputCounts(record.job_id));
+  assert.deepEqual(
+    projection.last_wake_attempt,
+    declined,
+    "toPublicProjection must pass last_wake_attempt through unmodified, matching kill_confirmed/identity_confirmed/identity_capture/escalation_refused_reason's own established pass-through pattern"
+  );
+
+  // Overwritable - never locked after the first write, matching every
+  // sibling setter above (setKillConfirmation's own doc comment on this
+  // exact point).
+  const delivered = {
+    outcome: "delivered" as const,
+    transportName: "claude-code-uds-messaging",
+    detail: "sent to this session's own parent",
+    attemptedAt: "2026-01-01T00:00:05.000Z",
+  };
+  store.setLastWakeAttempt(record.job_id, delivered);
+  assert.deepEqual(store.get(record.job_id)!.last_wake_attempt, delivered);
+  assert.equal(
+    Object.hasOwn(store.get(record.job_id)!.last_wake_attempt!, "permanent"),
+    false,
+    "a delivered attempt must never carry a permanent key at all (not even permanent: undefined) - see JobWakeAttempt.permanent's own docs on why the question does not apply to a wake that succeeded"
+  );
+});
+
+test("setLastWakeAttempt on a job id naming no record at all is a silent no-op, matching setKillConfirmation/setIdentityConfirmation's own already-gone handling", () => {
+  const store = new JobStore();
+  assert.doesNotThrow(() =>
+    store.setLastWakeAttempt("nope", {
+      outcome: "unavailable",
+      transportName: "n/a",
+      detail: "irrelevant",
+      attemptedAt: new Date().toISOString(),
+    })
+  );
+});
+
 test("a killed job's output buffer remains readable afterward - markKilled never touches stream buffers", () => {
   const store = new JobStore();
   const record = store.createJob({ argv: ["echo"], cwd: "/tmp", env: {}, isShell: false });
@@ -1555,6 +1622,7 @@ test("PublicJobProjection's field set is EXACTLY the frozen set, including count
       "job_id",
       "kill_confirmed",
       "label",
+      "last_wake_attempt",
       "queue_position",
       "signal",
       "started_at",
