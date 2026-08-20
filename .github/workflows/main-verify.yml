@@ -38,10 +38,17 @@ name: Main Verify
 # here). test/main-verify-workflow.test.js asserts the two `test`
 # jobs' matrices and step lists stay identical, so a drift here fails a
 # test rather than failing silently.
+#
+# workflow_dispatch alongside push: a push event to main can be lost or
+# delayed on GitHub's own side, leaving a merge unverified with no
+# recovery path short of waiting for the next one. A detection workflow
+# that cannot be started on demand is one whose own failures are
+# unrecoverable by design.
 on:
   push:
     branches:
       - main
+  workflow_dispatch: {}
 
 permissions:
   contents: read # workflow-level default; only report-failure below grants itself issues: write, since it is the only job that needs it
