@@ -271,7 +271,7 @@ The wake only ever fires in response to a job this same session started and that
 
 This is on by default; there's nothing to set. If you don't want ghantika writing to this channel, set `GHANTIKA_DISABLE_CLAUDE_MESSAGING_WAKE=1` in ghantika's own environment.
 
-**Status: `not-tested`, for the delivery itself.** The route is implemented, its authentication is enforced and passes with the real inherited credential, and it sits off the critical path of everything else this project does - job completion is still confirmed by an ordinary poll regardless of whether this wake ever fires, and it falls through cleanly when the channel it depends on is unavailable. What has not yet been observed is whether a message written over this channel actually resumes a genuinely idle session. See `docs/wake-support-matrix.md` for the full record.
+**Status: `worked`, for the self-targeted route - the child waking the exact session that started it.** The route is implemented, its authentication is enforced and passes with the real inherited credential, and it sits off the critical path of everything else this project does - job completion is still confirmed by an ordinary poll regardless of whether this wake ever fires, and it falls through cleanly when the channel it depends on is unavailable. On top of that: a message written over this channel has been observed resuming a genuinely idle session, delivered as its own turn with no approval step and nothing else between the job starting and the turn arriving. Waking a _different_ session - the peer path this same channel also carries, gated behind its own approval flow - remains untested. See `docs/wake-support-matrix.md` for the full record, including what was actually measured.
 
 ### The app-server wake (Codex)
 
