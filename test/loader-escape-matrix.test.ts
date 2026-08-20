@@ -333,13 +333,40 @@ function runPermanentGuardSuite(): { tests: number; pass: number; fail: number; 
   // prints only that warning and zero test output. Stripping just these
   // two lets the child run as a genuinely independent process, matching
   // how CI or a bare terminal invocation would run it.
+  //
+  // NODE_V8_COVERAGE is ALSO an ordinary environment variable and was ALSO
+  // being inherited here, unnoticed - c8 sets it on the outer
+  // process when this suite runs under `npm run coverage`, and every
+  // descendant process inherits it by default, so this supervisor and each
+  // of its 3 nested children were being instrumented too. That is real
+  // instrumentation-and-process-cost multiplication for zero coverage
+  // benefit: all 3 files (guard-mutation-coverage.test.ts,
+  // module-boundaries.test.ts, no-tasks-import.test.ts) already run at the
+  // TOP LEVEL of this repo's own coverage suite - 31, 100, and 135 tests
+  // respectively, confirmed directly from a real coverage run's own output,
+  // not assumed - so their production code is already fully exercised and
+  // measured there. Stripping NODE_V8_COVERAGE here removes only the
+  // redundant, unmeasured-benefit instrumentation cost of running them a
+  // SECOND time inside this nested supervisor; it does not remove coverage
+  // of anything, since nothing here is the only place that measures it.
   const childEnv = { ...process.env };
   delete childEnv.NODE_TEST_CONTEXT;
   delete childEnv.NODE_TEST_WORKER_ID;
+  delete childEnv.NODE_V8_COVERAGE;
   const result = spawnSync(
     process.execPath,
     [
       "--test",
+      // EXPLICIT, not the CLI's own implicit default. The CLI form (used
+      // here, unlike this repo's own top-level suite which uses
+      // the programmatic run() API) defaults an unset --test-concurrency to
+      // os.availableParallelism() - 1 - a HOST- and NODE-VERSION-DEPENDENT
+      // number, confirmed empirically to resolve to 7 on this 8-core Node
+      // 26 host, with no guarantee it matches a GitHub-hosted CI runner's
+      // core count or Node 22/24. A margin measured against that implicit
+      // default is not predictable across machines. 3 is chosen because
+      // there are exactly 3 files here - any higher value buys nothing.
+      "--test-concurrency=3",
       "test/guard-mutation-coverage.test.ts",
       "test/module-boundaries.test.ts",
       "test/no-tasks-import.test.ts",
