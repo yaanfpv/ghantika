@@ -129,15 +129,20 @@ jobs:
         # Same wrapper chain `npm run coverage` uses in ci.yml
         # (coverage-lock-worker-wrapper.mjs -> c8 -> the real script) so
         # this leg reproduces the actual coverage job's execution path,
-        # not an approximation of it.
-        run: >
-          node scripts/coverage-lock-worker-wrapper.mjs --
-          c8 --reporter=text --reporter=json-summary
-          node scripts/measure-concurrency-ceiling.mjs
-          --concurrency-values="$CONCURRENCY_VALUES"
-          --repeats=10
-          --test-timeout=120000
-          --label="$RUNNER_LABEL"
+        # not an approximation of it. `npm run coverage` gets `c8` resolved
+        # for free because npm prepends node_modules/.bin to PATH for any
+        # script it runs; a bare `run:` step here does not, so the wrapper's
+        # own PATH search has no way to find a binary that lives only under
+        # node_modules/.bin unless this step prepends it the same way.
+        run: |
+          export PATH="$PWD/node_modules/.bin:$PATH"
+          node scripts/coverage-lock-worker-wrapper.mjs -- \
+          c8 --reporter=text --reporter=json-summary \
+          node scripts/measure-concurrency-ceiling.mjs \
+          --concurrency-values="$CONCURRENCY_VALUES" \
+          --repeats=10 \
+          --test-timeout=120000 \
+          --label="$RUNNER_LABEL" \
           --leg=coverage
         env:
           CONCURRENCY_VALUES: ${{ matrix.concurrency_values }}
