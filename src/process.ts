@@ -685,7 +685,7 @@ export function identityElapsedTimesMatch(
 /**
  * The real outcome of one `ps -p <pid> -o etime=` read - see
  * `readProcessElapsedSeconds`'s own docs for why this is a three-way
- * discrimination, not the `number | undefined` shape this used to return.
+ * discrimination rather than a `number | undefined` shape.
  * `observer-failure`'s `timedOut` is a STRUCTURAL discriminator, set
  * explicitly by whichever call site produced the failure, never inferred
  * from `reason`'s own wording elsewhere - see `BirthIdentityAttemptResult`'s
@@ -709,14 +709,14 @@ export type ElapsedSecondsReadResult =
  * TEXT ONLY - `captureBirthIdentityPosixAsync` does NOT match against this
  * (or any) prefix to classify a timeout; it reads the structural
  * `observer-failure.timedOut` field each observer sets explicitly instead.
- * A prior version of this codebase DID classify by matching this exact
- * prefix, which worked only for this POSIX/`ps` observer - the Linux
- * `/proc` observer's own timeout reason never started with it (a different
- * string, "/proc/<pid>/stat did not settle within..."), so every Linux
- * aggregate-shortened timeout was silently misclassified as a genuine
+ * Matching against this exact prefix would work only for this POSIX/`ps`
+ * observer - the Linux `/proc` observer's own timeout reason never starts
+ * with it (a different string, "/proc/<pid>/stat did not settle
+ * within..."), so any string-match classification would silently
+ * misclassify every Linux aggregate-shortened timeout as a genuine
  * observer failure instead of aggregate-exhausted-mid-observation. This
  * constant is kept only so both of this function's own timeout sites emit
- * the same readable wording; it carries no behavioral meaning anymore.
+ * the same readable wording; it carries no behavioral meaning.
  */
 const OBSERVER_TIMEOUT_REASON_PREFIX = "ps did not settle within";
 
@@ -1682,12 +1682,10 @@ export async function captureBirthIdentityPosixAsync(
       // within its own ordinary allowance. Reported as
       // aggregate-exhausted-mid-observation so the two genuinely different
       // causes - "ps itself is broken" vs. "ps was still working, just
-      // out of time" - are never collapsed into one. A prior version of
-      // this check matched `reason` against a POSIX/`ps`-specific prefix,
-      // which silently misclassified every Linux aggregate-shortened
-      // timeout as observer-genuine-failure instead (the Linux `/proc`
-      // observer's own timeout reason never started with that prefix) -
-      // see `OBSERVER_TIMEOUT_REASON_PREFIX`'s own docs for the full story.
+      // out of time" - are never collapsed into one (see
+      // `OBSERVER_TIMEOUT_REASON_PREFIX`'s own docs for why matching
+      // `reason` against a prefix, instead of this structural field,
+      // would misclassify this case on Linux).
       const cutShortByAggregateBudget = effectiveTimeoutMs < timeoutMs && attempt.timedOut;
       logCaptureUndefined(
         pid,
@@ -2302,17 +2300,16 @@ export function confirmProcessGroupReapedPosix(
  * signal that resolved to ESRCH before ever reaching this arbitration -
  * both are "the group was already gone," never a real send, and firing
  * the callback for either would claim a terminal kill on a job nothing
- * here ever signaled. An earlier version of this comment reasoned about
- * only ONE direction of the natural-exit-vs-signal race: it observed that
- * firing `onSignaled` in the benign-race case was safe because
- * `jobStore.markKilled`'s terminal-state guard is first-write-wins, so a
- * natural `exit` that already claimed the slot couldn't be overwritten.
- * True for that ordering - but the opposite ordering is the one that
- * actually bites: `markKilled` claiming the slot FIRST, for a process
- * nobody signaled, with first-write-wins then locking in the WRONG
- * answer before the real natural `exit` ever arrives. `delivered` on
- * `SignalResult` (see its own docs) is what closes this: only a
- * genuine send may ever call `onSignaled`.
+ * here ever signaled. It is not enough to reason about only ONE direction
+ * of the natural-exit-vs-signal race: firing `onSignaled` in the
+ * benign-race case can look safe, since `jobStore.markKilled`'s
+ * terminal-state guard is first-write-wins, so a natural `exit` that
+ * already claimed the slot couldn't be overwritten - but the opposite
+ * ordering is the one that actually bites: `markKilled` claiming the slot
+ * FIRST, for a process nobody signaled, with first-write-wins then
+ * locking in the WRONG answer before the real natural `exit` ever
+ * arrives. `delivered` on `SignalResult` (see its own docs) is what
+ * closes this: only a genuine send may ever call `onSignaled`.
  */
 /**
  * The ONE owning arbitration point for a failed signal-send, shared by
@@ -2672,7 +2669,7 @@ function readPidStartTimesBatchPosixOnce(
  *   allowed to START.
  *
  * A genuine `observer-failure` on the FIRST attempt (nothing found yet)
- * propagates immediately, exactly as before this fix existed - it has
+ * propagates immediately - it has
  * already spent its own timeout once, the identical reasoning
  * `captureBirthIdentityPosixAsync`'s own docs give for never retrying that
  * status. A genuine `observer-failure` on a LATER retry attempt (after at

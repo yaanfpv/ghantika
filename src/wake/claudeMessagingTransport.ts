@@ -21,7 +21,7 @@
  * to surface in a result's `detail` string for logging; it plays no role in
  * how the message is addressed.
  *
- * ## AC2 - the socket path is read, never constructed
+ * ## The socket path is read, never constructed
  *
  * `process.env.CLAUDE_CODE_MESSAGING_SOCKET` is the ONLY source this
  * transport ever consults for the socket path. There is no fallback
@@ -49,7 +49,7 @@
  * - reproduced verbatim in `AUTH_MESSAGE_TYPE`/`USER_MESSAGE_TYPE` and
  * `buildAuthLine`/`buildUserMessageLine` below.
  *
- * ## AC3 - auth is CHECKED, not merely ignored, without ever guessing a
+ * ## Auth is checked, not merely ignored, without ever guessing a
  * credential
  *
  * Two independent pieces of evidence, neither of which required sending a
@@ -66,9 +66,9 @@
  *    (the connection was accepted and not dropped within the grace window).
  *
  * Together: the server enforces auth (1) and this transport's own real
- * request with the real credential passes that enforcement (2). That is
- * AC3 settled from observed behavior on both sides of the boundary, with
- * no negative-control probe attempted or needed.
+ * request with the real credential passes that enforcement (2) - settled
+ * from observed behavior on both sides of the boundary, with no
+ * negative-control probe attempted or needed.
  *
  * NOT measured, and therefore this transport's own reasoned design: there is
  * no `id`/acknowledgement field anywhere in the measured two-line example,
@@ -81,7 +81,7 @@
  * ack, and named explicitly in every "delivered" `WakeResult.detail` this
  * transport returns.
  *
- * ## AC4 - the child path structurally, but end-to-end delivery is unproven
+ * ## The child path, structurally - but end-to-end delivery is unproven
  *
  * The binary's own logic distinguishes a `childToken` (this transport's
  * whole path - the credential this session's own parent already handed it)
@@ -147,9 +147,9 @@ function describeError(error: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
-// AC2 chokepoint - reading the inherited path/token. Every other function in
-// this file that needs either value goes through here; there is no second
-// place in this file that reads `process.env` for these two names.
+// The chokepoint for reading the inherited path/token. Every other function
+// in this file that needs either value goes through here; there is no
+// second place in this file that reads `process.env` for these two names.
 // ---------------------------------------------------------------------------
 
 export type InheritedConnectionInfo =
@@ -163,7 +163,8 @@ export type InheritedConnectionInfo =
  * authenticate against it is not a usable connection, and this transport
  * never sends the auth line with an empty or missing token to find out.
  * This function never falls back to constructing a path from any other
- * value; see this file's header (AC2).
+ * value; see this file's header's "socket path is read, never
+ * constructed" section.
  */
 export function readInheritedConnectionInfo(
   env: NodeJS.ProcessEnv = process.env
@@ -323,8 +324,8 @@ export interface ClaudeMessagingWakeTransportOptions {
 
 /**
  * The concrete `WakeTransport` implementation described in this file's
- * header. See that header for the full design, what is measured versus
- * this transport's own reasoned design, and the AC2/AC4 boundaries.
+ * header. See that header for the full design and what is measured
+ * versus this transport's own reasoned design.
  */
 export class ClaudeMessagingWakeTransport implements WakeTransport {
   readonly name = TRANSPORT_NAME;
@@ -340,7 +341,7 @@ export class ClaudeMessagingWakeTransport implements WakeTransport {
 
   /**
    * Checks whether this process has an inherited socket/token pair
-   * (AC2's chokepoint - see `readInheritedConnectionInfo`) and, if so,
+   * (see `readInheritedConnectionInfo`) and, if so,
    * whether the token this session was actually given is accepted: a
    * connection carrying only the auth line, with the grace window elapsing
    * without a drop. This never sends a `type:"user"` line, so a `probe()`

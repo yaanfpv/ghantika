@@ -85,7 +85,7 @@ export const SELECTOR_TRANSPORT_NAME = "wake-transport-selector";
 /**
  * The one transport whose reach `GHANTIKA_WAKE_TRANSPORT_ENABLED` does NOT
  * govern - see `tasksAdapter.ts`'s own header comment on that gate for why:
- * this transport's destination is fixed by AC2's env-only chokepoint, not a
+ * this transport's destination is fixed by an env-only chokepoint, not a
  * runtime address the gate exists to guard. Exported as its own singleton,
  * never folded into `CODEX_GATED_TRANSPORTS` below, so the two populations
  * stay structurally distinct - a future change to what the gate means has

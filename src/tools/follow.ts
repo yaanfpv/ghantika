@@ -352,7 +352,7 @@ export async function handler(
   // never reach here, so neither one needs an abort listener registered
   // and then immediately torn down again. `signal` undefined (a caller
   // that does not pass one - a future/test caller, say) simply means this
-  // call is never abort-cancellable, the same as before this fix existed.
+  // call is never abort-cancellable.
   // Firing `onAbort` does every bit of cleanup this call owes on its own:
   // unsubscribe both listeners, clear the timer, and release the
   // admission slot - all before `settlement` even resolves.
@@ -597,13 +597,9 @@ function alreadyCancelledBeforeStartResult(): CallToolResult {
  * "never subscribed to the job and holds no admission-budget slot," which
  * is true when cancellation arrives before the handler starts, but FALSE
  * here - on this path the call DID subscribe and DID hold a slot, then
- * `onAbort` released both. The original single shared function's name -
- * `toolAlreadyCancelledResult`, presuming "already" - held only for the
- * before-start case; reusing it for the mid-wait case silently inherited
- * that false claim. Fixed here rather than by rewording generically,
- * since the caller-facing distinction (nothing was ever held, versus
- * something was held and has now been released) is genuinely useful and
- * worth keeping.
+ * `onAbort` released both. The caller-facing distinction (nothing was
+ * ever held, versus something was held and has now been released) is
+ * genuinely useful and worth keeping as two separate result builders.
  */
 function cancelledWhileWaitingResult(): CallToolResult {
   return {
