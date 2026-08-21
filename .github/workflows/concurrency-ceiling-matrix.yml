@@ -1,0 +1,144 @@
+name: Concurrency Ceiling Matrix
+
+# A permanent, manually-dispatched measurement tool - not part of the
+# shipped gate, and not scaffolding meant for removal once one value
+# lands. scripts/measure-concurrency-ceiling.mjs does the actual work; see
+# that file's header for the full rationale.
+#
+# WHY THIS STAYS IN THE TREE: a concurrency ceiling is a property of the
+# SUITE crossed with the HARDWARE, and both move independently of any one
+# measurement. The suite's own file count and content change as tests are
+# added, split, or quarantined; GitHub's hosted-runner hardware changes on
+# its own schedule. Re-running this on demand, whenever either side has
+# plausibly moved, is the way a value stays trustworthy rather than going
+# stale unnoticed.
+#
+# BOTH LEGS, MEASURED SEPARATELY: the plain test path (node:test's own
+# run(), no wrapper) and the SAME suite wrapped in c8's coverage
+# instrumentation, through the identical lock-wrapper chain
+# `npm run coverage` uses in ci.yml. Those are two structurally different
+# execution paths - c8 sets NODE_V8_COVERAGE and spawns the wrapped
+# command as one child process, with no mechanism that forces or limits
+# node:test's own internal file concurrency, but coverage instrumentation
+# carries its own real per-module cost that the plain path does not pay.
+# A value safe on one leg is not thereby shown safe on the other.
+#
+# TRIGGER, and why it is not workflow_dispatch alone: GitHub's own docs
+# state plainly that "this event will only trigger a workflow run if the
+# workflow file exists on the default branch" - so a workflow_dispatch-only
+# version of this file is undispatchable from any branch before that
+# branch merges, which defeats measuring anything before landing. `push`,
+# scoped to this exact branch and path-filtered to this file plus the
+# script it invokes, is what actually runs before merge. workflow_dispatch
+# stays as a second trigger - it is what re-runs this once the file is on
+# main, `--ref <branch>` for anything still in flight.
+on:
+  push:
+    branches:
+      - feat/coverage-concurrency-ci-matrix
+    paths:
+      - ".github/workflows/concurrency-ceiling-matrix.yml"
+      - "scripts/measure-concurrency-ceiling.mjs"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: concurrency-ceiling-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Two runners x two legs, each its own job, swept and reported
+  # SEPARATELY - a value measured on one os/leg pair is never carried to
+  # another. Candidate concurrency values are scaled to each runner's own
+  # vCPU count (ubuntu-latest = 4, macos-latest = 3 vCPU M1, per GitHub's
+  # own hosted-runner spec for a public repo), spanning roughly 0.25x
+  # through 2x cores.
+  sweep:
+    name: sweep (${{ matrix.os }}, ${{ matrix.leg }} leg)
+    runs-on: ${{ matrix.os }}
+    # Ten repeats per candidate value, sequentially in one job/VM - up to
+    # six candidate values x ten repeats x one full-suite run each. The
+    # real `test`/`coverage` jobs' own single-run timeouts are well under
+    # 15 minutes each; this budgets close to GitHub's own default job
+    # ceiling rather than trying to predict how contention at a high
+    # candidate value, or coverage instrumentation on top of it, affects
+    # wall time.
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            leg: test
+            concurrency_values: "1,2,3,4,6,8"
+          - os: ubuntu-latest
+            leg: coverage
+            concurrency_values: "1,2,3,4,6,8"
+          - os: macos-latest
+            leg: test
+            concurrency_values: "1,2,3,4,6"
+          - os: macos-latest
+            leg: coverage
+            concurrency_values: "1,2,3,4,6"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history - a shallow checkout leaves origin/main
+          # unresolvable, which is not a concurrency effect at all but a
+          # fixed per-run skip that reads as an unrelated failure at every
+          # candidate value alike.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # Fixed at one node version, not swept - this workflow measures
+          # the CPU/hardware and instrumentation axes only. ci.yml's own
+          # `test` job matrix already covers node 22 and 24 separately.
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: report hardware (availableParallelism, CPU count, platform, uname)
+        run: |
+          node -e "console.log('availableParallelism:', require('node:os').availableParallelism())"
+          node -e "console.log('cpus.length:', require('node:os').cpus().length)"
+          echo "platform: $(node -e "console.log(process.platform)")"
+          echo "arch: $(node -e "console.log(process.arch)")"
+          uname -a
+      - name: sweep (test leg)
+        if: ${{ matrix.leg == 'test' }}
+        # Matrix values read through env, not interpolated directly into
+        # the shell command, matching this repo's own convention elsewhere
+        # in ci.yml even though these particular values are static strings
+        # this file's own strategy.matrix.include defines, never
+        # attacker-influenced.
+        run: >
+          node scripts/measure-concurrency-ceiling.mjs
+          --concurrency-values="$CONCURRENCY_VALUES"
+          --repeats=10
+          --test-timeout=120000
+          --label="$RUNNER_LABEL"
+          --leg=test
+        env:
+          CONCURRENCY_VALUES: ${{ matrix.concurrency_values }}
+          RUNNER_LABEL: ${{ matrix.os }}
+      - name: sweep (coverage leg)
+        if: ${{ matrix.leg == 'coverage' }}
+        # Same wrapper chain `npm run coverage` uses in ci.yml
+        # (coverage-lock-worker-wrapper.mjs -> c8 -> the real script) so
+        # this leg reproduces the actual coverage job's execution path,
+        # not an approximation of it.
+        run: >
+          node scripts/coverage-lock-worker-wrapper.mjs --
+          c8 --reporter=text --reporter=json-summary
+          node scripts/measure-concurrency-ceiling.mjs
+          --concurrency-values="$CONCURRENCY_VALUES"
+          --repeats=10
+          --test-timeout=120000
+          --label="$RUNNER_LABEL"
+          --leg=coverage
+        env:
+          CONCURRENCY_VALUES: ${{ matrix.concurrency_values }}
+          RUNNER_LABEL: ${{ matrix.os }}

@@ -272,7 +272,12 @@ const TEST_FILE_PATTERN = /\.test\.(ts|js|mjs|cjs|mts|cts)$/;
 // further - a higher bound narrows the failure window without removing
 // it, since the underlying race is against whatever else happens to be
 // running at that moment, not against a fixed cost this file controls.
-const SERIAL_ONLY_TEST_FILES = new Set(["test/loader-escape-matrix.test.ts"]);
+const SERIAL_ONLY_TEST_FILES = new Set([
+  "test/loader-escape-matrix.test.ts",
+  "test/process-contention-timing.test.ts",
+  "test/modern-handshake-contention-timing.test.ts",
+  "test/doorbell-cutover-contention-timing.test.ts",
+]);
 
 // Every event name the test runner emits that can carry a `.file`
 // property, used both to reset the idle watchdog on ANY sign of life and
