@@ -154,13 +154,13 @@ function flipCase(value: string): string {
  * spellings that are actually the same file), never widen one (accepting
  * two spellings that are actually different files).
  *
- * Probing only the basename - as an earlier version of this function did -
- * cannot see a case-only difference in a PARENT component: a case-free
- * leaf like `123` gave that earlier probe nothing to test, so it returned
- * `true` unconditionally and let the caller fold the whole path regardless
- * of whether an ancestor directory's case actually mattered on that
- * filesystem. Flipping the whole path removes that blind spot by
- * construction - there is no component this probe does not examine.
+ * Probing the WHOLE path rather than only the basename closes a real
+ * blind spot: a case-free leaf like `123` would give a basename-only
+ * probe nothing to test, so it would return `true` unconditionally and
+ * let the caller fold the whole path regardless of whether an ancestor
+ * directory's case actually mattered on that filesystem. Flipping the
+ * whole path removes that blind spot by construction - there is no
+ * component this probe does not examine.
  */
 function isPathOnCaseInsensitiveFilesystem(resolvedPath: string): boolean {
   const flipped = flipCase(resolvedPath);
@@ -338,9 +338,7 @@ export function decideRunPolicy(resolvedExecutablePath: string): PolicyDecision 
  * from THIS SERVER's own process environment - never from the job's `env`
  * option, which only becomes the child's environment after the shell
  * binary has already been chosen - falling back to the bare name `cmd.exe`
- * when unset, exactly as Node does. Earlier revisions of this function
- * read the job's own env first, which could check a different binary
- * identity than the one Node was actually about to spawn.
+ * when unset, exactly as Node does.
  *
  * That value - whether an absolute `ComSpec` path or the bare fallback
  * name - is then run through the SAME `resolveExecutable` PATH+PATHEXT

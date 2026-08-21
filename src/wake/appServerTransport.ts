@@ -73,14 +73,11 @@
  * spawns for a delivered wake is ALSO bounded client-side by a wall-clock
  * ceiling independent of the server's own accounting, as a second,
  * defense-in-depth backstop. Deliberately NOT built here: any bespoke
- * "runaway turn count" circuit breaker. A previously-reported high-turn-count
- * figure did not reproduce under independent, controlled measurement (one
- * goal produced exactly one turn in 20 seconds, with several ordinary
- * multi-step model calls inside that single turn), and its cause was never
- * established - engineering a bespoke brake for a failure mode nobody has
- * reproduced would be guessing at a shape the evidence does not describe.
- * The token budget and the wall-clock ceiling are the bounds the evidence
- * actually supports.
+ * "runaway turn count" circuit breaker - no high-turn-count failure mode
+ * has been reproduced under controlled measurement, so engineering a
+ * bespoke brake for one would be guessing at a shape the evidence does
+ * not describe. The token budget and the wall-clock ceiling are the
+ * bounds the evidence actually supports.
  *
  * NO FORK, NO PATCH, NO PRIVATE PATH: this file spawns exactly the
  * documented `codex app-server` subcommand (default argv: `["app-server"]`,

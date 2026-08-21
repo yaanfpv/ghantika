@@ -495,11 +495,10 @@ export async function handler(args: Record<string, unknown> | undefined): Promis
     // OTHER custom signal (SIGSTOP and SIGCONT are the worked cases) sends
     // exactly what was asked without terminating anything, so it must
     // NEVER consume the one cleanup-reap opportunity: marking it
-    // unconditionally here previously poisoned the reap-once guard for a
-    // job that goes on to exit naturally much later, permanently
-    // disabling the real safety net for whatever real, live descendants
-    // its leader eventually leaves behind - a genuine leak, not a
-    // theoretical one.
+    // unconditionally here would poison the reap-once guard for a job
+    // that goes on to exit naturally much later, permanently disabling
+    // the real safety net for whatever real, live descendants its leader
+    // eventually leaves behind.
     if (signal === "SIGKILL") {
       jobStore.markReapAttempted(jobId);
     }
@@ -575,23 +574,23 @@ export async function handler(args: Record<string, unknown> | undefined): Promis
   // CONSUMING THE ONE REAP ATTEMPT is a separate decision from claiming
   // the terminal slot, and it is deliberately NOT made up front alongside
   // it - see the mark below, once this call's own outcome is known.
-  // Marking it here, before this call even ran, used to mean a group
-  // that survived this whole call UNCONFIRMED (the combined-degraded
+  // Marking it here, before this call even runs, would mean a group
+  // that survives this whole call UNCONFIRMED (the combined-degraded
   // cell: neither the pre-signal identity gate above nor the escalation
   // gate's own pre-SIGTERM snapshot could confirm anything, escalation
   // was correctly refused, and no SIGKILL was ever sent - see this file's
-  // own "escalation identity gate" header section) still had its ONE
-  // cleanup-reap attempt permanently spent by a call that never actually
-  // reaped anything. A real, still-alive, SIGTERM-resistant group left in
-  // exactly that state was then unreachable forever: a follow-up `kill()`
-  // call against the same (now-terminal) job record routes through this
-  // handler's own terminal-job branch above, which calls
-  // `jobStore.reapProcessGroupOnce` - and that call is a pure no-op
+  // own "escalation identity gate" header section) would still have its
+  // ONE cleanup-reap attempt permanently spent by a call that never
+  // actually reaped anything. A real, still-alive, SIGTERM-resistant
+  // group left in exactly that state would then be unreachable forever:
+  // a follow-up `kill()` call against the same (now-terminal) job record
+  // routes through this handler's own terminal-job branch above, which
+  // calls `jobStore.reapProcessGroupOnce` - and that call is a pure no-op
   // whenever `hasReapBeenAttempted` already reads `true`, regardless of
-  // whether the group is genuinely still alive. Fixing this needs no new
-  // API or flag: `reapProcessGroupOnce`'s existing guard just needs the
-  // SAME flag to actually mean "a reap was attempted AND CONFIRMED," never
-  // merely "a reap was attempted, confirmed or not."
+  // whether the group is genuinely still alive. `reapProcessGroupOnce`'s
+  // guard depends on that flag meaning "a reap was attempted AND
+  // CONFIRMED," never merely "a reap was attempted, confirmed or not" -
+  // exactly what marking late, once the outcome is known, guarantees.
   const result = await killProcessGroupPosix(handle.pid, POSIX_KILL_GRACE_PERIOD_MS, {
     onSignaled: (sentSignal) => {
       if (sentSignal === "SIGTERM") {

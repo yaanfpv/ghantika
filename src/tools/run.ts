@@ -23,8 +23,7 @@
  * external process this handler's own code launches on its OWN behalf (a
  * `ps` read, not the caller's job) is fired off and left running in the
  * background, never on this handler's response path, even against a
- * deliberately slow `ps` observer - a synchronous capture used to block
- * this exact response on however long `ps` took.
+ * deliberately slow `ps` observer.
  *
  * ## Three ways a job can be `failed` before this handler even returns
  *
@@ -437,11 +436,9 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
  * immediate admission (called synchronously from `handler` above) and a
  * deferred, dequeued spawn (called later, from inside `jobStore`'s own
  * `dequeueNext`, once this job reaches the front of the queue and a slot
- * has just been reserved for it - see `JobStore.enqueueJob`'s docs). Byte-
- * for-byte the same spawn/callback wiring `handler` used to perform
- * inline before the concurrency cap existed - factored out here purely so
- * the SAME wiring can be triggered from either call site, without
- * duplicating it.
+ * has just been reserved for it - see `JobStore.enqueueJob`'s docs).
+ * Factored out here purely so the SAME wiring can be triggered from
+ * either call site, without duplicating it.
  *
  * Every real terminal outcome CALLS `releaseSlot` for this job's
  * concurrency slot exactly once (see `JobStore.releaseSlot`'s own docs

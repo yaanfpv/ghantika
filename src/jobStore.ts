@@ -298,8 +298,8 @@ export interface JobRecord {
    * two typically settle within the same synchronous window (both are
    * consequences of the same real process-group event) but neither is
    * ordered strictly before the other (see `setKillConfirmation`'s own
-   * docs for why this field used to require `state` already terminal, and
-   * why that requirement was removed). A caller-supplied signal other than
+   * docs for why this field does not gate the write on `state` reaching
+   * terminal). A caller-supplied signal other than
    * `SIGTERM` splits in two: for a signal with no termination guarantee
    * (SIGSTOP is the worked case), THIS check's own result is what decides
    * whether the job becomes terminal at all (see `src/tools/kill.ts`'s
@@ -333,7 +333,7 @@ export interface JobRecord {
    * deadline enforcement, `src/server.ts`'s shutdown reap) has run its
    * course - which does NOT wait for, or gate, the record's own `state`
    * reaching terminal; see `setIdentityConfirmation`'s own docs for why
-   * that requirement was removed. Never set for a job whose gate was
+   * this field does not gate the write on that. Never set for a job whose gate was
    * refused (identity-mismatch) or skipped (already gone before the gate
    * itself could even run) - `gate.action` is `"proceed"` at every site
    * that writes this field. Distinct from `kill_confirmed` above, which is
@@ -655,7 +655,7 @@ export interface JobSeqCounter {
   next(): number;
 }
 
-/** Starts at 1 (matching the old per-stream `nextLineSeq`'s starting value) - never reset or reused. */
+/** Starts at 1 - never reset or reused. */
 export function createJobSeqCounter(): JobSeqCounter {
   let nextValue = 1;
   return {
@@ -700,13 +700,6 @@ export interface StreamLineEntry {
    * interleave policy (odd/even parity or similar) is needed to merge them,
    * and `output.ts`/`tail.ts`'s "both" mode uses exactly this real ordering
    * (see those files' own headers).
-   *
-   * (Earlier architectural history: this field used to be assigned from a
-   * PER-STREAM-only counter, and before that didn't exist at all -
-   * `output.ts`/`tail.ts` had to approximate `seq` as the line's array
-   * INDEX, exact only until the first eviction, and disclose only a
-   * deliberately-narrow `{gap: [X, X]}` placeholder. A real, persistent,
-   * now-GLOBAL `seq` removes both limitations at once.)
    */
   readonly seq: number;
 }
@@ -738,24 +731,16 @@ export interface StreamBufferSnapshot {
    * the two narrower cases where a single event does not correspond to a
    * complete line at all.
    *
-   * (Architectural history: an earlier revision of this fix tracked the
-   * exact SET of this stream's own evicted `seq` values, as the fewest
-   * possible disjoint `[start, end]` runs, specifically to avoid a single
-   * scalar boundary expanding into a contiguous range that could wrongly
-   * claim a still-alive SIBLING stream's `seq` as this stream's own loss -
-   * a real bug once `seq` became a per-job GLOBAL value shared across
-   * stdout/stderr, since this stream's own evicted set can itself be
-   * non-contiguous whenever the sibling owns one of the intervening
-   * values. An exact per-seq range representation is unbounded because
-   * stdout and stderr share one sequence counter, so a stream's own
-   * retained-line seqs can interleave with the sibling's, and any bounded
-   * collapse of that range representation (a hard cap, a response-side cap)
-   * reintroduces the same fabrication risk, since a widened/coalesced range
-   * is itself a scalar-boundary-shaped claim again. Scrapped in favor of
-   * this much simpler, deliberately WEAKER contract: a count and a
-   * boundary, never a value. A count can never misname a seq, because it
-   * never names one at all - see `droppedBeforeCursor`'s own computation in
-   * `src/tools/output.ts`/`src/tools/tail.ts` for the paired boundary.)
+   * A count rather than an exact per-seq disclosure is the deliberately
+   * weaker, safer contract here: `seq` is a per-job GLOBAL value shared
+   * across stdout/stderr (see `StreamLineEntry.seq`'s own docs), so a
+   * stream's own evicted `seq` values can be non-contiguous whenever the
+   * sibling owns one of the intervening values, and any range-shaped
+   * representation of that set - even a coalesced or capped one - risks
+   * wrongly claiming a still-alive SIBLING stream's `seq` as this stream's
+   * own loss. A count can never misname a seq, because it never names one
+   * at all - see `droppedBeforeCursor`'s own computation in
+   * `src/tools/output.ts`/`src/tools/tail.ts` for the paired boundary.
    *
    * Incremented by THREE writers, never reset or decremented:
    * `evictOldestLine` bumps it by exactly 1 every time it removes one of
@@ -772,9 +757,8 @@ export interface StreamBufferSnapshot {
    * `droppedCount:0` (see `evictAllLines`'s own docs for why that pairing
    * is reserved for response pagination and never used for genuine loss).
    * Matches this file's other `*EverMaterialized`/`*EverReceived`
-   * per-stream counters in shape (a single unbounded NUMBER, cheap
-   * regardless of a job's lifetime, unlike the abandoned per-seq-range
-   * design's array).
+   * per-stream counters in shape: a single unbounded NUMBER, cheap
+   * regardless of a job's lifetime.
    */
   readonly droppedCount: number;
 }
@@ -1081,10 +1065,7 @@ function materializeLine(
  * applies and this pass falls through to evict the old entry like any
  * other. So the exception protects a single oversized ENTRY only at the
  * instant it is created, never a license for `pending` to then grow
- * unboundedly on top of it forever across further, separate calls (a real
- * prior bug: the old entry sat protected no matter how large `pending`
- * grew afterward, since the exception ignored `pending` entirely, checking
- * only `state.lines.length`/`state.totalBytes`).
+ * unboundedly on top of it forever across further, separate calls.
  *
  * Net effect, proven by this file's tests: at the return of every
  * `appendChunkToBuffer` call, `sum(state.lines bytes) + state.pending.length
@@ -1422,10 +1403,8 @@ export type ReapReleaseDecision = "confirmed" | "unconfirmed" | "errored";
  * caller (`src/tools/run.ts`'s eager onExit wrapper, this file's own
  * automatic stranded-slot retry, `src/tools/kill.ts`'s manual late-
  * recovery branch) must go through this function rather than each
- * inventing its own mapping. This is deliberate: an earlier draft of this
- * fix had two independently-reasoned mappings that silently disagreed on
- * what `already-attempted` means, which is exactly the kind of drift a
- * single shared function exists to prevent.
+ * inventing its own mapping, so no two call sites can silently disagree
+ * on what `already-attempted` means.
  */
 export function reapOutcomeToReleaseDecision(outcome: ReapOutcome): "confirmed" | "unconfirmed" {
   switch (outcome.kind) {
@@ -3100,24 +3079,24 @@ export class JobStore {
    * already caught up could only ever DROP an honest, already-true
    * observation, never protect against a false one.
    *
-   * An earlier version of this method required the record to already be
-   * terminal before it would write at all. That guard was removed after a
-   * real, external race was found and confirmed between the eager reap at
-   * process exit (`reapProcessGroupOnce`, called from `beginSpawn`'s own
-   * `onExit` handler) and the SAME record's stdio-close-gated terminal
-   * transition (`createTerminalMarkGate` in `src/tools/run.ts`): Node's
-   * own `exit` event can fire before either stream's `end` event, so the
-   * reap can resolve with a genuine confirmation before the record has
-   * transitioned - and the old guard silently discarded exactly that
-   * write, with the reap-once tracking (`markReapAttempted`) already
-   * having consumed the one attempt, so no later call ever retried it.
-   * `kill_confirmed` stayed `undefined` permanently, not merely late.
+   * This method deliberately does not require the record to already be
+   * terminal before it writes: the eager reap at process exit
+   * (`reapProcessGroupOnce`, called from `beginSpawn`'s own `onExit`
+   * handler) races the SAME record's stdio-close-gated terminal
+   * transition (`createTerminalMarkGate` in `src/tools/run.ts`), since
+   * Node's own `exit` event can fire before either stream's `end` event -
+   * so the reap can resolve with a genuine confirmation before the record
+   * has transitioned. Gating the write on `state` having already caught
+   * up would drop exactly that honest, already-true observation, and
+   * since the reap-once tracking (`markReapAttempted`) has already
+   * consumed the one attempt by then, no later call would ever retry it -
+   * `kill_confirmed` would stay `undefined` permanently, not merely late.
    *
    * Returns whether the write actually landed (`true`) or was refused
    * because the record no longer exists (`false`). Callers that also
    * track the one-time reap-attempt flag (`markReapAttempted`) check this
    * before consuming it, and the check does TWO different jobs depending
-   * on why it failed - conflating them was the original bug:
+   * on why it failed:
    *
    * `confirmed: false, wrote: true` - the record still exists and the
    * reap genuinely could not confirm. This is the GENUINE RETRY case:
@@ -3148,18 +3127,15 @@ export class JobStore {
   /**
    * Records the PRE-signal identity check's own completed result - see
    * `JobRecord.identity_confirmed`'s own docs for exactly what this does
-   * and does not claim. Unlike the guard this method used to carry,
-   * writing no longer waits for the record's own `state` to reach
-   * terminal: an audit of all four real call sites (`kill.ts`'s
+   * and does not claim. This write does not wait for the record's own
+   * `state` to reach terminal: at all four real call sites (`kill.ts`'s
    * custom-signal and default branches, `run.ts`'s deadline enforcement,
-   * `src/server.ts`'s shutdown reap) found the identical already-gone /
-   * no-delivery race `setKillConfirmation`'s own docs describe above - the
-   * pre-signal gate can complete, and this write can run, before the SAME
-   * job's independent natural-exit transition has landed, at every one of
-   * those four sites. A terminal-state guard there silently dropped a
-   * true, already-known result in exactly that race, the same defect this
-   * field's twin was fixed for above - so the guard is removed here too,
-   * for the same reason.
+   * `src/server.ts`'s shutdown reap), the pre-signal gate can complete,
+   * and this write can run, before the SAME job's independent
+   * natural-exit transition has landed - the same already-gone /
+   * no-delivery race `setKillConfirmation`'s own docs describe above. A
+   * terminal-state guard here would drop a true, already-known result in
+   * exactly that race, same as it would for that method's field.
    */
   setIdentityConfirmation(jobId: string, confirmed: boolean): void {
     const record = this.jobs.get(jobId);
@@ -3294,7 +3270,7 @@ export class JobStore {
    * rather than permanently spent. In that second case the leader can be
    * very much still alive (a real, SIGTERM-resistant group whose earlier
    * SIGKILL escalation was correctly refused), unlike the root-exits-
-   * first case this function was originally written for.
+   * first case the eager call above already handles.
    *
    * RETRY SAFETY - a RETRY call (this function invoked again for a job
    * whose first attempt left `hasReapBeenAttempted` `false`, i.e. an
