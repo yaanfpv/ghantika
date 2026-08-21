@@ -24,17 +24,15 @@
  * makes that refusal. See the task-method tests below, and
  * `src/server.ts`'s own doc comment at its three `tasks/*` registrations
  * and at `attachExtensionTaskMethodInterceptor`, for the full grounding.
- * The three negative controls this file used to carry - a comparison
- * server (`test/fixtures/negative-control-server.ts`) built in three
+ * Three negative controls - a comparison server
+ * (`test/fixtures/negative-control-server.ts`) built in three
  * variants, each removing exactly one of the three guarantees
  * `src/server.ts` preserves under `serveStdio` while keeping the other two
  * intact, so each red result is attributable to the one removed guarantee -
- * now live in test/modern-handshake-contention-timing.test.ts:
+ * live in test/modern-handshake-contention-timing.test.ts:
  * every one of the three spawns a real orphan child
  * and polls a real `process.kill(pid, 0)` existence probe to confirm the
- * shutdown reap effect, which is the exact production-evidenced
- * concurrency-contention failure class from commit da343f0 (#137) - see
- * that sibling file's own header.
+ * shutdown reap effect. See that sibling file's own header.
  */
 import assert from "node:assert/strict";
 import { before, describe, test } from "node:test";
@@ -1436,16 +1434,6 @@ test("modern context: a malformed line arriving AFTER a successful server/discov
   assert.equal(body.error, undefined);
   server.child.kill("SIGKILL");
 });
-
-// ---------------------------------------------------------------------------
-// Three negative controls, each spawning a serveStdio-based comparison
-// server (test/fixtures/negative-control-server.ts) built to remove
-// exactly one guarantee while keeping the other two intact (see that
-// file's own doc comment) - proving by real execution that the real
-// assertions above (and in test/e2e-server.test.ts / test/shutdown.test.ts)
-// each observe a real failure mode, not a check that would stay green
-// even if the real wiring were removed.
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Wake-target metadata hand-off - `threadId` is handler material, never

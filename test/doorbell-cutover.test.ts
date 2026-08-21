@@ -10,10 +10,9 @@
  *
  * The REAL-delivery half of a3, plus the real-detector in-flight-ordering
  * case from a2, plus the whole of a4 (the real N=20-cycle
- * synthetic-harness proof) now live in
+ * synthetic-harness proof) live in
  * test/doorbell-cutover-contention-timing.test.ts -
- * see that file's own header for why (a production-evidenced
- * concurrency-contention failure class, commit da343f0/#137).
+ * see that file's own header.
  *
  * NEVER touches a real fleet seat's real mail doorbell - every detector
  * here (real or stub) is wired to either a scratch temp-dir path this

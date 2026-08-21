@@ -7,9 +7,7 @@
  * that distinction, which it states explicitly): the "real detectors"
  * cluster, the in-flight nonce-ordering test (the one test outside that
  * cluster whose own comments explicitly discuss racing a real 15ms poll
- * cadence against host contention), and the "synthetic N=20 cycle proof" -
- * the same production-evidenced failure class commit da343f0 (#137,
- * reverted) describes.
+ * cadence against host contention), and the "synthetic N=20 cycle proof".
  *
  * Moved into their own file for the same reason as
  * test/process-contention-timing.test.ts - see that file - so this class

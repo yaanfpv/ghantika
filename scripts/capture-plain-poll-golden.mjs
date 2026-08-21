@@ -356,9 +356,8 @@ async function captureFollow(server) {
  * own scenario-level kill calls did not already reach (there should be
  * none by the time this runs, but this is the same unconditional
  * guaranteed-cleanup shape test/modern-handshake-contention-timing.
- * test.ts's (moved there from test/modern-handshake.test.ts in a
- * later extraction) and test/wake-integration.test.ts's own shutdown
- * test both already establish, never left to a best-effort assumption).
+ * test.ts's and test/wake-integration.test.ts's own shutdown test
+ * both already establish, never left to a best-effort assumption).
  */
 async function shutdownServer(server) {
   if (server.child.exitCode !== null) return;
