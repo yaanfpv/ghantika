@@ -655,7 +655,7 @@ export interface JobSeqCounter {
   next(): number;
 }
 
-/** Starts at 1 (matching the old per-stream `nextLineSeq`'s starting value) - never reset or reused. */
+/** Starts at 1 - never reset or reused. */
 export function createJobSeqCounter(): JobSeqCounter {
   let nextValue = 1;
   return {
@@ -1065,10 +1065,7 @@ function materializeLine(
  * applies and this pass falls through to evict the old entry like any
  * other. So the exception protects a single oversized ENTRY only at the
  * instant it is created, never a license for `pending` to then grow
- * unboundedly on top of it forever across further, separate calls (a real
- * prior bug: the old entry sat protected no matter how large `pending`
- * grew afterward, since the exception ignored `pending` entirely, checking
- * only `state.lines.length`/`state.totalBytes`).
+ * unboundedly on top of it forever across further, separate calls.
  *
  * Net effect, proven by this file's tests: at the return of every
  * `appendChunkToBuffer` call, `sum(state.lines bytes) + state.pending.length

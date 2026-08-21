@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-- Doc comments across the wake, job-store, and process-control source now describe current behavior instead of the history of how a mechanism used to work. No code, logic, or behavior changed.
+- Doc comments across the wake, job-store, and process-control source describe current behavior. No code, logic, or behavior changed.
 
 - Main Verify's only trigger was a push to main, so a push event lost or delayed on GitHub's side left a merge unverified with no recovery path short of waiting for the next one. Added `workflow_dispatch` alongside the existing push trigger. Nothing about what the workflow runs changed.
 - The nested `node --test` supervisor one test file spawns to re-verify three permanent guard tests as a genuinely independent process was inheriting `NODE_V8_COVERAGE` from the outer coverage run, instrumenting itself and its three children for no benefit - those same three files already run, and are already measured, as part of the suite's own top level. Stripped the inherited variable, and pinned the nested spawn's own test concurrency explicitly, matching its file count, instead of an implicit default that depends on the host's core count and can differ between Node versions.

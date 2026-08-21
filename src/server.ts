@@ -47,37 +47,35 @@
  * The gate below (`isInitializedForToolCalls`) exists so `tools/call`
  * never runs before a client has completed a REAL, SUCCESSFUL handshake -
  * see `buildGhantikaServerCore()`'s own doc comment for the full
- * three-condition rationale (unchanged from before this file grew
- * `serveStdio` support). What DID change: the old code attached its two
- * observers (`attachInitializeRequestObserver`/
- * `attachInitializeResponseObserver`) directly onto a known `transport`
- * object BEFORE calling `server.connect(transport)` externally, relying
- * on `Protocol.connect()`'s own behavior of reading whatever
- * `transport.onmessage`/`.send` was already set at connect-time and
- * chaining it ahead of its own dispatch. Under `serveStdio`, a pinned
- * instance is never connected to the real wire transport at all - it is
- * connected to a `StdioConnectionChannel` proxy that `serveStdio`
- * constructs and connects INTERNALLY, inside its own `connectInstance()`,
- * entirely after this file's factory function has already returned. There
- * is no external hook that hands this file a reference to that channel
- * before `.connect()` runs on it.
+ * three-condition rationale. Both calling conventions this file supports -
+ * a direct `.connect(transport)` call, and `serveStdio`'s own internal
+ * `product.connect(channel)` call inside `connectInstance()` - need the
+ * same two observers (`attachInitializeRequestObserver`/
+ * `attachInitializeResponseObserver`) wired onto whatever object
+ * `.connect` is eventually called with, before any dispatch reaches it.
+ * Under `serveStdio`, a pinned instance is never connected to the real
+ * wire transport directly - it is connected to a `StdioConnectionChannel`
+ * proxy that `serveStdio` constructs and connects INTERNALLY, inside its
+ * own `connectInstance()`, entirely after this file's factory function has
+ * already returned, with no external hook available to reach that channel
+ * beforehand.
  *
- * The fix: override `.connect` on the `Server` instance ITSELF, so
- * whatever object `.connect(x)` is eventually called with - the real
- * `Transport` this file's own `createServer()` callers pass directly, or
- * the channel `serveStdio` passes internally - gets the SAME two
- * observers wired onto it FIRST, before delegating to the real
- * `Protocol.prototype.connect`. This preserves the exact chaining
- * mechanism the old code relied on (confirmed directly against the
- * installed SDK's own `Protocol.connect()` source, not assumed - it
- * still reads `transport.onmessage`/`.onclose`/`.onerror` at the moment
- * `connect()` runs and chains them), just triggered from inside this
- * file's own OWN `.connect` rather than from an external caller - so both
- * calling conventions (direct `.connect(transport)`, and `serveStdio`'s
- * own `product.connect(channel)`) share one wiring mechanism instead of
- * two. Proven against the real `StdioConnectionChannel` proxy by real
- * execution in `test/modern-handshake.test.ts`'s serveStdio gate-observer
- * tests, not assumed from reading the SDK's source alone.
+ * `.connect` is overridden on the `Server` instance ITSELF, so whatever
+ * object `.connect(x)` is eventually called with - the real `Transport`
+ * this file's own `createServer()` callers pass directly, or the channel
+ * `serveStdio` passes internally - gets the SAME two observers wired onto
+ * it FIRST, before delegating to the real `Protocol.prototype.connect`.
+ * This relies on `Protocol.connect()`'s own behavior of reading whatever
+ * `transport.onmessage`/`.onclose`/`.onerror` is already set at
+ * connect-time and chaining it ahead of its own dispatch (confirmed
+ * directly against the installed SDK's own `Protocol.connect()` source,
+ * not assumed), triggered from inside this file's own `.connect` rather
+ * than from an external caller - so both calling conventions (direct
+ * `.connect(transport)`, and `serveStdio`'s own `product.connect(channel)`)
+ * share one wiring mechanism instead of two. Proven against the real
+ * `StdioConnectionChannel` proxy by real execution in
+ * `test/modern-handshake.test.ts`'s serveStdio gate-observer tests, not
+ * assumed from reading the SDK's source alone.
  *
  * ## Modern era's own trust anchor: `serveStdio`'s construction sequence
  *
