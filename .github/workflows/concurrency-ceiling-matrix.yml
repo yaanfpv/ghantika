@@ -28,10 +28,15 @@ name: Concurrency Ceiling Matrix
 # workflow file exists on the default branch" - so a workflow_dispatch-only
 # version of this file is undispatchable from any branch before that
 # branch merges, which defeats measuring anything before landing. `push`,
-# scoped to this exact branch and path-filtered to this file plus the
-# script it invokes, is what actually runs before merge. workflow_dispatch
-# stays as a second trigger - it is what re-runs this once the file is on
-# main, `--ref <branch>` for anything still in flight.
+# scoped to this exact branch and path-filtered to every file this sweep's
+# own result actually depends on, is what actually runs before merge.
+# run-tests.mjs is in that list because it owns the serial/concurrent split
+# this sweep now imports rather than reimplements - a change there changes
+# what a repeat measures exactly as surely as a change to the measurement
+# script itself, so a push touching only that file still needs to
+# re-trigger this workflow. workflow_dispatch stays as a second trigger -
+# it is what re-runs this once the file is on main, `--ref <branch>` for
+# anything still in flight.
 on:
   push:
     branches:
@@ -39,6 +44,7 @@ on:
     paths:
       - ".github/workflows/concurrency-ceiling-matrix.yml"
       - "scripts/measure-concurrency-ceiling.mjs"
+      - "scripts/run-tests.mjs"
   workflow_dispatch: {}
 
 permissions:

@@ -110,15 +110,37 @@ function parseArgs(argv) {
  * discipline check. Those are runSweepOnce's job, once per batch; this is
  * the single-stream primitive both batches share.
  *
- * @param {{files: string[], concurrency: number | undefined, testTimeoutMs: number}} args
+ * `didFail` is set on ANY `test:fail` event, synthetic or not - matching
+ * run-tests.mjs's own `runOnce()`, which sets its failure flag
+ * unconditionally on every `test:fail` regardless of shape. `failedTests`
+ * stays filtered to named, non-synthetic entries because it exists to list
+ * WHICH tests failed for a human reading the summary; `didFail` exists to
+ * answer whether this batch failed AT ALL, and those are different
+ * questions with different correct filters. A synthetic-only failure
+ * therefore reports `didFail: true` with an empty `failedTests` list -
+ * accurate, since a real failure occurred and none of it had a name to
+ * attach to the list.
+ *
+ * @param {{files: string[], concurrency: number | undefined, testTimeoutMs: number, signal: AbortSignal}} args
  */
-function runOneBatch({ files, concurrency, testTimeoutMs }) {
+function runOneBatch({ files, concurrency, testTimeoutMs, signal }) {
   return new Promise((resolve, reject) => {
     const passedTests = [];
     const failedTests = [];
     const skipResults = [];
+    let didFail = false;
 
-    const stream = run({ files, timeout: testTimeoutMs, concurrency });
+    // Built conditionally, matching run-tests.mjs's own runOnce(): the
+    // canonical runner OMITS the concurrency key entirely for its serial
+    // batch rather than passing `concurrency: undefined`. node:test may
+    // treat the two the same today, but the parity claim this file makes
+    // should be true by construction rather than by resting on that
+    // happening to hold.
+    const runOptions = { files, timeout: testTimeoutMs, signal };
+    if (concurrency !== undefined) {
+      runOptions.concurrency = concurrency;
+    }
+    const stream = run(runOptions);
 
     stream.on("test:complete", (data) => {
       const classified = classifyTestCompletionForSkipDiscipline(data);
@@ -130,6 +152,7 @@ function runOneBatch({ files, concurrency, testTimeoutMs }) {
       }
     });
     stream.on("test:fail", (data) => {
+      didFail = true;
       if (data?.file && !isFileSyntheticCompletion(data)) {
         failedTests.push(`${rel(data.file)}::${data.name}`);
       }
@@ -137,7 +160,7 @@ function runOneBatch({ files, concurrency, testTimeoutMs }) {
     // Force flowing mode - matches run-tests.mjs's own stream handling;
     // without a consumer attached to "data" the stream never drains.
     stream.on("data", () => {});
-    stream.on("end", () => resolve({ passedTests, failedTests, skipResults }));
+    stream.on("end", () => resolve({ passedTests, failedTests, skipResults, didFail }));
     stream.on("error", (err) => reject(err));
   });
 }
@@ -178,9 +201,18 @@ function runSweepOnce({
 
     const wallStart = Date.now();
     let timedOut = false;
+    // Passed to every runOneBatch() call so the wall cap below can actually
+    // stop the active node:test stream rather than merely rejecting this
+    // promise while the stream keeps running. node:test's own run() accepts
+    // an AbortSignal and tears its stream down when it fires - the same
+    // "spawn detached and signal the whole group" shape the corpus records
+    // for a raw child_process, expressed through the API this code already
+    // calls rather than a second process-management layer bolted beside it.
+    const abortController = new AbortController();
 
     const wallCap = setTimeout(() => {
       timedOut = true;
+      abortController.abort();
       reject(
         new Error(
           `measure-concurrency-ceiling: repeat wall cap (${wallCapMs}ms) exceeded at concurrency=${concurrency}`
@@ -193,6 +225,7 @@ function runSweepOnce({
       const passedTests = [];
       const failedTests = [];
       const skipResults = [];
+      let didFail = false;
 
       // Sequential, matching runOnce()'s own batch ordering: the serial
       // batch never overlaps the concurrent one, since node:test resolves
@@ -202,10 +235,12 @@ function runSweepOnce({
           files: serialBatchFiles,
           concurrency: undefined,
           testTimeoutMs,
+          signal: abortController.signal,
         });
         passedTests.push(...batch.passedTests);
         failedTests.push(...batch.failedTests);
         skipResults.push(...batch.skipResults);
+        didFail = didFail || batch.didFail;
       }
       if (timedOut) return;
       if (concurrentBatchFiles.length > 0) {
@@ -213,10 +248,12 @@ function runSweepOnce({
           files: concurrentBatchFiles,
           concurrency,
           testTimeoutMs,
+          signal: abortController.signal,
         });
         passedTests.push(...batch.passedTests);
         failedTests.push(...batch.failedTests);
         skipResults.push(...batch.skipResults);
+        didFail = didFail || batch.didFail;
       }
       if (timedOut) return;
 
@@ -233,10 +270,12 @@ function runSweepOnce({
         passedTests: passedTests.sort(),
         failedTests: failedTests.sort(),
         skipErrors,
+        didFail,
       });
     })().catch((err) => {
       if (timedOut) return;
       clearTimeout(wallCap);
+      abortController.abort();
       reject(err);
     });
   });
@@ -357,10 +396,15 @@ async function main() {
           failedTests: ["<harness error - see message>"],
           skipErrors: [],
           harnessError: err.message,
+          didFail: true,
         };
       }
-      const status =
-        result.failedTests.length === 0 && result.skipErrors.length === 0 ? "clean" : "FAILED";
+      // didFail, never failedTests.length alone: a synthetic-only test:fail
+      // (a file-wrapper crash, a load-induced process failure with no named
+      // test attached) sets didFail without ever reaching failedTests, and
+      // treating that repeat as clean is exactly the false-green this
+      // rewrite exists to remove.
+      const status = !result.didFail && result.skipErrors.length === 0 ? "clean" : "FAILED";
       console.log(
         `${status} (${result.wallMs ?? "?"}ms, ${result.passedTests.length} passed, ${result.failedTests.length} failed)`
       );
@@ -368,9 +412,7 @@ async function main() {
     }
 
     const failedSets = repeatResults.map((r) => r.failedTests);
-    const allClean = repeatResults.every(
-      (r) => r.failedTests.length === 0 && r.skipErrors.length === 0
-    );
+    const allClean = repeatResults.every((r) => !r.didFail && r.skipErrors.length === 0);
     const consistentAcrossRepeats = failedSets.every((s) => sameSet(s, failedSets[0]));
     const failedTestUnion = [...new Set(failedSets.flat())].sort();
 
