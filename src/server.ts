@@ -447,8 +447,8 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
    * The one place a raw `notifications/cancelled` observation (from
    * `attachCancelledNotificationObserver`, wired at both `.connect` call
    * sites below) actually gets applied - factored out rather than
-   * duplicated at each call site, since the two-branch logic below is no
-   * longer the one-line `?.abort(reason)` it used to be. If a controller
+   * duplicated at each call site, since applying a cancellation is a
+   * two-branch decision rather than a plain `?.abort(reason)`. If a controller
    * is already registered for this id, abort it directly (the common
    * case). Otherwise this observation arrived before the `tools/call`
    * handler for the same id could register one - see
@@ -528,8 +528,7 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
     // itself chains its own dispatch AFTER whatever handler was already
     // present at connect time - so on every incoming message, including a
     // cancellation for a NONZERO id, this observer's own check actually
-    // runs BEFORE the SDK's own `_oncancel`, not after it as this file
-    // previously (incorrectly) claimed. `AbortSignal.any` combines both
+    // runs BEFORE the SDK's own `_oncancel`. `AbortSignal.any` combines both
     // signals regardless of which one fires first: once either aborts,
     // the combined signal stays aborted for good, so that ordering never
     // changes whether `combinedSignal` ends up aborted - only, harmlessly,
@@ -548,8 +547,8 @@ function buildGhantikaServerCore(): { server: Server; isInitialized(): boolean }
     // error branches) - that check reads the SDK's own controller, never
     // `ourController`, and this file never touches it. For every id other
     // than `0`/`""`, the SDK's own `_oncancel` DOES abort that controller
-    // on a real cancellation, so that suppression still applies exactly
-    // as before this fix - a cancelled call gets no response at all. For
+    // on a real cancellation, so that suppression still applies -
+    // a cancelled call gets no response at all. For
     // `0` and `""` specifically, the SDK's own controller is NEVER
     // aborted (its `_oncancel` guard drops the notification before ever
     // reaching it), so that suppression never triggers there:
@@ -1021,15 +1020,15 @@ async function performProcessShutdown(handle: StdioServerHandle, reason: string)
  * much at shutdown as they do for an explicit `kill()` call.
  *
  * Covers EVERY tracked job, terminal or not - not just the
- * `starting`/`running` ones (broadened from the original filter, which
- * excluded terminal jobs entirely). A terminal job record (its own LEADER
+ * `starting`/`running` ones. A terminal job record (its own LEADER
  * `exited` or was `killed`) can still have a real process GROUP with live
  * DESCENDANTS the leader forked and never `wait`-ed on before exiting on
  * its own (root-exits-first) - see `src/tools/kill.ts`'s own
  * `reapTerminalJobProcessGroup` docs for the identical fix applied there.
- * Excluding terminal jobs left exactly that class of orphan alive across
- * a server shutdown, regardless of the `kill()` fix, since shutdown is a
- * SEPARATE code path that never calls `kill()`'s own handler.
+ * Shutdown is a SEPARATE code path that never calls `kill()`'s own
+ * handler, so covering only `starting`/`running` jobs here would leave
+ * that same class of orphan alive across a server shutdown regardless of
+ * what `kill()` itself does.
  *
  * Every job is reaped CONCURRENTLY (`Promise.all`), not one after
  * another - reaping N jobs serially would multiply whatever grace period is
@@ -1624,9 +1623,8 @@ function initializeResponseOutcome(
  * before any line ever reaches the real transport at all, whether that
  * transport is later connected directly or wrapped by `serveStdio` -
  * removes the dependency on a callback slot `serveStdio` owns, and is a
- * genuine simplification over the split this file used to have (both
- * codes now share one code path and one, not two, real
- * `deserializeMessage` call per line).
+ * genuine simplification: both codes now share one code path and one,
+ * not two, real `deserializeMessage` call per line.
  *
  * The SDK's own exported `ReadBuffer` cannot be reused for this
  * specifically - confirmed empirically, not assumed: calling its
