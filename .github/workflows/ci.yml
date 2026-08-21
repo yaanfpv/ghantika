@@ -115,10 +115,13 @@ jobs:
       # tell a genuinely fixed value apart from one that merely fails
       # less often. Against real production load, two different tests
       # subsequently failed at the concurrent value that the small sweep
-      # had called clean - test/modern-handshake.test.ts:1311 (a reap
-      # guarantee) and test/doorbell-cutover.test.ts:770 (a synthetic
-      # cycle count), each on a separate, unrelated PR whose own diff
-      # never touched either test. A gate that reds on load unrelated to
+      # had called clean - a reap guarantee (then test/modern-handshake.
+      # test.ts:1311, now test/modern-handshake-contention-timing.test.ts
+      # after a later extraction moved exactly this contention-sensitive
+      # class) and a synthetic cycle count (then test/doorbell-cutover.
+      # test.ts:770, now test/doorbell-cutover-contention-timing.test.ts),
+      # each on a separate, unrelated PR whose own diff never touched
+      # either test. A gate that reds on load unrelated to
       # the change under review destroys the signal that gate exists to
       # provide, which is exactly what happened here.
       #
