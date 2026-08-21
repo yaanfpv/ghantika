@@ -48,6 +48,7 @@ import {
   loadCriticalTests,
   checkSkipDiscipline,
   classifyTestCompletionForSkipDiscipline,
+  partitionTestFilesForBatches,
 } from "./run-tests.mjs";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -104,45 +105,20 @@ function parseArgs(argv) {
 }
 
 /**
- * Runs the real suite once at the given node:test `concurrency` value and
- * returns the PASS SET and FAIL SET for that single run, not a collapsed
- * pass/fail boolean - disagreement between repeats at one value is exactly
- * the thing this measurement is trying to catch, and a boolean throws that
- * disagreement away before it can be seen.
+ * Runs ONE node:test `run()` call over a fixed file list and resolves with
+ * its raw pass/fail/skip events - no batching, no wall-cap, no skip-
+ * discipline check. Those are runSweepOnce's job, once per batch; this is
+ * the single-stream primitive both batches share.
  *
- * @param {{discovered: string[], skipBaseline: object, criticalTests: string[], concurrency: number, testTimeoutMs: number, wallCapMs: number}} args
+ * @param {{files: string[], concurrency: number | undefined, testTimeoutMs: number}} args
  */
-function runSweepOnce({
-  discovered,
-  skipBaseline,
-  criticalTests,
-  concurrency,
-  testTimeoutMs,
-  wallCapMs,
-}) {
+function runOneBatch({ files, concurrency, testTimeoutMs }) {
   return new Promise((resolve, reject) => {
-    // Every spawned test-file child process inherits this via env - same
-    // mechanism run-tests.mjs's own main() uses immediately before its own
-    // run() call.
-    process.env.GHANTIKA_POLICY_FILE = TEST_POLICY_ALLOW_PATH;
-
-    const wallStart = Date.now();
     const passedTests = [];
     const failedTests = [];
     const skipResults = [];
-    let timedOut = false;
 
-    const wallCap = setTimeout(() => {
-      timedOut = true;
-      reject(
-        new Error(
-          `measure-concurrency-ceiling: repeat wall cap (${wallCapMs}ms) exceeded at concurrency=${concurrency}`
-        )
-      );
-    }, wallCapMs);
-    wallCap.unref();
-
-    const stream = run({ files: discovered, timeout: testTimeoutMs, concurrency });
+    const stream = run({ files, timeout: testTimeoutMs, concurrency });
 
     stream.on("test:complete", (data) => {
       const classified = classifyTestCompletionForSkipDiscipline(data);
@@ -161,8 +137,89 @@ function runSweepOnce({
     // Force flowing mode - matches run-tests.mjs's own stream handling;
     // without a consumer attached to "data" the stream never drains.
     stream.on("data", () => {});
-    stream.on("end", () => {
+    stream.on("end", () => resolve({ passedTests, failedTests, skipResults }));
+    stream.on("error", (err) => reject(err));
+  });
+}
+
+/**
+ * Runs the real suite once at the given node:test `concurrency` value and
+ * returns the PASS SET and FAIL SET for that single run, not a collapsed
+ * pass/fail boolean - disagreement between repeats at one value is exactly
+ * the thing this measurement is trying to catch, and a boolean throws that
+ * disagreement away before it can be seen.
+ *
+ * Two batches, run SEQUENTIALLY, exactly matching run-tests.mjs's own
+ * runOnce(): the SERIAL_ONLY_TEST_FILES members alone first (no
+ * `concurrency` key at all), then everything else under the requested
+ * concurrency. A single `run()` call over every discovered file - what
+ * this function did before - measures a configuration the real runner
+ * never uses, since the quarantined files would then contend with every
+ * other file at every candidate value instead of never sharing a host
+ * with anything.
+ *
+ * @param {{discovered: string[], skipBaseline: object, criticalTests: string[], concurrency: number, testTimeoutMs: number, wallCapMs: number}} args
+ */
+function runSweepOnce({
+  discovered,
+  skipBaseline,
+  criticalTests,
+  concurrency,
+  testTimeoutMs,
+  wallCapMs,
+}) {
+  return new Promise((resolve, reject) => {
+    // Every spawned test-file child process inherits this via env - same
+    // mechanism run-tests.mjs's own main() uses immediately before its own
+    // run() call.
+    process.env.GHANTIKA_POLICY_FILE = TEST_POLICY_ALLOW_PATH;
+
+    const { serialBatchFiles, concurrentBatchFiles } = partitionTestFilesForBatches(discovered);
+
+    const wallStart = Date.now();
+    let timedOut = false;
+
+    const wallCap = setTimeout(() => {
+      timedOut = true;
+      reject(
+        new Error(
+          `measure-concurrency-ceiling: repeat wall cap (${wallCapMs}ms) exceeded at concurrency=${concurrency}`
+        )
+      );
+    }, wallCapMs);
+    wallCap.unref();
+
+    (async () => {
+      const passedTests = [];
+      const failedTests = [];
+      const skipResults = [];
+
+      // Sequential, matching runOnce()'s own batch ordering: the serial
+      // batch never overlaps the concurrent one, since node:test resolves
+      // one run() call's "end" event before this awaits the next call.
+      if (serialBatchFiles.length > 0) {
+        const batch = await runOneBatch({
+          files: serialBatchFiles,
+          concurrency: undefined,
+          testTimeoutMs,
+        });
+        passedTests.push(...batch.passedTests);
+        failedTests.push(...batch.failedTests);
+        skipResults.push(...batch.skipResults);
+      }
       if (timedOut) return;
+      if (concurrentBatchFiles.length > 0) {
+        const batch = await runOneBatch({
+          files: concurrentBatchFiles,
+          concurrency,
+          testTimeoutMs,
+        });
+        passedTests.push(...batch.passedTests);
+        failedTests.push(...batch.failedTests);
+        skipResults.push(...batch.skipResults);
+      }
+      if (timedOut) return;
+
       clearTimeout(wallCap);
       const wallMs = Date.now() - wallStart;
       const skipErrors = checkSkipDiscipline({
@@ -177,8 +234,7 @@ function runSweepOnce({
         failedTests: failedTests.sort(),
         skipErrors,
       });
-    });
-    stream.on("error", (err) => {
+    })().catch((err) => {
       if (timedOut) return;
       clearTimeout(wallCap);
       reject(err);
