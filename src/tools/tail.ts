@@ -23,8 +23,8 @@
  * from the retained floor (`after_cursor` is implicitly 0 - there is no
  * cursor argument, by design, since "give me the last N" is a fixed-size
  * window request, not an incremental-since-last-read one) and returns
- * only the LAST `N` real events. Unlike a positional gap marker (which the
- * old exact-range design suppressed when a window didn't reach the
+ * only the LAST `N` real events. Unlike a positional gap marker (which
+ * would need to suppress itself whenever a window doesn't reach the
  * retained floor, since a mere trim isn't a loss), this file's
  * `dropped`/`droppedBeforeCursor` disclosure is a simple historical fact
  * about the stream (has it EVER suffered a discrete loss event - an

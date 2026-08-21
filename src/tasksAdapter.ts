@@ -153,8 +153,7 @@
  * `cancelTask` returns the SAME fixed `ACK_RESULT` `updateTask` does,
  * matching the spec's own "eventually consistent - the ack may arrive
  * before the task's observable status reflects the requested change"
- * contract for `CancelTaskResult`, rather than reading a fresh snapshot
- * back the way this adapter did before this change.
+ * contract for `CancelTaskResult`.
  *
  * BOUNDARY, unwidened from `kill`'s own already-disclosed scope (see
  * `src/tools/kill.ts`'s extensive docs on this): cancelling means
@@ -229,10 +228,7 @@ export const TASKS_EXTENSION_URI = "io.modelcontextprotocol/tasks";
  * against `modelcontextprotocol/ext-tasks`, see
  * `schema/tasks-extension.schema.json`) is an EMPTY object with
  * `additionalProperties: false`: it forbids any key at all, not merely
- * "does not require one." This constant used to carry
- * `{methods: [...]}`, an honest but non-conformant addition this adapter
- * invented before the extension finalized - the released contract does not
- * tolerate it, so it is gone, not merely unused.
+ * "does not require one."
  */
 export const TASKS_CAPABILITY_DESCRIPTOR: JSONObject = Object.freeze({}) as unknown as JSONObject;
 
@@ -591,9 +587,9 @@ export const DEFAULT_POLL_INTERVAL_MS = 500;
  * docs for why this needs no separate scheduled sweep).
  *
  * This is also the value genuinely EXPOSED to a client, via `ttlMs`
- * on every terminal task-shaped response (`ttlMsFor`, below) -
- * previously it was a private constant this adapter consulted but
- * never surfaced. It is deliberately NOT exposed on a still-`working`
+ * on every terminal task-shaped response (`ttlMsFor`, below), rather
+ * than staying only the private constant this adapter consults
+ * internally. It is deliberately NOT exposed on a still-`working`
  * task: `ttlMs`'s meaning per this adapter's own purge design is "time
  * remaining before this TERMINAL record is reclaimed," and that clock has
  * not started for a task with no terminal instant to measure from yet - a
@@ -655,16 +651,14 @@ function buildGhantikaResultExtras(record: JobRecord): GhantikaResultExtras {
 
 /**
  * Projects a real `JobRecord` into the discriminated `DetailedTaskResult`
- * union - the shape `tasks/get` (via `buildGetTaskResult`) actually
- * returns, and, as of this change, ALSO the exact shape the real
- * `notifications/tasks` notification's own `params` carries (see
- * `startTaskStatusNotifier`, below): the spec's own
+ * union - the shape `tasks/get` (via `buildGetTaskResult`) returns, and
+ * also the exact shape the real `notifications/tasks` notification's own
+ * `params` carries (see `startTaskStatusNotifier`, below): the spec's own
  * `TaskStatusNotificationParams = NotificationParams & Task` is a bare
  * `DetailedTask` with no further wrapping, identical to what `tasks/get`
  * would have returned for that same task at that same moment - so this
  * function is reused rather than duplicated for the notification path,
- * exported for exactly that reuse (previously module-local, since nothing
- * outside `getTask` needed it before this change). Pure: reads `jobStore`'s
+ * exported for exactly that reuse. Pure: reads `jobStore`'s
  * own already-existing, real state (`getOutputWatchStopInfo`/
  * `getOutputCounts`) and the record's own fields, writes nothing.
  *
@@ -796,11 +790,9 @@ function isExpiredTerminalRecord(record: JobRecord, now: number): boolean {
  * check `updateTask`/`cancelTask` (below) both delegate to first - THROWS
  * (never returns a tagged not-found value) on an unknown or just-TTL-purged
  * `taskId`, via `taskNotFoundError` (`-32602`, see that function's own
- * docs). This used to return `TaskResult | TaskNotFound`, a
- * tagged success value a client had to branch on; the released spec answers
- * a missing task with a real JSON-RPC error, so this now matches that
- * contract at the SDK boundary instead of inventing its own success-shaped
- * "not found."
+ * docs) - the released spec answers a missing task with a real JSON-RPC
+ * error, so this matches that contract at the SDK boundary rather than
+ * inventing its own success-shaped "not found."
  *
  * A PURE read with one deliberate side effect: the lazy TTL purge (see
  * `TASK_TTL_MS`'s own docs) - once a terminal record is read PAST its TTL,
@@ -860,10 +852,10 @@ export function updateTask(taskId: string, now: number = Date.now()): AckResult 
  * consistent - the task's observable status may not have caught up to
  * `cancelled` the instant this call returns, even though this codebase's
  * own `kill.ts` claims the terminal state SYNCHRONOUSLY, the instant it
- * actually signals - see that file's "Idempotency and races" docs). This
- * used to return a FRESH `getTask` snapshot instead; the released
- * spec's own `UpdateTaskResult`/`CancelTaskResult` shape is a plain ack
- * with no task fields at all, so this no longer reads one back.
+ * actually signals - see that file's "Idempotency and races" docs). The
+ * released spec's own `UpdateTaskResult`/`CancelTaskResult` shape is a
+ * plain ack with no task fields at all, so this never reads a task
+ * snapshot back.
  *
  * `now` is captured ONCE by the caller (or defaults to one real
  * `Date.now()` here) for the existence/TTL check, exactly mirroring
@@ -957,18 +949,16 @@ export function taskUpdateParamsSchema(): StandardSchemaV1<unknown, TaskUpdatePa
 // (1) The output-driven wake - a coalesced, rate-bounded, firehose-guarded
 // accelerator built entirely on jobStore.ts's two generic hooks
 // (`onOutputArrival`/`onJobTerminal`) plus its generic watch-stop
-// annotation, carrying a per-batch stdout/stderr DELTA. This existed
-// before the extension finalized and used to travel under
-// `notifications/tasks/status` - a name that reads as spec vocabulary but
-// was never IN the spec (the real, released method is `notifications/tasks`,
-// singular, no `/status` suffix - see `TASKS_NOTIFICATION_METHOD` below).
-// Renamed to `GHANTIKA_OUTPUT_WAKE_METHOD`, a name that cannot be mistaken
-// for extension wire vocabulary. The firehose guard and its coalescing
-// behavior are preserved UNCHANGED here, under the new name, and this
-// rename is the only change this section makes to that mechanism.
+// annotation, carrying a per-batch stdout/stderr DELTA. Travels on the
+// wire as `notifications/ghantika/outputWake` (`GHANTIKA_OUTPUT_WAKE_METHOD`
+// below) - deliberately namespaced under `ghantika`, never under `tasks`,
+// so it can never be mistaken for the extension's own wire vocabulary
+// (the real, released spec method is `notifications/tasks`, singular -
+// see `TASKS_NOTIFICATION_METHOD` below) by a conformant client reading
+// the method name alone.
 //
 // (2) `notifications/tasks` (below, `TASKS_NOTIFICATION_METHOD`) - the
-// REAL, spec-defined status notification, added by this change. Carries a
+// REAL, spec-defined status notification. Carries a
 // complete `DetailedTask` snapshot (via `buildDetailedTaskResult`, reused
 // from `getTask`'s own path) per status TRANSITION, including the
 // terminal one - see `startTaskStatusNotifier`, below, for the full
@@ -1010,15 +1000,12 @@ export const FIREHOSE_SUSTAINED_MS = 2000;
 export const WATCH_STOP_REASON_FIREHOSE = "firehose";
 
 /**
- * ghantika's own pre-existing, non-spec output-delta wake's method name -
- * deliberately namespaced under `ghantika`, never under `tasks`, so it can
- * never be mistaken for the extension's own wire vocabulary by a
- * conformant client reading the method name alone. Was
- * `notifications/tasks/status` before this change (see this section's own
- * header for why that name was retired, not merely relocated). Optional:
- * a client MUST NOT rely on receiving it and continues to poll
- * `tasks/get`/`output`/`tail` regardless (see this section's own docs on
- * the poll floor) - unchanged by the rename.
+ * ghantika's own non-spec output-delta wake's method name - deliberately
+ * namespaced under `ghantika`, never under `tasks`, so it can never be
+ * mistaken for the extension's own wire vocabulary by a conformant client
+ * reading the method name alone. Optional: a client MUST NOT rely on
+ * receiving it and continues to poll `tasks/get`/`output`/`tail`
+ * regardless (see this section's own docs on the poll floor).
  */
 export const GHANTIKA_OUTPUT_WAKE_METHOD = "notifications/ghantika/outputWake";
 
@@ -1162,12 +1149,12 @@ function startTaskWatch(taskId: string, notifier: TaskWakeNotifier): void {
   // temporal-dead-zone hazard: the references are resolved at CALL time,
   // not definition time.
   //
-  // Tears down BOTH subscriptions, not just the output one: a firehose
-  // auto-stop previously left the terminal listener registered forever
-  // (its own `if (stopped) return` guard made it inert, but never removed
-  // it from JobStore), which leaked one listener per firehose-stopped job
-  // for the job's whole remaining life. Calling `unsubscribeTerminal` here
-  // too closes that regardless of which path stops the watch first.
+  // Tears down BOTH subscriptions, not just the output one: leaving the
+  // terminal listener registered - even inert, via its own `if (stopped)
+  // return` guard - would leak one listener per stopped job for the job's
+  // whole remaining life, since nothing else removes it from JobStore.
+  // Calling `unsubscribeTerminal` here too closes that regardless of
+  // which path stops the watch first.
   const stopWatch = (): void => {
     if (stopped) return;
     stopped = true;
@@ -1379,8 +1366,8 @@ function startTaskStatusNotifier(taskId: string, notifier: TaskWakeNotifier): vo
 //
 // `GHANTIKA_DISABLE_CLAUDE_MESSAGING_WAKE` governs `CLAUDE_MESSAGING_WAKE_
 // TRANSPORT` only, and it is an OPT-OUT, not an opt-in: that transport's
-// reach is fixed by AC2's own env-only chokepoint (this session's own
-// inherited socket, never constructed or guessed), so the uncertainty the
+// reach is fixed by an env-only chokepoint (this session's own inherited
+// socket, never constructed or guessed), so the uncertainty the
 // other gate exists for does not arise here, and the transport is attempted
 // by default. A user who does not want ghantika injecting a turn into
 // their session sets this variable to say so, in one place, documented in
@@ -1543,8 +1530,8 @@ export function emitWakeLatency(sample: WakeLatencySample): void {
  * whether ANYTHING is attempted: it decides only whether `CODEX_GATED_
  * TRANSPORTS` participate, because those two need a real Codex thread id
  * to address anything at all. `CLAUDE_MESSAGING_WAKE_TRANSPORT` needs no
- * target - AC2's whole point - so it is attempted regardless of
- * `resolution.state`, gated only by its own opt-out. A plain Claude Code
+ * target, so it is attempted regardless of `resolution.state`, gated only
+ * by its own opt-out. A plain Claude Code
  * client's request never carries the Codex-specific `_meta.threadId` this
  * file's `resolveWakeTarget` reads, so `resolution.state` is `"absent"`
  * for the exact zero-config audience this transport exists to serve - a
@@ -1633,8 +1620,8 @@ function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetReso
 
     selectAndWake(transports, target, buildTransportWakePayload(taskId, record))
       .then((wakeResult) => {
-        // t_transport_complete for the "completion" half of
-        // AC1's own wording - captured at the top of this handler, before
+        // t_transport_complete for the transport call's own completion -
+        // captured at the top of this handler, before
         // anything else runs in it, so `transportCallMs` measures the
         // transport call itself and nothing this handler does afterward.
         // Captured ONCE into a local rather than a second bare Date.now()
@@ -1687,8 +1674,8 @@ function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetReso
         }
       })
       .catch((error: unknown) => {
-        // t_transport_complete for the "failure" half of AC1's
-        // own wording - selectAndWake's own promise rejected rather than
+        // t_transport_complete for the transport call's own failure -
+        // selectAndWake's own promise rejected rather than
         // resolving (a real contract violation by a transport, or a bug in
         // the selector itself - see selectAndWake's own doc comment on why
         // this should not normally happen), so there is no real WakeResult
@@ -1752,12 +1739,11 @@ function extractJobId(result: CallToolResult): string | undefined {
  * `jobStore` write made unconditionally, independent of what gets
  * returned.
  *
- * REPLACES, never augments alongside, `content`/`structuredContent` - this
- * was an explicitly flagged open question before this adapter was built
- * against it (the spec's own `CreateTaskResult = Result & Task` example JSON
- * carries no `content`/`structuredContent` members, and the vendored
- * schema's `createTaskResult` $def locks `additionalProperties: false`
- * against a property set that does not include either). GROUNDED against
+ * REPLACES, never augments alongside, `content`/`structuredContent`: the
+ * spec's own `CreateTaskResult = Result & Task` example JSON carries no
+ * `content`/`structuredContent` members, and the vendored schema's
+ * `createTaskResult` $def locks `additionalProperties: false` against a
+ * property set that does not include either. GROUNDED against
  * the installed SDK's own runtime for this adapter, not merely inferred
  * from the spec text: `stampResultType` (the SDK's own encode-contract
  * step, confirmed by reading `@modelcontextprotocol/server`'s bundled
