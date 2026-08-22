@@ -14,13 +14,11 @@ import {
 
 const SCRIPT_PATH = fileURLToPath(new URL("../scripts/check-wake-claim.mjs", import.meta.url));
 
-// Three real sentences this repo actually shipped, taken verbatim from the
-// EC4 public-claim audit (local/qa-evidence/reviews/2026-08-15-sprint-3b-ec4-
-// public-claim-audit-e443639.md, V10/V11/V12) - not invented text. The
-// condition on this guard was explicit: a checker whose self-test and
-// negative control both pass while the predicate is wrong on every real hit
-// is worse than useless, so the negative control below plants one of these
-// exact historical violations rather than a synthetic stand-in.
+// Three real sentences from README.md, not invented text. The condition on
+// this guard is explicit: a checker whose self-test and negative control
+// both pass while the predicate is wrong on every real hit is worse than
+// useless, so the negative control below plants one of these exact
+// real-world violations rather than a synthetic stand-in.
 const V10 =
   "On a Tasks-capable connection, ghantika also rings directly the moment the job produces " +
   "output, instead of the agent having to ask";

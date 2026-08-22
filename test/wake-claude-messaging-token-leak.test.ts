@@ -22,7 +22,7 @@ const FAKE_TOKEN = "SECRET-TOKEN-MUST-NEVER-LEAK-88f3ac21";
 
 /**
  * Fails loudly if `haystack`'s own JSON serialization contains `needle`
- * anywhere - the shape of check AC5 asks for ("a check that would RED if
+ * anywhere - the shape a leak guard needs ("a check that would RED if
  * it ever leaks"). Serializing first (rather than scanning object values
  * field-by-field) means a future field added to `Capability`/`WakeResult`
  * is covered automatically, with no matching update required here.
@@ -135,7 +135,7 @@ test("wake(): delivered never surfaces the token", async () => {
       CLAUDE_CODE_MESSAGING_TOKEN: FAKE_TOKEN,
     },
   });
-  const result = await transport.wake({ hint: "AC5-test" }, "AC5 test payload");
+  const result = await transport.wake({ hint: "wake-test" }, "wake test payload");
   assert.equal(result.outcome, "delivered");
   assertNeverContains(result, FAKE_TOKEN, "wake() delivered result");
 });
@@ -147,14 +147,14 @@ test("wake(): refused (dropped) never surfaces the token", async () => {
       CLAUDE_CODE_MESSAGING_TOKEN: FAKE_TOKEN,
     },
   });
-  const result = await transport.wake({ hint: "AC5-test" }, "AC5 test payload");
+  const result = await transport.wake({ hint: "wake-test" }, "wake test payload");
   assert.equal(result.outcome, "refused");
   assertNeverContains(result, FAKE_TOKEN, "wake() refused result");
 });
 
 test("wake(): unavailable (no inherited env) never surfaces the token", async () => {
   const transport = new ClaudeMessagingWakeTransport({ env: {} });
-  const result = await transport.wake({ hint: "AC5-test" }, "AC5 test payload");
+  const result = await transport.wake({ hint: "wake-test" }, "wake test payload");
   assert.equal(result.outcome, "unavailable");
   assertNeverContains(result, FAKE_TOKEN, "wake() unavailable result");
 });

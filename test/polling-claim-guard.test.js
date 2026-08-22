@@ -63,7 +63,7 @@ test("green control: the corrected replacement text (what actually ships) is cle
   assert.deepEqual(findUniversalPollingClaims(CORRECTED_SENTENCE), []);
 });
 
-test("green control (AC2 - preserves follow as a bounded wait): the corrected text still names follow as available and non-polling, and the guard does not choke on that sentence either", () => {
+test("green control (preserves follow as a bounded wait): the corrected text still names follow as available and non-polling, and the guard does not choke on that sentence either", () => {
   const followSentence =
     "`follow` stays available as a client-independent bounded wait on that same floor - the " +
     "very tool this document tells you to reach for instead of polling - and needs neither " +
@@ -71,7 +71,7 @@ test("green control (AC2 - preserves follow as a bounded wait): the corrected te
   assert.deepEqual(findUniversalPollingClaims(followSentence), []);
 });
 
-test("green control (AC3): README's own true workflow statement - a client capability claim, not a per-tool polling claim - is never flagged", () => {
+test("green control: README's own true workflow statement - a client capability claim, not a per-tool polling claim - is never flagged", () => {
   assert.deepEqual(findUniversalPollingClaims(WORKFLOW_STATEMENT), []);
 });
 
@@ -123,14 +123,15 @@ test("green control: cross-sentence proximity does not falsely join an unrelated
   assert.deepEqual(hits, [], "the sentence split must keep the two clauses from being conflated");
 });
 
-test("green control (AC4 - a CHANGELOG-shaped entry describing the correction): the raw DETECTOR still fires on quoted defect text (documenting why production scope matters), but the guard's real scan surface never reaches CHANGELOG.md at all", () => {
+test("green control: a CHANGELOG-shaped entry quoting polling language still fires the raw DETECTOR, but the guard's real scan surface never reaches CHANGELOG.md at all", () => {
   const changelogEntry =
     "Fixed: the Configuration section previously claimed every tool answers by polling on every " +
     "client regardless, which was false about the shipped surface. It now names the actual floor " +
     "precisely.";
   // The bare detector, given this text directly, still flags the quoted
-  // defect - this is exactly the false-positive AC4 warns about, and it is
-  // why the real check below never scans CHANGELOG.md in the first place.
+  // language - text outside the Configuration section is outside the
+  // guard's input, so scope is what keeps a CHANGELOG entry from being
+  // flagged, not the detector being lenient.
   assert.equal(
     findUniversalPollingClaims(changelogEntry).length,
     1,
@@ -171,7 +172,7 @@ test("extractConfigurationSection throws when the document has no Configuration 
   assert.throws(() => extractConfigurationSection("## Something Else\n\nprose\n"), /Configuration/);
 });
 
-test("green control (AC3, at the scope level): README:15's workflow statement lives outside the Configuration section and is never even part of the scanned text", () => {
+test("green control (at the scope level): README:15's workflow statement lives outside the Configuration section and is never even part of the scanned text", () => {
   const readme = readFileSync(README_PATH, "utf8");
   assert.ok(
     readme.includes(WORKFLOW_STATEMENT),
@@ -195,9 +196,9 @@ test("green control: the real, current README.md's Configuration section makes n
   );
 });
 
-// --- AC5: negative control, observed to red then reverted - drives the real
-// CLI end to end via GHANTIKA_README_PATH, against a scratch copy of the real
-// README.md with the exact shipped defect planted back in. ---
+// --- Negative control: drives the real CLI end to end via
+// GHANTIKA_README_PATH, against a scratch copy of the real README.md with
+// the exact shipped defect planted back in. ---
 
 function runCliAgainst(readmeContent) {
   const dir = mkdtempSync(path.join(tmpdir(), "ghantika-polling-claim-guard-"));
