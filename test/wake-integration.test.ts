@@ -909,29 +909,31 @@ test("startTaskStatusNotifier releases its own onJobTerminal subscription on the
     });
     jobId = minted.taskId as string;
 
-    // All three onJobTerminal subscribers this connection's capability
+    // All four onJobTerminal subscribers this connection's capability
     // and this job's non-terminal mint-time state together wire -
-    // startTaskWatch, startTaskStatusNotifier, and startTransportWakeOnTerminal
-    // (registered unconditionally, regardless of isCapableConnection or the
+    // startTaskWatch, startTaskStatusNotifier, startTransportWakeOnTerminal,
+    // and startTransportWakeOnOutput (the latter two registered
+    // unconditionally, regardless of isCapableConnection or the
     // wake-transport gate - see maybeAugmentRunResult's own doc comment) -
     // are all live before the job's real terminal transition. The same
     // real oracle test/wake-transport-wiring.test.ts's own "fires AT MOST
     // ONCE" test already asserts this exact count before terminalization.
     assert.equal(
       jobStore.getJobTerminalListenerCount(jobId),
-      3,
-      "expected all three onJobTerminal subscribers registered before the terminal transition"
+      4,
+      "expected all four onJobTerminal subscribers registered before the terminal transition"
     );
 
     await pollTaskUntilTerminal(pair.client, jobId);
 
     // The real regression this test exists for: startTaskWatch's own
-    // stopWatch() and startTransportWakeOnTerminal's own unsubscribeTerminal()
-    // both already unsubscribe themselves correctly - checking only that
-    // the count DROPPED would pass even with startTaskStatusNotifier's own
-    // subscription leaked forever (count 3 -> 1, still a drop). The
+    // stopWatch() and both startTransportWakeOnTerminal's and
+    // startTransportWakeOnOutput's own unsubscribe calls already
+    // unsubscribe themselves correctly - checking only that the count
+    // DROPPED would pass even with startTaskStatusNotifier's own
+    // subscription leaked forever (count 4 -> 1, still a drop). The
     // assertion is exact-zero, which only holds once every one of the
-    // three has released its own listener - the leaked shape would read 1
+    // four has released its own listener - the leaked shape would read 1
     // here, never 0.
     assert.equal(
       jobStore.getJobTerminalListenerCount(jobId),

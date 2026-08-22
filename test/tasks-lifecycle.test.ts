@@ -1000,24 +1000,24 @@ describe("spawning tests: output-driven wake, firehose auto-stop, exit reporting
         // unregistered look identical to any caller that never inspects the
         // listener count directly.
         //
-        // The count this asserts is 2: two genuinely SEPARATE, independent
+        // The count this asserts is 3: three genuinely SEPARATE, independent
         // `onJobTerminal` subscribers share the same guard block in
         // `maybeAugmentRunResult` alongside the watch under test here - the
         // `notifications/tasks` per-transition status notifier
-        // (startTaskStatusNotifier, see its own docs) and the
-        // transport-layer wake subscriber (startTransportWakeOnTerminal, see
-        // its own docs - gated OFF by default via
-        // GHANTIKA_WAKE_TRANSPORT_ENABLED, but its SUBSCRIPTION is
-        // unconditional). Both must still be live here, since the job has
-        // not reached its real terminal transition yet - only the OTHER
-        // watch auto-stopped. If startTaskWatch's own listener were ever
-        // left registered instead of genuinely unsubscribed, this count
-        // would read 3 (the leaked one plus both siblings' own live ones),
-        // not 2.
+        // (startTaskStatusNotifier, see its own docs) and the two
+        // transport-layer wake subscribers (startTransportWakeOnTerminal
+        // and startTransportWakeOnOutput, see their own docs - both gated
+        // OFF by default via GHANTIKA_WAKE_TRANSPORT_ENABLED, but their
+        // SUBSCRIPTIONS are unconditional). All three must still be live
+        // here, since the job has not reached its real terminal transition
+        // yet - only the OTHER watch auto-stopped. If startTaskWatch's own
+        // listener were ever left registered instead of genuinely
+        // unsubscribed, this count would read 4 (the leaked one plus all
+        // three siblings' own live ones), not 3.
         assert.equal(
           jobStore.getJobTerminalListenerCount(jobId),
-          2,
-          "expected exactly the two independent onJobTerminal subscribers (notifications/tasks status notifier + transport-layer wake) to remain - the auto-stopped watch's own listener must be genuinely unsubscribed, not merely left inert"
+          3,
+          "expected exactly the three independent onJobTerminal subscribers (notifications/tasks status notifier + both transport-layer wake subscribers) to remain - the auto-stopped watch's own listener must be genuinely unsubscribed, not merely left inert"
         );
       } finally {
         mock.timers.reset();
