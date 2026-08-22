@@ -476,9 +476,10 @@ export function parseArgs(argv) {
     //
     // concurrency=8 is disclosed as unsafe on this host, not silently
     // avoided: 2 of 3 repeated full-suite runs at concurrency=8 failed,
-    // both times in test/modern-handshake.test.ts's negative-control
-    // tests (a different specific sub-test each time - "initialize-gate"
-    // and "parse-error reply" - never the same one twice, and no OTHER
+    // both times in test/modern-handshake-contention-timing.test.ts's
+    // negative-control tests (a different specific sub-test each time -
+    // "initialize-gate" and "parse-error reply" -
+    // never the same one twice, and no OTHER
     // file failed even once across all 12 full-suite runs in this
     // measurement, including the process/birth-identity family
     // (test/process.test.ts, test/process-slow-paths.test.ts,

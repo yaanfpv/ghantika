@@ -22,9 +22,10 @@
  * Usage: `node scripts/doorbell-cutover-harness.mjs` - prints a summary
  * report to stdout and exits 0 on success, exits 1 (with the failing
  * assertion's message on stderr) on any deviation from the above. Also
- * importable: `runHarness()` is what test/doorbell-cutover.test.ts calls
- * to assert on the SAME real run's structured result, rather than
- * re-deriving a second copy of this proof.
+ * importable: `runHarness()` is what
+ * test/doorbell-cutover-contention-timing.test.ts calls to assert on the
+ * SAME real run's structured result, rather than re-deriving a second
+ * copy of this proof.
  */
 
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
