@@ -275,8 +275,46 @@ function main() {
   // run-tests.mjs that produced the completion marker. See RUN_TOKEN_PATH's
   // own doc comment in scripts/run-tests.mjs for the full mechanism.
   const completion = loadCompletionMarker();
-  const currentHeadSha = readGitHeadSha();
-  if (!completion || completion.headSha !== currentHeadSha) {
+  // Matches scripts/run-tests.mjs's own degrade path for the identical
+  // condition: a git-less environment (no .git at all, e.g. a mount-none
+  // clone that ships only tracked file CONTENT) makes this call throw,
+  // exactly like the read run-tests.mjs performs when it writes the
+  // completion marker in the first place.
+  let currentHeadSha;
+  try {
+    currentHeadSha = readGitHeadSha();
+  } catch {
+    currentHeadSha = null;
+  }
+  if (currentHeadSha === null) {
+    if (completion && completion.headSha === null) {
+      // Both ends of the binding agree git was unavailable when they ran -
+      // this specific check is UNSCANNED, disclosed as such, never
+      // silently treated as a match. The run-token check just below is
+      // git-independent and still enforced, so a truncated or stale run
+      // is still caught by it.
+      console.error(
+        "coverage floor check: git unavailable - the completion marker's headSha binding is " +
+          "UNSCANNED this run; the run-token binding below still applies"
+      );
+    } else {
+      // git is unavailable HERE, but the completion marker either claims
+      // a real commit or is absent - neither can be verified against an
+      // unreadable current checkout, so this degrades to VOID rather than
+      // guessing in either direction.
+      console.error(
+        `coverage floor check: REFUSED - git is unavailable here, so the completion marker's ` +
+          `headSha (${completion ? JSON.stringify(completion.headSha) : "absent - no completion record"}) ` +
+          `cannot be verified against the current checkout.`
+      );
+      console.error(
+        `  this is VOID, not a pass and not a fail [no-git-headsha-verification] - see ` +
+          `${path.relative(REPO_ROOT, COMPLETION_MARKER_PATH)}.`
+      );
+      process.exitCode = VOID_EXIT_CODE;
+      return;
+    }
+  } else if (!completion || completion.headSha !== currentHeadSha) {
     console.error(
       `coverage floor check: REFUSED - no valid completion record for the current checkout ` +
         `(head ${currentHeadSha}). Either the run never reached its own completion point (it may ` +
