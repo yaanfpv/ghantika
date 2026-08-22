@@ -1615,6 +1615,61 @@ test("scripts/run-tests.mjs cannot be redirected even when every historical over
   }
 });
 
+test("a git-less isolated root (no .git at all - the exact shape a mount-none guest clone produces) completes a real run instead of crashing, and its own completion marker embeds headSha: null rather than a fabricated commit", () => {
+  const root = realpathSync(mkdtempSync(path.join(tmpdir(), "ghantika-git-less-")));
+  try {
+    copyProductionScriptIntoIsolatedRoot(root);
+
+    const testDir = path.join(root, "test");
+    mkdirSync(testDir, { recursive: true });
+    const realTestPath = path.join(testDir, "real.test.mjs");
+    writeFileSync(
+      realTestPath,
+      ['import { test } from "node:test";', 'test("a trivial passing test", () => {});', ""].join(
+        "\n"
+      )
+    );
+    writeFileSync(path.join(testDir, "skip-baseline.json"), "{}");
+    writeFileSync(path.join(testDir, "critical-tests.json"), "[]");
+    // Deliberately NOT calling gitInitAndCommitAll(root) - this root has no
+    // .git at all, matching a mount-none guest clone that ships only
+    // tracked file CONTENT.
+
+    const env = baseIsolatedChildEnv();
+    const result = collectChildResult(path.join(root, "scripts", "run-tests.mjs"), [], env);
+
+    assert.equal(
+      result.status,
+      0,
+      `a git-less root must still complete a real run rather than crash on the completion marker's own headSha read; stderr:\n${result.stderr}`
+    );
+    assert.ok(
+      result.stderr.includes("git unavailable") &&
+        result.stderr.includes("headSha binding is UNAVAILABLE"),
+      `expected the same disclosed-degrade shape tracked-file parity already uses for the identical condition; stderr:\n${result.stderr}`
+    );
+
+    const completionMarkerPath = path.join(root, "coverage", "run-completed.json");
+    assert.ok(
+      existsSync(completionMarkerPath),
+      "a git-less run must still write its completion marker"
+    );
+    const completion = JSON.parse(readFileSync(completionMarkerPath, "utf8"));
+    assert.equal(
+      completion.headSha,
+      null,
+      "the completion marker must honestly embed null rather than a fabricated or stale commit sha"
+    );
+    assert.equal(
+      typeof completion.runToken,
+      "string",
+      "the git-independent runToken binding is unaffected"
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("tracked-file parity is enforced unconditionally - setting GHANTIKA_TEST_DIR (or any of the other three retired variables, including the old fixture token) does not skip it, and a tracked-but-missing-from-disk file is still caught", () => {
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), "ghantika-redirect-immunity-parity-")));
   const decoyDir = realpathSync(
