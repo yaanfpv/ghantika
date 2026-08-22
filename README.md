@@ -234,6 +234,8 @@ Allowlisting an interpreter (a shell, `env`, `node`, and the like) is a real dec
 
 On Windows, that platform shell is resolved from this server's own `ComSpec` (falling back to a PATH search for `cmd.exe` against this server's own trusted `PATH` when unset - never a job's own environment) - this repository's CI has no Windows leg at all right now, so that resolution, and the fact that the resolved path is what actually launches, are verified by reading and by a platform-mocked unit test, not by real execution on a Windows host.
 
+Installing the package itself is a separate mechanism from what that shell resolution covers. On Windows, `npm install -g` launches a package's binary through a generated `.cmd`/`.ps1` shim rather than through the file's own executable mode (the mode this package's build step sets, and the one POSIX installs launch from directly) - this repository's CI has no Windows leg at all right now, so the packaging tests name and skip that shim rather than launch it, and whether it actually starts the installed binary is unverified rather than confirmed.
+
 `status`, `output`, `tail`, and `follow` all take `job_id`. `tail` also takes an optional `stream` (`stdout`/`stderr`/`both`) and `lines`; `output` takes `stream` plus `after_cursor` and `limit` for paging through a long job incrementally; `follow` takes `stream` plus `cursor` and `timeout_ms` for a single bounded wait instead of a page. `kill` takes `job_id`. Every tool's full input schema is advertised over `tools/list`, so an agent (or you) can always ask ghantika directly rather than trusting a doc that's drifted out of date.
 
 ### The auto-background wake (Claude Code)
