@@ -74,16 +74,9 @@ const POSIX_PROCESS_GROUP_SKIP =
     ? "exercises a real POSIX process-group primitive (ps/pgrep/negative-pid kill) with no win32 equivalent path here"
     : false;
 
-// The captureBirthIdentityPosixAsync tests below prove the ETIME-based
-// observer's own retry/timeout/aggregate-cap machinery by shadowing a fake
-// `ps` binary on PATH - a fixture that only exercises anything on the
-// platform that mechanism actually runs on. `captureBirthIdentityPosixAsync`
-// never shells out to `ps` at all on Linux (it reads `/proc/<pid>/stat`
-// directly instead - see src/process.ts's own docs for
-// `readLinuxStartTimeTicksAsync`), so a fake `ps` placed on PATH is simply
-// never invoked there: these tests would either observe a real, genuinely
-// found identity almost instantly (the fake ps never gets the chance to
-// run at all) or throw reading an invocation marker the fake ps never got
+// captureBirthIdentityPosixAsync's own tests moved to
+// test/process-contention-timing.test.ts.
+
 // A handful of tests need a REAL, currently-alive process's genuine
 // /proc/<pid>/stat entry (the "found" case) - macOS has no /proc filesystem
 // at all, so every read against it fails with the identical ENOENT a
@@ -1002,28 +995,8 @@ test(
   }
 );
 
-// --- captureBirthIdentityPosixAsync (the non-blocking counterpart run()'s
-// own production handler actually calls - see src/tools/run.ts's docs) ---
-
-// --- captureBirthIdentityPosixAsync's own retry semantics, exercised
-// directly against the PRODUCTION function via a fake `ps` shadowed onto
-// PATH (the same seam the hung-observer test above uses) - never through
-// test/helpers/birthIdentityRetry.ts, which has different failure
-// semantics and proves nothing about this function's own retry bound. ---
-
-// --- The two-bound model: a RETRY budget (governs whether another retry
-// may START, never whether an already-started one's `found` is accepted)
-// and an AGGREGATE cap (the pre-existing, published total-settlement bound
-// kill()/the shutdown reaper already document, moved by nothing below it).
-// Owners 1/2/3 exercise the retry budget in isolation with a generous
-// aggregate budget; owners 5/6 exercise the aggregate cap. ---
-
-// --- The AGGREGATE cap: the pre-existing, published total-settlement
-// bound (kill()/the shutdown reaper's own docs) that the retry addition
-// above must never widen. Two distinct expiry states: an observer
-// actually running when the cap hits (force-reaped, below), and the
-// scheduler asleep between attempts when the cap hits (no new observer
-// ever starts, further below). ---
+// captureBirthIdentityPosixAsync's own tests moved to
+// test/process-contention-timing.test.ts.
 
 // --- retryBirthIdentityCapture (test/helpers/birthIdentityRetry.ts - the
 // bounded retry every immediate-capture-then-assert test call site below
@@ -1202,36 +1175,8 @@ test("parseLinuxStatStartTimeTicks: returns undefined when the field-22 position
   assert.equal(parseLinuxStatStartTimeTicks(raw), undefined);
 });
 
-// --- readLinuxStartTimeTicksAsync's own bound (a real, confirmed defect: this
-// function used to `await` its `/proc/<pid>/stat` read directly, with no
-// timeout/AbortController/race at all - a reader that never settles left the
-// whole promise permanently pending, past every deadline
-// captureBirthIdentityPosixAsync's own aggregate-cap bookkeeping claimed to
-// enforce). This test injects a reader that never settles - the one case a
-// portable test can force deterministically, since a real `/proc` read
-// cannot be made to hang on demand - and proves the function's own returned
-// promise still settles within its caller-supplied bound regardless. Pure
-// and platform-agnostic like `parseLinuxStatStartTimeTicks`'s own tests
-// above: the injected reader means this needs no real Linux host or `/proc`
-// entry to exercise the exact code path production dispatches to on Linux. ---
-
-// --- GHANTIKA_TEST_DEGRADE_PROC_READ: the test-only, failure-only hatch on
-// the REAL reader (no injected reader passed below - this exercises the
-// production default, `REAL_PROC_STAT_ASYNC_READER`, exactly as run()'s own
-// real spawn-time capture and checkProcessIdentity's own kill-time
-// re-verify would). This is the removal-detects-it control the hatch's own
-// safety claim needs: it uses `process.pid` - a REAL, currently-alive
-// process whose genuine /proc entry a normal read WOULD find - so if a
-// future change ever let an engaged degrade mode fall through to a real or
-// fabricated "found" result, this is exactly the scenario that would catch
-// it. Every mode must produce "not-found" or "observer-failure", NEVER
-// "found", across the whole mode space - not just the modes each
-// individual test above happens to reach. ---
-
-// mutation control: an unrecognized value must be IGNORED entirely (falls
-// through to the real read), never treated as some other implicit mode -
-// this is what keeps the hatch's surface exactly the four literals above,
-// not "anything truthy".
+// readLinuxStartTimeTicksAsync and GHANTIKA_TEST_DEGRADE_PROC_READ's own
+// tests moved to test/process-contention-timing.test.ts.
 
 // --- identityElapsedTimesMatch (pure comparison, checkProcessIdentity's building block) ---
 
@@ -2312,12 +2257,13 @@ test("killProcessTreeWindows: synchronous and immediate - no waiting, no grace p
 });
 
 // ---------------------------------------------------------------------------
-// The escalation identity gate: before the SIGKILL escalation,
-// prove the process group is still the one this codebase spawned. Covers
-// the frozen six-token ps grammar (parsePidLstartRow), the batched/bounded/
-// force-reaped observer (readPidStartTimesBatchPosix), the pre-SIGTERM
-// snapshot (captureEscalationIdentitySnapshot) and its own fail-closed
-// cells, and the escalation-time decision (evaluateEscalationIdentityGate).
+// The escalation identity gate: before the SIGKILL escalation, prove the
+// process group is still the one this codebase spawned.
+// readPidStartTimesBatchPosix, captureEscalationIdentitySnapshot, and
+// evaluateEscalationIdentityGate moved to
+// test/process-contention-timing.test.ts. What stays here is
+// parsePidLstartRow's own grammar tests (immediately below) and its own
+// timing-constant sanity check.
 // ---------------------------------------------------------------------------
 
 test("PROCESS_IDENTITY_OBSERVATION_TIMEOUT_MS is the named 2000ms whole-phase budget, and is strictly less than POSIX_KILL_GRACE_PERIOD_MS - asserted directly, never eyeballed", () => {

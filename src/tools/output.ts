@@ -168,11 +168,12 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
 
   const body: Record<string, unknown> = { events: items, next_cursor: nextCursor };
   // `truncated` covers BOTH real causes a caller might not have everything:
-  // this stream (or, in "both" mode, either stream) has genuinely dropped
-  // some of its own history forever (retention eviction - see
-  // `view.truncated`), OR this specific call's own `limit` left more
-  // already-available events undisclosed this time (`limitClamped`) -
-  // never masking one cause with the other.
+  // this stream (or, in "both" mode, either stream) has genuinely lost some
+  // of its own output forever (retention eviction - including a reclaimed
+  // pending fragment or a chunk arriving after reclaim, neither of which
+  // was ever a materialized line - see `view.truncated`), OR this specific
+  // call's own `limit` left more already-available events undisclosed this
+  // time (`limitClamped`) - never masking one cause with the other.
   if (view.truncated || limitClamped) body.truncated = true;
 
   applyDropDisclosure(body, stream, view.perStreamDrop);
