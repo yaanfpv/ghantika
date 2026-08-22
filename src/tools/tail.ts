@@ -34,10 +34,12 @@
  * of whether this particular `lines` window happens to reach that floor.
  *
  * `truncated` covers two distinct causes, neither masking the other: this
- * stream (or, in "both" mode, either stream) has genuinely dropped some of
- * its own history forever (retention eviction), OR this call's own
- * `lines` window was smaller than what's currently available, so more
- * already-retained events exist beyond what this response returned.
+ * stream (or, in "both" mode, either stream) has genuinely lost some of its
+ * own output forever (retention eviction - including a reclaimed pending
+ * fragment or a chunk arriving after reclaim, neither of which was ever a
+ * materialized line), OR this call's own `lines` window was smaller than
+ * what's currently available, so more already-retained events exist beyond
+ * what this response returned.
  */
 import type { CallToolResult, Tool } from "@modelcontextprotocol/server";
 
@@ -124,8 +126,11 @@ export function handler(args: Record<string, unknown> | undefined): CallToolResu
 
   const body: Record<string, unknown> = { events: items, next_cursor: nextCursor };
   // `truncated` covers BOTH real causes a caller might not have everything
-  // this stream (or, in "both" mode, either stream) has ever produced - see
-  // this file's header for the two distinct causes.
+  // this stream (or, in "both" mode, either stream) has ever produced:
+  // genuine loss of its own output forever (eviction, a reclaimed pending
+  // fragment, or a chunk arriving after reclaim - none of the latter two
+  // was ever a materialized line - see this file's header), OR this call's
+  // own `lines` window leaving more already-retained events undisclosed.
   if (view.truncated || view.windowClamped) body.truncated = true;
 
   applyDropDisclosure(body, stream, view.perStreamDrop);
