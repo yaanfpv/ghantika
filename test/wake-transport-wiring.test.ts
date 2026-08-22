@@ -531,8 +531,8 @@ test("the transport-wake subscriber fires AT MOST ONCE per task - a duplicate ma
 
     assert.equal(
       jobStore.getJobTerminalListenerCount(job.job_id),
-      3,
-      "expected all three onJobTerminal subscribers (output watch, status notifier, transport wake) registered before the terminal transition"
+      4,
+      "expected all four onJobTerminal subscribers (output watch, status notifier, transport wake on terminal, transport wake on output) registered before the terminal transition"
     );
 
     jobStore.markExited(job.job_id, 0, null);

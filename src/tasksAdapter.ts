@@ -216,7 +216,7 @@ import {
   CODEX_GATED_TRANSPORTS,
   selectAndWake,
 } from "./wake/selectTransport.js";
-import type { WakeTransport } from "./wake/wakeTransport.js";
+import type { WakeTarget, WakeTransport } from "./wake/wakeTransport.js";
 
 // ---------------------------------------------------------------------------
 // The extension identity and the vendored, digest-verified schema
@@ -1422,10 +1422,70 @@ function buildTransportWakePayload(taskId: string, record: JobRecord): string {
   return `ghantika job ${taskId} reached ${record.state} - use status/output/tail to read the result`;
 }
 
+/**
+ * A short, factual string for the OUTPUT-triggered transport wake's own
+ * `wake()` payload - the sibling of `buildTransportWakePayload` above, same
+ * house register, deliberately generic (never the actual output lines):
+ * `startTaskWatch`'s own Tasks-notification path already carries real
+ * stdout/stderr content over an open MCP connection, and this mechanism is
+ * not that path - this payload never depends on a Tasks-capable connection
+ * existing at all. Names only the fact (a still-running job produced
+ * output) and the concrete next step, matching
+ * `buildTransportWakePayload`'s own reasoning for why it never names
+ * `tasks/get`.
+ */
+function buildOutputWakePayload(taskId: string): string {
+  return `ghantika job ${taskId} produced new output while still running - use status/output/tail to read it`;
+}
+
+/**
+ * The minimum gap `startTransportWakeOnOutput` enforces between two
+ * OUTPUT-triggered transport-wake attempts for the SAME job - the repeat
+ * gate, distinct from `WAKE_COALESCE_WINDOW_MS` above (which only collapses
+ * a tight burst INTO one wake decision inside a single attempt, never
+ * throttles a sustained stream - see `startTransportWakeOnOutput`'s own
+ * doc comment for why reusing that constant as the repeat gate was
+ * considered and rejected: it would re-open a fresh 200ms window the
+ * instant each flush's timer clears, injecting a new turn roughly every
+ * 200ms for the whole life of a sustained stream).
+ *
+ * Chosen from two bounds, both argued rather than assumed:
+ *
+ * LOWER BOUND - never meaningfully swallow the primary use case's own
+ * event spacing. A long-lived doorbell watch's real events are minutes to
+ * hours apart - any value up to a few minutes trivially clears this
+ * bound. A human manually re-testing with two deliberate touches seconds
+ * apart is the rare exception this bound has to tolerate, not the case it
+ * optimizes for, and even that exception is never silently lost: output
+ * arriving during an active cooldown is tracked and fires once, exactly
+ * when the cooldown expires - see this function's own doc comment.
+ *
+ * UPPER BOUND - do not inject an unreasonable number of turns for a
+ * genuinely continuous, non-firehose stream (a build log, a verbose lint
+ * run - anything under `FIREHOSE_LINES_PER_SEC`'s own auto-stop threshold,
+ * which this cooldown does not depend on: it already bounds the wake RATE
+ * independent of the output ARRIVAL rate, firehose or not - see
+ * `startTransportWakeOnOutput`'s own doc comment). Argued against a
+ * ten-minute continuous run: 30 seconds yields 20 wake attempts (600s /
+ * 30s) - twenty injected turns for one job, the "one turn per line" shape
+ * this mechanism must never produce, merely batched into a smaller
+ * number; 60 seconds still yields 10. This value yields 5 for that same
+ * ten-minute run, and 30 for a full hour of continuous output - roughly
+ * one nudge every two minutes for a job that never stops talking, a
+ * defensible "occasional check-in" cadence rather than a flood, while
+ * still comfortably clearing the lower bound above.
+ */
+export const OUTPUT_WAKE_COOLDOWN_MS = 120_000;
+
 // ---------------------------------------------------------------------------
 // Wake-latency instrumentation. Correlates three of the four
-// timestamps a wake's actual latency is made of, for `startTransportWakeOnTerminal`
-// below to capture and emit alongside every wake attempt it makes.
+// timestamps a wake's actual latency is made of, for `dispatchTransportWake`
+// below to capture and emit alongside every wake attempt it makes, on
+// behalf of BOTH `startTransportWakeOnTerminal` and
+// `startTransportWakeOnOutput` - a shared dispatch helper, so this section's
+// field names describe whichever real event triggered the attempt, not
+// only a terminal transition (see `WakeLatencySample.tTerminalMs`'s own
+// doc comment below for why the field name itself stays as it is).
 //
 // The fourth - the woken thread's own transcript actually showing the
 // resumed turn - is deliberately NOT captured here and never will be by
@@ -1452,6 +1512,17 @@ function buildTransportWakePayload(taskId: string, record: JobRecord): string {
 /** The three timestamps this file can itself observe for one wake attempt, plus its outcome and which transport produced it - everything `buildWakeLatencyRecord` needs to compute the two gaps this section's own header explains are reported separately, never collapsed. */
 export interface WakeLatencySample {
   readonly taskId: string;
+  /**
+   * The instant of whichever real event triggered THIS wake attempt - a
+   * job's terminal transition (`startTransportWakeOnTerminal`), or a
+   * materialized output line (`startTransportWakeOnOutput`). `tTerminalMs`
+   * is the stable wire key for that instant regardless of which of the two
+   * triggering events was observed: this is a wire-visible JSON key
+   * emitted verbatim by `buildWakeLatencyRecord` to a `console.error` log
+   * line an external harness may already parse by name (see this
+   * section's own header), so the field name identifies the LOG SCHEMA,
+   * never the specific trigger that produced any one sample.
+   */
   readonly tTerminalMs: number;
   readonly tSelectAndWakeEnterMs: number;
   readonly tTransportCompleteMs: number;
@@ -1573,6 +1644,160 @@ export function emitWakeLatency(sample: WakeLatencySample): void {
  * (`tasks/get`/`status`/`output`/`tail`) stays authoritative regardless of
  * whether this ever fires or what it finds when it does.
  */
+/**
+ * The set of transports eligible to attempt a wake for `resolution`, plus
+ * the `target` to pass them - shared, verbatim, by every dispatch site that
+ * calls `selectAndWake` from this file (`startTransportWakeOnTerminal` and
+ * `startTransportWakeOnOutput`), so the TWO-GATE design this section's own
+ * header describes can never drift between a terminal-triggered and an
+ * output-triggered wake: a future change to either gate's meaning changes
+ * this ONE function, not two call sites that could silently diverge - a
+ * gate that starts meaning something different for one trigger than the
+ * other would be a defect in this mechanism's own design.
+ *
+ * Reproduces `startTransportWakeOnTerminal`'s own original inline
+ * reasoning unchanged: `CLAUDE_MESSAGING_WAKE_TRANSPORT` needs no target,
+ * so it is attempted regardless of `resolution.state`, gated only by its
+ * own opt-out; `CODEX_GATED_TRANSPORTS` participate only when a real Codex
+ * thread id resolved AND the operator opted in. `target` is the real
+ * resolved target when one exists, `taskId` otherwise (a placeholder,
+ * informational only for `CLAUDE_MESSAGING_WAKE_TRANSPORT` - see that
+ * transport's own header) - safe only because `CODEX_GATED_TRANSPORTS` are
+ * never included in the same call when `target` is a placeholder; passing
+ * that placeholder to a transport that DOES address by it would misaddress
+ * it. Returns `undefined` when NEITHER gate admits anything - the caller's
+ * own "nothing eligible" early return.
+ */
+function eligibleWakeTransports(
+  taskId: string,
+  resolution: WakeTargetResolution
+): { readonly transports: WakeTransport[]; readonly target: WakeTarget } | undefined {
+  const transports: WakeTransport[] = [];
+  if (!isClaudeMessagingWakeDisabled()) transports.push(CLAUDE_MESSAGING_WAKE_TRANSPORT);
+  if (resolution.state === "resolved" && isTransportWakeEnabled()) {
+    transports.push(...CODEX_GATED_TRANSPORTS);
+  }
+  if (transports.length === 0) return undefined; // nothing eligible - both gates say no
+  const target = resolution.state === "resolved" ? resolution.target : taskId;
+  return { transports, target };
+}
+
+/**
+ * Fires one `selectAndWake` attempt for `taskId` against `transports`/
+ * `target`/`payload`, and records/logs its outcome - shared, verbatim, by
+ * every wake dispatch site in this file (`startTransportWakeOnTerminal` and
+ * `startTransportWakeOnOutput`), so the recording/logging shape
+ * (wake-latency emission, `JobRecord.last_wake_attempt`, the
+ * non-"delivered" `console.error`) can never drift between a
+ * terminal-triggered and an output-triggered wake.
+ *
+ * `tTriggerMs` is the caller's own timestamp for WHICHEVER real event
+ * triggered this particular attempt - see `WakeLatencySample.tTerminalMs`'s
+ * own doc comment for why that field's name identifies the log schema
+ * rather than any one trigger.
+ *
+ * The whole path is fire-and-forget: this function itself is synchronous
+ * and returns without waiting on `selectAndWake`, and nothing here can
+ * ever affect a caller's own return value or throw into
+ * whatever dispatch triggered it.
+ */
+function dispatchTransportWake(
+  taskId: string,
+  transports: WakeTransport[],
+  target: WakeTarget,
+  payload: string,
+  tTriggerMs: number
+): void {
+  // t_selectAndWake_enter: captured immediately before the call, so
+  // `dispatchSeamMs` (see this file's own wake-latency section above)
+  // measures exactly the code between the triggering event and this
+  // dispatch - nothing inside selectAndWake's own async work.
+  const tSelectAndWakeEnterMs = Date.now();
+
+  selectAndWake(transports, target, payload)
+    .then((wakeResult) => {
+      // t_transport_complete for the transport call's own completion -
+      // captured at the top of this handler, before anything else runs in
+      // it, so `transportCallMs` measures the transport call itself and
+      // nothing this handler does afterward. Captured ONCE into a local
+      // rather than a second bare Date.now() call: this same instant is
+      // also what setLastWakeAttempt's own `attemptedAt` below records,
+      // and the two must never be allowed to drift apart by whatever this
+      // handler does in between.
+      const tTransportCompleteMs = Date.now();
+      emitWakeLatency({
+        taskId,
+        tTerminalMs: tTriggerMs,
+        tSelectAndWakeEnterMs,
+        tTransportCompleteMs,
+        outcome: wakeResult.outcome,
+        transportName: wakeResult.transportName,
+      });
+      // Persisted regardless of outcome - a caller polling status/output/
+      // tail for this job (see JobRecord.last_wake_attempt's own docs on
+      // why this is worth surfacing at all) is told what happened even
+      // when the wake delivered cleanly, never only when it declined.
+      // `permanent` is meaningful only for a non-delivered outcome - see
+      // JobWakeAttempt.permanent's own docs - so the key itself is left OFF
+      // the object for a delivered result (built via two distinct object
+      // literals below, never a `permanent: undefined` on a single shared
+      // one), matching src/tools/status.ts's own documented reasoning for
+      // pid/birth_identity: an object literal always creates a key it
+      // assigns, even when the assigned value is `undefined`, so this
+      // keeps the in-process shape and the JSON.stringify'd wire shape
+      // identical rather than relying on the wire serialization alone to
+      // hide the difference.
+      const baseWakeAttempt = {
+        outcome: wakeResult.outcome,
+        transportName: wakeResult.transportName,
+        detail: wakeResult.detail ?? "no detail given",
+        attemptedAt: new Date(tTransportCompleteMs).toISOString(),
+      };
+      jobStore.setLastWakeAttempt(
+        taskId,
+        wakeResult.outcome === "delivered"
+          ? baseWakeAttempt
+          : { ...baseWakeAttempt, permanent: wakeResult.permanent === true }
+      );
+      if (wakeResult.outcome !== "delivered") {
+        console.error(
+          // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- wakeResult.outcome is this codebase's own WakeResult union ("refused" | "unavailable"), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
+          `[ghantika] transport wake ${wakeResult.outcome} for task`,
+          taskId,
+          "-",
+          wakeResult.detail
+        );
+      }
+    })
+    .catch((error: unknown) => {
+      // t_transport_complete for the transport call's own failure -
+      // selectAndWake's own promise rejected rather than resolving (a real
+      // contract violation by a transport, or a bug in the selector itself
+      // - see selectAndWake's own doc comment on why this should not
+      // normally happen), so there is no real WakeResult to name a
+      // transport from; "threw"/"n/a" record exactly that. Captured once,
+      // same reasoning as the .then() branch above.
+      const tTransportCompleteMs = Date.now();
+      emitWakeLatency({
+        taskId,
+        tTerminalMs: tTriggerMs,
+        tSelectAndWakeEnterMs,
+        tTransportCompleteMs,
+        outcome: "threw",
+        transportName: "n/a",
+      });
+      // "threw" carries no transport's own permanence claim at all (see
+      // JobWakeAttempt.permanent's own docs) - permanent stays absent.
+      jobStore.setLastWakeAttempt(taskId, {
+        outcome: "threw",
+        transportName: "n/a",
+        detail: error instanceof Error ? error.message : String(error),
+        attemptedAt: new Date(tTransportCompleteMs).toISOString(),
+      });
+      console.error("[ghantika] transport wake threw for task", taskId, error);
+    });
+}
+
 function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetResolution): void {
   const unsubscribeTerminal = jobStore.onJobTerminal(taskId, () => {
     // t_terminal: the first statement in this callback, which
@@ -1600,6 +1825,8 @@ function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetReso
       // Fall through, deliberately - see this function's own doc comment.
       // CODEX_GATED_TRANSPORTS are still excluded below (resolution.state
       // is not "resolved"); CLAUDE_MESSAGING_WAKE_TRANSPORT is unaffected.
+      // Logged here only, never duplicated by startTransportWakeOnOutput's
+      // own dispatch - see that function's own doc comment.
     }
 
     const record = jobStore.get(taskId);
@@ -1610,103 +1837,162 @@ function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetReso
     // code path in this codebase does.
     if (record === undefined) return;
 
-    const transports: WakeTransport[] = [];
-    if (!isClaudeMessagingWakeDisabled()) transports.push(CLAUDE_MESSAGING_WAKE_TRANSPORT);
-    if (resolution.state === "resolved" && isTransportWakeEnabled()) {
-      transports.push(...CODEX_GATED_TRANSPORTS);
+    const eligible = eligibleWakeTransports(taskId, resolution);
+    if (eligible === undefined) return;
+
+    dispatchTransportWake(
+      taskId,
+      eligible.transports,
+      eligible.target,
+      buildTransportWakePayload(taskId, record),
+      tTerminalMs
+    );
+  });
+}
+
+/**
+ * Starts the OUTPUT-triggered half of the transport-layer wake for a
+ * still-live job - called only from `maybeAugmentRunResult`, alongside
+ * (never instead of) `startTransportWakeOnTerminal`, under the identical
+ * guard (only when the backing job is not already terminal at mint time).
+ * The terminal-only trigger `startTransportWakeOnTerminal` provides is
+ * structurally unreachable for a job that never terminates - a long-lived
+ * doorbell watch - so this adds a SECOND trigger on the OUTPUT path,
+ * without moving or altering the terminal one.
+ *
+ * A SEPARATE `jobStore.onOutputArrival`/`onJobTerminal` subscription pair
+ * from every sibling's own - the same independence reasoning
+ * `startTaskStatusNotifier`'s own docs give for why it is separate from
+ * `startTaskWatch`: `startTaskWatch`'s own firehose auto-stop must never
+ * silence this one, and this one's own gates must never touch
+ * `startTransportWakeOnTerminal`'s. Uses
+ * `eligibleWakeTransports`/`dispatchTransportWake` - the same shared
+ * helpers `startTransportWakeOnTerminal` uses - so the two gates cannot
+ * silently diverge between the two triggers.
+ *
+ * Never reasons about which harness is running, or which transport is
+ * "the right one" for this job - see `eligibleWakeTransports`'s own
+ * unchanged gating: no host detection, no routing guess. A quiet job -
+ * nothing to report - simply never fires `onOutputArrival`, and this
+ * function does nothing about that silence; there is no timer running
+ * while a job is quiet, no state that ages, nothing that could mistake
+ * silence for a failure.
+ *
+ * ## The two-layer rate control, and why they are two, not one
+ *
+ * `WAKE_COALESCE_WINDOW_MS` (200ms) collapses a TIGHT BURST arriving
+ * inside one micro-batch window into a single wake decision - the exact
+ * mechanism `startTaskWatch` already uses for its own, unrelated
+ * Tasks-notification path, reused here for the identical reason. On its
+ * own this is NOT sufficient for a transport wake, because
+ * `ClaudeMessagingWakeTransport.wake()` (measured at source: no idle
+ * check, no dedup, unconditionally writes a real injected "user" turn on
+ * every call) would otherwise re-open a fresh 200ms window the instant
+ * each flush's timer clears, for as long as a sustained stream keeps
+ * arriving - a new injected turn roughly every 200ms, which is a "one
+ * turn per line" shape this mechanism must never produce, merely batched
+ * into a smaller number.
+ *
+ * `OUTPUT_WAKE_COOLDOWN_MS` (2 minutes - see that constant's own doc
+ * comment for the full argued bounds) is the REPEAT gate on top of that:
+ * once a wake fires, no further OUTPUT-triggered wake attempt for this
+ * job can fire until the cooldown elapses, however fast or slow
+ * output keeps arriving in between - which is also why this mechanism
+ * needs no firehose-rate detection of its own the way `startTaskWatch`
+ * does: the cooldown already bounds the wake RATE independent of the
+ * output ARRIVAL rate, so a genuine firehose is exactly as throttled as a
+ * merely-chatty stream, by the same one gate.
+ *
+ * Output arriving DURING an active cooldown is never dropped: it sets
+ * `pendingDuringCooldown`, and the moment the cooldown timer expires, a
+ * fresh wake attempt is scheduled (through the same 200ms micro-batch, so
+ * a burst arriving right at the cooldown boundary still collapses to one
+ * wake) - firing exactly once for whatever arrived during the cooldown,
+ * never once per line that arrived during it.
+ */
+function startTransportWakeOnOutput(taskId: string, resolution: WakeTargetResolution): void {
+  let stopped = false;
+  let windowTimer: NodeJS.Timeout | undefined;
+  let cooldownTimer: NodeJS.Timeout | undefined;
+  let pendingDuringCooldown = false;
+
+  const clearTimers = (): void => {
+    if (windowTimer !== undefined) {
+      clearTimeout(windowTimer);
+      windowTimer = undefined;
     }
-    if (transports.length === 0) return; // nothing eligible - both gates say no
+    if (cooldownTimer !== undefined) {
+      clearTimeout(cooldownTimer);
+      cooldownTimer = undefined;
+    }
+  };
 
-    const target = resolution.state === "resolved" ? resolution.target : taskId;
+  const onCooldownExpire = (): void => {
+    cooldownTimer = undefined;
+    if (stopped) return;
+    // Only re-arms the micro-batch window if something arrived while the
+    // cooldown was running - a job that went quiet during the cooldown
+    // simply returns to the idle state (no timer running at all) rather
+    // than firing a wake for nothing.
+    if (pendingDuringCooldown) scheduleWakeAttempt();
+  };
 
-    // t_selectAndWake_enter: captured immediately before the
-    // call, so `dispatchSeamMs` (see this file's own wake-latency section
-    // above) measures exactly the code between the terminal transition and
-    // this dispatch - nothing inside selectAndWake's own async work.
-    const tSelectAndWakeEnterMs = Date.now();
+  const fireWake = (): void => {
+    windowTimer = undefined;
+    if (stopped) return;
+    const eligible = eligibleWakeTransports(taskId, resolution);
+    // Even when neither gate admits a transport, the cooldown still
+    // starts: re-checking `eligibleWakeTransports` on every line while a
+    // gate is off would be wasted work for the job's whole remaining
+    // life, and an operator flipping a gate mid-job is already a known
+    // edge this file does not special-case elsewhere (the terminal wake
+    // reads the SAME gates fresh, once, at its own single fire).
+    if (eligible !== undefined) {
+      dispatchTransportWake(
+        taskId,
+        eligible.transports,
+        eligible.target,
+        buildOutputWakePayload(taskId),
+        Date.now()
+      );
+    }
+    pendingDuringCooldown = false;
+    cooldownTimer = setTimeout(onCooldownExpire, OUTPUT_WAKE_COOLDOWN_MS);
+  };
 
-    selectAndWake(transports, target, buildTransportWakePayload(taskId, record))
-      .then((wakeResult) => {
-        // t_transport_complete for the transport call's own completion -
-        // captured at the top of this handler, before
-        // anything else runs in it, so `transportCallMs` measures the
-        // transport call itself and nothing this handler does afterward.
-        // Captured ONCE into a local rather than a second bare Date.now()
-        // call: this same instant is also what setLastWakeAttempt's own
-        // `attemptedAt` below records, and the two must never be allowed to
-        // drift apart by whatever this handler does in between.
-        const tTransportCompleteMs = Date.now();
-        emitWakeLatency({
-          taskId,
-          tTerminalMs,
-          tSelectAndWakeEnterMs,
-          tTransportCompleteMs,
-          outcome: wakeResult.outcome,
-          transportName: wakeResult.transportName,
-        });
-        // Persisted regardless of outcome - a caller polling status/output/
-        // tail for this job (see JobRecord.last_wake_attempt's own docs on
-        // why this is worth surfacing at all) is told what happened even
-        // when the wake delivered cleanly, never only when it declined.
-        // `permanent` is meaningful only for a non-delivered outcome - see
-        // JobWakeAttempt.permanent's own docs - so the key itself is left
-        // OFF the object for a delivered result (built via two distinct
-        // object literals below, never a `permanent: undefined` on a
-        // single shared one), matching src/tools/status.ts's own
-        // documented reasoning for pid/birth_identity: an object literal
-        // always creates a key it assigns, even when the assigned value is
-        // `undefined`, so this keeps the in-process shape and the
-        // JSON.stringify'd wire shape identical rather than relying on the
-        // wire serialization alone to hide the difference.
-        const baseWakeAttempt = {
-          outcome: wakeResult.outcome,
-          transportName: wakeResult.transportName,
-          detail: wakeResult.detail ?? "no detail given",
-          attemptedAt: new Date(tTransportCompleteMs).toISOString(),
-        };
-        jobStore.setLastWakeAttempt(
-          taskId,
-          wakeResult.outcome === "delivered"
-            ? baseWakeAttempt
-            : { ...baseWakeAttempt, permanent: wakeResult.permanent === true }
-        );
-        if (wakeResult.outcome !== "delivered") {
-          console.error(
-            // nosemgrep: javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring -- wakeResult.outcome is this codebase's own WakeResult union ("refused" | "unavailable"), never attacker-supplied, and this is a diagnostic console.error to stderr, not a format-string sink.
-            `[ghantika] transport wake ${wakeResult.outcome} for task`,
-            taskId,
-            "-",
-            wakeResult.detail
-          );
-        }
-      })
-      .catch((error: unknown) => {
-        // t_transport_complete for the transport call's own failure -
-        // selectAndWake's own promise rejected rather than
-        // resolving (a real contract violation by a transport, or a bug in
-        // the selector itself - see selectAndWake's own doc comment on why
-        // this should not normally happen), so there is no real WakeResult
-        // to name a transport from; "threw"/"n/a" record exactly that.
-        // Captured once, same reasoning as the .then() branch above.
-        const tTransportCompleteMs = Date.now();
-        emitWakeLatency({
-          taskId,
-          tTerminalMs,
-          tSelectAndWakeEnterMs,
-          tTransportCompleteMs,
-          outcome: "threw",
-          transportName: "n/a",
-        });
-        // "threw" carries no transport's own permanence claim at all (see
-        // JobWakeAttempt.permanent's own docs) - permanent stays absent.
-        jobStore.setLastWakeAttempt(taskId, {
-          outcome: "threw",
-          transportName: "n/a",
-          detail: error instanceof Error ? error.message : String(error),
-          attemptedAt: new Date(tTransportCompleteMs).toISOString(),
-        });
-        console.error("[ghantika] transport wake threw for task", taskId, error);
-      });
+  const scheduleWakeAttempt = (): void => {
+    if (windowTimer !== undefined) return; // a window is already open - this line joins it
+    windowTimer = setTimeout(fireWake, WAKE_COALESCE_WINDOW_MS);
+  };
+
+  const unsubscribeOutput = jobStore.onOutputArrival(taskId, () => {
+    if (stopped) return;
+    if (cooldownTimer !== undefined) {
+      // A wake already fired within the last OUTPUT_WAKE_COOLDOWN_MS -
+      // record that there is something to report and wait for the
+      // cooldown to expire, rather than opening a new micro-batch window
+      // now. This is the repeat gate itself: see this function's own doc
+      // comment for why WAKE_COALESCE_WINDOW_MS alone cannot do this job.
+      pendingDuringCooldown = true;
+      return;
+    }
+    scheduleWakeAttempt();
+  });
+
+  const unsubscribeTerminal = jobStore.onJobTerminal(taskId, () => {
+    // No extra wake fires for the terminal transition itself here -
+    // startTransportWakeOnTerminal's own, entirely separate subscription
+    // already does that, with a payload naming the job's actual terminal
+    // state, which is strictly more informative than this function's own
+    // generic "produced output" ping. Tears down BOTH subscriptions and
+    // both timers, matching stopWatch's own reasoning above: leaving
+    // either listener registered would leak it for the job's whole
+    // remaining life, since nothing else removes it from JobStore.
+    if (stopped) return;
+    stopped = true;
+    clearTimers();
+    unsubscribeOutput();
+    unsubscribeTerminal();
   });
 }
 
@@ -1854,15 +2140,19 @@ export function maybeAugmentRunResult(
   if (record === undefined) return result; // defensive only - run() always creates the record before returning
 
   if (!isTerminalJobState(record.state)) {
-    // startTransportWakeOnTerminal runs regardless of isCapableConnection - it
-    // subscribes on the real JOB this run() call already created, never on the
-    // minted TASK shape below, so a non-capable connection's job is exactly as
-    // valid a subject as a capable one's. Its own preconditions
-    // (isTransportWakeEnabled, wakeTargetResolution.state === "resolved") are
-    // the only gates that legitimately apply; Tasks-extension capability is a
-    // fact about this connection's MCP notifications, and this mechanism never
-    // sends one - see its own doc comment.
+    // startTransportWakeOnTerminal/startTransportWakeOnOutput both run
+    // regardless of isCapableConnection - they subscribe on the real JOB
+    // this run() call already created, never on the minted TASK shape
+    // below, so a non-capable connection's job is exactly as valid a
+    // subject as a capable one's. Their own preconditions
+    // (isTransportWakeEnabled, wakeTargetResolution.state === "resolved")
+    // are the only gates that legitimately apply; Tasks-extension
+    // capability is a fact about this connection's MCP notifications, and
+    // neither mechanism ever sends one - see their own doc comments.
+    // The output trigger is ADDED alongside the terminal one, never in
+    // place of it - both are started, unconditionally, side by side.
     startTransportWakeOnTerminal(jobId, wakeTargetResolution);
+    startTransportWakeOnOutput(jobId, wakeTargetResolution);
     if (isCapableConnection) {
       startTaskWatch(jobId, notifier);
       startTaskStatusNotifier(jobId, notifier);
