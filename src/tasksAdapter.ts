@@ -42,15 +42,17 @@
  * method set (`tasks/get` / `tasks/update` / `tasks/cancel`, never
  * `tasks/list` or `tasks/result`) matches the FINALIZED extension's own
  * method-set change (see below), pinned here as a vendored, digest-verified
- * schema (`schema/tasks-extension.schema.json`, `config/tasks-schema-digest.json`)
+ * schema (`schema/tasks-extension.schema.json`, `config/tasks-schema-digest.json`
+ * - repository-only evidence; neither file is part of the published package)
  * rather than borrowed from the SDK's own deprecated shape.
  *
  * **The Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663)
  * finalized on 2026-07-28, and this adapter is now built directly against
  * that released contract** - not against a pre-finalization
- * guess. `schema/tasks-extension.schema.json` pins the spec's own generated
- * schema, measured directly (not summarized) against
- * `modelcontextprotocol/ext-tasks`; the result shapes and status vocabulary
+ * guess. `schema/tasks-extension.schema.json` (repository-only; not shipped
+ * in the published package) pins the spec's own generated schema, measured
+ * directly (not summarized) against `modelcontextprotocol/ext-tasks`; the
+ * result shapes and status vocabulary
  * below are checked against it in `test/tasks.test.ts`, most of them
  * (`createTaskResult`, `emittedAckResult`) against real emitted output -
  * `tasks/get`'s response is currently checked only against a hand-written
@@ -58,7 +60,8 @@
  * (`tasks/get`/`tasks/update`/`tasks/cancel`) are exercised by these same
  * behavior tests but never schema-validated: this schema vendors only the
  * response/result shapes the adapter emits, not the spec's request shapes
- * (see `config/tasks-schema-provenance.json` for the full accounting of
+ * (see `config/tasks-schema-provenance.json` - repository-only, not shipped
+ * in the published package - for the full accounting of
  * what this schema does and does not vendor). The one
  * thing this adapter still deliberately
  * narrows from the full spec: `TASK_STATUSES` emits four of the spec's five
@@ -226,7 +229,8 @@ export const TASKS_EXTENSION_URI = "io.modelcontextprotocol/tasks";
  * The `extensions` bag's own capability descriptor for this URI - the
  * spec's real, generated `TasksExtensionCapability` schema (measured
  * against `modelcontextprotocol/ext-tasks`, see
- * `schema/tasks-extension.schema.json`) is an EMPTY object with
+ * `schema/tasks-extension.schema.json` - repository-only, not shipped in
+ * the published package) is an EMPTY object with
  * `additionalProperties: false`: it forbids any key at all, not merely
  * "does not require one."
  */
@@ -297,7 +301,8 @@ function hasTasksExtensionKey(bag: Record<string, unknown> | undefined): boolean
 // Task status - a closed, four-value set this adapter EMITS, a strict
 // SUBSET of the spec's own closed, five-value `taskStatus` enum
 // (`working | input_required | completed | cancelled | failed` - see the
-// vendored `schema/tasks-extension.schema.json`'s `taskStatus` $def).
+// vendored `schema/tasks-extension.schema.json`'s `taskStatus` $def -
+// repository-only, not shipped in the published package).
 // 'expired' is never a member of either: a task past its TTL is REMOVED
 // (see getTask's own docs on the frozen TTL-vs-timeout separation), not
 // transitioned into some sixth status - a task that no longer resolves to
@@ -393,7 +398,8 @@ function mapJobStateToTaskStatus(state: JobState): TaskStatusValue {
 
 // ---------------------------------------------------------------------------
 // Result shapes - structurally match schema/tasks-extension.schema.json's
-// $defs exactly (validated in test/tasks.test.ts against the real,
+// $defs exactly (repository-only file, not shipped in the published
+// package; validated in test/tasks.test.ts against the real,
 // digest-verified schema file, never a hand-copied description of it).
 // Every variant below restates its own fields in full rather than composing
 // a shared base type, mirroring the schema's own header note on why it does
@@ -890,7 +896,8 @@ export interface TaskIdParams {
  * `tasks/cancel` (registered in `src/server.ts`) take. A fresh object per
  * call (never shared/mutated state), matching this module's
  * zero-persistent-state design. `taskId` must be a NON-EMPTY string - the
- * vendored, digest-verified extension schema (`schema/tasks-extension.schema.json`)
+ * vendored, digest-verified extension schema (`schema/tasks-extension.schema.json`
+ * - repository-only, not shipped in the published package)
  * pins `minLength: 1` on every `taskId` field it describes, so an empty
  * string would flow through `getTask`/`taskNotFoundError` and produce a
  * response that violates the very schema this adapter's results are
