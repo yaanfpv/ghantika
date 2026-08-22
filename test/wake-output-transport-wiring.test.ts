@@ -1,42 +1,36 @@
 /**
- * Proves `src/tasksAdapter.ts`'s `startTransportWakeOnOutput` subscriber
- * deterministically, in the NORMAL gate - never opt-in, never a real
- * process, never Tasks-capability evidence, which this mechanism must not
- * depend on. `test/wake-output-real-topology.test.ts` proves the same
- * mechanism against a real fswatch process and the real inherited Claude
- * messaging socket, but is opt-in and skipped by default, so it is not
- * standing coverage - nothing in the default gate or CI notices a
- * regression in this mechanism without the file this comment is in.
- *
- * Sibling of `test/wake-transport-wiring.test.ts`, same seam: drives
- * `jobStore` directly (`createJob`/`appendOutput`/`markExited`/
+ * Drives `src/tasksAdapter.ts`'s `startTransportWakeOnOutput` subscriber
+ * directly against `jobStore` (`createJob`/`appendOutput`/`markExited`/
  * `markKilled`, never a real spawned process, never `requestSlot()`) and
- * calls `maybeAugmentRunResult` directly to register the real subscription,
- * spying on the real, singleton `DEFAULT_TRANSPORTS` array via
- * `t.mock.method` - the same module-cache singleton
- * `../dist/tasksAdapter.js` itself calls through. Every test neutralizes
- * `DEFAULT_TRANSPORTS[0]` (`ClaudeMessagingWakeTransport`) unless it is the
- * one thing that test exists to exercise, exactly matching that sibling
- * file's own `neutralizeClaudeMessagingTransport` reasoning.
+ * through `maybeAugmentRunResult`'s own public entry point to register the
+ * real subscription, never negotiating Tasks capability. Spies on the
+ * real, singleton `DEFAULT_TRANSPORTS` array via `t.mock.method` - the
+ * same module-cache singleton `../dist/tasksAdapter.js` itself calls
+ * through. Every test neutralizes `DEFAULT_TRANSPORTS[0]`
+ * (`ClaudeMessagingWakeTransport`) unless it is the one thing that test
+ * exists to exercise, exactly matching `test/wake-transport-wiring.test.ts`'s
+ * own `neutralizeClaudeMessagingTransport` reasoning.
+ * `test/wake-output-real-topology.test.ts` exercises the same mechanism
+ * against a real fswatch process and the real inherited Claude messaging
+ * socket.
  *
- * The batching window is proven with `t.mock.timers`
- * (`apis: ["setTimeout"]`), never a real wall-clock wait, and this file
- * imports the real exported constant (`WAKE_COALESCE_WINDOW_MS`) rather
- * than hardcoding a duplicate of it, so a future change to that constant
- * moves this file's own ticks with it instead of silently drifting apart.
- * `setImmediate` is unaffected by faking `setTimeout` alone, so the
- * `settle()` helper below (identical to the sibling file's own) still lets
- * `dispatchTransportWake`'s real, un-faked `selectAndWake(...).then(...)`
- * promise chain actually settle after each `tick()`.
+ * `t.mock.timers` (`apis: ["setTimeout"]`) drives the batching window, and
+ * this file imports the real exported constant (`WAKE_COALESCE_WINDOW_MS`)
+ * rather than hardcoding a duplicate of it, so a future change to that
+ * constant moves this file's own ticks with it instead of silently
+ * drifting apart. `setImmediate` is unaffected by faking `setTimeout`
+ * alone, so the `settle()` helper below (identical to the sibling file's
+ * own) still lets `dispatchTransportWake`'s real, un-faked
+ * `selectAndWake(...).then(...)` promise chain actually settle after each
+ * `tick()`.
  *
- * This mechanism applies ONE rate control - the fixed, non-rolling
- * `WAKE_COALESCE_WINDOW_MS` batching window - and nothing above it: no
- * repeat gate, no cooldown, no flood handling of any kind. The
- * fixed-vs-rolling distinction is the one this file spends the most
- * assertions on, because a rolling debounce would pass every OTHER test
- * here too - only a sustained sub-window stream that keeps flushing
- * throughout, rather than holding everything until the stream goes quiet,
- * tells the two designs apart.
+ * The mechanism applies one rate control - a fixed, non-rolling ~200ms
+ * batching window - and nothing above it: no repeat gate, no cooldown, no
+ * flood handling of any kind. The window opens on a job's first new
+ * output line and every later line arriving before it closes joins that
+ * same window rather than resetting it, so a sustained stream keeps
+ * flushing on successive windows throughout its run rather than holding
+ * everything back until it goes quiet.
  */
 import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";

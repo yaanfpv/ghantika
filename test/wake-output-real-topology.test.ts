@@ -5,10 +5,13 @@
  * transports (test/wake-transport-wiring.test.ts) or drives a real spawned
  * process against a mock Tasks-capable client (test/wake-integration.test.ts).
  * Neither answers the actual question this file exists for: does the REAL,
- * real-app-inherited ClaudeMessagingWakeTransport singleton genuinely
- * deliver a wake while a real, never-exiting process is still `running` -
- * never merely once it has exited, which is a materially weaker and
- * already-covered case.
+ * real-app-inherited ClaudeMessagingWakeTransport singleton genuinely have
+ * its `wake()` method invoked while a real, never-exiting process is still
+ * `running` - never merely once it has exited, which is a materially
+ * weaker and already-covered case. This file observes the invocation
+ * itself, over the real socket, with the job's own state read at that
+ * exact moment - it does not, and cannot, observe whether the receiving
+ * session actually surfaced a turn from it.
  *
  * A REAL fswatch process (the same bare, unfiltered command shape
  * test/dogfood.test.ts already establishes as the realistic doorbell
@@ -180,7 +183,7 @@ async function probeAndExerciseIfAvailable(
 }
 
 test(
-  "real topology: a real, never-exiting fswatch job started through the real run() tool genuinely wakes THIS session's own real Claude messaging transport while status() still reports `running` - never once it has exited",
+  "real topology: a real, never-exiting fswatch job started through the real run() tool genuinely invokes THIS session's own real Claude messaging transport's wake() method while status() still reports `running` - never once it has exited",
   { skip: REAL_TOPOLOGY_SKIP },
   async (t) => {
     // Deliberately NOT neutralizeClaudeMessagingTransport - this is the one

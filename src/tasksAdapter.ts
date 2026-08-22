@@ -1851,15 +1851,22 @@ function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetReso
  * throughout, rather than waiting for the job to go quiet before ever
  * firing once.
  *
- * There is deliberately no rate limit above this window and nothing is
- * ever silently withheld: every distinct output event arriving outside an
- * already-open window opens its own new one and produces its own wake
- * attempt. The implied ceiling that follows purely from the window's own
- * width - at most one wake per window, so at most five per second - is
- * the only bound this mechanism imposes; it neither measures nor guesses
- * at any additional flood-control behavior a reference implementation
- * might apply on top of its own equivalent window, and none is built
- * here.
+ * There is deliberately no rate limit above this window: every distinct
+ * output event arriving outside an already-open window opens its own new
+ * one and produces its own wake attempt. The implied ceiling that follows
+ * purely from the window's own width - at most one wake per window, so at
+ * most five per second - is the only bound this mechanism imposes; it
+ * neither measures nor guesses at any additional flood-control behavior a
+ * reference implementation might apply on top of its own equivalent
+ * window, and none is built here.
+ *
+ * A window still open when the job reaches a terminal state is cancelled
+ * by `unsubscribeTerminal`'s own `clearTimers()` call below and never
+ * fires as an output wake - the job's separate terminal wake fires
+ * instead (`startTransportWakeOnTerminal`'s own subscription, entirely
+ * independent of this one), and any output the cancelled window was
+ * still holding remains readable through `status`/`output`/`tail`
+ * exactly as any other output does.
  */
 function startTransportWakeOnOutput(taskId: string, resolution: WakeTargetResolution): void {
   let stopped = false;
