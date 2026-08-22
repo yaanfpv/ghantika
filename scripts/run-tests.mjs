@@ -272,7 +272,27 @@ const TEST_FILE_PATTERN = /\.test\.(ts|js|mjs|cjs|mts|cts)$/;
 // further - a higher bound narrows the failure window without removing
 // it, since the underlying race is against whatever else happens to be
 // running at that moment, not against a fixed cost this file controls.
-const SERIAL_ONLY_TEST_FILES = new Set(["test/loader-escape-matrix.test.ts"]);
+export const SERIAL_ONLY_TEST_FILES = new Set([
+  "test/loader-escape-matrix.test.ts",
+  "test/process-contention-timing.test.ts",
+  "test/modern-handshake-contention-timing.test.ts",
+  "test/doorbell-cutover-contention-timing.test.ts",
+]);
+
+// The canonical serial/concurrent split, exported so a caller outside this
+// file (a concurrency-sweep measurement script, for one) reuses this exact
+// partition rather than recomputing it against its own copy of the set -
+// a reimplementation drifts silently the moment SERIAL_ONLY_TEST_FILES
+// changes on this side, since nothing would force the two to stay in sync.
+// Takes and returns ABSOLUTE paths, matching discoverTestFiles()'s own
+// output shape, so a caller never has to know this module's REPO_ROOT.
+export function partitionTestFilesForBatches(discoveredAbsPaths) {
+  const serialBatchFiles = discoveredAbsPaths.filter((f) => SERIAL_ONLY_TEST_FILES.has(rel(f)));
+  const concurrentBatchFiles = discoveredAbsPaths.filter(
+    (f) => !SERIAL_ONLY_TEST_FILES.has(rel(f))
+  );
+  return { serialBatchFiles, concurrentBatchFiles };
+}
 
 // Every event name the test runner emits that can carry a `.file`
 // property, used both to reset the idle watchdog on ANY sign of life and
@@ -476,9 +496,10 @@ export function parseArgs(argv) {
     //
     // concurrency=8 is disclosed as unsafe on this host, not silently
     // avoided: 2 of 3 repeated full-suite runs at concurrency=8 failed,
-    // both times in test/modern-handshake.test.ts's negative-control
-    // tests (a different specific sub-test each time - "initialize-gate"
-    // and "parse-error reply" - never the same one twice, and no OTHER
+    // both times in test/modern-handshake-contention-timing.test.ts's
+    // negative-control tests (a different specific sub-test each time -
+    // "initialize-gate" and "parse-error reply" -
+    // never the same one twice, and no OTHER
     // file failed even once across all 12 full-suite runs in this
     // measurement, including the process/birth-identity family
     // (test/process.test.ts, test/process-slow-paths.test.ts,
@@ -1165,8 +1186,7 @@ export function runOnce({
     // `concurrency` only when --test-concurrency was actually passed -
     // never a `concurrency: undefined` key relying on node:test's own
     // undefined-handling to fall back correctly.
-    const serialBatchFiles = discovered.filter((f) => SERIAL_ONLY_TEST_FILES.has(rel(f)));
-    const concurrentBatchFiles = discovered.filter((f) => !SERIAL_ONLY_TEST_FILES.has(rel(f)));
+    const { serialBatchFiles, concurrentBatchFiles } = partitionTestFilesForBatches(discovered);
     const batchDefs = [];
     if (serialBatchFiles.length > 0) {
       batchDefs.push({
