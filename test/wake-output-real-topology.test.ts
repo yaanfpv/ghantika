@@ -169,18 +169,18 @@ async function probeAndExerciseIfAvailable(
   const probe = await transport.probe();
   if (!probe.available) {
     console.error(
-      `[AC2 disclosure] ${label}: available=false (${probe.reason}) - not exercised for real in this environment`
+      `[output-wake-topology disclosure] ${label}: available=false (${probe.reason}) - not exercised for real in this environment`
     );
     return;
   }
-  const result = await transport.wake(taskId, `ac2-real-topology-probe-for-${label}`);
+  const result = await transport.wake(taskId, `output-wake-topology-probe-for-${label}`);
   console.error(
-    `[AC2 disclosure] ${label}: available=true - exercised for real, outcome="${result.outcome}" detail="${result.detail ?? "n/a"}"`
+    `[output-wake-topology disclosure] ${label}: available=true - exercised for real, outcome="${result.outcome}" detail="${result.detail ?? "n/a"}"`
   );
 }
 
 test(
-  "AC2 real topology: a real, never-exiting fswatch job started through the real run() tool genuinely wakes THIS session's own real Claude messaging transport while status() still reports `running` - never once it has exited",
+  "real topology: a real, never-exiting fswatch job started through the real run() tool genuinely wakes THIS session's own real Claude messaging transport while status() still reports `running` - never once it has exited",
   { skip: REAL_TOPOLOGY_SKIP },
   async (t) => {
     // Deliberately NOT neutralizeClaudeMessagingTransport - this is the one
@@ -198,13 +198,13 @@ test(
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const instance = createServer(serverTransport);
     await instance.server.connect(instance.transport);
-    // A PLAIN, non-Tasks-capable client - AC2's own topology has nothing
-    // to do with Tasks-extension capability (see
-    // startTransportWakeOnOutput's own doc comment: it is not gated by
-    // isCapableConnection at all), so this deliberately proves the
-    // mechanism reaches a plain connection too, not only a capable one.
+    // A PLAIN, non-Tasks-capable client - this topology has nothing to do
+    // with Tasks-extension capability (see startTransportWakeOnOutput's
+    // own doc comment: it is not gated by isCapableConnection at all), so
+    // this deliberately proves the mechanism reaches a plain connection
+    // too, not only a capable one.
     const client = new Client(
-      { name: "ghantika-ac2-real-topology-test-client", version: "0.0.0" },
+      { name: "ghantika-output-wake-real-topology-test-client", version: "0.0.0" },
       {}
     );
     await client.connect(clientTransport);
@@ -213,7 +213,10 @@ test(
     try {
       const runResult = (await client.callTool({
         name: "run",
-        arguments: { command: ["fswatch", resolvedTriggerPath], label: "ac2-real-topology" },
+        arguments: {
+          command: ["fswatch", resolvedTriggerPath],
+          label: "output-wake-real-topology",
+        },
       })) as { isError?: boolean; structuredContent?: { job_id?: unknown } };
       assert.notEqual(
         runResult.isError,
@@ -287,9 +290,13 @@ test(
           });
         }
       }
-      await waitForNoFswatchPid(resolvedTriggerPath).catch((error: unknown) => {
-        console.error(`[AC2 teardown] ${error instanceof Error ? error.message : String(error)}`);
-      });
+      // Deliberately NOT caught-and-continued: waitForNoFswatchPid is the
+      // independent process-table oracle that a real cleanup genuinely
+      // happened. Swallowing its rejection here would let node:test report
+      // this test green while a live fswatch fixture survives to
+      // contaminate later work - the exact swallowed-failure shape this
+      // file must never produce. A real teardown failure fails this test.
+      await waitForNoFswatchPid(resolvedTriggerPath);
       await instance.shutdown("wake-output-real-topology.test.ts complete");
     }
   }

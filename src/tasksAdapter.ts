@@ -1438,45 +1438,6 @@ function buildOutputWakePayload(taskId: string): string {
   return `ghantika job ${taskId} produced new output while still running - use status/output/tail to read it`;
 }
 
-/**
- * The minimum gap `startTransportWakeOnOutput` enforces between two
- * OUTPUT-triggered transport-wake attempts for the SAME job - the repeat
- * gate, distinct from `WAKE_COALESCE_WINDOW_MS` above (which only collapses
- * a tight burst INTO one wake decision inside a single attempt, never
- * throttles a sustained stream - see `startTransportWakeOnOutput`'s own
- * doc comment for why reusing that constant as the repeat gate was
- * considered and rejected: it would re-open a fresh 200ms window the
- * instant each flush's timer clears, injecting a new turn roughly every
- * 200ms for the whole life of a sustained stream).
- *
- * Chosen from two bounds, both argued rather than assumed:
- *
- * LOWER BOUND - never meaningfully swallow the primary use case's own
- * event spacing. A long-lived doorbell watch's real events are minutes to
- * hours apart - any value up to a few minutes trivially clears this
- * bound. A human manually re-testing with two deliberate touches seconds
- * apart is the rare exception this bound has to tolerate, not the case it
- * optimizes for, and even that exception is never silently lost: output
- * arriving during an active cooldown is tracked and fires once, exactly
- * when the cooldown expires - see this function's own doc comment.
- *
- * UPPER BOUND - do not inject an unreasonable number of turns for a
- * genuinely continuous, non-firehose stream (a build log, a verbose lint
- * run - anything under `FIREHOSE_LINES_PER_SEC`'s own auto-stop threshold,
- * which this cooldown does not depend on: it already bounds the wake RATE
- * independent of the output ARRIVAL rate, firehose or not - see
- * `startTransportWakeOnOutput`'s own doc comment). Argued against a
- * ten-minute continuous run: 30 seconds yields 20 wake attempts (600s /
- * 30s) - twenty injected turns for one job, the "one turn per line" shape
- * this mechanism must never produce, merely batched into a smaller
- * number; 60 seconds still yields 10. This value yields 5 for that same
- * ten-minute run, and 30 for a full hour of continuous output - roughly
- * one nudge every two minutes for a job that never stops talking, a
- * defensible "occasional check-in" cadence rather than a flood, while
- * still comfortably clearing the lower bound above.
- */
-export const OUTPUT_WAKE_COOLDOWN_MS = 120_000;
-
 // ---------------------------------------------------------------------------
 // Wake-latency instrumentation. Correlates three of the four
 // timestamps a wake's actual latency is made of, for `dispatchTransportWake`
@@ -1878,75 +1839,43 @@ function startTransportWakeOnTerminal(taskId: string, resolution: WakeTargetReso
  * while a job is quiet, no state that ages, nothing that could mistake
  * silence for a failure.
  *
- * ## The two-layer rate control, and why they are two, not one
+ * ## Rate control: ONE fixed micro-batch window, no rate limit above it
  *
- * `WAKE_COALESCE_WINDOW_MS` (200ms) collapses a TIGHT BURST arriving
- * inside one micro-batch window into a single wake decision - the exact
- * mechanism `startTaskWatch` already uses for its own, unrelated
- * Tasks-notification path, reused here for the identical reason. On its
- * own this is NOT sufficient for a transport wake, because
- * `ClaudeMessagingWakeTransport.wake()` (measured at source: no idle
- * check, no dedup, unconditionally writes a real injected "user" turn on
- * every call) would otherwise re-open a fresh 200ms window the instant
- * each flush's timer clears, for as long as a sustained stream keeps
- * arriving - a new injected turn roughly every 200ms, which is a "one
- * turn per line" shape this mechanism must never produce, merely batched
- * into a smaller number.
+ * `WAKE_COALESCE_WINDOW_MS` (200ms - the same constant, and the same
+ * mechanism, `startTaskWatch` already uses for its own, unrelated
+ * Tasks-notification path) is the ONLY rate control this mechanism
+ * applies. The window is FIXED, not rolling: it opens on the first
+ * output line and every later line arriving before it closes JOINS it
+ * rather than resetting it (see `scheduleWakeAttempt`'s own guard below),
+ * so a sustained stream keeps flushing on successive fixed windows
+ * throughout, rather than waiting for the job to go quiet before ever
+ * firing once.
  *
- * `OUTPUT_WAKE_COOLDOWN_MS` (2 minutes - see that constant's own doc
- * comment for the full argued bounds) is the REPEAT gate on top of that:
- * once a wake fires, no further OUTPUT-triggered wake attempt for this
- * job can fire until the cooldown elapses, however fast or slow
- * output keeps arriving in between - which is also why this mechanism
- * needs no firehose-rate detection of its own the way `startTaskWatch`
- * does: the cooldown already bounds the wake RATE independent of the
- * output ARRIVAL rate, so a genuine firehose is exactly as throttled as a
- * merely-chatty stream, by the same one gate.
- *
- * Output arriving DURING an active cooldown is never dropped: it sets
- * `pendingDuringCooldown`, and the moment the cooldown timer expires, a
- * fresh wake attempt is scheduled (through the same 200ms micro-batch, so
- * a burst arriving right at the cooldown boundary still collapses to one
- * wake) - firing exactly once for whatever arrived during the cooldown,
- * never once per line that arrived during it.
+ * There is deliberately no rate limit above this window and nothing is
+ * ever silently withheld: every distinct output event arriving outside an
+ * already-open window opens its own new one and produces its own wake
+ * attempt. The implied ceiling that follows purely from the window's own
+ * width - at most one wake per window, so at most five per second - is
+ * the only bound this mechanism imposes; it neither measures nor guesses
+ * at any additional flood-control behavior a reference implementation
+ * might apply on top of its own equivalent window, and none is built
+ * here.
  */
 function startTransportWakeOnOutput(taskId: string, resolution: WakeTargetResolution): void {
   let stopped = false;
   let windowTimer: NodeJS.Timeout | undefined;
-  let cooldownTimer: NodeJS.Timeout | undefined;
-  let pendingDuringCooldown = false;
 
   const clearTimers = (): void => {
     if (windowTimer !== undefined) {
       clearTimeout(windowTimer);
       windowTimer = undefined;
     }
-    if (cooldownTimer !== undefined) {
-      clearTimeout(cooldownTimer);
-      cooldownTimer = undefined;
-    }
-  };
-
-  const onCooldownExpire = (): void => {
-    cooldownTimer = undefined;
-    if (stopped) return;
-    // Only re-arms the micro-batch window if something arrived while the
-    // cooldown was running - a job that went quiet during the cooldown
-    // simply returns to the idle state (no timer running at all) rather
-    // than firing a wake for nothing.
-    if (pendingDuringCooldown) scheduleWakeAttempt();
   };
 
   const fireWake = (): void => {
     windowTimer = undefined;
     if (stopped) return;
     const eligible = eligibleWakeTransports(taskId, resolution);
-    // Even when neither gate admits a transport, the cooldown still
-    // starts: re-checking `eligibleWakeTransports` on every line while a
-    // gate is off would be wasted work for the job's whole remaining
-    // life, and an operator flipping a gate mid-job is already a known
-    // edge this file does not special-case elsewhere (the terminal wake
-    // reads the SAME gates fresh, once, at its own single fire).
     if (eligible !== undefined) {
       dispatchTransportWake(
         taskId,
@@ -1956,8 +1885,6 @@ function startTransportWakeOnOutput(taskId: string, resolution: WakeTargetResolu
         Date.now()
       );
     }
-    pendingDuringCooldown = false;
-    cooldownTimer = setTimeout(onCooldownExpire, OUTPUT_WAKE_COOLDOWN_MS);
   };
 
   const scheduleWakeAttempt = (): void => {
@@ -1967,15 +1894,6 @@ function startTransportWakeOnOutput(taskId: string, resolution: WakeTargetResolu
 
   const unsubscribeOutput = jobStore.onOutputArrival(taskId, () => {
     if (stopped) return;
-    if (cooldownTimer !== undefined) {
-      // A wake already fired within the last OUTPUT_WAKE_COOLDOWN_MS -
-      // record that there is something to report and wait for the
-      // cooldown to expire, rather than opening a new micro-batch window
-      // now. This is the repeat gate itself: see this function's own doc
-      // comment for why WAKE_COALESCE_WINDOW_MS alone cannot do this job.
-      pendingDuringCooldown = true;
-      return;
-    }
     scheduleWakeAttempt();
   });
 
@@ -1985,9 +1903,9 @@ function startTransportWakeOnOutput(taskId: string, resolution: WakeTargetResolu
     // already does that, with a payload naming the job's actual terminal
     // state, which is strictly more informative than this function's own
     // generic "produced output" ping. Tears down BOTH subscriptions and
-    // both timers, matching stopWatch's own reasoning above: leaving
-    // either listener registered would leak it for the job's whole
-    // remaining life, since nothing else removes it from JobStore.
+    // the timer, matching stopWatch's own reasoning above: leaving either
+    // listener registered would leak it for the job's whole remaining
+    // life, since nothing else removes it from JobStore.
     if (stopped) return;
     stopped = true;
     clearTimers();
