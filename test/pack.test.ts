@@ -243,21 +243,87 @@ function pgrepChildren(parentPid: number): number[] {
   }
 }
 
-async function waitForAChildPid(parentPid: number, timeoutMs = 5000): Promise<number> {
-  const start = Date.now();
-  for (;;) {
-    const children = pgrepChildren(parentPid);
-    if (children.length >= 1) return children[0]!;
-    if (Date.now() - start > timeoutMs) {
-      throw new Error(`no child process appeared under pid ${parentPid} within ${timeoutMs}ms`);
+/** Every descendant pid of a process, not just its direct children - this codebase's own exec chain depth under `npx` is not something this file can assume (whether it shells out through an intermediate wrapper before spawning the target varies by platform and npm version), so a single-hop lookup can silently land on the wrong process. Never includes `rootPid` itself. */
+function pgrepDescendants(rootPid: number): number[] {
+  const seen = new Set<number>();
+  let frontier = [rootPid];
+  while (frontier.length > 0) {
+    const next: number[] = [];
+    for (const pid of frontier) {
+      for (const child of pgrepChildren(pid)) {
+        if (!seen.has(child)) {
+          seen.add(child);
+          next.push(child);
+        }
+      }
     }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    frontier = next;
   }
+  return [...seen];
 }
 
-/** The real, OS-reported command line of a live process (`ps -o args=`), used only to read back WHICH script path a resolved `node <script>` invocation is actually running - the one fact this file cannot get any other way, since nothing in this codebase's own protocol reports its own script path. */
-function resolvedCommandLineOf(pid: number): string {
-  return execFileSync("ps", ["-o", "args=", "-p", String(pid)], { encoding: "utf8" }).trim();
+/** The exact argv of a live process, never a whitespace-joined-then-resplit string - a path is not guaranteed free of whitespace, and how many tokens the OS reports for one logical invocation is not fixed either. On Linux, `/proc/<pid>/cmdline` is the kernel's own NUL-delimited argv and is read directly. Elsewhere (no `/proc` filesystem), `ps -o args=` is the best available primitive and is whitespace-split as a fallback - a real, disclosed limitation on non-Linux hosts, not something this function papers over. */
+function argvOf(pid: number): string[] {
+  if (process.platform === "linux") {
+    const raw = readFileSync(`/proc/${pid}/cmdline`, "latin1");
+    return raw.split("\0").filter((token) => token.length > 0);
+  }
+  const commandLine = execFileSync("ps", ["-o", "args=", "-p", String(pid)], {
+    encoding: "utf8",
+  }).trim();
+  return commandLine.split(/\s+/).filter((token) => token.length > 0);
+}
+
+/**
+ * The real, resolved script path a running `npx ghantika` genuinely
+ * executes - found by searching the WHOLE descendant tree of npx's own
+ * process (never npx's own pid: its argv always contains its own real,
+ * resolvable `npx-cli.js`/`npm-cli.js` entry, which is not the answer and
+ * would be wrongly accepted by a check that merely asks "does some token
+ * resolve to a real file") rather than assuming a fixed number of exec
+ * hops. This codebase previously assumed exactly one hop and that the
+ * LAST whitespace-separated `ps` token of that one child was always the
+ * resolved path - true on macOS, but on Linux that same lookup can land
+ * on a shallower descendant whose own reported args end in the bare CLI
+ * argument `ghantika` rather than any path at all.
+ *
+ * So every descendant's argv is tried, and every token in each is tested
+ * against `realpathSync` from the LAST token to the FIRST - the first
+ * token that resolves to a real, existing file is the answer. A bare CLI
+ * argument never resolves to a file on disk, so it is silently skipped
+ * rather than accepted; this is what makes the check portable rather
+ * than a platform-specific guess about token position.
+ */
+async function findResolvedScriptPath(parentPid: number, timeoutMs = 5000): Promise<string> {
+  const start = Date.now();
+  const tried: string[] = [];
+  for (;;) {
+    for (const pid of pgrepDescendants(parentPid)) {
+      let argv: string[];
+      try {
+        argv = argvOf(pid);
+      } catch {
+        continue; // the process may have already exited between enumeration and inspection
+      }
+      for (let i = argv.length - 1; i >= 0; i--) {
+        const token = argv[i]!;
+        tried.push(token);
+        try {
+          return realpathSync(token);
+        } catch {
+          continue; // not a path, or does not exist - keep looking
+        }
+      }
+    }
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(
+        `no descendant of pid ${parentPid} had an argv token resolving to a real file within ${timeoutMs}ms - tried: ${JSON.stringify(tried)}`
+      );
+    }
+    // The target process may not have appeared, or fully replaced its
+    // argv, yet - poll rather than fail on the first empty sweep.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -482,31 +548,21 @@ describe("a real npm-pack tarball, installed and resolved from an isolated prefi
         primaryCwd
       );
       try {
-        // npx spawns a real child process running the resolved entry
-        // (verified directly: this test's own `spawned.child.pid` is
-        // `npm exec ghantika`, and its own real OS child's command line
-        // is `/usr/bin/env node <resolved-bin-path>` - the shebang
-        // interpreted literally rather than exec'd directly) - reading
-        // THAT child's own OS-reported command line is what proves which
-        // file is genuinely executing, independent of anything npx or
-        // this package reports about itself. The resolved script is
-        // always the LAST whitespace-separated token, regardless of
-        // whether the OS reports a 2-token (`node <path>`) or 3-token
-        // (`/usr/bin/env node <path>`) command line.
-        const runnerPid = await waitForAChildPid(spawned.child.pid!);
-        const commandLine = resolvedCommandLineOf(runnerPid);
-        const tokens = commandLine.split(/\s+/).filter((token) => token.length > 0);
-        const resolvedScriptPath = tokens[tokens.length - 1];
-        assert.ok(
-          resolvedScriptPath,
-          `could not parse a script path out of command line: ${JSON.stringify(commandLine)}`
-        );
-        const resolvedRealPath = realpathSync(resolvedScriptPath!);
+        // npx spawns a real descendant process running the resolved entry
+        // - reading that descendant's own OS-reported argv is what proves
+        // which file is genuinely executing, independent of anything npx
+        // or this package reports about itself. Which descendant actually
+        // reports a resolvable path, and at what argv position, is not
+        // fixed: it has been observed to differ by platform and Node
+        // version, so `findResolvedScriptPath` searches npx's whole
+        // descendant tree rather than assuming a fixed hop count or token
+        // position.
+        const resolvedRealPath = await findResolvedScriptPath(spawned.child.pid!);
 
         assert.equal(
           resolvedRealPath,
           realpathSync(installedEntryPath(primaryPrefix)),
-          `npx ghantika must run the ephemeral prefix's own installed entry; actually ran: ${JSON.stringify(commandLine)}`
+          `npx ghantika must run the ephemeral prefix's own installed entry; actually resolved: ${JSON.stringify(resolvedRealPath)}`
         );
         assert.notEqual(
           resolvedRealPath,
