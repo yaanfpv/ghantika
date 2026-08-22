@@ -28,15 +28,22 @@ name: Concurrency Ceiling Matrix
 # workflow file exists on the default branch" - so a workflow_dispatch-only
 # version of this file is undispatchable from any branch before that
 # branch merges, which defeats measuring anything before landing. `push`,
-# scoped to this exact branch and path-filtered to every file this sweep's
-# own result actually depends on, is what actually runs before merge.
-# run-tests.mjs is in that list because it owns the serial/concurrent split
-# this sweep now imports rather than reimplements - a change there changes
-# what a repeat measures exactly as surely as a change to the measurement
-# script itself, so a push touching only that file still needs to
-# re-trigger this workflow. workflow_dispatch stays as a second trigger -
-# it is what re-runs this once the file is on main, `--ref <branch>` for
-# anything still in flight.
+# scoped to this exact branch, is what actually runs before merge.
+# workflow_dispatch stays as a second trigger - it is what re-runs this
+# once the file is on main, `--ref <branch>` for anything still in flight.
+#
+# PATH FILTER, every entry named against what a repeat's result actually
+# depends on, not against whichever file was last flagged: the workflow
+# and measurement script themselves; run-tests.mjs, which owns the
+# serial/concurrent split this sweep imports rather than reimplements;
+# the coverage wrapper chain (coverage-lock-worker-wrapper.mjs) a repeat's
+# coverage leg runs through, matching npm run coverage's own chain in
+# ci.yml; and test/** as a whole - every test file's own count and
+# per-file cost is exactly what a repeat measures, and test/skip-baseline.json
+# and test/critical-tests.json (both under test/, so already covered by
+# the glob) change which tests actually run under a given concurrency
+# value. A change to any of these alters the subject being measured, so
+# each needs to re-trigger a repeat before the workflow ever reaches main.
 on:
   push:
     branches:
@@ -45,6 +52,8 @@ on:
       - ".github/workflows/concurrency-ceiling-matrix.yml"
       - "scripts/measure-concurrency-ceiling.mjs"
       - "scripts/run-tests.mjs"
+      - "scripts/coverage-lock-worker-wrapper.mjs"
+      - "test/**"
   workflow_dispatch: {}
 
 permissions:

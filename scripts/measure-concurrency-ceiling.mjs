@@ -78,8 +78,16 @@ function parseArgs(argv) {
     // Per-repeat wall cap - a genuinely hung run at some tested
     // concurrency value is itself a finding (report it), but it must not
     // consume the whole job's timeout-minutes budget and hide every
-    // candidate value queued behind it.
-    repeatWallCapMs: 300_000,
+    // candidate value queued behind it. The serial (concurrency=1)
+    // candidate is the slowest a healthy repeat ever runs - every higher
+    // concurrency value only adds parallelism, never removes it - so this
+    // cap is bounded against the slowest measured serial coverage-leg
+    // baseline: 900s against a highest observed of 548.092s leaves over
+    // 350s of margin, comfortably above the 415.221s and 368.52s serial
+    // baselines measured separately. A cap this low previously converted
+    // the sweep's own W=1 control into a harness error before any
+    // candidate value could be measured.
+    repeatWallCapMs: 900_000,
     label: "run",
     leg: "test",
   };
