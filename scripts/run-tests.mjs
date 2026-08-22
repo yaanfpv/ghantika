@@ -1171,8 +1171,25 @@ export function runOnce({
     // never trusted from an env var or derived any other way, so the
     // eventual completion marker (see onNormalCompletion below) is bound to
     // what git ACTUALLY has checked out right now, not to any caller's
-    // claim about it.
-    const headSha = readGitHeadSha();
+    // claim about it. Matches this file's own checkTrackedFileParity
+    // degrade path immediately above (in main()): a git-less environment
+    // (no .git at all, e.g. a mount-none clone that ships only tracked
+    // file CONTENT) makes this binding unavailable rather than wrong, so
+    // `headSha` is `null` here rather than letting the read throw
+    // uncaught - the completion marker below then honestly embeds `null`
+    // instead of a fabricated commit, and check-coverage-floor.mjs's own
+    // headSha check degrades the same way when it finds one.
+    let headSha;
+    try {
+      headSha = readGitHeadSha();
+    } catch {
+      headSha = null;
+      console.error(
+        "run-tests: git unavailable (or this is not a git working tree) - " +
+          "the completion marker's headSha binding is UNAVAILABLE this run; " +
+          "the run itself and its own runToken binding are unaffected"
+      );
+    }
 
     // Two batches at most, run SEQUENTIALLY rather than as one run() call:
     // SERIAL_ONLY_TEST_FILES members alone first (no `concurrency` key at

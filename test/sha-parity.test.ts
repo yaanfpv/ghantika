@@ -171,6 +171,16 @@ test("readGitHeadSha changes after a real new commit - proves it reads LIVE stat
   }
 });
 
+test("readGitHeadSha throws against a REAL directory that is not a git working tree at all - the exact shape a mount-none guest clone (tracked file content, no .git) produces", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ghantika-sha-parity-no-git-"));
+  try {
+    writeFileSync(path.join(dir, "file.txt"), "hello\n");
+    assert.throws(() => readGitHeadSha(dir), /not a git repository/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("isWorkingTreeDirty/readGitPorcelainStatus: a genuinely clean scratch repo reads clean; a real uncommitted modification makes it dirty; reverting the modification makes it clean again (mutate/red/restore/green, against real git)", () => {
   const dir = makeScratchGitRepo();
   try {

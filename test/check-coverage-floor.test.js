@@ -7,6 +7,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -886,6 +887,154 @@ test("VOID [no-completion-record]: no completion marker at all is treated the sa
   });
   assert.equal(status, VOID_EXIT_CODE, `output:\n${output}`);
   assert.ok(output.includes("no-completion-record"));
+});
+
+// =============================================================================
+// GIT-LESS DEGRADE: a mount-none guest clone ships only tracked file
+// CONTENT, never .git itself, so readGitHeadSha() throws inside THIS
+// script's own main() exactly as it does inside scripts/run-tests.mjs
+// (see that file's own isolated-root git-less test in
+// test/skip-discipline.test.ts). Proven here against a REAL isolated copy
+// of the production script with no .git at all - not a mock - since
+// nothing in this file lets a caller redirect where readGitHeadSha()
+// itself resolves REPO_ROOT from.
+// =============================================================================
+
+/**
+ * Copies the real, current scripts/check-coverage-floor.mjs and its two
+ * local dependencies (lib/is-main.mjs, check-sha-parity.mjs) byte for
+ * byte into `root`, which becomes an independent "repo root" the copy
+ * computes its own REPO_ROOT from - the same technique
+ * test/skip-discipline.test.ts's copyProductionScriptIntoIsolatedRoot
+ * already establishes for scripts/run-tests.mjs, reused here so this
+ * test is bound to actual production behavior rather than a parallel
+ * copy that could quietly drift apart from it.
+ */
+function copyCheckCoverageFloorIntoIsolatedRoot(root) {
+  const scriptsDir = path.join(root, "scripts");
+  const libDir = path.join(scriptsDir, "lib");
+  mkdirSync(libDir, { recursive: true });
+  writeFileSync(path.join(scriptsDir, "check-coverage-floor.mjs"), readFileSync(SCRIPT_PATH));
+  writeFileSync(
+    path.join(libDir, "is-main.mjs"),
+    readFileSync(path.join(REPO_ROOT, "scripts", "lib", "is-main.mjs"))
+  );
+  writeFileSync(
+    path.join(scriptsDir, "check-sha-parity.mjs"),
+    readFileSync(path.join(REPO_ROOT, "scripts", "check-sha-parity.mjs"))
+  );
+}
+
+test("git-less isolated root (no .git at all): the headSha binding degrades to UNSCANNED rather than crashing or VOIDing, when the completion marker also honestly recorded headSha: null", () => {
+  const root = realpathSync(mkdtempSync(path.join(tmpdir(), "ghantika-floor-git-less-")));
+  try {
+    copyCheckCoverageFloorIntoIsolatedRoot(root);
+    // Deliberately no git init at all - this root has no .git, matching a
+    // mount-none guest clone.
+
+    const summary = summaryWith(
+      Object.fromEntries(
+        Object.entries(COVERAGE_FLOORS).map(([metric, floor]) => [metric, floor + 10])
+      )
+    );
+    const summaryPath = path.join(root, "coverage-summary.json");
+    writeFileSync(summaryPath, JSON.stringify(summary));
+    const completionMarkerPath = path.join(root, "run-completed.json");
+    writeFileSync(
+      completionMarkerPath,
+      JSON.stringify({ headSha: null, at: new Date().toISOString(), runToken: "git-less-token" })
+    );
+    const runTokenPath = path.join(root, "run-token.json");
+    writeFileSync(runTokenPath, JSON.stringify({ token: "git-less-token" }));
+
+    const env = { ...process.env };
+    env.GHANTIKA_COVERAGE_SUMMARY_PATH = summaryPath;
+    env.GHANTIKA_COMPLETION_MARKER_PATH = completionMarkerPath;
+    env.GHANTIKA_RUN_TOKEN_PATH = runTokenPath;
+    env.GHANTIKA_TRUNCATION_MARKER_PATH = path.join(root, "does-not-exist-truncation.json");
+
+    // spawnSync, not execFileSync: the degrade disclosure goes to stderr
+    // via console.error, and execFileSync's return value on a SUCCESSFUL
+    // (non-throwing) run is stdout alone - this test needs both streams
+    // together regardless of which exit code the run produces.
+    const result = spawnSync(
+      process.execPath,
+      [path.join(root, "scripts", "check-coverage-floor.mjs")],
+      { env, encoding: "utf8" }
+    );
+    const status = typeof result.status === "number" ? result.status : 1;
+    const output = (result.stdout ?? "") + (result.stderr ?? "");
+
+    assert.equal(
+      status,
+      0,
+      `both sides agreeing git is unavailable must still reach an ordinary verdict, never crash or VOID; output:\n${output}`
+    );
+    assert.ok(
+      output.includes("git unavailable") && output.includes("UNSCANNED"),
+      `expected the disclosed degrade message; output:\n${output}`
+    );
+    assert.ok(
+      output.includes("every coverage metric is at or above its configured floor"),
+      `the run-token binding is git-independent and must still gate an ordinary pass; output:\n${output}`
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("git-less isolated root (no .git at all): a completion marker claiming a REAL commit cannot be verified and VOIDs, rather than being silently accepted", () => {
+  const root = realpathSync(mkdtempSync(path.join(tmpdir(), "ghantika-floor-git-less-void-")));
+  try {
+    copyCheckCoverageFloorIntoIsolatedRoot(root);
+
+    const summary = summaryWith(
+      Object.fromEntries(
+        Object.entries(COVERAGE_FLOORS).map(([metric, floor]) => [metric, floor + 10])
+      )
+    );
+    const summaryPath = path.join(root, "coverage-summary.json");
+    writeFileSync(summaryPath, JSON.stringify(summary));
+    const completionMarkerPath = path.join(root, "run-completed.json");
+    // Claims a real-looking commit sha, which this git-less root can never
+    // verify against anything - this must VOID, not silently pass.
+    writeFileSync(
+      completionMarkerPath,
+      JSON.stringify({
+        headSha: "a".repeat(40),
+        at: new Date().toISOString(),
+        runToken: "git-less-token",
+      })
+    );
+    const runTokenPath = path.join(root, "run-token.json");
+    writeFileSync(runTokenPath, JSON.stringify({ token: "git-less-token" }));
+
+    const env = { ...process.env };
+    env.GHANTIKA_COVERAGE_SUMMARY_PATH = summaryPath;
+    env.GHANTIKA_COMPLETION_MARKER_PATH = completionMarkerPath;
+    env.GHANTIKA_RUN_TOKEN_PATH = runTokenPath;
+    env.GHANTIKA_TRUNCATION_MARKER_PATH = path.join(root, "does-not-exist-truncation.json");
+
+    const result = spawnSync(
+      process.execPath,
+      [path.join(root, "scripts", "check-coverage-floor.mjs")],
+      { env, encoding: "utf8" }
+    );
+    const status = typeof result.status === "number" ? result.status : 1;
+    const output = (result.stdout ?? "") + (result.stderr ?? "");
+
+    assert.equal(
+      status,
+      VOID_EXIT_CODE,
+      `an unverifiable real-looking commit claim must VOID, never a silent pass; output:\n${output}`
+    );
+    assert.ok(
+      output.includes("no-git-headsha-verification"),
+      `expected the distinct no-git-headsha-verification reason; output:\n${output}`
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // =============================================================================
