@@ -23,15 +23,13 @@
   },
   "files": [
     "dist",
-    "schema",
-    "config/tasks-schema-digest.json",
-    "config/tasks-schema-provenance.json",
+    "!dist/**/*.map",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "prepack": "npm run build",
-    "build": "tsc",
+    "build": "tsc && node scripts/mark-bin-executable.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src scripts test eslint.config.js",
     "test": "npm run build && node scripts/run-tests.mjs",
