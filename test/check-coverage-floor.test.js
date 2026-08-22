@@ -598,7 +598,7 @@ test("sanity: the real production fallback path lives at REPO_ROOT, not under co
 });
 
 test("fail-open: an unwritable primary marker directory still produces VOID, via the fallback location", async () => {
-  const scratchDir = mkdtempSync(path.join(tmpdir(), "ghantika-ac1-failclosed-"));
+  const scratchDir = mkdtempSync(path.join(tmpdir(), "ghantika-fallback-marker-failclosed-"));
   const unwritableDir = path.join(scratchDir, "locked-coverage");
   mkdirSync(unwritableDir, { recursive: true });
   const primaryMarkerPath = path.join(unwritableDir, "run-truncated.json");
@@ -744,7 +744,7 @@ test("fail-open: an unwritable primary marker directory still produces VOID, via
 // real fix does - this is what actually proves the fallback is a genuine
 // RESCUE path, not a routine second copy.
 test("green control: a writable primary marker location never touches the fallback", async () => {
-  const scratchDir = mkdtempSync(path.join(tmpdir(), "ghantika-ac1-green-"));
+  const scratchDir = mkdtempSync(path.join(tmpdir(), "ghantika-fallback-marker-green-"));
   const primaryMarkerPath = path.join(scratchDir, "run-truncated.json");
   const fallbackMarkerPath = path.join(scratchDir, "fallback-marker.json");
   let driverPid;

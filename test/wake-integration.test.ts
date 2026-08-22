@@ -2163,7 +2163,7 @@ test("a declined wake on a real, app-spawned server (no Claude Code session ance
           // no _meta.threadId means resolveWakeTarget.ts resolves
           // "absent", which is what keeps CODEX_GATED_TRANSPORTS excluded
           // regardless of GHANTIKA_WAKE_TRANSPORT_ENABLED's own value.
-          arguments: { command: ["true"], label: "ac4-declined-wake-visibility" },
+          arguments: { command: ["true"], label: "declined-wake-visibility" },
         },
       });
       const runBody = (await server.nextLine()).parsed as PlainToolResponseBody;

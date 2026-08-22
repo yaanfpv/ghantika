@@ -11,17 +11,19 @@
  * that file already covers.
  *
  * Covers:
- *   - AC1: three real, correlated timestamps per job, captured from the
- *     genuine elapsed time of a real (mocked, but genuinely delayed) async
- *     transport call - never a fixed or synthesized number.
- *   - AC2: the two measurable gaps (`dispatchSeamMs`, `transportCallMs`) are
- *     reported as separate, named fields - never collapsed into one summary
- *     duration.
- *   - AC3: the payload actually sent to `wake()` is byte-identical to the
- *     known template, in both an outcome and a throw scenario - proving the
- *     new diagnostic code path never touches the wire-visible payload.
- *   - AC4: the instrumentation's own cost, measured directly (no I/O, no
- *     process spawn) rather than asserted by architecture alone.
+ *   - Timestamps: three real, correlated timestamps per job, captured from
+ *     the genuine elapsed time of a real (mocked, but genuinely delayed)
+ *     async transport call - never a fixed or synthesized number.
+ *   - Named gaps: the two measurable gaps (`dispatchSeamMs`,
+ *     `transportCallMs`) are reported as separate, named fields - never
+ *     collapsed into one summary duration.
+ *   - Payload fidelity: the payload actually sent to `wake()` is
+ *     byte-identical to the known template, in both an outcome and a throw
+ *     scenario - proving the new diagnostic code path never touches the
+ *     wire-visible payload.
+ *   - Instrumentation cost: the instrumentation's own cost, measured
+ *     directly (no I/O, no process spawn) rather than asserted by
+ *     architecture alone.
  *   - The "threw" outcome path: `selectAndWake`'s own promise rejecting is
  *     still recorded, with an honest `outcome`/`transportName` for the case
  *     where no real `WakeResult` exists to name a transport from.
@@ -133,10 +135,10 @@ function captureWakeLatencyRecords(t: TestContext): () => Array<Record<string, u
 }
 
 // =============================================================================
-// AC1 + AC2: real, correlated timestamps; two gaps, reported separately.
+// Real, correlated timestamps; two gaps, reported separately.
 // =============================================================================
 
-test("AC1/AC2: a delivered wake logs one correlated record whose three timestamps are monotonic and whose two gaps are separate, named fields - never collapsed into one duration", async (t) => {
+test("a delivered wake logs one correlated record whose three timestamps are monotonic and whose two gaps are separate, named fields - never collapsed into one duration", async (t) => {
   await withWakeTransportEnabled("1", async () => {
     neutralizeClaudeMessagingTransport(t);
     t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", available);
@@ -151,8 +153,8 @@ test("AC1/AC2: a delivered wake logs one correlated record whose three timestamp
     );
     const readRecords = captureWakeLatencyRecords(t);
 
-    const job = createNonTerminalJob("ac1-ac2-delivered");
-    const target: WakeTarget = "thread-ac1-ac2";
+    const job = createNonTerminalJob("timestamps-and-gaps-delivered");
+    const target: WakeTarget = "thread-timestamps-and-gaps";
     const resolution: WakeTargetResolution = { state: "resolved", target };
     maybeAugmentRunResult(makeRunResult(job.job_id), true, noopNotifier, resolution);
 
@@ -194,8 +196,8 @@ test("AC1/AC2: a delivered wake logs one correlated record whose three timestamp
       `t_selectAndWake_enter (${tEnter}) must not be after t_transport_complete (${tComplete})`
     );
 
-    // AC2's own requirement: the two gaps are SEPARATE, NAMED fields, never
-    // collapsed into one summary duration.
+    // The two gaps are SEPARATE, NAMED fields, never collapsed into one
+    // summary duration.
     assert.equal(record.dispatchSeamMs, tEnter - tTerminal);
     assert.equal(record.transportCallMs, tComplete - tEnter);
     assert.ok(
@@ -224,7 +226,7 @@ test("AC1/AC2: a delivered wake logs one correlated record whose three timestamp
   });
 });
 
-test('AC1: a rejecting wake() is recorded honestly as the real outcome selectAndWake itself reports ("unavailable") - it does NOT propagate as a "threw" record, because selectAndWake CATCHES a transport rejection internally and folds it into its own aggregate result rather than rejecting its own promise (see src/wake/selectTransport.ts\'s own selectAndWake doc comment: "wake() throwing... is treated as that transport failing this attempt exactly like an unavailable result"). This test exists specifically because an earlier version of THIS FILE assumed the opposite and asserted "threw" here - it failed against the real wiring, which is exactly what caught the wrong assumption.', async (t) => {
+test('a rejecting wake() is recorded honestly as the real outcome selectAndWake itself reports ("unavailable") - it does NOT propagate as a "threw" record, because selectAndWake CATCHES a transport rejection internally and folds it into its own aggregate result rather than rejecting its own promise (see src/wake/selectTransport.ts\'s own selectAndWake doc comment: "wake() throwing... is treated as that transport failing this attempt exactly like an unavailable result").', async (t) => {
   await withWakeTransportEnabled("1", async () => {
     neutralizeClaudeMessagingTransport(t);
     t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", available);
@@ -236,7 +238,7 @@ test('AC1: a rejecting wake() is recorded honestly as the real outcome selectAnd
     );
     const readRecords = captureWakeLatencyRecords(t);
 
-    const job = createNonTerminalJob("ac1-transport-rejects");
+    const job = createNonTerminalJob("transport-rejects");
     const target: WakeTarget = "thread-transport-rejects";
     const resolution: WakeTargetResolution = { state: "resolved", target };
     maybeAugmentRunResult(makeRunResult(job.job_id), true, noopNotifier, resolution);
@@ -270,12 +272,12 @@ test('AC1: a rejecting wake() is recorded honestly as the real outcome selectAnd
 });
 
 // =============================================================================
-// AC3: the payload actually sent to wake() is byte-identical to the known
+// The payload actually sent to wake() is byte-identical to the known
 // template, in both an outcome scenario and a throw scenario - proving the
 // new diagnostic code never touches the wire-visible payload.
 // =============================================================================
 
-test("AC3: the wake() payload is byte-identical to the known template - unaffected by whether the diagnostic emission succeeds, throws, or is present at all", async (t) => {
+test("the wake() payload is byte-identical to the known template - unaffected by whether the diagnostic emission succeeds, throws, or is present at all", async (t) => {
   await withWakeTransportEnabled("1", async () => {
     neutralizeClaudeMessagingTransport(t);
     t.mock.method(DEFAULT_TRANSPORTS[1]!, "probe", available);
@@ -290,8 +292,8 @@ test("AC3: the wake() payload is byte-identical to the known template - unaffect
       unavailable("second transport never reached once the first delivers")
     );
 
-    const job = createNonTerminalJob("ac3-payload-bytes");
-    const target: WakeTarget = "thread-ac3";
+    const job = createNonTerminalJob("payload-bytes");
+    const target: WakeTarget = "thread-payload-bytes";
     const resolution: WakeTargetResolution = { state: "resolved", target };
     maybeAugmentRunResult(makeRunResult(job.job_id), true, noopNotifier, resolution);
 
@@ -311,15 +313,15 @@ test("AC3: the wake() payload is byte-identical to the known template - unaffect
 });
 
 // =============================================================================
-// AC4: measure the instrumentation's own cost directly - no I/O, no process
+// Measure the instrumentation's own cost directly - no I/O, no process
 // spawn, a pure microbenchmark of exactly the code path that runs on every
 // wake attempt (buildWakeLatencyRecord + JSON.stringify).
 // =============================================================================
 
-test("AC4: buildWakeLatencyRecord + JSON.stringify (the exact per-attempt cost emitWakeLatency pays before writing to stderr) measures under 0.1ms per call on average, disclosed rather than assumed", () => {
+test("buildWakeLatencyRecord + JSON.stringify (the exact per-attempt cost emitWakeLatency pays before writing to stderr) measures under 0.1ms per call on average, disclosed rather than assumed", () => {
   const ITERATIONS = 10_000;
   const sample = {
-    taskId: "ac4-benchmark-task",
+    taskId: "instrumentation-benchmark-task",
     tTerminalMs: 1_000,
     tSelectAndWakeEnterMs: 1_001,
     tTransportCompleteMs: 1_250,
@@ -343,14 +345,14 @@ test("AC4: buildWakeLatencyRecord + JSON.stringify (the exact per-attempt cost e
   );
 });
 
-test("AC4: emitWakeLatency itself (including the console.error call) measures under 1ms per call on average, against a stubbed console.error so this benchmark's own stdout/stderr capture cost is excluded", (t) => {
+test("emitWakeLatency itself (including the console.error call) measures under 1ms per call on average, against a stubbed console.error so this benchmark's own stdout/stderr capture cost is excluded", (t) => {
   const ITERATIONS = 5_000;
   t.mock.method(console, "error", () => {
     // intentionally empty - this benchmark measures this file's own call
     // path, not the test runner's own stderr-capture overhead.
   });
   const sample = {
-    taskId: "ac4-benchmark-task-2",
+    taskId: "instrumentation-benchmark-task-2",
     tTerminalMs: 2_000,
     tSelectAndWakeEnterMs: 2_002,
     tTransportCompleteMs: 2_500,
