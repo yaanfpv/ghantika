@@ -12,6 +12,7 @@ import {
   NO_CLIENT_FOUND_SENTINEL,
   THREAD_FOLLOWER_START_TURN_METHOD,
   THREAD_OWNER_DISCOVERY_METHOD,
+  THREAD_OWNER_DISCOVERY_VERSION,
   buildStartTurnParams,
   encodeIpcFrame,
   evaluateSocketOwnership,
@@ -211,6 +212,8 @@ interface RecordedCall {
   readonly targetClientId: unknown;
   /** The `sourceClientId` this call carried - asserted by name so a caller that stops sending it shows up as `undefined` rather than as a silently-missing property. */
   readonly sourceClientId: unknown;
+  /** The `version` this call carried, or `undefined` if it sent none - asserted by name on thread-owner-discovery calls specifically, since that method is refused without it. */
+  readonly version: unknown;
 }
 
 /**
@@ -276,17 +279,30 @@ function startFakeDesktopIpcServer(
           method: string;
           params: unknown;
           targetClientId?: unknown;
+          version?: unknown;
         };
         // A message missing either discriminator is never answered by the
         // real app, so it is dropped here the same way rather than
         // reaching a method handler.
         if (message.type !== "request" || typeof message.requestId !== "string") continue;
+        // thread-owner-discovery specifically requires the correct protocol
+        // version or the real app never replies at all - see
+        // THREAD_OWNER_DISCOVERY_VERSION's own docs. Enforced here so a
+        // regression that stops sending it (or sends the wrong value) reds
+        // this suite instead of passing silently.
+        if (
+          message.method === THREAD_OWNER_DISCOVERY_METHOD &&
+          message.version !== THREAD_OWNER_DISCOVERY_VERSION
+        ) {
+          continue;
+        }
 
         calls.push({
           method: message.method,
           params: message.params,
           targetClientId: message.targetClientId,
           sourceClientId: message.sourceClientId,
+          version: message.version,
         });
 
         let reply: { result?: unknown; error?: unknown } | undefined;
@@ -594,7 +610,7 @@ test("wake(): a message missing the envelope discriminators (bare id, no type, n
   }
 });
 
-test("wake(): the full sequence delivers - initialize, then thread-owner-discovery carrying the initialize clientId as hostId, then thread-follower-start-turn targeted at the discovered owner with the exact measured turnStartParams shape", async () => {
+test('wake(): the full sequence delivers - initialize, then thread-owner-discovery carrying the fixed hostId "local" literal and the discovery protocol version, then thread-follower-start-turn targeted at the discovered owner with the exact measured turnStartParams shape', async () => {
   const { dir, socketPath } = fakeSocketPath();
   const server = await startFakeDesktopIpcServer(socketPath, {
     initialize: () => ({ result: { clientId: "caller-client-9" } }),
@@ -621,10 +637,72 @@ test("wake(): the full sequence delivers - initialize, then thread-owner-discove
       hostId: "local",
       conversationId: "conversation-abc",
     });
+    // The discovery call is refused by the fake server (and by the real
+    // app) without this exact version - reaching "delivered" already
+    // proves it was sent, and this asserts the exact value by name.
+    assert.equal(discovery!.version, THREAD_OWNER_DISCOVERY_VERSION);
 
     assert.equal(startTurn!.method, THREAD_FOLLOWER_START_TURN_METHOD);
     assert.equal(startTurn!.targetClientId, "owner-client-7");
     assert.deepEqual(startTurn!.params, buildStartTurnParams("conversation-abc", "please resume"));
+  } finally {
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("wake(): thread-owner-discovery with a MISSING version, or a version other than 1, gets NO REPLY from a server enforcing the real contract - the same silent-drop shape a missing envelope discriminator produces, proving this suite's own version gate would red if the production discovery call ever stopped sending it", async () => {
+  const { dir, socketPath } = fakeSocketPath();
+  const server = await startFakeDesktopIpcServer(socketPath);
+  try {
+    // Bypasses DesktopIpcWakeTransport entirely, on purpose: drives the
+    // fake server directly with hand-built discovery requests carrying no
+    // version and a wrong version, to prove the fake server's own version
+    // gate actually reds on both rather than merely accepting whatever it
+    // is given.
+    const socket = net.createConnection({ path: socketPath });
+    await new Promise<void>((resolve, reject) => {
+      socket.once("connect", () => resolve());
+      socket.once("error", reject);
+    });
+    const replies: unknown[] = [];
+    const reader = new ServerFrameReader();
+    socket.on("data", (chunk: Buffer) => replies.push(...reader.push(chunk)));
+
+    const missingVersionFrame = encodeServerFrame({
+      type: "request",
+      requestId: "discovery-no-version",
+      sourceClientId: null,
+      method: THREAD_OWNER_DISCOVERY_METHOD,
+      params: { hostId: "local", conversationId: "conversation-no-version" },
+    });
+    socket.write(missingVersionFrame);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.deepEqual(replies, [], "discovery with no version must get no reply at all");
+    assert.equal(
+      server.calls.length,
+      0,
+      "discovery with no version must never reach a method handler"
+    );
+
+    const wrongVersionFrame = encodeServerFrame({
+      type: "request",
+      requestId: "discovery-wrong-version",
+      sourceClientId: null,
+      method: THREAD_OWNER_DISCOVERY_METHOD,
+      params: { hostId: "local", conversationId: "conversation-wrong-version" },
+      version: THREAD_OWNER_DISCOVERY_VERSION + 1,
+    });
+    socket.write(wrongVersionFrame);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.deepEqual(replies, [], "discovery with the wrong version must also get no reply at all");
+    assert.equal(
+      server.calls.length,
+      0,
+      "discovery with the wrong version must never reach a method handler"
+    );
+
+    socket.destroy();
   } finally {
     await server.close();
     rmSync(dir, { recursive: true, force: true });
