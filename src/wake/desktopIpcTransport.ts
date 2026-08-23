@@ -48,38 +48,55 @@
  * `THREAD_OWNER_DISCOVERY_METHOD`, `THREAD_FOLLOWER_START_TURN_METHOD`,
  * and `buildStartTurnParams` below.
  *
- * NOT measured, and therefore this transport's own reasoned design rather
- * than a confirmed fact about the app's real wire behavior:
+ * ## The request/reply envelope
  *
- * - How a request is correlated with its reply. This transport stamps
- *   every outgoing message with a fresh random `id` and expects a reply
- *   object carrying that same `id`, treating a `result` property as
- *   success and an `error` property as failure (a conventional
- *   JSON-RPC-shaped envelope) - see `IpcConnection.call` below.
- * - How `thread-owner-discovery`'s "no owner" outcome is actually spelled
- *   on the wire. This transport accepts several plausible shapes (a null
- *   or empty `ownerId`, an `ownerId` literally equal to the sentinel
- *   string quoted in the measured facts, or an `error` reply whose
- *   message mentions it) - see `NO_CLIENT_FOUND_SENTINEL` and
- *   `interpretOwnerDiscoveryResult` below.
- * - What value `hostId` actually identifies. The measured facts name the
- *   field but not its semantics; this transport assumes it is the calling
- *   client's own `clientId`, returned from its own prior `initialize`
- *   call.
- * - How a reply gets routed to one SPECIFIC client rather than broadcast.
- *   This transport assumes an envelope-level `targetClientId` field,
- *   populated only for the final call, once a real owner has actually
- *   been discovered.
+ * Every outgoing message carries a `type` discriminator (the literal
+ * string `"request"`), a `requestId`, and a `sourceClientId` - `null` on a
+ * connection's first call (`initialize`, before the app has assigned this
+ * connection an id) and that call's own returned `clientId` on every call
+ * after it on the same connection (see `IpcConnection`'s own `clientId`
+ * field below):
  *
- * None of this is verified against a captured real reply - it is this
- * transport's own best guess at the surrounding envelope the three
- * measured calls travel inside, built to be exercised realistically in
- * `test/wake-desktop-ipc.test.ts` against a fake local socket server that
- * implements the SAME guessed envelope. A maintainer who later captures a
- * real reply and finds any of this wrong has a single, contained place to
- * fix it; every call site here already fails soft rather than assuming the
- * guess was right, so a wrong guess degrades this transport to permanently
- * `unavailable` rather than silently mis-delivering anything.
+ *   request:  { type: "request", requestId, sourceClientId, method,
+ *               params, targetClientId? }
+ *   response: { type: "response", requestId, method, resultType,
+ *               handledByClientId, result }
+ *
+ * A reply is matched to its request by `requestId`. Success is
+ * `resultType === "success"`, with `result` carrying the payload; any
+ * other `resultType` is a failure, whose text this transport looks for in
+ * several plausible locations across the reply rather than committing to
+ * one (see `IpcConnection.dispatch` below), since the protocol does not
+ * pin a single canonical location for it. A request missing the
+ * `type`/`requestId` discriminators is never answered at all - it
+ * produces no reply and no error, so a caller of this transport that
+ * somehow bypassed the envelope above would see only a request timeout,
+ * indistinguishable from a genuinely unresponsive app.
+ *
+ * `thread-owner-discovery` carries two further requirements beyond the
+ * shape above: it needs an explicit `version` field (currently `1`) or it
+ * is never answered, and its `hostId` parameter is the fixed literal
+ * string `"local"` rather than the calling client's own id. A successful
+ * reply's owner id is the envelope-level `handledByClientId` field, never
+ * a field inside `result`; a genuine no-owner outcome is
+ * `resultType:"error"` with a bare STRING `error` equal to the sentinel
+ * in `NO_CLIENT_FOUND_SENTINEL`, never an object and never folded into
+ * `result` - see `interpretOwnerDiscoveryResult`'s own docs for the full
+ * shape.
+ *
+ * This transport fails soft on anything outside the shapes above: an
+ * envelope field it does not recognise, or a failure-text location none
+ * of the checked spellings match, degrades a call to `unavailable` with a
+ * named diagnostic rather than mis-delivering or throwing.
+ *
+ * A disclosed, unresolved limit: `thread-owner-discovery` never replies at
+ * all for a conversation id that has never been opened in any live
+ * renderer window, rather than answering with a genuine no-owner result.
+ * This does not affect a real wake target, which is by definition a
+ * conversation that has been opened in a window at some point, so it does
+ * not change what a caller of this transport should do - it is recorded
+ * because it is a real, observed limit of what this transport's
+ * owner-discovery step can answer.
  *
  * ## The owner gate is a disclosed boundary, not a bug to route around
  *
@@ -174,6 +191,8 @@ export const INITIALIZE_METHOD = "initialize";
 
 /** The `method` value sent to find which connected client currently owns (has open) a conversation - measured verbatim. */
 export const THREAD_OWNER_DISCOVERY_METHOD = "thread-owner-discovery";
+/** `thread-owner-discovery`'s current protocol version. Omitting `version` entirely gets no reply at all, the same silent-drop shape as a missing envelope discriminator. See `OutgoingEnvelope.version`'s own docs on why this is a literal rather than a resolved table lookup. */
+export const THREAD_OWNER_DISCOVERY_VERSION = 1;
 
 /** The `method` value sent to actually start a turn on a conversation, targeted at its owning client - measured verbatim. */
 export const THREAD_FOLLOWER_START_TURN_METHOD = "thread-follower-start-turn";
@@ -278,21 +297,44 @@ export class IpcFrameDecoder {
 }
 
 // ---------------------------------------------------------------------------
-// The request/response envelope - see this file's header for which parts
-// of this are measured and which are this transport's own design.
+// The request/response envelope - see this file's header for the shape.
 // ---------------------------------------------------------------------------
 
 interface OutgoingEnvelope {
-  readonly id: string;
+  /**
+   * Every request the app's IPC router accepts carries a literal
+   * `"request"` discriminator - omitting it produces total silence (no
+   * reply, no error) rather than a rejection, because the router never
+   * recognizes the message as a request at all.
+   */
+  readonly type: "request";
+  /** The app correlates a reply by `requestId`, never a bare `id`. */
+  readonly requestId: string;
+  /**
+   * `null` only for the very first `initialize` call on a fresh
+   * connection, before the app has assigned this connection a clientId;
+   * every subsequent call on the same connection carries that assigned id
+   * here.
+   */
+  readonly sourceClientId: string | null;
   readonly method: string;
   readonly params: Record<string, unknown>;
   /** Present only on the final, targeted call - see this file's header on how routing to one specific client is assumed to work. */
   readonly targetClientId?: string;
+  /**
+   * Required by `thread-owner-discovery` specifically: a call with no
+   * `version` field gets no reply at all, the same silent-drop shape as a
+   * missing envelope discriminator above. Currently `1`. This transport
+   * does not generalise to reading every method's protocol version from
+   * the app, so this field is set only where a call is known to need it,
+   * as a literal rather than a resolved table lookup.
+   */
+  readonly version?: number;
 }
 
-/** The result of one `IpcConnection.call` - a protocol-level `error` reply is `{ok:false}`, never a thrown exception, so a caller can distinguish "the app answered and refused" from "the connection itself broke" (the latter surfaces as a rejected promise instead - see `IpcConnection.call`'s own docs). */
+/** The result of one `IpcConnection.call` - a protocol-level `error` reply is `{ok:false}`, never a thrown exception, so a caller can distinguish "the app answered and refused" from "the connection itself broke" (the latter surfaces as a rejected promise instead - see `IpcConnection.call`'s own docs). `handledByClientId` is carried on the success case because `thread-owner-discovery` reports the owner there, at the envelope level, never inside `result` - see this file's header and `IpcConnection.dispatch` below. */
 type IpcCallOutcome =
-  | { readonly ok: true; readonly result: unknown }
+  | { readonly ok: true; readonly result: unknown; readonly handledByClientId: string | undefined }
   | { readonly ok: false; readonly message: string };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -315,7 +357,7 @@ function describeError(error: unknown): string {
 
 /** One outstanding `IpcConnection.call` awaiting its reply - see that method's own docs. */
 interface PendingIpcCall {
-  readonly id: string;
+  readonly requestId: string;
   readonly settle: (outcome: IpcCallOutcome) => void;
   readonly onFatal: (error: Error) => void;
 }
@@ -326,6 +368,14 @@ class IpcConnection {
   private readonly decoder = new IpcFrameDecoder();
   private pending: PendingIpcCall | undefined;
   private fatal: Error | undefined;
+  /**
+   * `null` until this connection's own `initialize` call succeeds, then the
+   * clientId the app assigned it - every call after that stamps this as
+   * `sourceClientId` (see `OutgoingEnvelope.sourceClientId`'s own docs).
+   * Set by `call()` itself reading its own outcome, so a caller never has
+   * to remember to wire it through separately.
+   */
+  private clientId: string | null = null;
 
   private constructor(socket: net.Socket) {
     this.socket = socket;
@@ -373,28 +423,57 @@ class IpcConnection {
     for (const message of messages) this.dispatch(message);
   }
 
+  /**
+   * Matches an incoming frame against this connection's one outstanding
+   * call - by `requestId`, per this file's header and `OutgoingEnvelope`'s
+   * own docs. A live connection also receives frames that are never a
+   * reply to anything this transport sent - a `broadcast` (e.g.
+   * `thread-stream-following-changed`) or a `client-discovery-request` the
+   * app addresses to every connected client. Neither carries a matching
+   * `requestId`, so the identity check below already ignores them
+   * correctly; this transport's short-lived, one-shot connection has no
+   * need to answer a discovery request the way a persistent participant
+   * would.
+   */
   private dispatch(message: unknown): void {
     if (this.pending === undefined) return; // no outstanding call - nothing this transport sent could be replying, so this is silently ignored rather than treated as a fatal surprise
-    if (!isRecord(message) || message.id !== this.pending.id) return; // not our reply - this transport's own sequence never has more than one outstanding call, but a stray or unrelated frame from the bus is still handled gracefully rather than misfiled onto the wrong caller
+    if (!isRecord(message) || message.requestId !== this.pending.requestId) return; // not our reply - this transport's own sequence never has more than one outstanding call, but a stray or unrelated frame from the bus (a broadcast, a discovery request) is still handled gracefully rather than misfiled onto the wrong caller
     const pending = this.pending;
     this.pending = undefined;
-    if ("error" in message) {
-      const errorValue = message.error;
-      const text =
-        isRecord(errorValue) && typeof errorValue.message === "string"
-          ? errorValue.message
-          : describeUnexpectedReply(errorValue);
-      pending.settle({ ok: false, message: text });
+    if (message.resultType === "success") {
+      // `handledByClientId` is carried on the envelope itself, sibling to
+      // `result` - `thread-owner-discovery`'s success reply is
+      // `{..., handledByClientId: "<owner clientId>", result: {}}`. Read
+      // unconditionally here (not just for that one method) since it
+      // costs nothing when a reply omits it.
+      const handledByClientId =
+        isRecord(message) && typeof message.handledByClientId === "string"
+          ? message.handledByClientId
+          : undefined;
+      pending.settle({ ok: true, result: message.result, handledByClientId });
       return;
     }
-    if ("result" in message) {
-      pending.settle({ ok: true, result: message.result });
-      return;
-    }
-    pending.settle({
-      ok: false,
-      message: `reply carried neither "result" nor "error": ${describeUnexpectedReply(message)}`,
-    });
+    // A non-success `resultType` is the app's own failure signal.
+    // `thread-owner-discovery`'s own no-owner case is a bare top-level
+    // `error` STRING equal to the literal sentinel
+    // (`resultType:"error", error:"no-client-found"`) - not an object, not
+    // nested in `result`. Checked first since it is the one confirmed
+    // shape; every other shape below remains this transport's own
+    // contingency, kept because a failure on some OTHER method could
+    // still spell its message differently.
+    const errorValue = isRecord(message) ? message.error : undefined;
+    const resultValue = isRecord(message) ? message.result : undefined;
+    const text =
+      typeof errorValue === "string"
+        ? errorValue
+        : isRecord(resultValue) && typeof resultValue.message === "string"
+          ? resultValue.message
+          : isRecord(errorValue) && typeof errorValue.message === "string"
+            ? errorValue.message
+            : typeof message.result === "string"
+              ? message.result
+              : describeUnexpectedReply(message);
+    pending.settle({ ok: false, message: text });
   }
 
   private handleFatal(error: Error): void {
@@ -418,14 +497,20 @@ class IpcConnection {
     method: string,
     params: Record<string, unknown>,
     timeoutMs: number,
-    targetClientId?: string
+    targetClientId?: string,
+    version?: number
   ): Promise<IpcCallOutcome> {
     if (this.fatal !== undefined) return Promise.reject(this.fatal);
-    const id = randomUUID();
-    const envelope: OutgoingEnvelope =
-      targetClientId === undefined
-        ? { id, method, params }
-        : { id, method, params, targetClientId };
+    const requestId = randomUUID();
+    const envelope: OutgoingEnvelope = {
+      type: "request",
+      requestId,
+      sourceClientId: this.clientId,
+      method,
+      params,
+      ...(targetClientId === undefined ? {} : { targetClientId }),
+      ...(version === undefined ? {} : { version }),
+    };
 
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -437,11 +522,20 @@ class IpcConnection {
       }, timeoutMs);
 
       this.pending = {
-        id,
+        requestId,
         settle: (outcome: IpcCallOutcome) => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
+          // Self-assigns this connection's clientId the moment its OWN
+          // `initialize` call succeeds, so every later call on the same
+          // connection stamps the real `sourceClientId` without the caller
+          // (`wake()`) having to remember to wire it through separately -
+          // see `OutgoingEnvelope.sourceClientId`'s own docs.
+          if (this.clientId === null && method === INITIALIZE_METHOD && outcome.ok) {
+            const assigned = extractClientId(outcome.result);
+            if (assigned !== undefined) this.clientId = assigned;
+          }
           resolve(outcome);
         },
         onFatal: (error: Error) => {
@@ -482,24 +576,35 @@ export function extractClientId(result: unknown): string | undefined {
   return typeof clientId === "string" && clientId.length > 0 ? clientId : undefined;
 }
 
-/** The outcome of interpreting a `thread-owner-discovery` reply's `result` - see this file's header on the several plausible "no owner" shapes this transport accepts. */
+/**
+ * The outcome of interpreting a successful `thread-owner-discovery` reply.
+ *
+ * A successful reply's owner id is the envelope-level `handledByClientId`
+ * field (`IpcCallOutcome.handledByClientId`), with `result` itself empty
+ * (`{}`). The no-owner case is decided BEFORE this function ever runs -
+ * see `wake()`'s own call site, which checks `isNoClientFoundMessage` on a
+ * non-`ok` outcome first: `resultType:"error"`, `error:"no-client-found"`
+ * (a bare string). This function's only job is the success case: a
+ * present, non-empty `handledByClientId` is a real owner; its absence on
+ * an otherwise-successful reply is `malformed` rather than assumed to
+ * mean "no owner", since a genuine no-owner reply is never a success in
+ * the first place.
+ */
 export type OwnerDiscoveryOutcome =
   | { readonly kind: "found"; readonly ownerId: string }
   | { readonly kind: "no-owner" }
   | { readonly kind: "malformed"; readonly detail: string };
 
-export function interpretOwnerDiscoveryResult(result: unknown): OwnerDiscoveryOutcome {
-  if (!isRecord(result) || !("ownerId" in result)) {
-    return { kind: "malformed", detail: describeUnexpectedReply(result) };
+export function interpretOwnerDiscoveryResult(
+  handledByClientId: string | undefined
+): OwnerDiscoveryOutcome {
+  if (handledByClientId === undefined || handledByClientId.length === 0) {
+    return {
+      kind: "malformed",
+      detail: `a successful thread-owner-discovery reply carried no usable handledByClientId (got: ${describeUnexpectedReply(handledByClientId)})`,
+    };
   }
-  const ownerId = result.ownerId;
-  if (ownerId === null || ownerId === "" || ownerId === NO_CLIENT_FOUND_SENTINEL) {
-    return { kind: "no-owner" };
-  }
-  if (typeof ownerId === "string") {
-    return { kind: "found", ownerId };
-  }
-  return { kind: "malformed", detail: describeUnexpectedReply(result) };
+  return { kind: "found", ownerId: handledByClientId };
 }
 
 /** True when a protocol-level error message (from either `thread-owner-discovery` or `thread-follower-start-turn`) is this app's own way of saying no window currently owns the target conversation, rather than some other, genuinely unexpected failure. */
@@ -696,14 +801,18 @@ export class DesktopIpcWakeTransport implements WakeTransport {
 
       const discoveryOutcome = await connection.call(
         THREAD_OWNER_DISCOVERY_METHOD,
-        { hostId: clientId, conversationId: target },
-        this.requestTimeoutMs
+        // hostId is the fixed literal string "local", never the calling
+        // client's own clientId - see this file's header.
+        { hostId: "local", conversationId: target },
+        this.requestTimeoutMs,
+        undefined,
+        THREAD_OWNER_DISCOVERY_VERSION
       );
       if (!discoveryOutcome.ok) {
         if (isNoClientFoundMessage(discoveryOutcome.message)) return this.refusedNoOwner(target);
         return this.unavailable(`thread-owner-discovery was rejected: ${discoveryOutcome.message}`);
       }
-      const interpreted = interpretOwnerDiscoveryResult(discoveryOutcome.result);
+      const interpreted = interpretOwnerDiscoveryResult(discoveryOutcome.handledByClientId);
       if (interpreted.kind === "no-owner") return this.refusedNoOwner(target);
       if (interpreted.kind === "malformed") {
         return this.unavailable(
