@@ -12,6 +12,7 @@ import {
   NO_CLIENT_FOUND_SENTINEL,
   THREAD_FOLLOWER_START_TURN_METHOD,
   THREAD_OWNER_DISCOVERY_METHOD,
+  THREAD_OWNER_DISCOVERY_VERSION,
   buildStartTurnParams,
   encodeIpcFrame,
   evaluateSocketOwnership,
@@ -120,30 +121,27 @@ test("evaluateSocketOwnership: rejects a uid mismatch, naming both the socket's 
 // without having measured the real app's exact wire spelling.
 // ---------------------------------------------------------------------------
 
-test("interpretOwnerDiscoveryResult: a real ownerId string is 'found'", () => {
-  assert.deepEqual(interpretOwnerDiscoveryResult({ ownerId: "client-42" }), {
+// interpretOwnerDiscoveryResult now takes the envelope-level
+// handledByClientId directly - the no-owner case is decided
+// at the wake() call site, BEFORE this function ever runs, by checking
+// isNoClientFoundMessage on a non-ok outcome (see that function's own
+// tests below and wake()'s own call site). This function's only remaining
+// job is interpreting a SUCCESSFUL reply's owner id.
+
+test("interpretOwnerDiscoveryResult: a real handledByClientId string is 'found'", () => {
+  assert.deepEqual(interpretOwnerDiscoveryResult("client-42"), {
     kind: "found",
     ownerId: "client-42",
   });
 });
 
-test("interpretOwnerDiscoveryResult: a null ownerId is 'no-owner'", () => {
-  assert.deepEqual(interpretOwnerDiscoveryResult({ ownerId: null }), { kind: "no-owner" });
-});
-
-test("interpretOwnerDiscoveryResult: an ownerId literally equal to the measured sentinel string is 'no-owner'", () => {
-  assert.deepEqual(interpretOwnerDiscoveryResult({ ownerId: NO_CLIENT_FOUND_SENTINEL }), {
-    kind: "no-owner",
-  });
-});
-
-test("interpretOwnerDiscoveryResult: a reply missing ownerId entirely is 'malformed', never silently treated as either found or no-owner", () => {
-  const outcome = interpretOwnerDiscoveryResult({ somethingElse: true });
+test("interpretOwnerDiscoveryResult: undefined (a successful reply with no handledByClientId at all) is 'malformed', never silently treated as 'no-owner' - a genuine no-owner reply is never a success in the first place", () => {
+  const outcome = interpretOwnerDiscoveryResult(undefined);
   assert.equal(outcome.kind, "malformed");
 });
 
-test("interpretOwnerDiscoveryResult: a non-string, non-null ownerId (e.g. a number) is 'malformed'", () => {
-  const outcome = interpretOwnerDiscoveryResult({ ownerId: 12345 });
+test("interpretOwnerDiscoveryResult: an empty string is 'malformed', same reasoning as undefined", () => {
+  const outcome = interpretOwnerDiscoveryResult("");
   assert.equal(outcome.kind, "malformed");
 });
 
@@ -212,13 +210,27 @@ interface RecordedCall {
   readonly method: string;
   readonly params: unknown;
   readonly targetClientId: unknown;
+  /** The `sourceClientId` this call carried - asserted by name so a caller that stops sending it shows up as `undefined` rather than as a silently-missing property. */
+  readonly sourceClientId: unknown;
+  /** The `version` this call carried, or `undefined` if it sent none - asserted by name on thread-owner-discovery calls specifically, since that method is refused without it. */
+  readonly version: unknown;
 }
 
-/** `undefined` from a handler means "never reply" - used to exercise this transport's own request-timeout path. */
+/**
+ * `undefined` from a handler means "never reply" - used to exercise this
+ * transport's own request-timeout path. `handledByClientId` mirrors the
+ * envelope-level field `thread-owner-discovery` actually reports its owner
+ * on - see `interpretOwnerDiscoveryResult`'s own docs. `error` may be a
+ * bare string, matching the real no-owner shape
+ * (`resultType:"error", error:"no-client-found"`), or an object for any
+ * other simulated failure this suite exercises.
+ */
 type FakeReplyHandler = (
   params: unknown,
   targetClientId: unknown
-) => { readonly result?: unknown; readonly error?: unknown } | undefined;
+) =>
+  | { readonly result?: unknown; readonly error?: unknown; readonly handledByClientId?: string }
+  | undefined;
 
 interface FakeServerBehavior {
   readonly initialize?: FakeReplyHandler;
@@ -234,10 +246,19 @@ interface FakeServerHandle {
 
 const DEFAULT_BEHAVIOR: Required<FakeServerBehavior> = {
   initialize: () => ({ result: { clientId: "fake-client-1" } }),
-  threadOwnerDiscovery: () => ({ result: { ownerId: "owner-client-1" } }),
+  threadOwnerDiscovery: () => ({ result: {}, handledByClientId: "owner-client-1" }),
   threadFollowerStartTurn: () => ({ result: { started: true } }),
 };
 
+/**
+ * Speaks the real IPC envelope: requires `type === "request"` and a
+ * `requestId` on every incoming message, exactly as the real app's own
+ * IPC router does - a message missing either is silently dropped (no
+ * reply at all) rather than answered with an error. Replies
+ * `{type:"response", requestId, method, resultType, result}` -
+ * `resultType: "success"` on the happy path, `"error"` on a handler's
+ * `error` return, matching what `IpcConnection.dispatch` actually reads.
+ */
 function startFakeDesktopIpcServer(
   socketPath: string,
   behavior: FakeServerBehavior = {}
@@ -252,15 +273,36 @@ function startFakeDesktopIpcServer(
     socket.on("data", (chunk: Buffer) => {
       for (const raw of reader.push(chunk)) {
         const message = raw as {
-          id: string;
+          type?: unknown;
+          requestId?: unknown;
+          sourceClientId?: unknown;
           method: string;
           params: unknown;
           targetClientId?: unknown;
+          version?: unknown;
         };
+        // A message missing either discriminator is never answered by the
+        // real app, so it is dropped here the same way rather than
+        // reaching a method handler.
+        if (message.type !== "request" || typeof message.requestId !== "string") continue;
+        // thread-owner-discovery specifically requires the correct protocol
+        // version or the real app never replies at all - see
+        // THREAD_OWNER_DISCOVERY_VERSION's own docs. Enforced here so a
+        // regression that stops sending it (or sends the wrong value) reds
+        // this suite instead of passing silently.
+        if (
+          message.method === THREAD_OWNER_DISCOVERY_METHOD &&
+          message.version !== THREAD_OWNER_DISCOVERY_VERSION
+        ) {
+          continue;
+        }
+
         calls.push({
           method: message.method,
           params: message.params,
           targetClientId: message.targetClientId,
+          sourceClientId: message.sourceClientId,
+          version: message.version,
         });
 
         let reply: { result?: unknown; error?: unknown } | undefined;
@@ -275,7 +317,24 @@ function startFakeDesktopIpcServer(
         }
 
         if (reply === undefined) continue; // simulate no reply at all - exercises this transport's own request timeout
-        socket.write(encodeServerFrame({ id: message.id, ...reply }));
+        // resultType/result/handledByClientId all sit at the envelope's
+        // own top level, never nested. A failure's error travels as a
+        // bare top-level `error` field - a plain string for the real
+        // no-owner case, or whatever shape a test handler supplies for
+        // any other simulated failure - never folded into `result`.
+        const resultType = "error" in reply ? "error" : "success";
+        socket.write(
+          encodeServerFrame({
+            type: "response",
+            requestId: message.requestId,
+            method: message.method,
+            resultType,
+            ...("error" in reply ? { error: reply.error } : { result: reply.result }),
+            ...(reply.handledByClientId === undefined
+              ? {}
+              : { handledByClientId: reply.handledByClientId }),
+          })
+        );
       }
     });
   });
@@ -468,11 +527,94 @@ test("probe(): unavailable on a platform with no process.getuid (this transport'
 // header.
 // ---------------------------------------------------------------------------
 
-test("wake(): the full sequence delivers - initialize, then thread-owner-discovery carrying the initialize clientId as hostId, then thread-follower-start-turn targeted at the discovered owner with the exact measured turnStartParams shape", async () => {
+test('wake(): every call on the connection carries the envelope discriminators - type:"request" and a string requestId are implicit in every server.calls entry (the fake server drops anything missing them, asserted separately below), and sourceClientId is null on the first call then the assigned clientId on every call after it', async () => {
+  const { dir, socketPath } = fakeSocketPath();
+  const server = await startFakeDesktopIpcServer(socketPath, {
+    initialize: () => ({ result: { clientId: "caller-client-envelope" } }),
+    threadOwnerDiscovery: () => ({ result: {}, handledByClientId: "owner-client-envelope" }),
+  });
+  try {
+    const transport = new DesktopIpcWakeTransport({ socketPath });
+    const result = await transport.wake("conversation-envelope", "hello");
+    assert.equal(result.outcome, "delivered");
+
+    // Reaching "delivered" at all already proves every call was answered,
+    // which the fake server only does for a message carrying
+    // type:"request" and a string requestId - see the negative control
+    // immediately below for the direct proof that a message missing them
+    // gets no reply. This test's own job is the positional detail: WHICH
+    // sourceClientId each of the three calls carried.
+    assert.equal(server.calls.length, 3);
+    const [init, discovery, startTurn] = server.calls;
+    assert.equal(init!.sourceClientId, null, "initialize has no prior clientId to send");
+    assert.equal(discovery!.sourceClientId, "caller-client-envelope");
+    assert.equal(startTurn!.sourceClientId, "caller-client-envelope");
+  } finally {
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("wake(): a message missing the envelope discriminators (bare id, no type, no sourceClientId) gets NO REPLY AT ALL from a server enforcing the real contract - the app's IPC router never even recognizes the message as a request, so it is silently dropped rather than answered with an error.", async () => {
+  const { dir, socketPath } = fakeSocketPath();
+  const server = await startFakeDesktopIpcServer(socketPath);
+  try {
+    // Bypasses DesktopIpcWakeTransport entirely, on purpose:
+    // DesktopIpcWakeTransport can no longer be made to send this shape at
+    // all, so this test drives the fake server directly with a
+    // hand-built frame to prove the shape itself is unanswered - see this
+    // file's own header on `startFakeDesktopIpcServer`.
+    const socket = net.createConnection({ path: socketPath });
+    await new Promise<void>((resolve, reject) => {
+      socket.once("connect", () => resolve());
+      socket.once("error", reject);
+    });
+    const oldShapedFrame = encodeServerFrame({
+      id: "old-shape-1",
+      method: INITIALIZE_METHOD,
+      params: { clientType: "ghantika-wake-transport" },
+    });
+    const replies: unknown[] = [];
+    const reader = new ServerFrameReader();
+    socket.on("data", (chunk: Buffer) => replies.push(...reader.push(chunk)));
+    socket.write(oldShapedFrame);
+
+    // Bounded wait, not a race against a transport timeout - this asserts
+    // the outcome (silence) directly: a reply arriving here would fail
+    // this assertion, so silence is actively distinguished from an answer
+    // rather than assumed by omission. `server.calls` staying empty
+    // additionally proves the message never reached a method handler at
+    // all, which is what "silently dropped" means as opposed to "answered
+    // with an error" - a materially different failure this fake server
+    // could otherwise produce.
+    await new Promise((r) => setTimeout(r, 300));
+    assert.deepEqual(replies, [], "the old envelope must get no reply at all");
+    assert.equal(
+      server.calls.length,
+      0,
+      "an unrecognized message must never reach a method handler"
+    );
+    socket.destroy();
+
+    // The mechanism that turns this silence into `wake()`'s own
+    // `unavailable` outcome - IpcConnection.call's request timeout, keyed
+    // on nothing but "did a matching reply ever arrive" - is exercised
+    // end to end by the existing "the fake server never replies to
+    // initialize at all" tests above; this test's job is proving the
+    // silence itself is what a message missing the envelope
+    // discriminators earns from a contract-enforcing server, never
+    // refused and never a crash.
+  } finally {
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('wake(): the full sequence delivers - initialize, then thread-owner-discovery carrying the fixed hostId "local" literal and the discovery protocol version, then thread-follower-start-turn targeted at the discovered owner with the exact measured turnStartParams shape', async () => {
   const { dir, socketPath } = fakeSocketPath();
   const server = await startFakeDesktopIpcServer(socketPath, {
     initialize: () => ({ result: { clientId: "caller-client-9" } }),
-    threadOwnerDiscovery: () => ({ result: { ownerId: "owner-client-7" } }),
+    threadOwnerDiscovery: () => ({ result: {}, handledByClientId: "owner-client-7" }),
   });
   try {
     const transport = new DesktopIpcWakeTransport({ socketPath });
@@ -489,9 +631,16 @@ test("wake(): the full sequence delivers - initialize, then thread-owner-discove
 
     assert.equal(discovery!.method, THREAD_OWNER_DISCOVERY_METHOD);
     assert.deepEqual(discovery!.params, {
-      hostId: "caller-client-9",
+      // hostId is the fixed literal string "local", never the caller's
+      // own initialize-assigned clientId - see desktopIpcTransport.ts's
+      // discovery call site.
+      hostId: "local",
       conversationId: "conversation-abc",
     });
+    // The discovery call is refused by the fake server (and by the real
+    // app) without this exact version - reaching "delivered" already
+    // proves it was sent, and this asserts the exact value by name.
+    assert.equal(discovery!.version, THREAD_OWNER_DISCOVERY_VERSION);
 
     assert.equal(startTurn!.method, THREAD_FOLLOWER_START_TURN_METHOD);
     assert.equal(startTurn!.targetClientId, "owner-client-7");
@@ -502,10 +651,68 @@ test("wake(): the full sequence delivers - initialize, then thread-owner-discove
   }
 });
 
-test("wake(): OWNER GATE - no client has the thread open (ownerId: null) - refused, quoting the measured no-client-found sentinel, and thread-follower-start-turn is NEVER sent (proving this transport never forges or routes around the gate)", async () => {
+test("wake(): thread-owner-discovery with a MISSING version, or a version other than 1, gets NO REPLY from a server enforcing the real contract - the same silent-drop shape a missing envelope discriminator produces, proving this suite's own version gate would red if the production discovery call ever stopped sending it", async () => {
+  const { dir, socketPath } = fakeSocketPath();
+  const server = await startFakeDesktopIpcServer(socketPath);
+  try {
+    // Bypasses DesktopIpcWakeTransport entirely, on purpose: drives the
+    // fake server directly with hand-built discovery requests carrying no
+    // version and a wrong version, to prove the fake server's own version
+    // gate actually reds on both rather than merely accepting whatever it
+    // is given.
+    const socket = net.createConnection({ path: socketPath });
+    await new Promise<void>((resolve, reject) => {
+      socket.once("connect", () => resolve());
+      socket.once("error", reject);
+    });
+    const replies: unknown[] = [];
+    const reader = new ServerFrameReader();
+    socket.on("data", (chunk: Buffer) => replies.push(...reader.push(chunk)));
+
+    const missingVersionFrame = encodeServerFrame({
+      type: "request",
+      requestId: "discovery-no-version",
+      sourceClientId: null,
+      method: THREAD_OWNER_DISCOVERY_METHOD,
+      params: { hostId: "local", conversationId: "conversation-no-version" },
+    });
+    socket.write(missingVersionFrame);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.deepEqual(replies, [], "discovery with no version must get no reply at all");
+    assert.equal(
+      server.calls.length,
+      0,
+      "discovery with no version must never reach a method handler"
+    );
+
+    const wrongVersionFrame = encodeServerFrame({
+      type: "request",
+      requestId: "discovery-wrong-version",
+      sourceClientId: null,
+      method: THREAD_OWNER_DISCOVERY_METHOD,
+      params: { hostId: "local", conversationId: "conversation-wrong-version" },
+      version: THREAD_OWNER_DISCOVERY_VERSION + 1,
+    });
+    socket.write(wrongVersionFrame);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.deepEqual(replies, [], "discovery with the wrong version must also get no reply at all");
+    assert.equal(
+      server.calls.length,
+      0,
+      "discovery with the wrong version must never reach a method handler"
+    );
+
+    socket.destroy();
+  } finally {
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('wake(): OWNER GATE - no client has the thread open (resultType:"error", a bare string error equal to the sentinel) - refused, quoting the sentinel, and thread-follower-start-turn is NEVER sent (proving this transport never forges or routes around the gate)', async () => {
   const { dir, socketPath } = fakeSocketPath();
   const server = await startFakeDesktopIpcServer(socketPath, {
-    threadOwnerDiscovery: () => ({ result: { ownerId: null } }),
+    threadOwnerDiscovery: () => ({ error: NO_CLIENT_FOUND_SENTINEL }),
   });
   try {
     const transport = new DesktopIpcWakeTransport({ socketPath });
@@ -552,7 +759,7 @@ test("wake(): OWNER GATE - discovery answers with a protocol-level error mention
 test("wake(): OWNER GATE race - an owner IS discovered, but the app's own internal enforcement still refuses start-turn (the window closed in between) - refused, not unavailable, the same disclosed boundary as the up-front no-owner case", async () => {
   const { dir, socketPath } = fakeSocketPath();
   const server = await startFakeDesktopIpcServer(socketPath, {
-    threadOwnerDiscovery: () => ({ result: { ownerId: "owner-client-1" } }),
+    threadOwnerDiscovery: () => ({ result: {}, handledByClientId: "owner-client-1" }),
     threadFollowerStartTurn: () => ({ error: { message: NO_CLIENT_FOUND_SENTINEL } }),
   });
   try {
@@ -596,7 +803,7 @@ test("wake(): nothing listening at all - unavailable, never a thrown exception r
 test("wake(): NEVER RETRIES - exactly one connection is made per wake() call, whether it succeeds or is refused/unavailable, so a failed attempt returns promptly rather than presenting as a hang", async () => {
   const { dir, socketPath } = fakeSocketPath();
   const server = await startFakeDesktopIpcServer(socketPath, {
-    threadOwnerDiscovery: () => ({ result: { ownerId: null } }),
+    threadOwnerDiscovery: () => ({ error: NO_CLIENT_FOUND_SENTINEL }),
   });
   try {
     const transport = new DesktopIpcWakeTransport({ socketPath });
