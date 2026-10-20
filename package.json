@@ -55,7 +55,7 @@
     "report:coverage-delta": "node scripts/report-coverage-delta.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/server": "2.0.0"
+    "@modelcontextprotocol/server": "2.3.0"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
